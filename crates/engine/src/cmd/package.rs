@@ -521,13 +521,13 @@ mod tests {
             }
         }
         let linked = dir.join("Links").join("my photo.png");
-        let uri = format!("file:{}", linked.to_string_lossy().replace(' ', "%20"));
+        let uri = format!("file:{}", linked.to_string_lossy().replace('\\', "/").replace('%', "%25").replace(' ', "%20").replace('#', "%23"));
         assert!(spreads.contains(&format!(r#"LinkResourceURI="{uri}""#)), "{spreads}");
         assert!(!spreads.contains("<Contents") && !spreads.contains(r#"StoredState="Embedded""#), "no image is embedded");
         let back = designcraft_idml::import_idml_with(&idml, &|_| None).unwrap();
         let asset = back.assets.values().next().unwrap();
         assert!(asset.data.is_empty(), "no image is embedded");
-        assert_eq!(asset.link.as_deref(), linked.to_str());
+        assert_eq!(asset.link.as_deref().map(Path::new), Some(linked.as_path()));
     }
 
     /// A link whose file is gone has no bytes to copy: the package leaves it out of Links/, the
@@ -864,21 +864,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn package_refuses_windows_directory_redirects() {
-        use std::os::windows::fs::symlink_dir;
+        use std::os::windows::fs::MetadataExt;
 
         let base = std::env::temp_dir().join(format!("dc-package-windows-redirect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let outside = base.join("separate");
         std::fs::create_dir_all(&outside).unwrap();
         let redirected = base.join("Package");
-        match symlink_dir(&outside, &redirected) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                let _ = std::fs::remove_dir_all(&base);
-                return;
-            }
-            Err(e) => panic!("could not create directory redirect: {e}"),
-        }
+        // Directory junctions are real redirecting reparse points and do not require the
+        // symbolic-link privilege (1314) or Developer Mode. This test must exercise refusal,
+        // rather than silently skip its security assertion on ordinary Windows accounts.
+        let junction = std::process::Command::new("cmd").args(["/D", "/C", "mklink", "/J"]).arg(&redirected).arg(&outside).output().unwrap();
+        assert!(junction.status.success(), "could not create directory junction: {}", String::from_utf8_lossy(&junction.stderr));
+        assert_ne!(std::fs::symlink_metadata(&redirected).unwrap().file_attributes() & 0x400, 0, "fixture must be a reparse point");
         let mut s = Session::new();
         s.execute("file.new", &json!({"title": "Annual"})).unwrap();
         assert!(s.execute("file.package", &json!({"dir": redirected.to_string_lossy(), "idml": false})).is_err());

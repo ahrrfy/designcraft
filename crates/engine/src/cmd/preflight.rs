@@ -354,11 +354,17 @@ mod placed_vector_tests {
         s.execute("file.place", &json!({"base64": base64_encode(&png), "name": "photo.jpg", "x": 72, "y": 72, "width": 20})).unwrap();
         let doc = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc);
         let asset = doc.assets.values_mut().next().unwrap();
-        std::sync::Arc::make_mut(asset).link = Some("/definitely/missing dir/photo.jpg".into());
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let missing_path =
+            std::env::temp_dir().join(format!("dc-preflight-missing-{}-{nonce}", std::process::id())).join("missing dir").join("photo.jpg");
+        assert!(!missing_path.exists());
+        let missing_link = missing_path.to_string_lossy().into_owned();
+        std::sync::Arc::make_mut(asset).link = Some(missing_link.clone());
         let r = s.execute("preflight.run", &json!({})).unwrap();
         let missing: Vec<&str> =
             r["issues"].as_array().unwrap().iter().filter(|i| i["kind"] == "missingLink").map(|i| i["message"].as_str().unwrap()).collect();
-        assert_eq!(missing, ["Missing link: /definitely/missing dir/photo.jpg"]);
+        let expected = format!("Missing link: {missing_link}");
+        assert_eq!(missing, [expected.as_str()]);
     }
 }
 

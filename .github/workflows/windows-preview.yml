@@ -1,0 +1,189 @@
+name: Windows AI preview
+
+on:
+  push:
+    tags: ['v*-ai*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ai-preview-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verified:
+    if: github.repository == 'ahrrfy/designcraft'
+    name: Verify existing exact-commit Rust CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ci_url: ${{ steps.proof.outputs.ci_url }}
+    steps:
+      - name: Require a completed successful Rust CI run without rerunning it
+        id: proof
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          gh api --method GET "repos/$GH_REPO/actions/workflows/ci.yml/runs" \
+            -f head_sha="$SOURCE_SHA" -f per_page=100 > runs.json
+          ci_url="$(jq -er --arg sha "$SOURCE_SHA" --arg repo "$GH_REPO" '
+            [.workflow_runs[] | select(
+              .head_sha == $sha and .head_repository.full_name == $repo and
+              ((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch") and
+              .path == ".github/workflows/ci.yml" and .name == "Rust CI"
+            )] | sort_by(.id) | reverse | .[0] |
+            if . == null then error("No Rust CI run exists for the exact source commit")
+            elif .status != "completed" or .conclusion != "success" then
+              error("Latest exact-commit Rust CI is pending or unsuccessful; no automatic rerun is performed")
+            elif .html_url != ("https://github.com/" + $repo + "/actions/runs/" + (.id | tostring)) then
+              error("Unexpected CI run URL")
+            else .html_url end
+          ' runs.json)"
+          printf 'ci_url=%s\n' "$ci_url" >> "$GITHUB_OUTPUT"
+          printf 'Reusing successful Rust CI for %s: %s\n' "$SOURCE_SHA" "$ci_url" >> "$GITHUB_STEP_SUMMARY"
+
+  portable:
+    name: Unsigned Windows x64 portable
+    needs: verified
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      ci_url: ${{ needs.verified.outputs.ci_url }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 3
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      DESIGNCRAFT_REQUIRE_WINRES: '1'
+      CRAFT_FONTS_REQUIRED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pinned redistributable font collection
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-ai-preview
+      - name: Build exact checked-out commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CRAFT_FONTS_DIR = Join-Path $env:GITHUB_WORKSPACE 'craft-fonts'
+          $env:DESIGNCRAFT_BUILD_SHA = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve build commit' }
+          $env:DESIGNCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+          cargo build --release --locked -p designcraft -p designcraft-cli --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          git diff --exit-code -- Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Release changed the lockfile' }
+      - name: Assemble portable preview and licenses
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          VERIFIED_CI_URL: ${{ needs.verified.outputs.ci_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve commit' }
+          $label = 'preview-' + $sha.Substring(0, 12)
+          if ($env:RELEASE_REF.StartsWith('refs/tags/')) {
+            if ($env:RELEASE_REF_NAME -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+-ai[0-9A-Za-z.-]*$') { throw 'Expected vX.Y.Z-ai... prerelease tag' }
+            $label = $env:RELEASE_REF_NAME
+          }
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist/smart-design-portable'
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'dist/preview'
+          New-Item -ItemType Directory -Force -Path $stage, $releaseDir | Out-Null
+          Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/designcraft.exe', 'target/x86_64-pc-windows-msvc/release/designcraft-cli.exe' -Destination $stage
+          Copy-Item -LiteralPath 'NOTICE', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-FOXIT', 'ASSETS.md' -Destination $stage
+          'Portable Smart Design preview. Settings and recovery remain beside these executables.' | Set-Content -LiteralPath (Join-Path $stage 'portable.txt') -Encoding ascii
+          Copy-Item -LiteralPath 'docs/ai-production.ar.md' -Destination $stage
+          $fontNotices = Join-Path $stage 'font-licenses'
+          New-Item -ItemType Directory -Force -Path $fontNotices | Out-Null
+          Copy-Item -LiteralPath 'licenses/epaint-default-fonts' -Destination $fontNotices -Recurse
+          Get-ChildItem -LiteralPath 'assets/fonts' -File -Filter 'OFL-*.txt' | Copy-Item -Destination $fontNotices
+          Copy-Item -LiteralPath 'craft-fonts/ATTRIBUTION.md', 'craft-fonts/LICENSE-MIT', 'craft-fonts/LICENSE-APACHE' -Destination $fontNotices
+          Get-ChildItem -LiteralPath 'craft-fonts/fonts' -Recurse -File | Where-Object { $_.Name -match '^(OFL|LICENSE|COPYING|NOTICE|AUTHORS)' -or $_.Extension -eq '.md' } | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath((Join-Path $env:GITHUB_WORKSPACE 'craft-fonts'), $_.FullName)
+            $destination = Join-Path $fontNotices $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $destination
+          }
+          $instructions = @(
+            'Smart Design / التصميم الذكي — independent Windows x64 preview',
+            'Based on DesignCraft by the ArtCraft team and contributors. This fork is independently maintained.',
+            'UNSIGNED PREVIEW: these binaries are not code-signed. Pre-alpha; keep backup copies of documents.',
+            'Extract the whole ZIP into a new folder, then run .\designcraft.exe. No MSI or system associations are installed.',
+            'Keep portable.txt beside these executables in a writable folder. Settings, logs, AI data and recovery stay in DesignCraftData beside them; DESIGNCRAFT_CONFIG_DIR overrides that location. An unwritable portable folder disables portable mode with a visible warning, so move this copy to a writable folder.',
+            'CLI: .\designcraft-cli.exe --help',
+            'AI: Window > AI Production / AI Skills / AI Usage. Providers/services and models must be configured separately.',
+            'Cloud credentials: masked UI field saved in Windows Credential Manager, or selected-provider environment variable for its default endpoint. Custom endpoints use separate credential entries. No keys are bundled.',
+            'Editable exchange: Export IDML is available. Optional Export INDD requires an installed licensed Windows InDesign and currently accepts native-only documents without linked assets or groups; no Adobe software is bundled.',
+            'Printing and commercial-press suitability require human review and physical paper proof.',
+            ('Source commit: ' + $sha),
+            ('Verified successful Rust CI: ' + $env:VERIFIED_CI_URL)
+          )
+          $instructions | Set-Content -LiteralPath (Join-Path $stage 'RUN-ME.txt') -Encoding utf8
+          $sha | Set-Content -LiteralPath (Join-Path $stage 'SOURCE-COMMIT.txt') -Encoding ascii
+          $env:VERIFIED_CI_URL | Set-Content -LiteralPath (Join-Path $stage 'CI-RUN.txt') -Encoding ascii
+          $zip = Join-Path $releaseDir ('smart-design-' + $label + '-windows-x64-unsigned-portable.zip')
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          ($hash + '  ' + (Split-Path $zip -Leaf)) | Set-Content -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt') -Encoding ascii
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smart-design-windows-x64-unsigned
+          path: dist/preview/*
+          if-no-files-found: error
+
+  draft:
+    name: Draft tagged prerelease
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: portable
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: smart-design-windows-x64-unsigned
+          path: preview
+      - name: Create draft without replacing an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREVIEW_TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERIFIED_CI_URL: ${{ needs.portable.outputs.ci_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-ai[0-9A-Za-z.-]*$ ]]
+          if gh release view "$PREVIEW_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; review it instead of replacing assets.' >&2
+            exit 1
+          fi
+          printf '%s\n' 'Independent Smart Design fork. Unsigned Windows x64 portable preview; no MSI.' "Source commit: $SOURCE_SHA" "Existing successful Rust CI for this exact commit: $VERIFIED_CI_URL" 'CI was verified and reused without rerunning it. This does not certify physical printing or commercial-press output.' > notes.txt
+          gh release create "$PREVIEW_TAG" --verify-tag --draft --prerelease --title "Smart Design $PREVIEW_TAG (unsigned preview)" --notes-file notes.txt preview/*

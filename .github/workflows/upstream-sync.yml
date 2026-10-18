@@ -1,0 +1,88 @@
+name: Propose upstream sync
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    if: github.repository == 'ahrrfy/designcraft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge fixed upstream into a separate review branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No fetched scripts/workflows execute here. Main is never reset, pushed or auto-merged.
+          git fetch --no-tags https://github.com/storytold/designcraft.git main
+          upstream="$(git rev-parse FETCH_HEAD)"
+          base="$(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo 'Upstream main is already integrated.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          branch="sync/upstream-${upstream:0:12}"
+          existing="$(gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty')"
+          if [ -n "$existing" ]; then
+            printf 'Existing integration review: %s\n' "$existing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          report_dir='.github/upstream-sync-reports'
+          mkdir -p "$report_dir"
+          report="$report_dir/${upstream:0:12}.md"
+          git diff --name-status "$base...$upstream" > "$RUNNER_TEMP/upstream-paths.txt"
+          draft=()
+          if git merge --no-ff --no-commit "$upstream"; then
+            git commit -m "Merge upstream ${upstream:0:12} for review"
+            result='Upstream merged into this review branch; feature preservation and CI still require review.'
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
+            if [ ! -s "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
+              echo 'Merge failed without file conflicts; no branch is published.' >&2
+              exit 1
+            fi
+            git merge --abort
+            draft=(--draft)
+            result='CONFLICTS: this branch contains only a report. Upstream code has NOT been merged; resolve manually before review.'
+          fi
+          {
+            printf '# Upstream integration review\n\n%s\n\n' "$result"
+            printf -- '- Fork main base: %s\n- Upstream main: %s\n- Source: https://github.com/storytold/designcraft\n\n' "$base" "$upstream"
+            printf '## Upstream changed paths\n\n```text\n'
+            cat "$RUNNER_TEMP/upstream-paths.txt"
+            printf '```\n'
+            if [ -f "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
+              printf '\n## Conflicting paths\n\n```text\n'
+              cat "$RUNNER_TEMP/upstream-conflicts.txt"
+              printf '```\n'
+            fi
+            printf '\nReview AI production, skills, provider contracts, native commands, branding and packaging. Do not resolve conflicts by replacing fork main with upstream.\n'
+            printf '\nThe GitHub token-created PR may not start CI automatically. Run Rust CI manually against this exact branch before merging. No automatic merge or release is performed.\n'
+          } > "$report"
+          git add -- "$report"
+          git commit -m "Document upstream ${upstream:0:12} integration review"
+          gh auth setup-git
+          # An existing remote branch causes a normal push refusal; never force overwrite it.
+          git push --set-upstream origin "$branch"
+          gh pr create --base main --head "$branch" --title "Review upstream ${upstream:0:12} integration" --body-file "$report" "${draft[@]}"

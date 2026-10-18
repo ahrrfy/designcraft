@@ -1,0 +1,22 @@
+[package]
+name = "designcraft-ai-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local, review-gated and revision-pinned Agent Skills catalog"
+
+[lints]
+workspace = true
+
+[dependencies]
+designcraft-ai-types = { path = "../ai-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+sha2 = "0.10"
+serde_yaml = "0.9"
+png = "0.18"
+
+[dev-dependencies]
+tempfile.workspace = true

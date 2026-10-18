@@ -15,6 +15,11 @@ list (author, source, license) is in ASSETS.md.
 - Source Sans 3 and Source Serif 4 (assets/fonts/Source*) — SIL Open Font License 1.1. See assets/fonts/OFL-SourceSans3.txt, OFL-SourceSerif4.txt.
 - Inter (assets/fonts/Inter-*.ttf) — SIL Open Font License 1.1. See assets/fonts/OFL-Inter.txt.
 - JetBrains Mono (assets/fonts/JetBrainsMono-*.ttf) — SIL Open Font License 1.1. See assets/fonts/OFL-JetBrainsMono.txt.
+- egui fallback fonts, embedded by epaint_default_fonts 0.36.2: Hack, Noto Emoji,
+  Ubuntu Light and emoji-icon-font. Their complete license texts are retained in
+  licenses/epaint-default-fonts/ (Hack-Regular.txt, OFL.txt, UFL.txt and
+  emoji-icon-font-mit-license.txt), shipped under font-licenses/epaint-default-fonts/
+  in the Windows preview. No additional font files are added to this repository.
 - English hyphenation word list (assets/hyphenation/en-us.dic) — derived from the Moby Hyphenator II
   list by Grady Ward, public domain (Project Gutenberg eBook #3204). The hyphenation patterns
   (assets/hyphenation/en-us.pat) are trained from it by DesignCraft and released as CC0-1.0.
@@ -84,7 +89,9 @@ list (author, source, license) is in ASSETS.md.
   (Apache-2.0 OR MIT) are pdfcraft's patched copies, fetched by git from its vendor/ directory at
   the commit that Cargo.toml pins (https://github.com/storytold/pdfcraft, MIT OR Apache-2.0).
   hayro-interpret embeds PDFium's Foxit standard-14 fonts under PDFium's BSD-style license
-  (vendor/hayro-interpret/assets/LICENSE_FOXIT) and a CMYK profile under CC0-1.0.
+  (complete copyright, conditions and disclaimer in LICENSE-FOXIT, included in binary
+  packages; copied from the pinned pdfcraft vendor/hayro-interpret/assets/LICENSE_FOXIT)
+  and a CMYK profile under CC0-1.0.
 
 Rust dependencies (vello_cpu, kurbo, skrifa, harfrust, image, egui, eframe, …) are permissively
 licensed (MIT/Apache-2.0/BSD/ISC/Zlib) and fetched through crates.io.

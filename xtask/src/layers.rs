@@ -33,6 +33,9 @@ impl Class {
 /// The layering table. Names are package names without the `designcraft-`
 /// prefix.
 pub const TABLE: &[(&str, Class)] = &[
+    ("ai-types", Class::Layer(0)),
+    ("ai-skills", Class::Layer(1)),
+    ("ai-providers", Class::Layer(1)),
     ("geom", Class::Layer(0)),
     ("color", Class::Layer(0)),
     ("doc", Class::Layer(1)),
@@ -50,6 +53,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("engine", Class::Layer(5)),
     ("ui-egui", Class::Layer(6)),
     ("mcp", Class::Layer(6)),
+    ("ai-runtime", Class::Layer(6)),
     ("testkit", Class::Testkit),
     // L7 apps and tooling
     ("designcraft", Class::Exempt),

@@ -33,6 +33,7 @@ log = { workspace = true }
 quick-xml = { workspace = true }
 caseless = { workspace = true }
 unicode-segmentation = { workspace = true }
+sha2 = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 craft-atomic = { workspace = true }

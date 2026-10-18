@@ -10,6 +10,7 @@ description = "DesignCraft egui frontend (InDesign-style UI); swappable — noth
 workspace = true
 
 [dependencies]
+zeroize = "1"
 craft-ui = { workspace = true }
 designcraft-geom = { workspace = true }
 designcraft-color = { workspace = true }
@@ -19,6 +20,8 @@ designcraft-compose = { workspace = true }
 designcraft-render = { workspace = true }
 designcraft-tools = { workspace = true }
 designcraft-engine = { workspace = true }
+designcraft-ai-types = { path = "../ai-types" }
+image = { workspace = true }
 unicode-bidi = { workspace = true }
 unicode-bidi-mirroring = { workspace = true }
 unicode-segmentation = { workspace = true }

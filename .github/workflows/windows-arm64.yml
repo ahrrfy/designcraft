@@ -28,6 +28,9 @@ permissions:
 
 jobs:
   windows-arm64:
+    # The fork ships a separate x64 portable preview. The inherited MSI still
+    # uses upstream identity and must not be distributed by this fork.
+    if: github.repository == 'storytold/designcraft'
     # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
     uses: storytold/craft-common-actions/.github/workflows/windows-arm64.yml@main
     with:

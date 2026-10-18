@@ -17,7 +17,7 @@ use crate::{DocState, EngineError, Result, Session};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(query "file.exportIdml", "Export IDML…", [], None,
-            "{path?, embedImages?: true} — writes an IDML package to `path`, or returns {base64} without a path",
+            "{path?, embedImages?: true} — writes real .idml output (extensionless paths gain .idml), or returns {base64}; {warnings} names known interchange losses",
             has_doc, export_idml),
         cmd!(noundo "file.openIdml", "Open IDML", [], None,
             "{path | base64, name?} — opens an IDML package, or an InDesign document or template (.indd, .indt: converted to IDML first; its conversion warnings join `warnings`), as a new document (linked images are read next to the file or from its Links/ folder; the fonts in a `Document Fonts` folder beside it load first) → {index, documentFonts, warnings: conversion warnings, package parts missing, font files skipped, GREP styles whose pattern can't compile}",
@@ -26,16 +26,37 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 fn export_idml(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = super::formats::optional_path("file.exportIdml", p, "idml")?;
     let st = s.doc()?;
+    let mut pending: Vec<_> =
+        st.doc.spreads.iter().chain(&st.doc.parents).flat_map(|spread| spread.items.iter().map(|item| (item.as_ref(), 0usize))).take(65537).collect();
+    let mut visited = 0usize;
+    let mut labels = 0usize;
+    while let Some((item, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 65536 || depth > 64 || pending.len() > 65536 {
+            return Err(bad("file.exportIdml", "IDML export supports at most 65536 items and 64 group levels"));
+        }
+        labels += usize::from(!item.label.is_empty());
+        let remaining = 65537usize.saturating_sub(pending.len());
+        pending.extend(item.children().iter().take(remaining).map(|child| (child.as_ref(), depth + 1)));
+    }
+    let warnings = if labels > 0 {
+        vec![format!(
+            "Script labels on {labels} object(s) are not preserved by the current IDML interchange; keep the .designcraft source for full native metadata"
+        )]
+    } else {
+        vec![]
+    };
     let opts = designcraft_idml::ExportOptions { embed_images: p.get("embedImages").and_then(Value::as_bool).unwrap_or(true) };
     let bytes = designcraft_idml::export_idml_with(&st.doc, &opts);
-    match str_param(p, "path") {
+    match path.as_deref() {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
             crate::io::write_file(path, &bytes).map_err(EngineError::Other)?;
-            Ok(json!({"path": path, "bytes": bytes.len()}))
+            Ok(json!({"path": path, "bytes": bytes.len(),"warnings":warnings}))
         }
-        None => Ok(json!({"base64": base64_encode(&bytes), "bytes": bytes.len()})),
+        None => Ok(json!({"base64": base64_encode(&bytes), "bytes": bytes.len(),"warnings":warnings})),
     }
 }
 
@@ -494,9 +515,14 @@ mod tests {
             "file://192.0.2.1/s/x.png",
             text.to_str().unwrap(),
             zero.to_str().unwrap(),
-            "/dev/zero",
             "Links/zero.png",
             "Links/notes.png",
+            // /dev/zero is a Unix device, but a drive-rooted ordinary filename on Windows.
+            // Exercise the host's device namespace without unrelated filesystem probes.
+            #[cfg(unix)]
+            "/dev/zero",
+            #[cfg(windows)]
+            r"\\.\NUL",
         ];
         for link in links {
             let (idml, _) = linked_idml(link, false).unwrap();

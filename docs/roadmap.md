@@ -1,6 +1,6 @@
 # DesignCraft roadmap (detail)
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (.indd and .indt open through indd-utils; text threads by hand; the gate waits on the Primary Text Frame page fixes) · **Target:** Adobe InDesign 2026 (21.6)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-18 · **Change:** minor (native AI production and reviewed skills; .indd and .indt open through indd-utils; text threads by hand; the gate waits on the Primary Text Frame page fixes) · **Target:** Adobe InDesign 2026 (21.6)
 
 Forward-looking plan. The one-page summary is [ROADMAP.md](../ROADMAP.md); numbers are in
 [target-app-parity.md](target-app-parity.md); the work list is [gaps.md](gaps.md). Hours are
@@ -49,6 +49,12 @@ In order. Each closes a beta blocker from [gaps.md](gaps.md).
 5. **Composition oracle** (gap 4): synthetic stories set in InDesign 2026 vs DesignCraft;
    optical kerning; the overset rule. 80–140 h.
 6. **Start on any GPU; find every installed font** (gaps 5, 6). 25–50 h.
+
+### Native AI production — implementation, 2026-10-18
+
+The independent Smart Design fork adds five desktop AI panels, independent text/image models, endpoint-scoped Windows credentials, reviewed immutable skills and bounded reference analysis. Books use human proof checkpoints (default four pages, at most 32 per batch and 1,000 total), one cumulative budget and pinned skill revisions; interrupted work never resumes API calls automatically. Client resource admission and the owned Ollama process are not OS/GPU isolation. Printing submits the exact frozen PDF/font/color/printer proof after a durable human decision. Four builtin skills remain drafts with no active revisions; approval validates all template variants.
+
+The original deterministic eight-page A4 fixture was reopened through installed InDesign 21.2: 52 editable stories/text frames, matching content and 99 object bounds, no missing fonts/overset; Script labels are lost. This does not measure AI quality or savings. Manual upstream integration and CI/unsigned Windows preview workflows preserve the fork review path; current-head CI/release and physical paper proof remain pending. See the [Arabic operating and evaluation guide](ai-production.ar.md). The pre-alpha gate and parity estimates are unchanged.
 
 ## Milestones
 
@@ -111,6 +117,7 @@ output intent · EPS place") is done except Books depth and EPS (preview only).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-18 | minor | Reviewed book batches, Windows vault/local lifecycle, frozen print proof and measured sample INDD roundtrip documented; current-head CI/release and paper proof pending; no stage or parity change |
 | 2026-10-13 | minor | INDD and INDT open through storytold/indd-utils; focus item 3 shrinks to a real-file corpus (10–30 h) |
 | 2026-10-12 | minor | Threading row: threading by hand works; the gate waits on the Primary Text Frame page fixes (#165), 5–7 h |
 | 2026-10-10 | trivial | Ready figure 42% → 47% (method aligned with the standard); beta distance 28 points |

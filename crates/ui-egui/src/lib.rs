@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod about;
+pub mod ai;
 pub mod canvas;
 pub mod chrome;
 pub mod control;
@@ -47,6 +48,8 @@ pub use control::{ControlRequest, ControlResponse};
 pub type ReadFn = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
 pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 pub type PickFn = Box<dyn FnMut(&str) -> Option<String>>;
+/// Native production host. Calls enqueue work or poll a worker; they must never perform network I/O.
+pub type AiFn = Box<dyn FnMut(&mut Session, designcraft_ai_types::protocol::AiRequest) -> designcraft_ai_types::protocol::AiSnapshot>;
 /// Context captured before any host file-picker or read await.
 #[derive(Clone, Debug)]
 pub struct ImportRequest {
@@ -68,6 +71,8 @@ pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<ImportedFile>>>;
 /// Platform services injected by the host (desktop or web).
 #[derive(Default)]
 pub struct Services {
+    /// Optional native AI bridge. Web hosts without it show an unavailable panel.
+    pub ai: Option<AiFn>,
     /// Open-file dialog for a purpose (`open`, `place`) → path.
     pub pick_open: Option<PickFn>,
     /// Save dialog with a suggested name → path.
@@ -185,6 +190,9 @@ impl Default for PdfExportSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiState {
+    /// Production work, credentials, drafts and reports exist for this session only.
+    #[serde(skip)]
+    pub ai: ai::AiUiState,
     pub brightness: theme::Brightness,
     pub screen_mode: ScreenMode,
     /// The screen mode leaving Presentation returns to: the one it was entered from.
@@ -355,6 +363,7 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         UiState {
+            ai: ai::AiUiState::default(),
             brightness: theme::Brightness::MediumDark,
             screen_mode: ScreenMode::Normal,
             presentation_return: ScreenMode::Normal,
@@ -1120,6 +1129,7 @@ impl DesignApp {
 
     /// Per-frame logic before layout.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        ai::poll(self, ctx);
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }
@@ -1624,6 +1634,7 @@ impl DesignApp {
         story_editor::show(self, &ctx);
         dialogs::show(self, &ctx);
         about::show(self, &ctx);
+        ai::show(self, &ctx);
         menus::palette(self, &ctx);
         if self.custom_titlebar {
             chrome::resize_borders(self, ui);

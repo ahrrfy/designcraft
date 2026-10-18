@@ -53,10 +53,13 @@ pub fn specs() -> Vec<CommandSpec> {
             ok()
         }),
         cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} — a `path` without the .designcraft extension gets it → {path: the file written, bytes}", has_doc, file_save),
-        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} — a path without the .designcraft extension gets it → {path: the file written, bytes}", has_doc, file_save),
+        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} — native .designcraft output; PDF/IDML use their exporters; INDD/INDT writing is unavailable → {path: the file written, bytes}", has_doc, |s,p| {
+            if !p.get("path").is_some_and(Value::is_string) { return Err(bad("file.saveAs","path must be a string")); }
+            file_save(s,p)
+        }),
         cmd!(noundo "file.saveACopy", "Save a Copy…", ["File"], None, "{path} — writes the document without changing which file it is or its unsaved state; a path without the .designcraft extension gets it → {path: the file written, bytes}", has_doc, |s, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.saveACopy", "missing `path`"))?;
-            let path = with_document_extension(path);
+            let path = super::formats::native_path(path)?;
             let mut copy = (*s.doc()?.doc).clone();
             super::datamerge::refresh_relative_paths(&mut copy, std::path::Path::new(&path));
             let bytes = to_bytes_with_preview(&copy, &s.cache)?;
@@ -552,12 +555,23 @@ fn file_open_bytes(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("path").is_some_and(|v| !v.is_string()) {
+        return Err(bad("file.save", "path must be a string when provided"));
+    }
     let st = s.doc_mut()?;
     // Saving to the document's own file keeps its name, even one opened without the extension.
     let path = str_param(p, "path")
-        .map(with_document_extension)
+        .map(super::formats::native_path)
+        .transpose()?
         .or_else(|| st.path.clone())
         .ok_or_else(|| bad("file.save", "missing `path` (document has never been saved)"))?;
+    if std::path::Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ["indd", "indt", "idml", "pdf"].iter().any(|known| ext.eq_ignore_ascii_case(known)))
+    {
+        return Err(bad("file.save", "saving native bytes under an interchange extension is not supported; choose a .designcraft destination"));
+    }
     // Before anything about the document changes: a refused save leaves it as it was.
     crate::file_access::check_write(&path).map_err(EngineError::Other)?;
     // Prepare paths for the destination without changing the live document until persistence succeeds.
@@ -931,9 +945,14 @@ pub(crate) fn snippet_bytes(s: &mut Session) -> Result<Vec<u8>> {
 }
 
 fn snippet_export(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = match p.get("path") {
+        None => None,
+        Some(Value::String(path)) => Some(super::formats::native_path(path)?),
+        Some(_) => return Err(bad("snippet.export", "path must be a string")),
+    };
     let d = super::edit::clip_doc(s)?;
     let bytes = to_bytes(&d)?;
-    match str_param(p, "path") {
+    match path.as_deref() {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
             crate::io::write_file(path, &bytes).map_err(EngineError::Other)?;

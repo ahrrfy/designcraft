@@ -1,0 +1,62 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Windows quality gates
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-quality
+      - name: Resolve only locked dependencies
+        run: cargo fetch --locked
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Workspace tests
+        run: cargo test --locked --workspace
+      - name: PDF dependency policy
+        run: cargo run --locked -p xtask -- pdf-deps
+      - name: Asset attribution
+        run: cargo run --locked -p xtask -- assets
+      - name: Dependency layering
+        run: cargo run --locked -p xtask -- layers
+      - name: Portable crates and UI compile for WebAssembly
+        # xtask selects exactly the L0-L5 and UI packages. Guard its child Cargo calls too.
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: cargo run --locked -p xtask -- wasm
+      - name: Lockfile stayed unchanged
+        if: always()
+        run: git diff --exit-code -- Cargo.lock

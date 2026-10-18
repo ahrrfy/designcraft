@@ -304,6 +304,7 @@ fn pick_save(name: &str) -> Option<String> {
 
 fn services() -> Services {
     Services {
+        ai: ai_service(),
         pick_open: Some(Box::new(|purpose: &str| {
             let mut dialog = rfd::FileDialog::new();
             for filter in open_filters(purpose) {
@@ -312,10 +313,38 @@ fn services() -> Services {
             dialog.pick_file().map(|p| p.to_string_lossy().to_string())
         })),
         pick_save: Some(Box::new(pick_save)),
-        read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
+        read: Some(Box::new(|p: &str| {
+            let bytes = designcraft_engine::io::read_capped(p, 64 * 1024 * 1024).map_err(|e| e.to_string())?;
+            if bytes.len() > 64 * 1024 * 1024 {
+                return Err("Preview or data file exceeds the 64-MiB read limit".into());
+            }
+            Ok(bytes)
+        })),
         write: Some(Box::new(|p: &str, b: &[u8]| designcraft_engine::atomic::write_atomic(std::path::Path::new(p), b).map_err(|e| e.to_string()))),
         clipboard_text: Some(Box::new(|| arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok())),
         ..Default::default()
+    }
+}
+
+/// Keep the native runtime above the UI/engine layers; secrets never enter UI preferences.
+fn ai_service() -> Option<designcraft_ui_egui::AiFn> {
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        if no_prefs() {
+            return None;
+        }
+        let root = profile::config_dir()?.join("AI");
+        match designcraft_ai_runtime::ProductionRunner::open(root) {
+            Ok(mut runner) => Some(Box::new(move |session, request| runner.handle(session, request))),
+            Err(error) => {
+                log::error!("AI runtime initialization failed: {error}");
+                None
+            }
+        }
     }
 }
 
@@ -383,7 +412,7 @@ fn main() -> std::process::ExitCode {
     }
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("DesignCraft")
+            .with_title("Smart Design")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([900.0, 560.0])
             .with_decorations(!cfg!(target_os = "windows"))
@@ -461,7 +490,7 @@ fn main() -> std::process::ExitCode {
     // A panic that ends the window (egui-wgpu's own) is caught here: never a crash.
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         eframe::run_native(
-            "DesignCraft",
+            "Smart Design",
             options,
             Box::new(move |cc| {
                 let mut restarted = None;

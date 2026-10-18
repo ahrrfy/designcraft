@@ -27,6 +27,16 @@ fn main() {
     app.custom_titlebar = cfg!(target_os = "windows");
     let lines: Vec<serde_json::Value> =
         script.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("json line")).collect();
+    // An explicit data-only fixture permits offscreen native-panel QA without provider calls.
+    if let Some(fixture) = lines.iter().find_map(|l| l.get("aiFixture")) {
+        match serde_json::from_value::<designcraft_ai_types::protocol::AiSnapshot>(fixture.clone()) {
+            Ok(snapshot) => app.services.ai = Some(Box::new(move |_, _| snapshot.clone())),
+            Err(error) => {
+                eprintln!("invalid AI screenshot fixture: {error}");
+                return;
+            }
+        }
+    }
     if lines.first().is_none_or(|l| l.get("empty").is_none()) {
         let _ = app.run("file.newSample", serde_json::json!({}));
     }

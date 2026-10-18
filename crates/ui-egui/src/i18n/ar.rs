@@ -1,5 +1,11 @@
 //! Original Arabic interface translations, stored in logical Unicode order.
 pub(super) const TABLE: &[(&str, &str)] = &[
+    ("AI Production…", "الإنتاج بالذكاء الاصطناعي…"),
+    ("AI Skills…", "مهارات الذكاء الاصطناعي…"),
+    ("AI Usage…", "استخدام الذكاء الاصطناعي…"),
+    ("AI Providers and Keys…", "مزودو الذكاء الاصطناعي والمفاتيح…"),
+    ("Local AI…", "الذكاء الاصطناعي المحلي…"),
+    ("AI Host Request", "طلب خدمة الذكاء الاصطناعي"),
     ("File", "ملف"),
     ("Edit", "تحرير"),
     ("Layout", "تخطيط"),

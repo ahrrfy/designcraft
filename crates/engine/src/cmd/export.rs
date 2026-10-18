@@ -36,6 +36,7 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 fn print_booklet(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = super::formats::optional_path("file.printBooklet", p, "pdf")?;
     const ID: &str = "file.printBooklet";
     let kind = match str_param(p, "type").unwrap_or("saddleStitch") {
         "saddleStitch" => designcraft_pdf::BookletKind::SaddleStitch,
@@ -46,7 +47,7 @@ fn print_booklet(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.doc()?;
     let r = designcraft_pdf::export_booklet(&super::interchange::with_pdf_boxes(&st.doc), &s.cache, &opts)
         .map_err(|e| EngineError::Other(e.to_string()))?;
-    match str_param(p, "path") {
+    match path.as_deref() {
         Some(path) => {
             #[cfg(not(target_arch = "wasm32"))]
             crate::io::write_file(path, &r.bytes).map_err(EngineError::Other)?;
@@ -708,6 +709,19 @@ fn first_page_ref(pdf: &[u8]) -> Option<usize> {
 }
 
 fn export_pdf(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = super::formats::optional_path("file.exportPdf", p, "pdf")?;
+    let r = pdf_report(s, p)?;
+    match path.as_deref() {
+        Some(path) => {
+            write_file(path, &r.bytes)?;
+            Ok(json!({"path":path,"bytes":r.bytes.len(),"pages":r.pages,"warnings":r.warnings}))
+        }
+        None => Ok(json!({"base64":super::base64_encode(&r.bytes),"bytes":r.bytes.len(),"pages":r.pages,"warnings":r.warnings})),
+    }
+}
+
+/// The same complete PDF pipeline for export and frozen print preparation.
+pub(super) fn pdf_report(s: &Session, p: &Value) -> Result<designcraft_pdf::ExportReport> {
     let st = s.doc()?;
     let opts = options(p, st.doc.page_count())?;
     // Transparency Flattener presets: High / Medium / Low Resolution, or a ppi.
@@ -804,13 +818,7 @@ fn export_pdf(s: &mut Session, p: &Value) -> Result<Value> {
     {
         r.warnings.push(format!("transparency flattened: {n} region(s) rasterised"));
     }
-    match str_param(p, "path") {
-        Some(path) => {
-            write_file(path, &r.bytes)?;
-            Ok(json!({"path": path, "bytes": r.bytes.len(), "pages": r.pages, "warnings": r.warnings}))
-        }
-        None => Ok(json!({"base64": super::base64_encode(&r.bytes), "bytes": r.bytes.len(), "pages": r.pages, "warnings": r.warnings})),
-    }
+    Ok(r)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

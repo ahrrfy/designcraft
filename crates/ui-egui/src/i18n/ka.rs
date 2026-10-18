@@ -4,6 +4,12 @@
 //! Portuguese, Japanese, Italian and Ukrainian tables has a row here, plus a few labels that only
 //! the code or the command table use.
 pub(super) const TABLE: &[(&str, &str)] = &[
+    ("AI Production…", "AI წარმოება…"),
+    ("AI Skills…", "AI უნარები…"),
+    ("AI Usage…", "AI გამოყენება…"),
+    ("AI Providers and Keys…", "AI მომწოდებლები და გასაღებები…"),
+    ("Local AI…", "ლოკალური AI…"),
+    ("AI Host Request", "AI სერვისის მოთხოვნა"),
     ("File", "ფაილი"),
     ("Edit", "რედაქტირება"),
     ("Layout", "განლაგება"),
