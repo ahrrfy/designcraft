@@ -50,7 +50,7 @@ jobs:
             else .html_url end
           ' runs.json)"
           printf 'ci_url=%s\n' "$ci_url" >> "$GITHUB_OUTPUT"
-          printf 'Reusing successful Rust CI for `%s`: %s\n' "$SOURCE_SHA" "$ci_url" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Reusing successful Rust CI for %s: %s\n' "$SOURCE_SHA" "$ci_url" >> "$GITHUB_STEP_SUMMARY"
 
   portable:
     name: Unsigned Windows x64 portable

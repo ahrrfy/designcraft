@@ -602,6 +602,7 @@ mod tests {
     #[test]
     fn explicit_approval_is_the_only_path_between_real_http_batches() {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/", listener.local_addr().unwrap());
@@ -719,6 +720,7 @@ mod tests {
     #[test]
     fn cumulative_request_limit_survives_a_human_checkpoint() {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let dir = tempfile::tempdir().unwrap();

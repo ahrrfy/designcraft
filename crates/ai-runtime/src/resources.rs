@@ -9,6 +9,45 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+// A scoped unit-test input, never compiled into the application. Worker tests capture
+// this explicit input when spawning; independent test threads cannot affect one another.
+#[cfg(test)]
+thread_local! {
+    static TEST_ADMISSION_SNAPSHOT: std::cell::RefCell<Option<ResourceSnapshot>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestAdmissionGuard {
+    previous: Option<ResourceSnapshot>,
+    // Restoring a thread-local value must happen on the thread that installed it.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl TestAdmissionGuard {
+    pub(crate) fn install(snapshot: ResourceSnapshot) -> Self {
+        Self { previous: TEST_ADMISSION_SNAPSHOT.with(|current| current.replace(Some(snapshot))), _thread_bound: std::marker::PhantomData }
+    }
+
+    pub(crate) fn healthy() -> Self {
+        Self::install(ResourceSnapshot { cpu_threads_available: 8, total_ram_mb: 32_768, available_ram_mb: 24_576, ..Default::default() })
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestAdmissionGuard {
+    fn drop(&mut self) {
+        TEST_ADMISSION_SNAPSHOT.with(|current| {
+            let _ = current.replace(self.previous.take());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_admission_snapshot() -> Option<ResourceSnapshot> {
+    TEST_ADMISSION_SNAPSHOT.with(|current| current.borrow().clone())
+}
+
 /// Held throughout one local inference request (including Comfy polling).
 /// One process-wide slot prevents concurrent local generation from profiles.
 pub struct LocalRequestGuard {
@@ -31,13 +70,21 @@ impl LocalRequestGuard {
         if selection.provider == ProviderKind::Ollama && is_cloud_model(&selection.model) {
             return Err("Cloud-tagged Ollama models are disabled in local generation; choose a downloaded local model".into());
         }
-        let snapshot = memory_snapshot();
+        let snapshot = admission_memory_snapshot();
         admit_memory(policy, &snapshot)?;
         LOCAL_INFERENCE_ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "Another local inference is running; wait before sending another request".to_string())?;
         Ok(Self { held: true })
     }
+}
+
+fn admission_memory_snapshot() -> ResourceSnapshot {
+    #[cfg(test)]
+    if let Some(snapshot) = test_admission_snapshot() {
+        return snapshot;
+    }
+    memory_snapshot()
 }
 
 fn is_cloud_model(model: &str) -> bool {
@@ -193,6 +240,22 @@ pub fn check_comfy_workflow(workflow: &Value, policy: &LocalResourcePolicy) -> R
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn synthetic_admission_input_is_scoped_and_nested_inputs_restore() {
+        assert!(test_admission_snapshot().is_none());
+        {
+            let _healthy = TestAdmissionGuard::healthy();
+            assert_eq!(test_admission_snapshot().unwrap().available_ram_mb, 24_576);
+            assert!(std::thread::spawn(|| test_admission_snapshot().is_none()).join().unwrap(), "Unrelated threads must not inherit test telemetry");
+            {
+                let _low = TestAdmissionGuard::install(ResourceSnapshot { total_ram_mb: 32_768, available_ram_mb: 1024, ..Default::default() });
+                assert_eq!(test_admission_snapshot().unwrap().available_ram_mb, 1024);
+            }
+            assert_eq!(test_admission_snapshot().unwrap().available_ram_mb, 24_576);
+        }
+        assert!(test_admission_snapshot().is_none());
+    }
 
     #[test]
     fn rejects_ram_pressure_missing_telemetry_and_arithmetic_overflow() {

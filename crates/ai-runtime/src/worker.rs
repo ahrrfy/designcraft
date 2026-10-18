@@ -94,12 +94,16 @@ fn spawn_inner(
     roots: Option<Arc<designcraft_engine::file_access::AutomationRoots>>,
     prior_ledger: Option<UsageLedger>,
 ) -> Result<Worker, String> {
+    #[cfg(test)]
+    let test_memory = crate::resources::test_admission_snapshot();
     let (sender, receiver) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancellation = cancel.clone();
     std::thread::Builder::new()
         .name("designcraft-ai-worker".into())
         .spawn(move || {
+            #[cfg(test)]
+            let _test_memory = test_memory.map(crate::resources::TestAdmissionGuard::install);
             let budget = match &work {
                 Work::Production { request, .. } => request.settings.budget.clone(),
                 Work::Skill { settings, .. } => settings.budget.clone(),
@@ -954,6 +958,90 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    fn explicit_low_ram_in_spawned_worker_stops_before_ledger_and_http() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicU32;
+        use std::time::{Duration, Instant};
+
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicU32::new(0));
+        let observed = calls.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        socket.set_nonblocking(false).unwrap();
+                        socket.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                        // A regression sends only to this bounded spy, never a real model.
+                        let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("Low-memory HTTP spy: {error}"),
+                }
+            }
+        });
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        for available in [1024, 4096] {
+            // The first fixture fails the reserve floor; the second exceeds 85% used
+            // while remaining above the 2048-MiB floor. Both use the real policy.
+            let _memory = crate::resources::TestAdmissionGuard::install(designcraft_ai_types::ResourceSnapshot {
+                cpu_threads_available: 8,
+                total_ram_mb: 32_768,
+                available_ram_mb: available,
+                ..Default::default()
+            });
+            let settings = AiSettings {
+                text_model: ModelSelection { provider: ProviderKind::Ollama, model: "low-memory-spy".into(), endpoint: Some(endpoint.clone()) },
+                budget: BudgetSpec { token_limit: 256_000, max_output_tokens: 512, max_requests: 1, repair_attempts: 0, ..Default::default() },
+                ..Default::default()
+            };
+            let work = Work::Production {
+                request: TaskRequest {
+                    prompt: "Create an editable native frame".into(),
+                    settings,
+                    skill_ids: vec![],
+                    auto_select_skills: false,
+                    target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+                    export_directory: None,
+                },
+                context: json!({}),
+                catalog: designcraft_engine::cmd::production::catalog(),
+                skills: vec![],
+                base: session.doc().unwrap().clone(),
+                prefs: session.prefs.clone(),
+            };
+            let worker = spawn(work, vec![], None).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let outcome = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "Low-memory worker exceeded its deadline");
+                match worker.receiver.recv_timeout(remaining).unwrap() {
+                    Message::Progress { .. } => {}
+                    Message::Finished(outcome) | Message::FinishedWithLedger(outcome, _) => break outcome,
+                }
+            };
+            let error = outcome.result.err().unwrap();
+            assert!(error.contains("memory protection"), "{error}");
+            assert!(error.contains(&format!("{available} MiB available")), "The worker must use its captured synthetic telemetry: {error}");
+            assert_eq!(outcome.usage.requests, 0, "Resource rejection must precede admission reservation");
+            assert_eq!(outcome.usage.estimated_tokens, 0);
+            assert_eq!(calls.load(Ordering::Relaxed), 0, "Resource rejection must precede any HTTP connection");
+        }
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn batch_scope_rejects_global_commands_old_pages_literal_ids_and_inherited_selection() {
         let scope = BatchScope { start: 1, count: 1 };
         let mut plan = ProductionPlan {
@@ -1119,6 +1207,7 @@ mod tests {
     #[test]
     fn provider_failures_and_missing_usage_are_accounted_without_network() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         let mut ledger = UsageLedger::new(BudgetSpec { max_requests: 2, ..Default::default() }).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
@@ -1177,6 +1266,7 @@ mod tests {
     #[test]
     fn command_validation_repairs_on_private_document_with_one_ledger() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         let mut session = Session::new();
         session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
         let base = session.doc().unwrap().clone();
@@ -1215,6 +1305,7 @@ mod tests {
     #[test]
     fn failed_image_job_returns_no_partial_plan_and_records_request() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
@@ -1236,6 +1327,7 @@ mod tests {
     #[test]
     fn preflight_errors_are_repaired_before_returning_a_plan() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         let mut session = Session::new();
         session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
         let base = session.doc().unwrap().clone();

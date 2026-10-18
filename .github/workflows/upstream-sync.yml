@@ -68,7 +68,7 @@ jobs:
           fi
           {
             printf '# Upstream integration review\n\n%s\n\n' "$result"
-            printf -- '- Fork main base: `%s`\n- Upstream main: `%s`\n- Source: https://github.com/storytold/designcraft\n\n' "$base" "$upstream"
+            printf -- '- Fork main base: %s\n- Upstream main: %s\n- Source: https://github.com/storytold/designcraft\n\n' "$base" "$upstream"
             printf '## Upstream changed paths\n\n```text\n'
             cat "$RUNNER_TEMP/upstream-paths.txt"
             printf '```\n'

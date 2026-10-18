@@ -1233,6 +1233,7 @@ mod tests {
     #[test]
     fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::Arc;
