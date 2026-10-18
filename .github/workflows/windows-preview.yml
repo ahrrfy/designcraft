@@ -117,11 +117,12 @@ jobs:
           $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'dist/preview'
           New-Item -ItemType Directory -Force -Path $stage, $releaseDir | Out-Null
           Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/designcraft.exe', 'target/x86_64-pc-windows-msvc/release/designcraft-cli.exe' -Destination $stage
-          Copy-Item -LiteralPath 'NOTICE', 'LICENSE-MIT', 'LICENSE-APACHE', 'ASSETS.md' -Destination $stage
+          Copy-Item -LiteralPath 'NOTICE', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-FOXIT', 'ASSETS.md' -Destination $stage
           'Portable Smart Design preview. Settings and recovery remain beside these executables.' | Set-Content -LiteralPath (Join-Path $stage 'portable.txt') -Encoding ascii
           Copy-Item -LiteralPath 'docs/ai-production.ar.md' -Destination $stage
           $fontNotices = Join-Path $stage 'font-licenses'
           New-Item -ItemType Directory -Force -Path $fontNotices | Out-Null
+          Copy-Item -LiteralPath 'licenses/epaint-default-fonts' -Destination $fontNotices -Recurse
           Get-ChildItem -LiteralPath 'assets/fonts' -File -Filter 'OFL-*.txt' | Copy-Item -Destination $fontNotices
           Copy-Item -LiteralPath 'craft-fonts/ATTRIBUTION.md', 'craft-fonts/LICENSE-MIT', 'craft-fonts/LICENSE-APACHE' -Destination $fontNotices
           Get-ChildItem -LiteralPath 'craft-fonts/fonts' -Recurse -File | Where-Object { $_.Name -match '^(OFL|LICENSE|COPYING|NOTICE|AUTHORS)' -or $_.Extension -eq '.md' } | ForEach-Object {
