@@ -224,7 +224,13 @@ pub struct UsageSummary {
 pub struct CredentialStatus {
     pub selection: ModelSelection,
     pub persisted: bool,
+    /// Actual credential presence for this endpoint, from protected storage,
+    /// an authorized session key or the canonical provider environment.
     pub available: bool,
+    /// Whether this refresh could access protected storage; independent from
+    /// whether a key exists or an in-memory credential is usable.
+    #[serde(default)]
+    pub protected_storage_available: bool,
     pub message: String,
 }
 

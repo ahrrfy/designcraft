@@ -21,6 +21,7 @@ pub use package::PackageFiles;
 const MAX_INDEX: u64 = 8 * 1024 * 1024;
 const MAX_CACHE_TEXT: usize = 256 * 1024;
 const MAX_REVISIONS: usize = 4096;
+const MAX_SNAPSHOT_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SkillError {
@@ -43,6 +44,17 @@ pub enum SkillError {
 }
 
 pub type Result<T> = std::result::Result<T, SkillError>;
+
+/// Text formats eligible for progressive model context. Binary references may
+/// be analyzed and cached separately, but are never implicitly loaded as text.
+pub const SUPPORTED_TEXT_REFERENCE_EXTENSIONS: &[&str] = &["md", "txt", "json", "csv"];
+
+pub fn is_supported_text_reference(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SUPPORTED_TEXT_REFERENCE_EXTENSIONS.iter().any(|supported| ext.eq_ignore_ascii_case(supported)))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -381,16 +393,27 @@ impl SkillRegistry {
         }
         let skill_bytes = self.verified_file(record, "SKILL.md")?;
         let instructions = package::instructions(&skill_bytes)?;
+        if instructions.len() > MAX_SNAPSHOT_TEXT_BYTES {
+            return Err(SkillError::Invalid("skill snapshot instructions and references exceed the 64-KiB text context limit".into()));
+        }
+        let mut text_bytes = instructions.len();
         let mut references = BTreeMap::new();
         let mut reference_hashes = BTreeMap::new();
         for name in selected_references {
             if !record.manifest.references.contains(name) {
                 return Err(SkillError::Invalid("reference is not declared by the skill".into()));
             }
-            if !["md", "txt", "json", "csv"].iter().any(|ext| name.ends_with(&format!(".{ext}"))) {
+            if !is_supported_text_reference(name) {
                 return Err(SkillError::Unsupported("binary references require cached analysis".into()));
             }
-            let bytes = self.verified_file(record, name)?;
+            let remaining = MAX_SNAPSHOT_TEXT_BYTES.saturating_sub(text_bytes);
+            let bytes = self.verified_file_bounded(record, name, remaining as u64).map_err(|error| match error {
+                SkillError::Invalid(message) if message == "file type or size limit" || message == "file size limit" => {
+                    SkillError::Invalid("skill snapshot instructions and references exceed the 64-KiB text context limit".into())
+                }
+                other => other,
+            })?;
+            text_bytes = text_bytes.checked_add(bytes.len()).ok_or_else(|| SkillError::Invalid("skill snapshot text size overflow".into()))?;
             let text = String::from_utf8(bytes.clone()).map_err(|_| SkillError::Invalid("reference is not UTF-8".into()))?;
             references.insert(name.clone(), text);
             reference_hashes.insert(name.clone(), sha256(&bytes));
@@ -473,6 +496,10 @@ impl SkillRegistry {
     }
 
     fn verified_file(&self, record: &SkillRevision, name: &str) -> Result<Vec<u8>> {
+        self.verified_file_bounded(record, name, package::MAX_FILE)
+    }
+
+    fn verified_file_bounded(&self, record: &SkillRevision, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
         package::validate_package_path(name)?;
         let expected = record.file_hashes.get(name).ok_or_else(|| SkillError::Integrity(name.into()))?;
         let root = self.revision_dir(&record.skill_id, &record.revision)?;
@@ -481,7 +508,7 @@ impl SkillRegistry {
         for ancestor in path.ancestors().skip(1).take_while(|p| *p != root) {
             package::reject_symlink(ancestor)?;
         }
-        let bytes = package::read_bounded(&path, package::MAX_FILE)?;
+        let bytes = package::read_bounded(&path, max_bytes.min(package::MAX_FILE))?;
         if sha256(&bytes) != *expected {
             return Err(SkillError::Integrity(name.into()));
         }

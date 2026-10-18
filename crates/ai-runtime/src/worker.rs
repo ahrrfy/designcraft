@@ -350,8 +350,7 @@ impl Runner<'_> {
                 if response.images.len() != 1 {
                     return Err("Image provider must return exactly one image per placement".into());
                 }
-                let image = response.images.into_iter().next().ok_or("Image provider returned no image")?;
-                validate_image(&image)?;
+                let image = prepare_generated_image(response.images.into_iter().next().ok_or("Image provider returned no image")?)?;
                 *bytes_used = bytes_used.checked_add(image.bytes.len()).ok_or("Generated image byte count overflow")?;
                 if *bytes_used > MAX_JSON {
                     return Err("Generated images exceed the task's 4-MiB raster limit".into());
@@ -776,6 +775,97 @@ fn batch_proofs(
     }
     Ok(proofs)
 }
+/// Native placement accepts PNG/JPEG. Normalize provider WebP before caching and byte accounting.
+fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<providers::GeneratedImage, String> {
+    if generated.mime_type == "image/webp" {
+        use image::{ImageDecoder, ImageEncoder};
+        if generated.bytes.len() > MAX_JSON || !generated.bytes.starts_with(b"RIFF") || generated.bytes.get(8..12) != Some(b"WEBP") {
+            return Err("Generated WebP must have a valid header and fit within 4 MiB".into());
+        }
+        validate_webp_chunks(&generated.bytes)?;
+        let mut decoder =
+            image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&generated.bytes)).map_err(|e| format!("Cannot read generated WebP: {e}"))?;
+        let (width, height) = decoder.dimensions();
+        validate_image_dimensions(width, height)?;
+        // Reserve the full RGB/RGBA raster before decoding; never resize or discard alpha.
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(width);
+        limits.max_image_height = Some(height);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        limits.reserve(decoder.total_bytes()).map_err(|e| format!("Generated WebP exceeds decoding memory limit: {e}"))?;
+        decoder.set_limits(limits).map_err(|e| format!("Cannot limit generated WebP: {e}"))?;
+        let profile = decoder.icc_profile().map_err(|e| format!("Cannot read generated WebP color profile: {e}"))?;
+        let decoded = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("Cannot decode generated WebP: {e}"))?;
+        let mut output = BoundedImageBytes(Vec::new());
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut output);
+        if let Some(profile) = profile {
+            encoder.set_icc_profile(profile).map_err(|e| format!("Cannot preserve generated WebP color profile: {e}"))?;
+        }
+        encoder
+            .write_image(decoded.as_bytes(), width, height, decoded.color().into())
+            .map_err(|e| format!("Cannot encode generated WebP as PNG within 4 MiB: {e}"))?;
+        generated.bytes = output.0;
+        generated.filename = "generated.png".into();
+        generated.mime_type = "image/png".into();
+    }
+    validate_image(&generated)?;
+    Ok(generated)
+}
+
+/// Bound advertised metadata/payload sizes before the decoder allocates from chunk headers.
+fn validate_webp_chunks(bytes: &[u8]) -> Result<(), String> {
+    let number = |offset: usize| -> Result<u32, String> {
+        let raw: [u8; 4] =
+            bytes.get(offset..offset.saturating_add(4)).ok_or("Truncated generated WebP chunk")?.try_into().map_err(|_| "Invalid WebP chunk")?;
+        Ok(u32::from_le_bytes(raw))
+    };
+    if u64::from(number(4)?).saturating_add(8) != bytes.len() as u64 {
+        return Err("Generated WebP has an invalid container length".into());
+    }
+    let mut offset = 12usize;
+    while offset < bytes.len() {
+        let tag = bytes.get(offset..offset.saturating_add(4)).ok_or("Truncated generated WebP chunk")?;
+        let size = usize::try_from(number(offset.saturating_add(4))?).map_err(|_| "Generated WebP chunk is too large")?;
+        let start = offset.checked_add(8).ok_or("Generated WebP chunk overflow")?;
+        let end = start.checked_add(size).ok_or("Generated WebP chunk overflow")?;
+        let payload = bytes.get(start..end).ok_or("Generated WebP chunk exceeds its input buffer")?;
+        // Static placement cannot preserve an animation; do not decode arbitrary frame canvases.
+        if tag == b"ANIM" || tag == b"ANMF" {
+            return Err("Generated WebP must be a static illustration".into());
+        }
+        // Extended containers can advertise a small canvas around an oversized bitstream.
+        if tag == b"VP8 " {
+            let [a, b, c, d]: [u8; 4] = payload.get(6..10).ok_or("Truncated generated WebP frame")?.try_into().map_err(|_| "Invalid WebP frame")?;
+            validate_image_dimensions(u32::from(u16::from_le_bytes([a, b]) & 0x3fff), u32::from(u16::from_le_bytes([c, d]) & 0x3fff))?;
+        } else if tag == b"VP8L" {
+            let dimensions: [u8; 4] = payload.get(1..5).ok_or("Truncated generated WebP frame")?.try_into().map_err(|_| "Invalid WebP frame")?;
+            let bits = u32::from_le_bytes(dimensions);
+            validate_image_dimensions((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)?;
+        }
+        offset = end.checked_add(size & 1).ok_or("Generated WebP chunk overflow")?;
+        if offset > bytes.len() {
+            return Err("Generated WebP chunk is missing padding".into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse oversized encoded output during compression rather than allocating it in full first.
+struct BoundedImageBytes(Vec<u8>);
+impl std::io::Write for BoundedImageBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_JSON.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("Generated PNG exceeds 4 MiB"));
+        }
+        self.0.try_reserve_exact(bytes.len()).map_err(|_| std::io::Error::other("Cannot allocate generated PNG"))?;
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn validate_image(image: &providers::GeneratedImage) -> Result<(), String> {
     let valid_header = match image.mime_type.as_str() {
         "image/png" => image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
@@ -786,6 +876,9 @@ fn validate_image(image: &providers::GeneratedImage) -> Result<(), String> {
         return Err("Image generation must return a PNG/JPEG within 4 MiB".into());
     }
     let (width, height) = designcraft_images::pixel_size(&image.bytes).ok_or("Invalid generated raster header")?;
+    validate_image_dimensions(width, height)
+}
+fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 16_000_000 {
         return Err("Generated raster exceeds 16 million pixels".into());
     }
@@ -1322,6 +1415,134 @@ mod tests {
         assert!(runner.expand_images(plan, &settings, &mut BTreeMap::new(), &mut 0).is_err());
         assert_eq!(ledger.summary().requests, 1);
         assert!(ledger.summary().has_unreported_usage);
+    }
+
+    // Existing CC0 Compact ICC Profiles fixture, attributed and pinned in ASSETS.md.
+    const TEST_SRGB_ICC: &[u8] = include_bytes!("../../../assets/icc/sRGB-v2-magic.icc");
+
+    fn webp_fixture(profile: Option<&[u8]>) -> (providers::GeneratedImage, image::RgbaImage) {
+        use image::ImageEncoder;
+        let pixels = image::RgbaImage::from_fn(3, 2, |x, y| image::Rgba([20 + x as u8, 70 + y as u8, 130, 128]));
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        if let Some(profile) = profile {
+            encoder.set_icc_profile(profile.to_vec()).unwrap();
+        }
+        encoder.encode(pixels.as_raw(), 3, 2, image::ExtendedColorType::Rgba8).unwrap();
+        (providers::GeneratedImage { bytes, filename: "comfy-output.webp".into(), mime_type: "image/webp".into() }, pixels)
+    }
+
+    #[test]
+    fn real_comfy_webp_is_normalized_cached_and_placed_as_native_graphic() {
+        use image::ImageDecoder;
+        struct ImageMock(RefCell<Option<providers::GeneratedImage>>);
+        impl Provider for ImageMock {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                Err("Text generation is not used".into())
+            }
+            fn images(&self, selection: &ModelSelection, _: Option<&str>, request: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                assert_eq!(selection.provider, ProviderKind::ComfyUi);
+                assert!(request.comfy.is_some());
+                Ok(ImageResponse {
+                    images: vec![self.0.borrow_mut().take().ok_or("Image requested twice despite cache")?],
+                    usage: Usage { input_tokens: Some(10), output_tokens: Some(20), ..Default::default() },
+                    error: None,
+                })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("Model listing is not used".into())
+            }
+        }
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let (webp, pixels) = webp_fixture(Some(TEST_SRGB_ICC));
+        let original_profile = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&webp.bytes)).unwrap().icc_profile().unwrap().unwrap();
+        assert_eq!(original_profile, TEST_SRGB_ICC);
+        let provider = ImageMock(RefCell::new(Some(webp)));
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::ComfyUi, model: "mock".into(), endpoint: None },
+            comfy_workflow: Some(json!({"1":{"class_type":"SaveImage","inputs":{"width":3,"height":2,"batch_size":1}}})),
+            ..Default::default()
+        };
+        let mut value = plan();
+        value["images"] = json!([{"prompt":"A tree illustration","page":0,"rect":[120,220,270,360],"label":"tree"}]);
+        let plan = parse_plan(&value.to_string(), OutputMode::NativeWithImages, &catalog()).unwrap();
+        let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut cache = BTreeMap::new();
+        let mut bytes_used = 0;
+        let expanded = runner.expand_images(plan.clone(), &settings, &mut cache, &mut bytes_used).unwrap();
+        assert!(expanded.images.is_empty());
+        let cached = cache.values().next().unwrap();
+        assert_eq!(cached.mime_type, "image/png");
+        assert_eq!(cached.filename, "generated.png");
+        assert_eq!(bytes_used, cached.bytes.len(), "Count the placed PNG rather than the compressed WebP");
+        assert_eq!(image::load_from_memory(&cached.bytes).unwrap().to_rgba8(), pixels);
+        let converted_profile = image::codecs::png::PngDecoder::new(std::io::Cursor::new(&cached.bytes)).unwrap().icc_profile().unwrap().unwrap();
+        assert_eq!(converted_profile, original_profile, "Preserve the actual embedded ICC bytes through WebP to PNG conversion");
+        let retried = runner.expand_images(plan, &settings, &mut cache, &mut bytes_used).unwrap();
+        assert_eq!(retried.commands, expanded.commands);
+        assert_eq!(ledger.summary().requests, 1, "Reuse normalized images on repair without another provider call");
+        assert_eq!(ledger.summary().input_tokens, 10);
+        assert_eq!(ledger.summary().output_tokens, 20);
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":expanded.commands,"outputMode":"native_with_images"})).unwrap();
+        let doc = &session.doc().unwrap().doc;
+        assert_eq!(doc.assets.len(), 1);
+        let asset = doc.assets.values().next().unwrap();
+        assert_eq!(asset.mime, "image/png");
+        assert_eq!(asset.pixels, Some((3, 2)));
+        assert_eq!(image::load_from_memory(&asset.data).unwrap().to_rgba8(), pixels);
+        assert_eq!(
+            image::codecs::png::PngDecoder::new(std::io::Cursor::new(asset.data.as_slice())).unwrap().icc_profile().unwrap().unwrap(),
+            original_profile
+        );
+        assert!(doc.spreads[0].items.iter().any(|item| item.label == "tree" && matches!(item.content, designcraft_engine::doc::Content::Graphic(_))));
+    }
+
+    #[test]
+    fn webp_normalization_rejects_malformed_oversized_chunks_and_pixel_bombs() {
+        let (mut malformed, _) = webp_fixture(None);
+        malformed.bytes.get_mut(16..20).unwrap().copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(prepare_generated_image(malformed).err().unwrap().contains("chunk"));
+        let (mut bomb, _) = webp_fixture(None);
+        // The fixture is a real VP8L image; replace only its 14-bit width/height header.
+        assert_eq!(bomb.bytes.get(12..16).unwrap(), b"VP8L");
+        bomb.bytes.get_mut(21..25).unwrap().copy_from_slice(&0x0fff_ffff_u32.to_le_bytes());
+        assert!(prepare_generated_image(bomb).err().unwrap().contains("16 million pixels"));
+        let (mut oversized, _) = webp_fixture(None);
+        oversized.bytes.resize(MAX_JSON + 1, 0);
+        assert!(prepare_generated_image(oversized).is_err());
+        let (mut animated, pixels) = webp_fixture(None);
+        let frame_chunk = animated.bytes.get(12..).unwrap().to_vec();
+        let mut bytes = b"RIFF\0\0\0\0WEBP".to_vec();
+        // Valid 3x2 extended animation: alpha + animation flags, one lossless frame.
+        bytes.extend_from_slice(b"VP8X\x0a\0\0\0\x12\0\0\0\x02\0\0\x01\0\0");
+        bytes.extend_from_slice(b"ANIM\x06\0\0\0\0\0\0\0\0\0");
+        bytes.extend_from_slice(b"ANMF");
+        bytes.extend_from_slice(&u32::try_from(16 + frame_chunk.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 10, 0, 0, 0]);
+        bytes.extend_from_slice(&frame_chunk);
+        let riff_size = u32::try_from(bytes.len() - 8).unwrap();
+        bytes.get_mut(4..8).unwrap().copy_from_slice(&riff_size.to_le_bytes());
+        assert!(image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes)).unwrap().has_animation());
+        assert_eq!(image::load_from_memory(&bytes).unwrap().to_rgba8(), pixels);
+        animated.bytes = bytes;
+        assert!(prepare_generated_image(animated).err().unwrap().contains("static illustration"));
+    }
+
+    #[test]
+    fn normalized_png_writer_refuses_to_allocate_beyond_task_image_limit() {
+        use std::io::Write;
+        let mut output = BoundedImageBytes(vec![0; MAX_JSON - 1]);
+        assert!(output.write_all(&[1, 2]).is_err());
+        assert_eq!(output.0.len(), MAX_JSON - 1);
+        output.write_all(&[1]).unwrap();
+        assert_eq!(output.0.len(), MAX_JSON);
     }
 
     #[test]

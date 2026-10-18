@@ -239,6 +239,82 @@ fn template_review_rejects_excessive_variant_and_total_action_counts() {
     }
 }
 
+#[test]
+fn snapshot_text_formats_are_shared_and_binary_references_are_never_read_as_text() {
+    let (temp, mut registry) = registry();
+    let mut files = builtin::packages().unwrap().remove(0);
+    let mut manifest: NativeManifest = serde_json::from_slice(files.get("designcraft.json").unwrap()).unwrap();
+    manifest.references = ["references/a.md", "references/b.txt", "references/c.JSON", "references/d.csv", "references/source.pdf"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for name in &manifest.references {
+        files.insert(name.clone(), format!("Content for {name}").into_bytes());
+    }
+    files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+    let revision = registry.import_files(files, Provenance::default()).unwrap();
+    approve(&mut registry, temp.path(), &revision);
+    let root = registry.revision_dir(&revision.skill_id, &revision.revision).unwrap();
+    fs::remove_file(root.join("references/source.pdf")).unwrap();
+    let selected: Vec<_> = manifest.references.iter().filter(|name| is_supported_text_reference(name)).cloned().collect();
+    let snapshot = registry.snapshot(&revision.skill_id, &selected).unwrap();
+    assert_eq!(snapshot.references.len(), 4);
+    assert_eq!(snapshot.references.get("references/c.JSON").unwrap(), "Content for references/c.JSON");
+    assert!(matches!(registry.snapshot(&revision.skill_id, &["references/source.pdf".into()]), Err(SkillError::Unsupported(_))));
+    assert!(registry.snapshot(&revision.skill_id, &["references/undeclared.txt".into()]).is_err());
+}
+
+#[test]
+fn snapshot_rejects_large_text_context_instead_of_silently_dropping_references() {
+    let (temp, mut registry) = registry();
+    let mut files = builtin::packages().unwrap().remove(0);
+    let mut manifest: NativeManifest = serde_json::from_slice(files.get("designcraft.json").unwrap()).unwrap();
+    manifest.references = vec!["references/large.json".into()];
+    files.insert("references/large.json".into(), vec![b' '; MAX_SNAPSHOT_TEXT_BYTES + 1]);
+    files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+    let revision = registry.import_files(files, Provenance::default()).unwrap();
+    approve(&mut registry, temp.path(), &revision);
+    let error = registry.snapshot(&revision.skill_id, &["references/large.json".into()]).unwrap_err();
+    assert!(error.to_string().contains("64-KiB text context limit"));
+    assert_eq!(registry.snapshot(&revision.skill_id, &[]).unwrap().references.len(), 0);
+}
+
+#[test]
+#[cfg(any(windows, unix))]
+fn bounded_text_reference_loading_still_rejects_directory_redirection() {
+    let (temp, mut registry) = registry();
+    let revision = registry.install_builtin_drafts().unwrap().remove(0);
+    approve(&mut registry, temp.path(), &revision);
+    let root = registry.revision_dir(&revision.skill_id, &revision.revision).unwrap();
+    let reference_dir = root.join("references");
+    let original = root.join("original-references");
+    fs::rename(&reference_dir, &original).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("review.md"), b"Outside content must not be read").unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("cmd")
+            .creation_flags(0x08000000)
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&reference_dir)
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "junction fixture failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), &reference_dir).unwrap();
+    let error = registry.snapshot(&revision.skill_id, &["references/review.md".into()]).unwrap_err();
+    assert!(matches!(&error, SkillError::Invalid(_)));
+    assert!(error.to_string().contains("links are not allowed") || error.to_string().contains("reparse points are not allowed"));
+    #[cfg(windows)]
+    fs::remove_dir(&reference_dir).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(&reference_dir).unwrap();
+    fs::rename(&original, &reference_dir).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn folder_symlink_is_rejected() {

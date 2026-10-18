@@ -346,12 +346,23 @@ impl ProductionRunner {
             return Err("Select at most eight skills per task".into());
         }
         let mut snapshots = Vec::new();
+        let mut skill_context_bytes = 2usize;
+        let supported = supported_commands();
         for id in ids {
             let card = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown skill: {id}"))?;
             let revision = card.active_revision.as_ref().ok_or_else(|| format!("Skill {id} requires approval"))?;
             let record = self.registry.revision(&id, revision).map_err(|e| e.to_string())?;
-            let refs = record.manifest.references.iter().filter(|s| s.ends_with(".md") || s.ends_with(".txt")).take(2).cloned().collect::<Vec<_>>();
-            snapshots.push(self.registry.snapshot(&id, &refs).map_err(|e| e.to_string())?);
+            if !skill_is_compatible(record, &supported) {
+                return Err(format!("Skill {id} is incompatible with the current native engine"));
+            }
+            let refs = selected_skill_references(record);
+            let snapshot = self.registry.snapshot(&id, &refs).map_err(|e| e.to_string())?;
+            let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?.len();
+            skill_context_bytes = skill_context_bytes.checked_add(bytes.saturating_add(1)).ok_or("Selected skill context size overflow")?;
+            if skill_context_bytes > 64 * 1024 {
+                return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
+            }
+            snapshots.push(snapshot);
         }
         let pins = snapshots.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
         let settings = task.settings.clone();
@@ -456,15 +467,20 @@ impl ProductionRunner {
     }
 
     fn prepare_credentials(&mut self, selections: &[designcraft_ai_types::ModelSelection]) -> Result<(), String> {
-        if !Vault::available() {
-            return Ok(());
-        }
         for selection in selections {
             validate_endpoint(selection)?;
             if self.keys.iter().any(|key| key.matches(selection)) {
                 continue;
             }
-            if let Some(secret) = self.vault.load(selection)? {
+            if !Vault::available() {
+                continue;
+            }
+            let stored = credential_from_store_or_transient(
+                selection,
+                || self.vault.load(selection),
+                || crate::vault::selected_key(&self.keys, selection).is_some(),
+            )?;
+            if let Some(secret) = stored {
                 self.store_session_key(selection, secret)?;
             }
         }
@@ -481,19 +497,8 @@ impl ProductionRunner {
                 } else {
                     Err("OS-protected credential storage is unavailable; session keys remain in memory only".into())
                 };
-                match presence {
-                    Ok(persisted) => CredentialStatus {
-                        selection,
-                        persisted,
-                        available: true,
-                        message: if persisted {
-                            "OS-protected key stored for this endpoint".into()
-                        } else {
-                            "No protected key stored for this endpoint".into()
-                        },
-                    },
-                    Err(message) => CredentialStatus { selection, persisted: false, available: false, message },
-                }
+                let transient_available = crate::vault::selected_key(&self.keys, &selection).is_some();
+                credential_status(selection, presence, transient_available)
             })
             .collect();
     }
@@ -711,24 +716,7 @@ impl ProductionRunner {
     }
 
     fn choose_skills(&self, prompt: &str) -> Vec<String> {
-        let words = prompt
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| s.chars().count() >= 3 || s.eq_ignore_ascii_case("a4"))
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
-        let mut entries = self
-            .registry
-            .catalog("")
-            .into_iter()
-            .filter(|e| e.enabled && e.active_revision.is_some())
-            .map(|e| {
-                let haystack = format!("{} {} {}", e.skill_id, e.name, e.description).to_lowercase();
-                (words.iter().filter(|w| haystack.contains(w.as_str())).count(), e.skill_id)
-            })
-            .filter(|(score, _)| *score > 0)
-            .collect::<Vec<_>>();
-        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        entries.into_iter().take(3).map(|(_, id)| id).collect()
+        choose_compatible_skills(prompt, self.registry.catalog(""), &supported_commands())
     }
     fn refresh_catalog(&mut self) {
         let supported = supported_commands();
@@ -738,17 +726,18 @@ impl ProductionRunner {
             .into_iter()
             .flat_map(|entry| {
                 let supported = &supported;
-                entry.revisions.into_iter().map(move |revision| SkillCard {
-                    id: entry.skill_id.clone(),
-                    name: revision.name,
-                    description: revision.description,
-                    active: entry.active_revision.as_ref() == Some(&revision.revision),
-                    revision: revision.revision,
-                    approved: revision.status == RevisionStatus::Approved,
-                    enabled: entry.enabled,
-                    compatible: revision.manifest.external_tools.is_empty()
-                        && !revision.manifest.required_commands.is_empty()
-                        && revision.manifest.required_commands.iter().all(|c| supported.contains(c)),
+                entry.revisions.into_iter().map(move |revision| {
+                    let compatible = skill_is_compatible(&revision, supported);
+                    SkillCard {
+                        id: entry.skill_id.clone(),
+                        name: revision.name,
+                        description: revision.description,
+                        active: entry.active_revision.as_ref() == Some(&revision.revision),
+                        revision: revision.revision,
+                        approved: revision.status == RevisionStatus::Approved,
+                        enabled: entry.enabled,
+                        compatible,
+                    }
                 })
             })
             .collect();
@@ -874,6 +863,81 @@ fn validate_skill_templates(registry: &SkillRegistry, session: &Session, id: &st
             .map_err(|e| format!("Skill template {name} is incompatible with the native engine: {e}"))?;
     }
     Ok(())
+}
+
+/// Stored credentials keep precedence over environment fallbacks. A storage
+/// error may be ignored only when the caller's endpoint-aware resolver confirms
+/// a usable transient key. This helper never serializes or returns that key.
+fn credential_from_store_or_transient(
+    selection: &designcraft_ai_types::ModelSelection,
+    load: impl FnOnce() -> Result<Option<SecretString>, String>,
+    transient_available: impl FnOnce() -> bool,
+) -> Result<Option<SecretString>, String> {
+    validate_endpoint(selection)?;
+    match load() {
+        Ok(stored) => Ok(stored),
+        Err(error) => {
+            if transient_available() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn credential_status(selection: designcraft_ai_types::ModelSelection, presence: Result<bool, String>, transient_available: bool) -> CredentialStatus {
+    let protected_storage_available = presence.is_ok();
+    let persisted = presence.as_ref().copied().unwrap_or(false);
+    let available = persisted || transient_available;
+    let message = match presence {
+        Ok(true) => "OS-protected key stored for this endpoint".into(),
+        Ok(false) if transient_available => {
+            "Credential available from an authorized session or canonical provider environment; no protected key stored".into()
+        }
+        Ok(false) => "No credential available for this endpoint; no protected key stored".into(),
+        Err(error) if transient_available => format!("Credential available from an authorized session or canonical provider environment; {error}"),
+        Err(error) => format!("No credential available for this endpoint; {error}"),
+    };
+    CredentialStatus { selection, persisted, available, protected_storage_available, message }
+}
+
+fn skill_is_compatible(revision: &designcraft_ai_skills::SkillRevision, supported: &BTreeSet<String>) -> bool {
+    revision.manifest.external_tools.is_empty()
+        && !revision.manifest.required_commands.is_empty()
+        && revision.manifest.required_commands.iter().all(|command| supported.contains(command))
+}
+
+fn selected_skill_references(revision: &designcraft_ai_skills::SkillRevision) -> Vec<String> {
+    revision.manifest.references.iter().filter(|path| designcraft_ai_skills::is_supported_text_reference(path)).cloned().collect()
+}
+
+fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::CatalogEntry>, supported: &BTreeSet<String>) -> Vec<String> {
+    let words = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 3 || word.eq_ignore_ascii_case("a4"))
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    let mut ranked = entries
+        .into_iter()
+        .filter(|entry| {
+            entry.enabled
+                && entry.active_revision.as_ref().is_some_and(|active| {
+                    entry
+                        .revisions
+                        .iter()
+                        .find(|revision| &revision.revision == active)
+                        .is_some_and(|revision| revision.status == RevisionStatus::Approved && skill_is_compatible(revision, supported))
+                })
+        })
+        .map(|entry| {
+            let haystack = format!("{} {} {}", entry.skill_id, entry.name, entry.description).to_lowercase();
+            (words.iter().filter(|word| haystack.contains(word.as_str())).count(), entry.skill_id)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    ranked.into_iter().take(3).map(|(_, id)| id).collect()
 }
 
 fn supported_commands() -> BTreeSet<String> {
@@ -1496,6 +1560,138 @@ mod tests {
         let saved = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
         assert!(!saved.contains("test-private-value"));
         assert!(!serde_json::to_string(&runner.snapshot).unwrap().contains("test-private-value"));
+    }
+
+    #[test]
+    fn credential_readiness_is_independent_from_protected_storage_health() {
+        let selection = designcraft_ai_types::ModelSelection {
+            provider: ProviderKind::OpenAi,
+            model: "synthetic-model".into(),
+            endpoint: Some("https://credential-review.invalid/v1/".into()),
+        };
+        let empty = credential_status(selection.clone(), Ok(false), false);
+        assert!(!empty.available);
+        assert!(!empty.persisted);
+        assert!(empty.protected_storage_available);
+        let stored = credential_status(selection.clone(), Ok(true), false);
+        assert!(stored.available && stored.persisted && stored.protected_storage_available);
+        let missing = credential_status(selection.clone(), Err("Protected storage denied".into()), false);
+        assert!(!missing.available && !missing.persisted && !missing.protected_storage_available);
+        let keys = vec![SessionKey::new(&selection, SecretString::new("synthetic-runtime-credential".into())).unwrap()];
+        let in_memory = crate::vault::selected_key(&keys, &selection).is_some();
+        let usable = credential_status(selection.clone(), Err("Protected storage denied".into()), in_memory);
+        assert!(usable.available);
+        assert!(!usable.protected_storage_available);
+        assert!(!usable.persisted);
+        let other_endpoint =
+            designcraft_ai_types::ModelSelection { endpoint: Some("https://other-credential-review.invalid/v1/".into()), ..selection };
+        // Custom endpoints inherit neither another endpoint's session key nor
+        // canonical-provider environment keys, even when those exist locally.
+        let inherited = crate::vault::selected_key(&keys, &other_endpoint).is_some();
+        assert!(!inherited);
+        let other = credential_status(other_endpoint, Ok(false), inherited);
+        assert!(!other.available);
+        let serialized = serde_json::to_string(&usable).unwrap();
+        assert!(!serialized.contains("synthetic-runtime-credential"));
+        assert!(!serialized.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn credential_preparation_allows_authorized_transient_keys_when_storage_is_denied() {
+        let canonical = designcraft_ai_types::ModelSelection { provider: ProviderKind::OpenAi, model: "test-model".into(), endpoint: None };
+        // Inject already-authorized canonical environment presence; do not
+        // mutate process environment or access the user's credential store.
+        let prepared = credential_from_store_or_transient(&canonical, || Err("Synthetic storage denied".into()), || true).unwrap();
+        assert!(prepared.is_none(), "the worker retains its canonical environment fallback");
+        let status = credential_status(canonical.clone(), Err("Synthetic storage denied".into()), true);
+        assert!(status.available && !status.protected_storage_available);
+        let custom =
+            designcraft_ai_types::ModelSelection { endpoint: Some("https://authorized-session-review.invalid/v1/".into()), ..canonical.clone() };
+        let session = vec![SessionKey::new(&custom, SecretString::new("synthetic-authorized-session-key".into())).unwrap()];
+        assert!(
+            credential_from_store_or_transient(
+                &custom,
+                || Err("Synthetic storage denied".into()),
+                || crate::vault::selected_key(&session, &custom).is_some(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let other_endpoint =
+            designcraft_ai_types::ModelSelection { endpoint: Some("https://unauthorized-session-review.invalid/v1/".into()), ..canonical };
+        let denied = credential_from_store_or_transient(
+            &other_endpoint,
+            || Err("Synthetic storage denied".into()),
+            || crate::vault::selected_key(&session, &other_endpoint).is_some(),
+        )
+        .unwrap_err();
+        assert_eq!(denied, "Synthetic storage denied", "custom endpoints must inherit no session or canonical environment key");
+    }
+
+    #[test]
+    fn credential_preparation_keeps_stored_key_precedence_and_requires_a_real_fallback() {
+        let selection = designcraft_ai_types::ModelSelection { provider: ProviderKind::OpenAi, model: "test-model".into(), endpoint: None };
+        let stored = credential_from_store_or_transient(
+            &selection,
+            || Ok(Some(SecretString::new("synthetic-stored-key".into()))),
+            || panic!("a successful stored key must take precedence without checking transient credentials"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.expose(), "synthetic-stored-key");
+        assert!(
+            credential_from_store_or_transient(&selection, || Ok(None), || panic!("a healthy empty store is not a storage error")).unwrap().is_none()
+        );
+        let missing = credential_from_store_or_transient(&selection, || Err("Synthetic storage denied".into()), || false).unwrap_err();
+        assert_eq!(missing, "Synthetic storage denied");
+        let invalid = designcraft_ai_types::ModelSelection { endpoint: Some("http://remote-credential-review.invalid/v1/".into()), ..selection };
+        assert!(
+            credential_from_store_or_transient(
+                &invalid,
+                || panic!("invalid endpoints must fail before accessing storage"),
+                || panic!("invalid endpoints cannot use transient fallback"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_skill_selection_uses_the_manual_current_compatibility_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entry = runner.registry.catalog("school-print-preflight").remove(0);
+        let record = entry.revisions.first_mut().unwrap();
+        record.status = RevisionStatus::Approved;
+        entry.active_revision = Some(record.revision.clone());
+        let supported = supported_commands();
+        assert_eq!(choose_compatible_skills("A4 طباعة", vec![entry.clone()], &supported), vec![entry.skill_id.clone()]);
+        let mut removed_command = entry.clone();
+        removed_command.revisions[0].manifest.required_commands.push("removed.engine.command".into());
+        assert!(!skill_is_compatible(&removed_command.revisions[0], &supported));
+        assert!(choose_compatible_skills("A4 طباعة", vec![removed_command], &supported).is_empty());
+        let mut external_tool = entry.clone();
+        external_tool.revisions[0].manifest.external_tools.push("unsupported-external-tool".into());
+        assert!(!skill_is_compatible(&external_tool.revisions[0], &supported));
+        assert!(choose_compatible_skills("A4 طباعة", vec![external_tool], &supported).is_empty());
+        let mut disabled = entry.clone();
+        disabled.enabled = false;
+        assert!(choose_compatible_skills("A4 طباعة", vec![disabled], &supported).is_empty());
+        let mut draft = entry;
+        draft.revisions[0].status = RevisionStatus::Draft;
+        assert!(choose_compatible_skills("A4 طباعة", vec![draft], &supported).is_empty());
+    }
+
+    #[test]
+    fn runtime_selects_every_supported_text_reference_including_third_and_fourth_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut record = runner.registry.catalog("").remove(0).revisions.remove(0);
+        record.manifest.references =
+            ["references/a.md", "references/b.txt", "references/c.json", "references/d.csv", "references/source.pdf", "references/icon.png"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(selected_skill_references(&record), vec!["references/a.md", "references/b.txt", "references/c.json", "references/d.csv"]);
     }
 
     #[test]

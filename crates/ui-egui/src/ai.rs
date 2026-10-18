@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::{DesignApp, rtl};
-use designcraft_ai_types::protocol::{AiRequest, AiSettings, AiSnapshot, TaskRequest, TaskTarget, TokenRates};
+use designcraft_ai_types::protocol::{AiRequest, AiSettings, AiSnapshot, BatchSnapshot, TaskRequest, TaskTarget, TokenRates};
 use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind};
 use serde_json::Value;
 
@@ -19,6 +19,63 @@ impl std::fmt::Debug for Secret {
 impl Drop for Secret {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// Human review belongs to one complete, immutable proof manifest and document revision.
+#[derive(Clone, PartialEq, Eq)]
+struct BatchReviewKey {
+    job_id: String,
+    checkpoint: u32,
+    batch: u32,
+    document: (u64, u64),
+    page_range: (u32, u32),
+    task_shape: (u32, u32, u32),
+    proofs: Vec<(String, String)>,
+}
+impl BatchReviewKey {
+    fn from_batch(batch: &BatchSnapshot) -> Option<Self> {
+        if batch.status != "awaiting_human_proof" {
+            return None;
+        }
+        let mut reports = batch.batches.iter().filter(|report| report.batch == batch.current_batch);
+        let current = reports.next()?;
+        if reports.next().is_some() {
+            return None;
+        }
+        if current.proof_paths.len() != current.proof_sha256.len() || current.proof_paths.len() > 34 || !(1..=32).contains(&current.page_count) {
+            return None;
+        }
+        let mut pages = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for (path, sha) in current.proof_paths.iter().zip(&current.proof_sha256) {
+            if path.is_empty()
+                || !paths.insert(path.replace('\\', "/").to_ascii_lowercase())
+                || sha.len() != 64
+                || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            if path.to_ascii_lowercase().ends_with(".png") && !pages.insert(path) {
+                return None;
+            }
+        }
+        if u32::try_from(pages.len()).ok() != Some(current.page_count) {
+            return None;
+        }
+        Some(Self {
+            job_id: batch.job_id.clone(),
+            checkpoint: batch.checkpoint,
+            batch: batch.current_batch,
+            document: (batch.document_uid?, batch.document_revision?),
+            page_range: (current.page_start, current.page_count),
+            task_shape: (batch.total_pages, batch.pages_per_batch, batch.total_batches),
+            proofs: current.proof_paths.iter().cloned().zip(current.proof_sha256.iter().cloned()).collect(),
+        })
+    }
+
+    fn pages(&self) -> impl Iterator<Item = &(String, String)> {
+        self.proofs.iter().filter(|(path, _)| path.to_ascii_lowercase().ends_with(".png"))
     }
 }
 
@@ -55,7 +112,11 @@ pub struct AiUiState {
     rates_confirmed: bool,
     workflow_json: String,
     workflow_error: String,
-    proof_key: Option<(String, u32)>,
+    proof_key: Option<BatchReviewKey>,
+    reviewed_proofs: BTreeSet<(String, String)>,
+    proof_document_version: Option<(u64, u64)>,
+    proof_document_matches: bool,
+    review_input_is_human: bool,
     proof_path: Option<String>,
     proof_loaded: Option<String>,
     proof_texture: Option<egui::TextureHandle>,
@@ -115,6 +176,10 @@ impl Default for AiUiState {
             workflow_json: String::new(),
             workflow_error: String::new(),
             proof_key: None,
+            reviewed_proofs: BTreeSet::new(),
+            proof_document_version: None,
+            proof_document_matches: false,
+            review_input_is_human: false,
             proof_path: None,
             proof_loaded: None,
             proof_texture: None,
@@ -157,14 +222,11 @@ impl AiUiState {
             self.preview_path = None;
             self.preview = None;
         }
-        let proof_key = snapshot.batch.as_ref().map(|b| (b.job_id.clone(), b.checkpoint));
+        let proof_key = snapshot.batch.as_ref().and_then(BatchReviewKey::from_batch);
         if self.proof_key != proof_key {
-            self.proof_path = snapshot
-                .batch
-                .as_ref()
-                .and_then(|b| b.batches.iter().find(|report| report.batch == b.current_batch))
-                .and_then(|r| r.proof_paths.iter().find(|p| p.to_ascii_lowercase().ends_with(".png")))
-                .cloned();
+            self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
+            self.reviewed_proofs.clear();
+            self.proof_document_matches = false;
             self.proof_loaded = None;
             self.proof_texture = None;
             self.proof_error.clear();
@@ -182,6 +244,42 @@ impl AiUiState {
             self.print_reviewed = false;
         }
         self.snapshot = snapshot;
+    }
+
+    fn sync_proof_document(&mut self, document: Option<(u64, u64)>) {
+        if self.proof_document_version != document {
+            self.reviewed_proofs.clear();
+            self.proof_document_version = document;
+        }
+        self.proof_document_matches = self.proof_key.as_ref().is_some_and(|key| Some(key.document) == document);
+    }
+
+    fn can_review_selected_proof(&self) -> bool {
+        self.review_input_is_human
+            && !self.snapshot.busy
+            && self.proof_document_matches
+            && self.proof_texture.is_some()
+            && self.proof_error.is_empty()
+            && self.proof_loaded == self.proof_path
+            && self.proof_path.as_ref().is_some_and(|path| self.proof_key.as_ref().is_some_and(|key| key.pages().any(|(page, _)| page == path)))
+    }
+
+    /// Only an explicit per-page UI gesture records review; preview loading never does.
+    fn review_selected_proof(&mut self) {
+        if !self.can_review_selected_proof() {
+            return;
+        }
+        if let Some(page) = self.proof_key.as_ref().and_then(|key| key.pages().find(|(path, _)| self.proof_path.as_deref() == Some(path.as_str()))) {
+            self.reviewed_proofs.insert(page.clone());
+        }
+    }
+
+    fn can_approve_batch(&self) -> bool {
+        self.review_input_is_human
+            && !self.snapshot.busy
+            && self.proof_document_matches
+            && self.proof_error.is_empty()
+            && self.proof_key.as_ref().is_some_and(|key| key.pages().all(|page| self.reviewed_proofs.contains(page)))
     }
 
     fn task_active(&self) -> bool {
@@ -212,6 +310,32 @@ impl AiUiState {
 /// Typed UI path shared by all panel buttons. Credentials move directly to the host without JSON,
 /// logs, serialization, document metadata or preference storage.
 pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String> {
+    if !human_review_input(app)
+        && matches!(
+            &request,
+            AiRequest::ApproveSkill { .. }
+                | AiRequest::ApproveBatch { .. }
+                | AiRequest::SetApiKey { .. }
+                | AiRequest::SaveApiKey { .. }
+                | AiRequest::RemoveApiKey { .. }
+                | AiRequest::RefreshCredentials
+                | AiRequest::PrintDocument { .. }
+                | AiRequest::SubmitPreparedPrint { .. }
+                | AiRequest::OpenPrintProof { .. }
+                | AiRequest::StartLocalOllama { .. }
+                | AiRequest::StopLocalOllama
+        )
+    {
+        return Err("This action requires a human gesture in the desktop panel; control-generated input is not approval.".into());
+    }
+    if let AiRequest::ApproveBatch { job_id, checkpoint } = &request {
+        app.ui.ai.review_input_is_human = human_review_input(app);
+        app.ui.ai.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
+        if !app.ui.ai.can_approve_batch() || !app.ui.ai.proof_key.as_ref().is_some_and(|key| key.job_id == *job_id && key.checkpoint == *checkpoint) {
+            return Err("Review and confirm every page of the current document proof before approving this checkpoint.".into());
+        }
+        app.ui.ai.reviewed_proofs.clear();
+    }
     let Some(host) = app.services.ai.as_mut() else {
         let e = "Native AI host is unavailable in this build.".to_string();
         app.ui.ai.error = e.clone();
@@ -234,6 +358,10 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
     let result = serde_json::to_value(&snapshot).map_err(|e| e.to_string());
     app.ui.ai.accept(snapshot);
     result
+}
+
+fn human_review_input(app: &DesignApp) -> bool {
+    !app.in_control && !app.control_input_frame.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Control channel / MCP command path: `ai.request {method, ...}`. Methods match the snake_case
@@ -356,6 +484,8 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         return;
     }
     let mut state = std::mem::take(&mut app.ui.ai);
+    state.review_input_is_human = human_review_input(app);
+    state.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
     let a = app.ui.language == "ar";
     let mut open = state.open;
     let mut requests = Vec::new();
@@ -539,6 +669,16 @@ fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, req
                     a,
                     if credential.available { "Credential available" } else { "Credential unavailable" },
                     if credential.available { "مفتاح الاتصال متاح" } else { "مفتاح الاتصال غير متاح" },
+                );
+                label(
+                    ui,
+                    a,
+                    if credential.protected_storage_available { "OS-protected storage available" } else { "OS-protected storage unavailable" },
+                    if credential.protected_storage_available {
+                        "مخزن حماية نظام التشغيل متاح"
+                    } else {
+                        "مخزن حماية نظام التشغيل غير متاح"
+                    },
                 );
                 rtl::label(ui, &credential.message);
             }
@@ -790,6 +930,10 @@ fn usage_line(ui: &mut egui::Ui, a: bool, usage: &designcraft_ai_types::protocol
 }
 
 fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
+    let can_review = s.can_review_selected_proof();
+    let can_approve = s.can_approve_batch();
+    let page_count = s.proof_key.as_ref().map_or(0, |key| key.pages().count());
+    let mut confirm_page = false;
     let Some(batch) = &s.snapshot.batch else {
         return;
     };
@@ -819,6 +963,11 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                 ui.add(egui::Label::new(name).truncate()).on_hover_text(path);
                 if path.to_ascii_lowercase().ends_with(".png") && button(ui, a, "Open proof preview", "فتح معاينة المراجعة") {
                     s.proof_path = Some(path.clone());
+                    s.proof_loaded = None;
+                    s.proof_texture = None;
+                }
+                if s.reviewed_proofs.iter().any(|(page, _)| page == path) {
+                    label(ui, a, "Reviewed", "تمت المراجعة");
                 }
             });
         }
@@ -839,15 +988,32 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             ui,
             a,
             "Review every proof page. The next batch uses the same cumulative task limits.",
-            "راجع كل صفحات المراجعة. تخضع الدفعة التالية لحدود المهمة التراكمية نفسها.",
+            "افتح كل صورة وأكد مراجعتها. تخضع الدفعة التالية لحدود المهمة التراكمية نفسها.",
         );
+        rtl::label(ui, format!("{} {} / {}", text(a, "Pages confirmed:", "الصفحات المؤكد مراجعتها:"), s.reviewed_proofs.len(), page_count));
+        if page_count == 0 {
+            label(ui, a, "Verified previews for every batch page are required.", "يلزم توفر صور موثقة لجميع صفحات الدفعة.");
+        } else if !s.proof_document_matches {
+            label(
+                ui,
+                a,
+                "The active document does not match this proof revision. Return to that document or restart the task after changes.",
+                "المستند النشط لا يطابق إصدار البروفة. ارجع إلى المستند نفسه أو أعد بدء المهمة بعد تعديلاته.",
+            );
+        }
+        if ui
+            .add_enabled(can_review, egui::Button::new(rtl::widget(ui, text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة"))))
+            .clicked()
+        {
+            confirm_page = true;
+        }
         let final_batch = batch.current_batch >= batch.total_batches;
         let (en, ar) = if final_batch {
             ("Approve final proof and finish", "اعتماد المراجعة النهائية وإنهاء المهمة")
         } else {
             ("Approve proof and generate next batch", "اعتماد المراجعة وإنشاء الدفعة التالية")
         };
-        if ui.add_enabled(s.proof_texture.is_some() && s.proof_error.is_empty(), egui::Button::new(rtl::widget(ui, text(a, en, ar)))).clicked() {
+        if ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar)))).clicked() {
             requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
         }
     }
@@ -878,6 +1044,10 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             }
         }
     });
+    if confirm_page {
+        s.review_selected_proof();
+        ui.ctx().request_repaint();
+    }
 }
 
 fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
@@ -1306,11 +1476,15 @@ fn load_proof_preview(app: &mut DesignApp, ctx: &egui::Context) {
     s.proof_texture = None;
     let Some(read) = &app.services.read else {
         s.proof_error = "Proof reader unavailable.".into();
+        s.reviewed_proofs.retain(|(page, _)| page != &path);
         return;
     };
     match preview_texture(read, &path, ctx, "ai_batch_proof") {
         Ok(texture) => s.proof_texture = Some(texture),
-        Err(e) => s.proof_error = e,
+        Err(e) => {
+            s.proof_error = e;
+            s.reviewed_proofs.retain(|(page, _)| page != &path);
+        }
     }
     ctx.request_repaint();
 }
@@ -1423,5 +1597,240 @@ mod tests {
         assert!(app.run("ai.request", json!({"method":"start_local_ollama", "executable":"C:/fixture/ollama.exe"})).is_err());
         assert!(app.run("ai.request", json!({"method":"stop_local_ollama"})).is_err());
         assert_eq!(calls.get(), 0);
+    }
+
+    struct ProofFixture {
+        app: DesignApp,
+        ctx: egui::Context,
+        checkpoint: AiSnapshot,
+        calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+    impl ProofFixture {
+        fn new() -> Self {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let host_calls = calls.clone();
+            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])));
+            let mut png = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+            let png = png.into_inner();
+            let mut app = DesignApp::new(
+                Session::new(),
+                Services {
+                    read: Some(Box::new(move |_| Ok(png.clone()))),
+                    ai: Some(Box::new(move |_, _| {
+                        host_calls.set(host_calls.get() + 1);
+                        AiSnapshot { available: true, ..Default::default() }
+                    })),
+                    ..Default::default()
+                },
+            );
+            app.run("file.new", json!({})).unwrap();
+            let document = app.session.active().map(|d| (d.uid, d.revision)).unwrap();
+            let checkpoint = AiSnapshot {
+                available: true,
+                batch: Some(BatchSnapshot {
+                    job_id: "two-page-proof".into(),
+                    total_pages: 4,
+                    pages_per_batch: 2,
+                    current_batch: 1,
+                    total_batches: 2,
+                    completed_pages: 2,
+                    status: "awaiting_human_proof".into(),
+                    checkpoint: 1,
+                    document_uid: Some(document.0),
+                    document_revision: Some(document.1),
+                    batches: vec![designcraft_ai_types::protocol::BatchReport {
+                        batch: 1,
+                        page_count: 2,
+                        proof_paths: vec!["book.designcraft".into(), "proof.pdf".into(), "page-1.png".into(), "page-2.png".into()],
+                        proof_sha256: vec!["0".repeat(64), "1".repeat(64), "2".repeat(64), "3".repeat(64)],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            app.ui.ai.accept(checkpoint.clone());
+            app.ui.ai.sync_proof_document(Some(document));
+            app.ui.ai.review_input_is_human = true;
+            Self { app, ctx: egui::Context::default(), checkpoint, calls }
+        }
+
+        fn view(&mut self, path: &str) {
+            self.app.ui.ai.proof_path = Some(path.into());
+            self.app.ui.ai.proof_loaded = None;
+            load_proof_preview(&mut self.app, &self.ctx);
+        }
+
+        fn confirm_all(&mut self) {
+            let pages: Vec<_> = self.app.ui.ai.proof_key.as_ref().unwrap().pages().map(|(path, _)| path.clone()).collect();
+            for path in pages {
+                self.view(&path);
+                self.app.ui.ai.review_selected_proof();
+            }
+        }
+    }
+
+    #[test]
+    fn batch_approval_requires_explicit_review_of_every_page_not_first_autoload() {
+        let mut fixture = ProofFixture::new();
+        load_proof_preview(&mut fixture.app, &fixture.ctx);
+        assert!(fixture.app.ui.ai.proof_texture.is_some());
+        assert!(fixture.app.ui.ai.reviewed_proofs.is_empty(), "autoload is not human review");
+        assert!(!fixture.app.ui.ai.can_approve_batch());
+        fixture.app.ui.ai.review_selected_proof();
+        assert_eq!(fixture.app.ui.ai.reviewed_proofs.len(), 1);
+        assert!(!fixture.app.ui.ai.can_approve_batch(), "first page alone must not approve a two-page batch");
+        assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
+        assert_eq!(fixture.calls.get(), 0);
+        fixture.app.ui.ai.proof_path = Some("page-2.png".into());
+        fixture.app.ui.ai.review_selected_proof();
+        assert_eq!(fixture.app.ui.ai.reviewed_proofs.len(), 1, "the previous texture cannot confirm the newly selected page");
+        fixture.view("page-2.png");
+        assert!(!fixture.app.ui.ai.can_approve_batch(), "loading the second page is not confirmation");
+        fixture.app.ui.ai.review_selected_proof();
+        assert!(fixture.app.ui.ai.can_approve_batch());
+    }
+
+    #[test]
+    fn batch_review_resets_for_checkpoint_proof_fingerprints_and_document_revision() {
+        for change in ["checkpoint", "png hash", "pdf hash", "path", "page range", "task shape", "document uid", "document revision"] {
+            let mut fixture = ProofFixture::new();
+            fixture.confirm_all();
+            assert!(fixture.app.ui.ai.can_approve_batch());
+            let mut changed = fixture.checkpoint.clone();
+            let batch = changed.batch.as_mut().unwrap();
+            match change {
+                "checkpoint" => batch.checkpoint += 1,
+                "png hash" => batch.batches[0].proof_sha256[2] = "a".repeat(64),
+                "pdf hash" => batch.batches[0].proof_sha256[1] = "a".repeat(64),
+                "path" => batch.batches[0].proof_paths[2] = "replacement.png".into(),
+                "page range" => batch.batches[0].page_start += 1,
+                "task shape" => batch.total_pages += 1,
+                "document uid" => batch.document_uid = batch.document_uid.map(|uid| uid + 1),
+                "document revision" => batch.document_revision = batch.document_revision.map(|revision| revision + 1),
+                _ => panic!("Unknown proof regression case: {change}"),
+            }
+            let document = Some((batch.document_uid.unwrap(), batch.document_revision.unwrap()));
+            fixture.app.ui.ai.accept(changed);
+            fixture.app.ui.ai.sync_proof_document(document);
+            assert!(fixture.app.ui.ai.reviewed_proofs.is_empty(), "{change}");
+            assert!(fixture.app.ui.ai.proof_texture.is_none(), "{change}");
+            assert!(!fixture.app.ui.ai.can_approve_batch(), "{change}");
+        }
+        let mut fixture = ProofFixture::new();
+        fixture.confirm_all();
+        let document = fixture.app.ui.ai.proof_key.as_ref().unwrap().document;
+        fixture.app.ui.ai.sync_proof_document(Some((document.0, document.1 + 1)));
+        assert!(fixture.app.ui.ai.reviewed_proofs.is_empty());
+        assert!(!fixture.app.ui.ai.can_review_selected_proof());
+        assert!(!fixture.app.ui.ai.can_approve_batch());
+    }
+
+    #[test]
+    fn empty_missing_duplicate_or_unfingerprinted_batch_pages_cannot_approve() {
+        for change in ["empty", "missing png", "missing hash", "duplicate png", "duplicate pdf", "case alias png", "invalid hash"] {
+            let mut fixture = ProofFixture::new();
+            let mut changed = fixture.checkpoint.clone();
+            let report = &mut changed.batch.as_mut().unwrap().batches[0];
+            match change {
+                "empty" => {
+                    report.page_count = 0;
+                    report.proof_paths.clear();
+                    report.proof_sha256.clear();
+                }
+                "missing png" => {
+                    report.proof_paths.pop();
+                    report.proof_sha256.pop();
+                }
+                "missing hash" => {
+                    report.proof_sha256.pop();
+                }
+                "duplicate png" => report.proof_paths[3] = report.proof_paths[2].clone(),
+                "case alias png" => report.proof_paths[3] = "PAGE-1.PNG".into(),
+                "duplicate pdf" => {
+                    report.proof_paths.push("proof.pdf".into());
+                    report.proof_sha256.push("1".repeat(64));
+                }
+                "invalid hash" => report.proof_sha256[2] = "missing".into(),
+                _ => panic!("Unknown proof regression case: {change}"),
+            }
+            fixture.app.ui.ai.accept(changed);
+            assert!(fixture.app.ui.ai.proof_key.is_none(), "{change}");
+            assert!(!fixture.app.ui.ai.can_approve_batch(), "{change}");
+        }
+    }
+
+    #[test]
+    fn failed_page_reload_revokes_its_previous_human_confirmation() {
+        let mut fixture = ProofFixture::new();
+        fixture.confirm_all();
+        assert!(fixture.app.ui.ai.can_approve_batch());
+        fixture.app.services.read = Some(Box::new(|_| Err("synthetic proof read failure".into())));
+        fixture.view("page-1.png");
+        assert_eq!(fixture.app.ui.ai.reviewed_proofs.len(), 1);
+        assert!(!fixture.app.ui.ai.can_approve_batch());
+        fixture.app.ui.ai.review_selected_proof();
+        assert_eq!(fixture.app.ui.ai.reviewed_proofs.len(), 1, "a failed preview cannot be confirmed");
+    }
+
+    #[test]
+    fn control_cannot_approve_after_all_pages_reviewed_but_typed_human_action_can() {
+        let mut fixture = ProofFixture::new();
+        fixture.confirm_all();
+        assert!(fixture.app.ui.ai.can_approve_batch());
+        assert!(fixture.app.run("ai.request", json!({"method":"approve_batch", "job_id":"two-page-proof", "checkpoint":1})).is_err());
+        assert_eq!(fixture.calls.get(), 0);
+        dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).unwrap();
+        assert_eq!(fixture.calls.get(), 1);
+        assert!(fixture.app.ui.ai.reviewed_proofs.is_empty(), "the human approval is consumed once");
+        assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
+        assert_eq!(fixture.calls.get(), 1);
+    }
+
+    #[test]
+    fn synthetic_control_frames_cannot_confirm_pages_or_submit_batch_approval() {
+        let mut fixture = ProofFixture::new();
+        fixture.view("page-1.png");
+        fixture.app.control_input_frame.store(true, std::sync::atomic::Ordering::Relaxed);
+        fixture.app.ui.ai.review_input_is_human = human_review_input(&fixture.app);
+        fixture.app.ui.ai.review_selected_proof();
+        assert!(fixture.app.ui.ai.reviewed_proofs.is_empty());
+        fixture.app.control_input_frame.store(false, std::sync::atomic::Ordering::Relaxed);
+        fixture.app.ui.ai.review_input_is_human = human_review_input(&fixture.app);
+        fixture.confirm_all();
+        for control_request in [true, false] {
+            fixture.app.in_control = control_request;
+            fixture.app.control_input_frame.store(!control_request, std::sync::atomic::Ordering::Relaxed);
+            assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
+            assert_eq!(fixture.calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn human_only_typed_dispatch_rejects_control_requests_and_synthetic_frames() {
+        let mut fixture = ProofFixture::new();
+        for control_request in [true, false] {
+            fixture.app.in_control = control_request;
+            fixture.app.control_input_frame.store(!control_request, std::sync::atomic::Ordering::Relaxed);
+            for request in [
+                AiRequest::ApproveSkill { id: "fixture".into(), revision: "1".into() },
+                AiRequest::SubmitPreparedPrint { token: "fixture".into(), request_id: "fixture-op".into() },
+                AiRequest::SaveApiKey { selection: fixture.app.ui.ai.settings.text_model.clone(), key: "fixture".into() },
+                AiRequest::RemoveApiKey { selection: fixture.app.ui.ai.settings.text_model.clone() },
+                AiRequest::RefreshCredentials,
+                AiRequest::OpenPrintProof { token: "fixture".into() },
+                AiRequest::StartLocalOllama { executable: "C:/fixture/ollama.exe".into() },
+                AiRequest::StopLocalOllama,
+            ] {
+                assert!(dispatch(&mut fixture.app, request).is_err());
+                assert_eq!(fixture.calls.get(), 0);
+            }
+        }
+        fixture.app.in_control = false;
+        fixture.app.control_input_frame.store(false, std::sync::atomic::Ordering::Relaxed);
+        dispatch(&mut fixture.app, AiRequest::ApproveSkill { id: "fixture".into(), revision: "1".into() }).unwrap();
+        dispatch(&mut fixture.app, AiRequest::SubmitPreparedPrint { token: "fixture".into(), request_id: "fixture-op".into() }).unwrap();
+        assert_eq!(fixture.calls.get(), 2, "ordinary human typed actions still reach the mock host");
     }
 }
