@@ -9,3 +9,11 @@ plan/
 /.claude/
 /target-*/
 /craft-fonts/
+# Local credentials, signing keys and portable user data are never source assets.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pfx
+*.p12
+**/DesignCraftData/

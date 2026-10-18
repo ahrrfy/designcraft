@@ -322,6 +322,8 @@ impl Default for Prefs {
 }
 
 pub struct Session {
+    /// One immutable, engine-preflighted PDF and its frozen printer settings per session.
+    pub(crate) prepared_print: Option<Arc<cmd::print::PreparedPrint>>,
     docs: Vec<DocState>,
     active: Option<usize>,
     /// An undoable command is running: the commands it runs are part of its undo step.
@@ -389,6 +391,7 @@ impl Session {
     pub fn new() -> Self {
         guard::install_panic_hook();
         Session {
+            prepared_print: None,
             docs: vec![],
             active: None,
             in_undo_step: false,
@@ -527,10 +530,20 @@ impl Session {
     /// Run command `id`. A panic inside it becomes [`EngineError::Internal`] and leaves the
     /// document as it was (see [`guard`]).
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
+        // Rejected production/print preparation preserves composition and merge-preview state.
+        // Check before the usual command prologue commits or restores that state.
+        if matches!(id, "production.apply" | "file.print")
+            && (self.tool.composing() || self.active().is_some_and(|st| st.interaction.is_some() || st.preview_stash.is_some()))
+        {
+            return Err(cmd::bad(id, "finish the current interaction or preview first"));
+        }
         // A command from outside the IME ends its composition first, keeping the marked text as
         // typed: Undo then takes back that typing, and nothing runs on top of the preview the
         // composition would drop. Queries and recovery saves leave it alone.
-        if self.tool.composing() && id != "file.recovery.save" && find_command(id).is_some_and(|c| c.journal || c.undoable) {
+        if self.tool.composing()
+            && !matches!(id, "file.recovery.save" | "file.printPrepared")
+            && find_command(id).is_some_and(|c| c.journal || c.undoable)
+        {
             self.end_composition()?;
         }
         self.guarded(id, |s| s.execute_unguarded(id, params))
@@ -556,7 +569,7 @@ impl Session {
         // Preview is temporary. Save, merge, and every other edit restore the template first.
         // Queries stay read-only so the panel can poll fields during a preview. `data.preview`
         // itself is the one command that fills the live document.
-        if id != "data.preview" && (spec.undoable || spec.journal) {
+        if !matches!(id, "data.preview" | "file.printPrepared") && (spec.undoable || spec.journal) {
             self.stop_data_preview();
         }
         // Preview restoration can replace the document before a Find handler resolves bounds.

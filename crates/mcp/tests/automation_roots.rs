@@ -217,37 +217,38 @@ fn every_writing_command_is_refused_outside_the_write_root() {
     run_ok(&mut server, "frame.create", json!({"rect": [36, 300, 300, 100], "content": "text", "text": "Selected"}));
     run_ok(&mut server, "select.firstAbove", json!({}));
 
-    // Every command that writes a file, with the path parameter it takes.
-    let writes: Vec<(&str, &str)> = vec![
-        ("file.save", "path"),
-        ("file.saveAs", "path"),
-        ("file.saveACopy", "path"),
-        ("file.exportPdf", "path"),
-        ("file.exportEpub", "path"),
-        ("file.exportFixedEpub", "path"),
-        ("file.exportHtml", "path"),
-        ("file.exportText", "path"),
-        ("file.exportXml", "path"),
-        ("file.exportIdml", "path"),
-        ("file.printBooklet", "path"),
-        ("snippet.export", "path"),
-        ("swatch.save", "path"),
-        ("library.new", "path"),
-        ("book.exportPdf", "path"),
-        ("book.new", "path"),
-        ("file.package", "dir"),
-        ("links.copyTo", "dir"),
-        ("file.recovery.save", "dir"),
+    // Valid format suffixes let both halves exercise filesystem authority rather than
+    // rejecting the request earlier for an invalid output format. Directory entries have none.
+    let writes: Vec<(&str, &str, &str)> = vec![
+        ("file.save", "path", "designcraft"),
+        ("file.saveAs", "path", "designcraft"),
+        ("file.saveACopy", "path", "designcraft"),
+        ("file.exportPdf", "path", "pdf"),
+        ("file.exportEpub", "path", "epub"),
+        ("file.exportFixedEpub", "path", "epub"),
+        ("file.exportHtml", "path", "html"),
+        ("file.exportText", "path", "txt"),
+        ("file.exportXml", "path", "xml"),
+        ("file.exportIdml", "path", "idml"),
+        ("file.printBooklet", "path", "pdf"),
+        ("snippet.export", "path", "designcraft"),
+        ("swatch.save", "path", "ase"),
+        ("library.new", "path", "json"),
+        ("book.exportPdf", "path", "pdf"),
+        ("book.new", "path", "dcbook"),
+        ("file.package", "dir", ""),
+        ("links.copyTo", "dir", ""),
+        ("file.recovery.save", "dir", ""),
     ];
     // A book with a chapter to export, so `book.exportPdf` gets as far as its path.
     run_ok(&mut server, "book.new", json!({"path": inside("first.dcbook")}));
     run_ok(&mut server, "book.add", json!({"path": s(&base.join("in/doc.designcraft"))}));
-    for (command, key) in &writes {
-        let target = if *key == "dir" { outside("folder") } else { outside(&format!("out-{command}")) };
+    for (command, key, extension) in &writes {
+        let target = if *key == "dir" { outside("folder") } else { outside(&format!("out-{command}.{extension}")) };
         refused(&mut server, command, json!({*key: target}), "outside the write root");
     }
-    for tool in ["save_document", "export_png", "render_page"] {
-        let (error, text) = call(&mut server, tool, json!({"path": outside("tool.out")}));
+    for (tool, name) in [("save_document", "tool.designcraft"), ("export_png", "tool.png"), ("render_page", "tool.png")] {
+        let (error, text) = call(&mut server, tool, json!({"path": outside(name)}));
         assert!(error && text.contains("outside the write root"), "{tool}: {text}");
     }
     // The control-channel methods behind `save_document` and `export_png`.
@@ -269,17 +270,22 @@ fn every_writing_command_is_refused_outside_the_write_root() {
     assert!(!base.join("out2").exists() && !base.join("in/x.designcraft").exists());
 
     // Inside the write root every one of them works, and the files appear.
-    for (command, key) in &writes {
-        let target = if *key == "dir" { inside(&format!("dir-{command}")) } else { inside(&format!("out-{command}")) };
+    for (command, key, extension) in &writes {
+        let target = if *key == "dir" { inside(&format!("dir-{command}")) } else { inside(&format!("out-{command}.{extension}")) };
         run_ok(&mut server, command, json!({*key: target}));
     }
     for tool in ["export_png", "render_page"] {
         ok(&mut server, tool, json!({"path": inside(&format!("{tool}.png"))}));
         assert!(base.join("out").join(format!("{tool}.png")).exists(), "{tool}");
     }
-    for file in
-        ["out-file.save.designcraft", "out-file.exportPdf", "out-file.exportIdml", "out-book.exportPdf", "out-swatch.save", "out-snippet.export"]
-    {
+    for file in [
+        "out-file.save.designcraft",
+        "out-file.exportPdf.pdf",
+        "out-file.exportIdml.idml",
+        "out-book.exportPdf.pdf",
+        "out-swatch.save.ase",
+        "out-snippet.export.designcraft",
+    ] {
         assert!(base.join("out").join(file).exists(), "{file}");
     }
     assert!(base.join("out/dir-file.package/Instructions.txt").exists() && base.join("out/dir-links.copyTo/pic.png").exists());

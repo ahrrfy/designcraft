@@ -20,6 +20,7 @@ pub(crate) mod find;
 pub use find::same_find_domain;
 pub(crate) mod flex;
 mod fonts;
+mod formats;
 mod guides;
 mod index;
 mod inspect;
@@ -46,7 +47,8 @@ mod pdflayers;
 mod place_text;
 pub mod preflight;
 mod prefs;
-mod print;
+pub mod print;
+pub mod production;
 mod qr;
 mod rulers;
 mod scripts;
@@ -168,6 +170,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
     SPECS.get_or_init(|| {
         let mut v = Vec::new();
         v.extend(file::specs());
+        v.extend(formats::specs());
         v.extend(interchange::specs());
         v.extend(export::specs());
         v.extend(edit::specs());
@@ -203,6 +206,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(select::specs());
         v.extend(package::specs());
         v.extend(print::specs());
+        v.extend(production::specs());
         v.extend(text::specs());
         v.extend(thread::specs());
         v.extend(tabs::specs());

@@ -16,6 +16,12 @@ pub fn shown(app: &DesignApp, id: &str) -> bool {
 
 /// UI commands: (id, label, shortcut, params).
 pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
+    ("ai.production", "AI Production…", None, "{} — open native AI production"),
+    ("ai.skills", "AI Skills…", None, "{} — review, sample and approve skills"),
+    ("ai.usage", "AI Usage…", None, "{} — session task and usage reports"),
+    ("ai.providers", "AI Providers and Keys…", None, "{} — configure models and OS-protected credentials"),
+    ("ai.local", "Local AI…", None, "{} — connect local inference and configure resource limits"),
+    ("ai.request", "AI Host Request", None, "{method, …} — see ai::request_command; all requests use the optional native host"),
     ("app.newDocumentDialog", "New Document…", Some("Cmd+N"), "{}"),
     ("app.openDialog", "Open…", Some("Cmd+O"), "{}"),
     ("app.openRecent", "Open Recent File", None, "{index} — file.openRecent, with an alert when the file can't be opened"),
@@ -901,6 +907,12 @@ pub const MENUS: &[(&str, &[&str])] = &[
             "ui:window.hidePanelsExceptTools",
             "ui:window.toolsDoubleColumn",
             "-",
+            "ui:ai.production",
+            "ui:ai.skills",
+            "ui:ai.usage",
+            "ui:ai.providers",
+            "ui:ai.local",
+            "-",
             "ui:window.brightness",
         ],
     ),
@@ -986,6 +998,18 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
         Ok(json!(*b))
     };
     Some(match id {
+        "ai.production" | "ai.skills" | "ai.usage" | "ai.providers" | "ai.local" => {
+            app.ui.ai.open = true;
+            app.ui.ai.tab = match id {
+                "ai.skills" => 1,
+                "ai.usage" => 2,
+                "ai.providers" => 3,
+                "ai.local" => 4,
+                _ => 0,
+            };
+            crate::ai::dispatch(app, designcraft_ai_types::protocol::AiRequest::Poll)
+        }
+        "ai.request" => crate::ai::request_command(app, p),
         "window.minimize" => {
             app.pending_window_commands.push(egui::ViewportCommand::Minimized(true));
             Ok(Value::Null)

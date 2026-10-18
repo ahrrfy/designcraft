@@ -23,6 +23,8 @@ permissions:
 
 jobs:
   freebsd:
+    # Windows + WASM are required for this fork; the VM remains available on demand.
+    if: github.repository == 'storytold/designcraft' || github.event_name == 'workflow_dispatch'
     # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
     uses: storytold/craft-common-actions/.github/workflows/freebsd.yml@main
     with:

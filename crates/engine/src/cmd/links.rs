@@ -729,7 +729,7 @@ mod tests {
         let moved = dir.join("new/replacement.eps");
         std::fs::rename(&replacement, &moved).unwrap();
         assert_eq!(s.execute("links.relinkFolder", &json!({"dir": dir.join("new").to_string_lossy()})).unwrap()["relinked"], 1);
-        assert_eq!(s.doc().unwrap().doc.assets[&aid].link.as_deref(), moved.to_str());
+        assert_eq!(s.doc().unwrap().doc.assets[&aid].link.as_deref().map(std::path::Path::new), Some(moved.as_path()));
         assert_eq!(s.execute("links.list", &json!({})).unwrap()[0]["status"], "ok");
         let _ = std::fs::remove_dir_all(dir);
     }

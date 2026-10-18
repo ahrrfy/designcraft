@@ -19,6 +19,46 @@ use std::path::{Path, PathBuf};
 /// Files that may touch the file system, with why. Paths are relative to `crates/`. A file not
 /// listed here, and not a test file or test module, must not.
 const ALLOWED: &[(&str, &str)] = &[
+    (
+        "ai-runtime/src/vault.rs",
+        "The native host supplies its already-validated private profile directory. Canonicalization establishes a hashed credential namespace only; this module reads no profile file contents and creates no credential files. Secret persistence uses the OS credential store, isolated by profile, provider and normalized endpoint, with no command-selected filesystem destination.",
+    ),
+    (
+        "ai-runtime/src/batch.rs",
+        "Batch proof directories and proof reads are checked against the host's pinned private profile authority; fixed checkpoint/history names and validated artifact names are written through checked profile helpers. Requested final export directories are checked before creation, and each final file goes through an engine command under the originating job's captured automation roots. Recovered checkpoint files confer no approval or continuation authority.",
+    ),
+    (
+        "ai-runtime/src/indesign.rs",
+        "The optional installed-InDesign COM bridge stages only engine-produced, native-only IDML. Every requested output, staging, audit and bounded-read path is checked against captured AutomationRoots before filesystem effects, including asynchronous completion; final and audit files use create_new and existing outputs are refused. The external helper runs fixed code with paths passed as environment data; it does not inspect installation internals, accept arbitrary scripts, or terminate the user's application.",
+    ),
+    (
+        "ai-runtime/src/localserver.rs",
+        "Only the explicit desktop executable selection reaches this module. The selected local ollama.exe path is checked against automation read roots before canonicalization or metadata probes, and the resolved path is checked again. Launch uses fixed serve arguments and a restricted environment; lifecycle operations address only the child this host started. This does not sandbox that external program's own filesystem access.",
+    ),
+    (
+        "ai-runtime/src/output.rs",
+        "The host's fixed print-proofs directory and bounded hash-token filenames are checked against pinned private profile authority before creation and engine writes. Proof reads use capped engine I/O under that same authority and verify the frozen PDF hash before review or submission. Requested external saves retain caller automation roots and use the engine's checked frozen-PDF save command; durable attempt records precede submission of the existing immutable engine artifact.",
+    ),
+    (
+        "ai-runtime/src/runtime.rs",
+        "The desktop host chooses the private profile root; direct profile I/O uses only fixed or validated descendants. Every command-named import/export/output path is checked against the effective automation roots before probing or creating it, and asynchronous publication retains the originating roots.",
+    ),
+    (
+        "ai-runtime/src/references.rs",
+        "Selected reference paths are checked against the originating automation read roots before metadata probes and each bounded open; worker execution retains those roots. Reference decoding does not open linked resources.",
+    ),
+    (
+        "ai-runtime/src/science.rs",
+        "The requested output directory is checked against automation write roots before creation; every generated file is written through engine::io or an engine export command.",
+    ),
+    (
+        "ai-skills/src/lib.rs",
+        "The registry root is chosen by the desktop host. Command-named import/export paths are checked by ai-runtime before entry; internal revision/evidence/catalog paths use fixed names or validated identifiers and package link checks.",
+    ),
+    (
+        "ai-skills/src/package.rs",
+        "ai-runtime checks command-named package sources and destinations against automation roots before entry. Folder traversal rejects symbolic links and reparse points; package members are bounded validated relative names, and exports create new destinations without following existing files.",
+    ),
     ("engine/src/io.rs", "the checked gateway: every read and write a command makes"),
     ("engine/src/file_access.rs", "the root check itself (resolves links with the file system)"),
     ("engine/src/atomic.rs", "how a write reaches the disk; commands call it only through io::write_file and io::replace_with"),
