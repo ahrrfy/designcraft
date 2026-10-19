@@ -305,6 +305,37 @@ impl AiUiState {
             || self.settings.image_model.provider != ProviderKind::ComfyUi
             || (self.workflow_error.is_empty() && self.settings.comfy_workflow.is_some())
     }
+
+    fn production_issue(&self, available: bool, document: bool, arabic: bool) -> Option<&'static str> {
+        let (en, ar) = if !available {
+            ("Native AI host is unavailable. Open the desktop application.", "خدمة الذكاء غير متاحة. افتح تطبيق سطح المكتب.")
+        } else if self.snapshot.busy {
+            ("A task is running. Wait for it to finish or cancel it.", "توجد مهمة قيد التشغيل. انتظر انتهاءها أو ألغها.")
+        } else if self.task_active() {
+            (
+                "Review and approve the current batch, or cancel the task before starting another.",
+                "راجع الدفعة الحالية واعتمدها، أو ألغ المهمة قبل بدء مهمة أخرى.",
+            )
+        } else if self.prompt.trim().is_empty() {
+            ("Enter production instructions.", "أدخل تعليمات الإنتاج.")
+        } else if self.settings.text_model.model.trim().is_empty() {
+            ("Choose a text model in Providers and keys.", "اختر نموذج النص من تبويب المزودين والمفاتيح.")
+        } else if !self.new_document && !document {
+            ("Open a document or choose New A4 document.", "افتح مستنداً أو اختر مستند A4 جديداً.")
+        } else if self.settings.output_mode == OutputMode::NativeWithImages
+            && self.settings.image_model.provider != ProviderKind::ComfyUi
+            && self.settings.image_model.model.trim().is_empty()
+        {
+            ("Choose an image model in Providers and keys.", "اختر نموذج الصور من تبويب المزودين والمفاتيح.")
+        } else if !self.workflow_ready() {
+            ("Complete a valid ComfyUI API workflow in Providers and keys.", "أكمل مخطط ComfyUI API صالحاً في تبويب المزودين والمفاتيح.")
+        } else if self.settings.budget.max_cost_usd.is_some() && !self.rates_confirmed {
+            ("Set and confirm the provider prices in Limits.", "أدخل أسعار المزود وأكّدها من قسم الحدود.")
+        } else {
+            return None;
+        };
+        Some(text(arabic, en, ar))
+    }
 }
 
 /// Typed UI path shared by all panel buttons. Credentials move directly to the host without JSON,
@@ -859,13 +890,11 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
             }
         }
         field(ui, a, "Output/sample directory (optional for production)", "مجلد المخرجات والعينة (اختياري للإنتاج)", &mut s.directory);
-        let valid = available
-            && !s.prompt.trim().is_empty()
-            && !s.settings.text_model.model.trim().is_empty()
-            && (s.new_document || document)
-            && s.workflow_ready()
-            && (s.settings.budget.max_cost_usd.is_none() || s.rates_confirmed);
-        if ui.add_enabled(valid, egui::Button::new(rtl::widget(ui, text(a, "Start production", "بدء الإنتاج")))).clicked() {
+        let issue = s.production_issue(available, document, a);
+        if let Some(reason) = issue {
+            rtl::label(ui, reason);
+        }
+        if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Start production", "بدء الإنتاج")))).clicked() {
             requests.push(AiRequest::Start(TaskRequest {
                 prompt: s.prompt.clone(),
                 settings: s.settings.clone(),
@@ -1494,7 +1523,51 @@ mod tests {
     use super::*;
     use crate::Services;
     use designcraft_engine::Session;
+    use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::json;
+    #[test]
+    fn disabled_production_button_explains_the_missing_model() {
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() },
+        );
+        app.run("ai.production", json!({})).unwrap();
+        app.ui.ai.prompt = "Create an editable activity".into();
+        let mut harness = crate::test_window::open(app, egui::vec2(1500.0, 1100.0));
+        harness.run_steps(3);
+        assert!(harness.get_by_label("Start production").accesskit_node().is_disabled());
+        assert!(harness.query_by_label("Choose a text model in Providers and keys.").is_some(), "a disabled button must explain what to fix");
+        harness.state_mut().app.ui.ai.settings.text_model.model = "fixture-model".into();
+        harness.run_steps(3);
+        assert!(!harness.get_by_label("Start production").accesskit_node().is_disabled());
+        assert!(harness.query_by_label("Choose a text model in Providers and keys.").is_none());
+    }
+
+    #[test]
+    fn production_readiness_preserves_workflow_budget_and_human_review_guards() {
+        let mut state = AiUiState { prompt: "Native activity".into(), ..Default::default() };
+        state.settings.text_model.model = "text-model".into();
+        state.settings.output_mode = OutputMode::NativeWithImages;
+        state.settings.image_model.provider = ProviderKind::Gemini;
+        assert_eq!(state.production_issue(true, false, false), Some("Choose an image model in Providers and keys."));
+        state.settings.image_model.model = "image-model".into();
+        state.settings.budget.max_cost_usd = Some(1.8);
+        assert_eq!(state.production_issue(true, false, true), Some("أدخل أسعار المزود وأكّدها من قسم الحدود."));
+        state.rates_confirmed = true;
+        assert_eq!(state.production_issue(true, false, false), None);
+        state.settings.image_model.provider = ProviderKind::ComfyUi;
+        state.settings.image_model.model.clear();
+        assert_eq!(state.production_issue(true, false, false), Some("Complete a valid ComfyUI API workflow in Providers and keys."));
+        state.workflow_json = r#"{"node":{"text":"{{prompt}}"}}"#.into();
+        state.edit_workflow();
+        assert_eq!(state.production_issue(true, false, false), None, "a workflow can specify its checkpoint without a model placeholder");
+        state.snapshot.batch = Some(BatchSnapshot { status: "awaiting_human_proof".into(), ..Default::default() });
+        assert_eq!(
+            state.production_issue(true, false, false),
+            Some("Review and approve the current batch, or cancel the task before starting another.")
+        );
+        assert!(!state.can_approve_batch());
+    }
     #[test]
     fn callback_dispatch_and_manual_settings_survive_poll() {
         let mut app = DesignApp::new(

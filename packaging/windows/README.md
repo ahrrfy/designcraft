@@ -1,5 +1,13 @@
 # Windows installer UI
 
+Native development previews can be launched with `start-native-preview.ps1 -ManifestPath <absolute-json-path>`.
+The launcher reads and writes UTF-8 explicitly, including on Windows PowerShell 5, and preserves
+the existing profile used to scope protected provider keys. Missing profile/document/executable
+paths stop startup instead of creating an unrelated blank session. `-ValidateOnly` checks the
+paths and recorded executable hash without starting the app or contacting providers; automated
+probes can use `-Hidden`. Run `powershell.exe -NoProfile -File packaging/windows/test-preview-launcher.ps1`
+to verify Arabic paths, UTF-8 with and without a BOM, read-only validation and missing-path rejection.
+
 `installer-ui.wxs` is generated from the shared `craft-installer` crate in
 [craft-libs](https://github.com/storytold/craft-libs/tree/main/crates/installer).
 `package.ps1` compiles it with this app's package source. The common UI provides progress,
