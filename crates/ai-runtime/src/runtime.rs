@@ -353,6 +353,14 @@ impl ProductionRunner {
         }
         let expected = match task.target {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
+            TaskTarget::ContinueBook => {
+                let current = session.doc().map_err(|e| e.to_string())?;
+                batch::continuation_progress(current)?;
+                if task.settings.pages_per_batch == 0 {
+                    return Err("Continuing a book requires reviewed batches".into());
+                }
+                Some((current.uid, current.revision))
+            }
             TaskTarget::NewA4 { pages } => {
                 if !(1..=1000).contains(&pages) {
                     return Err("AI new documents support 1–1000 A4 pages".into());
@@ -364,7 +372,7 @@ impl ProductionRunner {
             }
         };
         let (base, context) = match task.target {
-            TaskTarget::CurrentDocument => (session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?),
+            TaskTarget::CurrentDocument | TaskTarget::ContinueBook => (session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?),
             TaskTarget::NewA4 { pages } => {
                 let mut scratch = Session::new();
                 scratch.execute("file.new", &new_a4(pages)).map_err(|e| e.to_string())?;
@@ -414,9 +422,8 @@ impl ProductionRunner {
             crate::design::check_geometry(Some(&base), &base, profile)?;
         }
         let settings = task.settings.clone();
-        if let TaskTarget::NewA4 { pages } = task.target
-            && settings.pages_per_batch > 0
-            && pages > settings.pages_per_batch
+        if matches!(task.target, TaskTarget::ContinueBook)
+            || matches!(task.target, TaskTarget::NewA4 { pages } if settings.pages_per_batch > 0 && pages > settings.pages_per_batch)
         {
             return self.start_batches(session, task, snapshots, base, context);
         }
@@ -726,7 +733,7 @@ impl ProductionRunner {
                 std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
                 let trace = runs.join(format!("{}.json", report.id));
                 let context = match task.target {
-                    TaskTarget::CurrentDocument => compact_context(session)?,
+                    TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
                     TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages}),
                 };
                 write_json(
@@ -904,7 +911,7 @@ impl ProductionRunner {
                 skill_id: id.clone(),
                 revision: revision.clone(),
                 name: profile.name.clone(),
-                execution_mode: if matches!(target, Some(TaskTarget::NewA4 { .. }))
+                execution_mode: if matches!(target, Some(TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook))
                     && profile.page_families.iter().all(|family| !family.text_slots.is_empty())
                 {
                     "native_templates".into()

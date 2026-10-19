@@ -91,6 +91,7 @@ pub struct AiUiState {
     key_for_images: bool,
     prompt: String,
     new_document: bool,
+    continue_book: bool,
     pages: u32,
     automatic_skills: bool,
     selected_skills: BTreeSet<String>,
@@ -158,6 +159,7 @@ impl Default for AiUiState {
             key_for_images: false,
             prompt: String::new(),
             new_document: true,
+            continue_book: false,
             pages: 8,
             automatic_skills: true,
             selected_skills: BTreeSet::new(),
@@ -926,11 +928,24 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
             )));
         });
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut s.new_document, false, rtl::widget(ui, text(a, "Current document", "المستند الحالي")));
-            ui.radio_value(&mut s.new_document, true, rtl::widget(ui, text(a, "New A4 document", "مستند A4 جديد")));
-            ui.add_enabled(s.new_document, egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
+            if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Current document", "المستند الحالي"))).clicked() {
+                s.new_document = false;
+                s.continue_book = false;
+            }
+            if ui.radio(s.new_document, rtl::widget(ui, text(a, "New A4 document", "مستند A4 جديد"))).clicked() {
+                s.new_document = true;
+                s.continue_book = false;
+            }
+            if ui.radio(s.continue_book, rtl::widget(ui, text(a, "Continue remaining book pages", "استكمال صفحات الكتاب المتبقية"))).clicked()
+            {
+                s.new_document = false;
+                s.continue_book = true;
+            }
+            if s.new_document {
+                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
+            }
             label(ui, a, "Pages per batch", "الصفحات في كل دفعة");
-            ui.add_enabled(s.new_document, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=32));
+            ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=32));
         });
         if s.automatic_skills {
             label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
@@ -970,7 +985,13 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
                 settings: s.settings.clone(),
                 auto_select_skills: s.automatic_skills,
                 skill_ids: if s.automatic_skills { Vec::new() } else { s.selected_skills.iter().cloned().collect() },
-                target: if s.new_document { TaskTarget::NewA4 { pages: s.pages } } else { TaskTarget::CurrentDocument },
+                target: if s.new_document {
+                    TaskTarget::NewA4 { pages: s.pages }
+                } else if s.continue_book {
+                    TaskTarget::ContinueBook
+                } else {
+                    TaskTarget::CurrentDocument
+                },
                 export_directory: (!s.directory.trim().is_empty()).then(|| s.directory.clone()),
             }));
         }

@@ -18,6 +18,7 @@ pub(crate) fn package() -> Result<PackageFiles> {
             ("cover", "Opening page with title, clear visual and pupil name", "templates/cover.json"),
             ("compare-practice", "Compare two examples, then complete an independent drawing task", "templates/compare-practice.json"),
             ("review", "Review through counting, matching and a short reflection", "templates/review.json"),
+            ("curriculum-map", "Scope and Sequence / five-unit curriculum overview with unit objectives; adapt to the brief, not a cover or practice activity", "templates/curriculum-map.json"),
         ].map(|(id, purpose, template)| PageFamily { id: id.into(), purpose: purpose.into(), template: template.into(), text_slots:vec![],image_slots:vec![] }).into(),
         corrections: vec![DesignCorrection { before: "Every page contains one picture and one repeated activity".into(), after: "Choose the number of related activities and pictures from the learning objective, with clear response space".into(), reason: "Preserve variation, useful practice and visual clarity".into() }],
     };
@@ -50,7 +51,26 @@ pub(crate) fn package() -> Result<PackageFiles> {
         text(&mut review, instruction, [54.0, y, 540.0, y + 48.0], 18.0, true);
         block(&mut review, [70.0, y + 65.0, 105.0, y + 100.0], "C=75 M=5 Y=100 K=0");
     }
-    let templates = [("templates/cover.json", cover), ("templates/compare-practice.json", compare), ("templates/review.json", review)];
+    let mut curriculum_map = Vec::new();
+    header(&mut curriculum_map, "خطة التعلم", "KINDERGARTEN MATH");
+    text(&mut curriculum_map, "Scope and Sequence", [54.0, 120.0, 540.0, 185.0], 30.0, false);
+    for (y, swatch, overview) in [
+        (205.0, "C=100 M=90 Y=10 K=0", "Unit 1: Numbers 1-5\nCount objects and write numerals."),
+        (300.0, "C=75 M=5 Y=100 K=0", "Unit 2: Numbers 6-10\nCount objects and write numerals."),
+        (395.0, "C=15 M=100 Y=100 K=0", "Unit 3: Shapes and Colors\nName shapes and sort by color."),
+        (490.0, "C=100 M=90 Y=10 K=0", "Unit 4: Patterns and Comparison\nExtend patterns; compare amounts."),
+        (585.0, "C=75 M=5 Y=100 K=0", "Unit 5: Simple Addition\nJoin two groups and count the total."),
+    ] {
+        block(&mut curriculum_map, [54.0, y, 540.0, y + 84.0], swatch);
+        text(&mut curriculum_map, overview, [70.0, y + 5.0, 524.0, y + 79.0], 18.0, false);
+    }
+    text(&mut curriculum_map, "مراجعة المعلم مطلوبة.", [54.0, 690.0, 540.0, 734.0], 14.0, true);
+    let templates = [
+        ("templates/cover.json", cover),
+        ("templates/compare-practice.json", compare),
+        ("templates/review.json", review),
+        ("templates/curriculum-map.json", curriculum_map),
+    ];
     for family in &mut profile.page_families {
         if let Some((_, actions)) = templates.iter().find(|(path, _)| *path == family.template) {
             family.text_slots = actions
@@ -66,7 +86,10 @@ pub(crate) fn package() -> Result<PackageFiles> {
                         .and_then(|a| a.params.pointer("/attrs/size"))
                         .and_then(serde_json::Value::as_f64)
                         .unwrap_or(18.0);
-                    let max_chars = if size >= 26.0 {
+                    let overview_row = family.id == "curriculum-map" && example.starts_with("Unit ");
+                    let max_chars = if overview_row {
+                        80
+                    } else if size >= 26.0 {
                         24
                     } else if size <= 14.0 {
                         28
@@ -75,7 +98,11 @@ pub(crate) fn package() -> Result<PackageFiles> {
                     };
                     Some(DesignTextSlot {
                         id: format!("text-{index}"),
-                        purpose: format!("Short editable text; use brief language. Example: {example}"),
+                        purpose: if overview_row {
+                            format!("Curriculum overview row: unit label and learning objective, at most two short lines. Adapt to the brief while keeping the unit progression. Example: {example}")
+                        } else {
+                            format!("Short editable text; use brief language. Example: {example}")
+                        },
                         command: index,
                         max_chars,
                     })

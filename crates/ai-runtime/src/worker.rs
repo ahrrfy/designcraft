@@ -256,7 +256,10 @@ impl Runner<'_> {
         }
         let profile = profiles.first().copied();
         if let Some(style) = skills.iter().find(|skill| crate::template_plan::eligible(skill))
-            && matches!(request.target, designcraft_ai_types::protocol::TaskTarget::NewA4 { .. })
+            && matches!(
+                request.target,
+                designcraft_ai_types::protocol::TaskTarget::NewA4 { .. } | designcraft_ai_types::protocol::TaskTarget::ContinueBook
+            )
         {
             let scope = match scope {
                 Some(scope) => scope,
@@ -468,7 +471,11 @@ impl Runner<'_> {
             .unwrap_or(0);
         let per_page =
             u32::try_from(text_capacity).map_err(|_| "Template content capacity overflow")?.saturating_mul(2).saturating_add(128).max(1024);
-        let output_limit = scope.count.saturating_mul(per_page).saturating_add(512).min(request.settings.budget.max_output_tokens);
+        // Gemini counts internal thinking against the same output allowance.
+        // Preserve a bounded reasoning margin without asking for more page content.
+        let thinking_margin = if request.settings.text_model.provider == ProviderKind::Gemini { 4096 } else { 0 };
+        let output_limit =
+            scope.count.saturating_mul(per_page).saturating_add(512).saturating_add(thinking_margin).min(request.settings.budget.max_output_tokens);
         let response = self.generate(
             &request.settings.text_model,
             &GenerationRequest {
@@ -1289,6 +1296,15 @@ mod tests {
 
     #[test]
     fn template_production_uses_one_short_content_request_and_native_commands_without_paid_repairs() {
+        template_content_request(0);
+    }
+
+    #[test]
+    fn continuing_templates_compile_only_the_remaining_scoped_pages() {
+        template_content_request(2);
+    }
+
+    fn template_content_request(start_page: u32) {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
         let temp = tempfile::tempdir().unwrap();
@@ -1311,7 +1327,7 @@ mod tests {
             .enumerate()
             .map(|(page, family)| {
                 let text = family.text_slots.iter().map(|slot| (slot.id.clone(), "Test".to_owned())).collect::<BTreeMap<_, _>>();
-                json!({"page":page,"family":family.id,"text":text,"illustrations":[]})
+                json!({"page":page + start_page as usize,"family":family.id,"text":text,"illustrations":[]})
             })
             .collect::<Vec<_>>();
         struct ContentProvider {
@@ -1321,7 +1337,7 @@ mod tests {
         impl Provider for ContentProvider {
             fn generate(
                 &self,
-                _: &ModelSelection,
+                selection: &ModelSelection,
                 _: Option<&str>,
                 request: &GenerationRequest,
                 _: &AtomicBool,
@@ -1331,7 +1347,10 @@ mod tests {
                 assert!(!request.system.contains("NATIVE CATALOG"));
                 assert!(request.prompt.contains("CONTENT_GUIDANCE_REGRESSION"));
                 assert!(request.prompt.contains("REFERENCE_GUIDANCE_REGRESSION"));
-                assert!(request.max_output_tokens <= 2560);
+                assert!(request.max_output_tokens <= 8192);
+                if selection.provider == ProviderKind::Gemini {
+                    assert!(request.max_output_tokens > 4096, "Thinking allowance must not truncate the small visible content plan");
+                }
                 Ok(GenerationResponse {
                     text: self.response.clone(),
                     usage: Usage { input_tokens: Some(100), output_tokens: Some(64), ..Default::default() },
@@ -1349,10 +1368,18 @@ mod tests {
             ContentProvider { response: json!({"title":"Short native content","pages":pages}).to_string(), calls: std::cell::Cell::new(0) };
         let mut session = Session::new();
         session.execute("file.new", &json!({"preset":"A4","pages":4,"facingPages":false})).unwrap();
+        for page in 0..start_page {
+            session.execute("frame.create", &json!({"spread":page,"rect":[54,54,100,100],"content":"unassigned"})).unwrap();
+        }
         let base = session.doc().unwrap().clone();
         let original = base.doc.clone();
         let settings = AiSettings {
             allow_paid_repairs: true,
+            text_model: if start_page > 0 {
+                ModelSelection { provider: ProviderKind::Gemini, model: "mock-thinking-model".into(), endpoint: None }
+            } else {
+                AiSettings::default().text_model
+            },
             budget: BudgetSpec { token_limit: 500_000, repair_attempts: 3, max_requests: 8, ..Default::default() },
             ..Default::default()
         };
@@ -1361,15 +1388,20 @@ mod tests {
             settings: settings.clone(),
             skill_ids: vec![skill.skill_id.clone()],
             auto_select_skills: false,
-            target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 4 },
+            target: if start_page == 0 {
+                designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 4 }
+            } else {
+                designcraft_ai_types::protocol::TaskTarget::ContinueBook
+            },
             export_directory: None,
         };
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
-        let result =
-            runner.production(request, json!({"batch_scope":{"start":0,"count":2}}), catalog(), vec![skill], base, session.prefs.clone()).unwrap();
+        let result = runner
+            .production(request, json!({"batch_scope":{"start":start_page,"count":2}}), catalog(), vec![skill], base, session.prefs.clone())
+            .unwrap();
         let Product::BatchPlan { plan, proofs } = result else {
             panic!("Expected a native batch proof");
         };

@@ -14,7 +14,7 @@ fn style_package_authenticates_profile_and_rejects_broken_family_links() {
     let (temp, mut registry) = registry();
     let mut files = crate::educational_style::package().unwrap();
     let record = registry.import_files(files.clone(), Provenance::default()).unwrap();
-    assert_eq!(record.manifest.design_profile.as_ref().unwrap().page_families.len(), 3);
+    assert_eq!(record.manifest.design_profile.as_ref().unwrap().page_families.len(), 4);
     let path = temp.path().join("proof.png");
     let mut png_bytes = Vec::new();
     {
@@ -39,7 +39,7 @@ fn style_package_authenticates_profile_and_rejects_broken_family_links() {
     let pinned = registry.snapshot(&record.skill_id, &[]).unwrap();
     let profile = pinned.design_profile.clone().unwrap();
     assert_eq!(profile.margin_mm, 15.0);
-    assert_eq!(pinned.templates.len(), 3);
+    assert_eq!(pinned.templates.len(), 4);
     let mut manifest: NativeManifest = serde_json::from_slice(files.get("designcraft.json").unwrap()).unwrap();
     manifest.design_profile.as_mut().unwrap().page_families[0].template = "templates/missing.json".into();
     files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());

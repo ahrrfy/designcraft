@@ -47,6 +47,30 @@ pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRo
     Ok(Some(snapshot))
 }
 
+/// A continuation starts only from a deliberately selected current book. Never
+/// infer permission or a page offset from stale, editable checkpoint metadata.
+pub(super) fn continuation_progress(base: &DocState) -> Result<(u32, u32), String> {
+    let pages = u32::try_from(base.doc.spreads.len()).map_err(|_| "Invalid existing book page count")?;
+    if !(1..=1000).contains(&pages)
+        || base.doc.spreads.iter().any(|spread| {
+            spread.pages.len() != 1
+                || spread.pages.iter().any(|page| {
+                    !page.width.is_finite()
+                        || !page.height.is_finite()
+                        || (page.width - 210.0 * 72.0 / 25.4).abs() > 0.1
+                        || (page.height - 297.0 * 72.0 / 25.4).abs() > 0.1
+                })
+        })
+    {
+        return Err("Continue book requires 1–1000 single A4 pages".into());
+    }
+    let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
+    if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
+        return Err("Continue book requires completed opening pages followed only by blank pages; existing content will not be overwritten".into());
+    }
+    Ok((pages, u32::try_from(start).map_err(|_| "Invalid continuation page")?))
+}
+
 impl ProductionRunner {
     pub(super) fn start_batches(
         &mut self,
@@ -56,7 +80,14 @@ impl ProductionRunner {
         mut base: DocState,
         context: Value,
     ) -> Result<(), String> {
-        let TaskTarget::NewA4 { pages } = task.target else { return Err("Batch production requires a new A4 book".into()) };
+        let (pages, completed, existing) = match task.target {
+            TaskTarget::NewA4 { pages } => (pages, 0, None),
+            TaskTarget::ContinueBook => {
+                let (pages, completed) = continuation_progress(&base)?;
+                (pages, completed, Some((base.uid, base.revision)))
+            }
+            TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
+        };
         let size = task.settings.pages_per_batch;
         if !(1..=32).contains(&size) || !(1..=1000).contains(&pages) {
             return Err("Invalid book or batch size".into());
@@ -72,7 +103,10 @@ impl ProductionRunner {
             total_pages: pages,
             pages_per_batch: size,
             current_batch: 1,
-            total_batches: pages.div_ceil(size),
+            total_batches: pages.saturating_sub(completed).div_ceil(size),
+            completed_pages: completed,
+            document_uid: existing.map(|(uid, _)| uid),
+            document_revision: existing.map(|(_, revision)| revision),
             status: "running".into(),
             ..Default::default()
         };
@@ -541,6 +575,22 @@ mod tests {
             export_directory: None,
         }
     }
+    #[test]
+    fn continuation_refuses_blank_books_filled_books_holes_and_non_a4_pages() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(4)).unwrap();
+        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert_eq!(continuation_progress(session.doc().unwrap()).unwrap(), (4, 1));
+        session.execute("frame.create", &json!({"spread":2,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        session.execute("frame.create", &json!({"spread":1,"rect":[50,50,100,100]})).unwrap();
+        session.execute("frame.create", &json!({"spread":3,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        session.execute("file.new", &json!({"width":400,"height":600,"pages":2,"facingPages":false})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap()).is_err());
+    }
     fn wait(runner: &mut ProductionRunner, session: &mut Session) -> AiSnapshot {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -602,6 +652,15 @@ mod tests {
 
     #[test]
     fn explicit_approval_is_the_only_path_between_real_http_batches() {
+        reviewed_http_batches(0);
+    }
+
+    #[test]
+    fn continuing_an_existing_book_preserves_its_prefix_and_human_http_checkpoints() {
+        reviewed_http_batches(2);
+    }
+
+    fn reviewed_http_batches(initial_completed: u32) {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -646,10 +705,11 @@ mod tests {
                         }
                     }
                 }
-                let page = server_calls.fetch_add(1, Ordering::Relaxed);
-                if page > 1 {
+                let request_index = server_calls.fetch_add(1, Ordering::Relaxed);
+                if request_index > 1 {
                     return Err("Unexpected unapproved provider request".into());
                 }
+                let page = initial_completed + request_index;
                 let plan = json!({"title":"Reviewed native book","commands":[{"command":"frame.create","params":{"spread":page,"rect":[50,60,200,180],"content":"unassigned"}},{"command":"object.label","params":{"ids":["$0.id"],"label":format!("page-{}",page+1)}}],"images":[]});
                 let reply =
                     json!({"done":true,"message":{"content":plan.to_string()},"prompt_eval_count":120,"eval_count":30,"prompt_eval_cached_count":10})
@@ -666,15 +726,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
-        let started = runner.handle(&mut session, AiRequest::Start(task(endpoint, 3)));
+        let mut request = task(endpoint, 3);
+        let mut prefix = vec![];
+        if initial_completed > 0 {
+            session.execute("file.new", &new_a4(initial_completed + 2)).unwrap();
+            for page in 0..initial_completed {
+                session.execute("frame.create", &json!({"spread":page,"rect":[50,50,100,100],"content":"unassigned"})).unwrap();
+            }
+            prefix = session.doc().unwrap().doc.spreads.iter().take(initial_completed as usize).cloned().collect();
+            request.target = TaskTarget::ContinueBook;
+        }
+        let prior_undo = session.doc().map(|state| state.history.undo.len()).unwrap_or(0);
+        let started = runner.handle(&mut session, AiRequest::Start(request));
         assert!(started.busy, "{}", started.message);
         let first = wait(&mut runner, &mut session);
         assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
         let checkpoint = first.batch.as_ref().unwrap();
-        assert_eq!(checkpoint.completed_pages, 1);
+        assert_eq!(checkpoint.completed_pages, initial_completed + 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(checkpoint.batches[0].proof_paths.len(), 3);
-        let approved_page = session.doc().unwrap().doc.spreads[0].clone();
+        let approved_page = session.doc().unwrap().doc.spreads[initial_completed as usize].clone();
+        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
         for _ in 0..8 {
             runner.handle(&mut session, AiRequest::Poll);
             std::thread::sleep(Duration::from_millis(5));
@@ -696,14 +768,15 @@ mod tests {
         let second = wait(&mut runner, &mut session);
         assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
         let final_checkpoint = second.batch.as_ref().unwrap();
-        assert_eq!(final_checkpoint.completed_pages, 2);
+        assert_eq!(final_checkpoint.completed_pages, initial_completed + 2);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(final_checkpoint.cumulative_usage.requests, 2);
         assert_eq!(final_checkpoint.cumulative_usage.input_tokens, 240);
         assert!(final_checkpoint.batches.iter().all(|batch| batch.usage.requests == 1));
-        assert_eq!(session.doc().unwrap().doc.spreads[0], approved_page);
-        assert_eq!(session.doc().unwrap().doc.spreads[1].items[0].label, "page-2");
-        assert_eq!(session.doc().unwrap().history.undo.len(), 2);
+        assert_eq!(session.doc().unwrap().doc.spreads[initial_completed as usize], approved_page);
+        assert_eq!(session.doc().unwrap().doc.spreads[(initial_completed + 1) as usize].items[0].label, format!("page-{}", initial_completed + 2));
+        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
+        assert_eq!(session.doc().unwrap().history.undo.len(), prior_undo + 2);
         let completed =
             runner.handle(&mut session, AiRequest::ApproveBatch { job_id: final_checkpoint.job_id.clone(), checkpoint: final_checkpoint.checkpoint });
         assert_eq!(completed.batch.as_ref().unwrap().status, "completed");

@@ -70,7 +70,12 @@ impl Default for AiSettings {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskTarget {
     CurrentDocument,
-    NewA4 { pages: u32 },
+    /// Explicit new authority to fill the contiguous blank suffix of an existing A4 book.
+    /// Persisted checkpoints never grant this authority.
+    ContinueBook,
+    NewA4 {
+        pages: u32,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
