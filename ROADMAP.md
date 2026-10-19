@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI6 (2026-10-19): Template production pins selected skill instructions and references without retaining unused non-style command examples. The style's executable templates and the 64-KiB task-context guard remain intact; generic command planning retains its examples.
+
 - AI5 (2026-10-19): Explicitly continue the contiguous blank suffix of an existing single-page A4 book with the same scoped native execution, pinned skills, cumulative new-job ledger and human proof gates. Existing pages and recovered-checkpoint restrictions stay intact. An original five-unit curriculum-map template supports editable Scope and Sequence pages.
 
 - AI4 (2026-10-19): Versioned educational design profiles link rules, native page-family templates and explicit corrections. Production selects one style locally or by user choice, pins it across batches and propagates illustration rules to the image provider. Content-only planning compiles native commands from bound template slots locally; automatic extra paid planning requests are opt-in. Local preflight checks compiler compatibility, image-command capacity, print geometry and grouped strokes; human batch approval remains required.

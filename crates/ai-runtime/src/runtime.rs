@@ -1,7 +1,7 @@
 use crate::vault::{SessionKey, Vault};
 use crate::{ledger::UsageLedger, science, worker};
 use designcraft_ai_providers::{SecretString, validate_endpoint};
-use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry};
+use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry, SkillSnapshot};
 use designcraft_ai_types::protocol::*;
 use designcraft_ai_types::{EngineAction, ProviderKind};
 use designcraft_engine::{Session, file_access};
@@ -396,7 +396,6 @@ impl ProductionRunner {
             return Err("Select at most eight skills per task".into());
         }
         let mut snapshots = Vec::new();
-        let mut skill_context_bytes = 2usize;
         let supported = supported_commands();
         for id in ids {
             let card = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown skill: {id}"))?;
@@ -407,13 +406,9 @@ impl ProductionRunner {
             }
             let refs = selected_skill_references(record);
             let snapshot = self.registry.snapshot(&id, &refs).map_err(|e| e.to_string())?;
-            let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?.len();
-            skill_context_bytes = skill_context_bytes.checked_add(bytes.saturating_add(1)).ok_or("Selected skill context size overflow")?;
-            if skill_context_bytes > 64 * 1024 {
-                return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
-            }
             snapshots.push(snapshot);
         }
+        let snapshots = bounded_task_skills(snapshots, &task.target)?;
         let pins = snapshots.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
         if snapshots.iter().filter(|s| s.design_profile.is_some()).count() > 1 {
             return Err("Choose one design style per task to avoid conflicting identities".into());
@@ -1027,6 +1022,28 @@ impl ProductionRunner {
     }
 }
 
+/// The content compiler executes only the design style's immutable templates.
+/// Other selected skills contribute guidance, references and pinned identities;
+/// their native command examples are not needed by this execution path.
+fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> Result<Vec<SkillSnapshot>, String> {
+    if matches!(target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook) && skills.iter().any(crate::template_plan::eligible) {
+        for skill in &mut skills {
+            if skill.design_profile.is_none() {
+                skill.templates.clear();
+            }
+        }
+    }
+    let mut bytes = 2usize;
+    for skill in &skills {
+        let size = serde_json::to_vec(skill).map_err(|e| e.to_string())?.len();
+        bytes = bytes.checked_add(size.saturating_add(1)).ok_or("Selected skill context size overflow")?;
+        if bytes > 64 * 1024 {
+            return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
+        }
+    }
+    Ok(skills)
+}
+
 fn design_revision(entry: &designcraft_ai_skills::CatalogEntry) -> Option<&designcraft_ai_skills::SkillRevision> {
     let latest = entry.revisions.last()?;
     if latest.status == RevisionStatus::Draft {
@@ -1360,6 +1377,40 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_tasks_keep_skill_guidance_without_loading_unused_command_examples() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let session = Session::new();
+        runner.registry.set_enabled("early-years-clear-style", true).unwrap();
+        runner.prepare_style(&session, "early-years-clear-style").unwrap();
+        let style = runner.registry.snapshot("early-years-clear-style", &[]).unwrap();
+        assert!(crate::template_plan::eligible(&style));
+        let mut guidance = style.clone();
+        guidance.skill_id = "large-native-guidance".into();
+        guidance.design_profile = None;
+        guidance.instructions = "Preserve actual educational guidance".into();
+        guidance.references.insert("references/rules.md".into(), "Use short independent activities".into());
+        guidance.templates = std::collections::BTreeMap::from([(
+            "templates/example.json".into(),
+            vec![designcraft_ai_types::EngineAction { command: "frame.create".into(), params: json!({"text":"x".repeat(65 * 1024)}) }],
+        )]);
+        let originals = vec![guidance.clone(), style.clone()];
+        assert!(bounded_task_skills(originals.clone(), &TaskTarget::CurrentDocument).is_err());
+        assert!(bounded_task_skills(vec![guidance.clone()], &TaskTarget::ContinueBook).is_err(), "No compiler style means command examples remain");
+        for target in [TaskTarget::ContinueBook, TaskTarget::NewA4 { pages: 48 }] {
+            let bounded = bounded_task_skills(originals.clone(), &target).unwrap();
+            assert!(bounded[0].templates.is_empty());
+            assert_eq!(bounded[0].instructions, guidance.instructions);
+            assert_eq!(bounded[0].references, guidance.references);
+            assert_eq!(bounded[0].revision, guidance.revision);
+            assert_eq!(bounded[0].reference_hashes, guidance.reference_hashes);
+            assert_eq!(serde_json::to_value(&bounded[1]).unwrap(), serde_json::to_value(&style).unwrap());
+        }
+        guidance.instructions = "x".repeat(65 * 1024);
+        assert!(bounded_task_skills(vec![guidance, style], &TaskTarget::ContinueBook).is_err(), "The context guard still limits actual guidance");
+    }
 
     #[test]
     fn corrected_design_context_uses_resolved_native_type_and_color_values() {
