@@ -39,7 +39,7 @@ fn approve(registry: &mut SkillRegistry, temp: &Path, record: &SkillRevision) {
 fn drafts_require_review_and_preserve_active_revision_on_edit() {
     let (temp, mut registry) = registry();
     let records = registry.install_builtin_drafts().unwrap();
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 8);
     let first = records.first().unwrap();
     assert_eq!(first.status, RevisionStatus::Draft);
     assert!(registry.snapshot(&first.skill_id, &[]).is_err());
@@ -67,6 +67,25 @@ fn drafts_require_review_and_preserve_active_revision_on_edit() {
     assert!(!pinned.instructions.is_empty());
     let reopened = SkillRegistry::open(temp.path().join("catalog")).unwrap();
     assert!(!reopened.catalog(&first.skill_id).first().unwrap().enabled);
+}
+
+#[test]
+fn native_adaptations_preserve_licenses_without_loading_them_as_task_guidance() {
+    let (_temp, mut registry) = registry();
+    let records = registry.install_builtin_drafts().unwrap();
+    for (id, license, needle) in [("native-design-composition", "Apache-2.0", "Apache License"), ("native-design-quality", "MIT", "MIT License")] {
+        let record = records.iter().find(|record| record.skill_id == id).unwrap();
+        assert_eq!(record.status, RevisionStatus::Draft);
+        assert_eq!(record.provenance.license.as_deref(), Some(license));
+        assert!(record.manifest.external_tools.is_empty());
+        assert_eq!(record.manifest.references, ["references/layout-contract.md"]);
+        let files = registry.review_files(id, &record.revision).unwrap();
+        let license = std::str::from_utf8(files.get("references/LICENSE.txt").unwrap()).unwrap();
+        assert!(license.contains(needle));
+        let notice = std::str::from_utf8(files.get("references/NOTICE.md").unwrap()).unwrap();
+        assert!(notice.contains("Pinned commit:") && notice.contains("Source SHA-256:"));
+        assert!(registry.snapshot(id, &[]).is_err(), "import must not approve the adaptation");
+    }
 }
 
 #[test]
@@ -209,8 +228,7 @@ fn arabic_catalog_queries_find_the_respective_builtin_drafts() {
         ("A4", "school-print-preflight"),
     ] {
         let entries = registry.catalog(query);
-        assert_eq!(entries.len(), 1, "query: {query}");
-        let entry = entries.first().unwrap();
+        let entry = entries.iter().find(|entry| entry.skill_id == expected_id).unwrap_or_else(|| panic!("query: {query}"));
         assert_eq!(entry.skill_id, expected_id, "query: {query}");
         assert_eq!(entry.revisions.first().unwrap().status, RevisionStatus::Draft);
         assert!(entry.active_revision.is_none());

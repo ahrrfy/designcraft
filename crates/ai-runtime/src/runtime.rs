@@ -1237,7 +1237,7 @@ mod tests {
             assert!(runner.pending.is_none());
             assert!(session.documents().is_empty());
             assert!(!Path::new(&outside_path).exists());
-            assert_eq!(snapshot.skills.len(), 4);
+            assert_eq!(snapshot.skills.len(), 8);
         }
     }
 
@@ -1475,7 +1475,7 @@ mod tests {
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         let snapshot = runner.handle(&mut session, AiRequest::Poll);
-        assert_eq!(snapshot.skills.len(), 4);
+        assert_eq!(snapshot.skills.len(), 8);
         assert!(snapshot.skills.iter().all(|s| !s.approved));
         let skill = &snapshot.skills[0];
         let denied = runner.handle(&mut session, AiRequest::ApproveSkill { id: skill.id.clone(), revision: skill.revision.clone() });

@@ -454,12 +454,17 @@ impl SkillRegistry {
         builtin::packages()?
             .into_iter()
             .map(|files| {
+                let license = match files.get("references/LICENSE.txt") {
+                    Some(bytes) if bytes.starts_with(b"MIT License") => "MIT",
+                    Some(_) => "Apache-2.0",
+                    None => "MIT OR Apache-2.0",
+                };
                 self.import_files(
                     files,
                     Provenance {
-                        source: "DesignCraft original builtin".into(),
+                        source: "DesignCraft native builtin; upstream attribution, where applicable, is in references/NOTICE.md".into(),
                         author: Some("DesignCraft contributors".into()),
-                        license: Some("MIT OR Apache-2.0".into()),
+                        license: Some(license.into()),
                         source_sha256: None,
                     },
                 )

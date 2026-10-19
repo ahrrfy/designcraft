@@ -2,15 +2,15 @@ use crate::{NativeManifest, PackageFiles, Result};
 use designcraft_ai_types::EngineAction;
 use serde_json::json;
 
-/// Original text and synthetic sample content. No bundled source PDFs, fonts or
-/// third-party artwork. All packages deliberately begin unapproved.
+/// Native instructions and synthetic samples, including attributed adaptations.
+/// No source PDFs, fonts or third-party artwork. All packages begin unapproved.
 pub(crate) fn packages() -> Result<Vec<PackageFiles>> {
-    [
+    let mut packages = [
         ("early-years-booklet-planning", "Plan a clear early-years booklet from teacher requirements, age range and learning outcomes. تخطيط كتيب وكراس وملزمة ومنهج علوم ورياضيات وحاسوب لرياض الأطفال حسب العمر والأهداف التعليمية.",
-         "Confirm age range, language, page count, learning objectives, available paper and binding. Produce a page-by-page plan before layout. Use one objective and one short instruction per activity. Keep tasks suitable for the stated developmental stage. Do not invent school branding, curriculum alignment, prices or permissions. Use native editable text and shapes. Obtain teacher review of learning content and visual review before production.",
+         "Confirm age range, language, page count, learning objectives, available paper and binding. Produce a page-by-page plan before layout. Each activity needs a clear objective and short instruction; a page may contain several related activities, subtopics and pictures. Choose observation, comparison, matching, sequence or mixed layouts according to the brief rather than repeating a single-picture template. Keep tasks suitable for the stated developmental stage. Do not invent school branding, curriculum alignment, prices or permissions. Use native editable text and shapes. Obtain teacher review of learning content and visual review before production.",
          "Booklet planning sample", "1. Cover and pupil name\n2. Trace a line\n3. Count three circles\n4. Teacher review", "Check reading level, pencil control, realistic page count and safe binding margins."),
         ("early-years-activity-layout", "Lay out simple, editable early-years activities with generous spacing and clear task areas. تصميم وتوزيع أنشطة ورسومات تعليمية قابلة للتحرير بمساحات واضحة ومريحة للأطفال.",
-         "Use a traditional flat page: a short heading, a single instruction, a spacious activity area and a small pupil-name field. Keep type straight and separate from task marks. Use vector shapes for tracing and counting when native commands support them. Keep answer areas and writing lines clear. Avoid visual noise, overlapping labels and decorations that compete with the task. Preserve exact user dimensions and margins. Never silently substitute an image for an editable activity.",
+         "Use a traditional flat page with aligned sections, clear headings and spacious activity areas. Each activity has its own short instruction; several related activities and independent illustrations may share a page. Choose the visual density and picture count from the brief, not a fixed one-picture or one-topic rule. Keep type straight and separate from task marks. Use native vector shapes for tracing, diagrams and counting when supported. Use realistic images when requested, within separate native frames. Keep answer areas and writing lines clear. Preserve exact user dimensions and margins. Never silently substitute an image for an editable activity.",
          "Activity layout sample", "Name: ____________________\nDraw a line from each number to its group.\n\n1                       one circle\n2                       two circles\n3                       three circles", "Inspect every object boundary, writing area, contrast and instruction length."),
         ("arabic-english-typography", "Check Arabic and English typography, text direction and editable bilingual classroom layouts. تنسيق الخطوط والنصوص العربية والإنجليزية واتجاه الفقرات والمحاذاة في الصفحات التعليمية.",
          "Keep Arabic as logical Unicode text and use native shaping and paragraph direction. Use RTL paragraphs for Arabic and LTR for English; review mixed numbers, punctuation and parentheses visually. Do not reverse character strings or rasterize text to hide shaping problems. Verify the actual selected font supports every glyph and intended print size. Use explicit aligned text areas with sufficient leading. Preserve supplied copy exactly. Native command capability determines available direction and style operations; report unsupported typography controls rather than simulating them.",
@@ -46,7 +46,44 @@ pub(crate) fn packages() -> Result<Vec<PackageFiles>> {
             ("templates/sample.json".into(), actions_bytes),
             ("references/review.md".into(), format!("# Human sample review\n\n{review}\n").into_bytes()),
         ]))
-    }).collect()
+    }).collect::<Result<Vec<_>>>()?;
+    packages.extend([
+        embedded(&[
+            ("SKILL.md", include_bytes!("../skills/native-design-composition/SKILL.md")),
+            ("designcraft.json", include_bytes!("../skills/native-design-composition/designcraft.json")),
+            ("templates/sample.json", include_bytes!("../skills/native-design-composition/templates/sample.json")),
+            ("references/layout-contract.md", include_bytes!("../skills/native-design-composition/references/layout-contract.md")),
+            ("references/LICENSE.txt", include_bytes!("../skills/native-design-composition/references/LICENSE.txt")),
+            ("references/NOTICE.md", include_bytes!("../skills/native-design-composition/references/NOTICE.md")),
+        ]),
+        embedded(&[
+            ("SKILL.md", include_bytes!("../skills/native-design-quality/SKILL.md")),
+            ("designcraft.json", include_bytes!("../skills/native-design-quality/designcraft.json")),
+            ("templates/sample.json", include_bytes!("../skills/native-design-quality/templates/sample.json")),
+            ("references/layout-contract.md", include_bytes!("../skills/native-design-quality/references/layout-contract.md")),
+            ("references/LICENSE.txt", include_bytes!("../skills/native-design-quality/references/LICENSE.txt")),
+            ("references/NOTICE.md", include_bytes!("../skills/native-design-quality/references/NOTICE.md")),
+        ]),
+        embedded(&[
+            ("SKILL.md", include_bytes!("../skills/native-engine-workflow/SKILL.md")),
+            ("designcraft.json", include_bytes!("../skills/native-engine-workflow/designcraft.json")),
+            ("templates/sample.json", include_bytes!("../skills/native-engine-workflow/templates/sample.json")),
+            ("references/layout-contract.md", include_bytes!("../skills/native-engine-workflow/references/layout-contract.md")),
+            ("references/NOTICE.md", include_bytes!("../skills/native-engine-workflow/references/NOTICE.md")),
+        ]),
+        embedded(&[
+            ("SKILL.md", include_bytes!("../skills/native-illustration/SKILL.md")),
+            ("designcraft.json", include_bytes!("../skills/native-illustration/designcraft.json")),
+            ("templates/sample.json", include_bytes!("../skills/native-illustration/templates/sample.json")),
+            ("references/drawing-contract.md", include_bytes!("../skills/native-illustration/references/drawing-contract.md")),
+            ("references/NOTICE.md", include_bytes!("../skills/native-illustration/references/NOTICE.md")),
+        ]),
+    ]);
+    Ok(packages)
+}
+
+fn embedded(files: &[(&str, &[u8])]) -> PackageFiles {
+    files.iter().map(|(path, bytes)| ((*path).into(), bytes.to_vec())).collect()
 }
 
 fn append_text(actions: &mut Vec<EngineAction>, text: &str, rect: [f64; 4], size: f64, rtl: bool) {

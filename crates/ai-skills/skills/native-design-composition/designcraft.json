@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "skill_id": "native-design-composition",
+  "required_commands": [
+    "frame.create",
+    "object.stroke",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/layout-contract.md"
+  ],
+  "templates": [
+    "templates/sample.json"
+  ],
+  "sample_template": "templates/sample.json",
+  "external_tools": [],
+  "compatibility_notes": "Native adaptation. Sample uses Tahoma and A4 scratch rendering. Picture slots demonstrate layout, not final photographic artwork. Human sample review is required before activation."
+}

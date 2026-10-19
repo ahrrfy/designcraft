@@ -18,7 +18,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 const MAX_JSON: usize = 4 * 1024 * 1024;
 const MAX_PROMPT: usize = 192 * 1024;
-const MAX_IMAGES: usize = 4;
+const MAX_IMAGES: usize = 8;
 const MAX_ACTIONS: usize = 512;
 const ANALYZER: &str = "designcraft.visual-style.v1";
 #[cfg(test)]
@@ -262,19 +262,30 @@ impl Runner<'_> {
             let (previous, validation) = match parsed {
                 Ok(raw_plan) => {
                     let previous = bounded_json(&serde_json::to_value(&raw_plan).map_err(|e| e.to_string())?, MAX_JSON)?;
-                    // Image failures fail the whole task. Never publish a partially illustrated layout.
-                    let expanded = self.expand_images(raw_plan, &request.settings, &mut image_cache, &mut image_bytes)?;
-                    self.progress("Validating commands and print preflight on a private document", 0.85)?;
-                    match simulate_scoped(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope) {
-                        Ok(()) => {
-                            check_cancel(self.cancel)?;
-                            if let Some(scope) = scope {
-                                let proofs = batch_proofs(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope)?;
-                                return Ok(Product::BatchPlan { plan: expanded, proofs });
+                    // Validate native typography before spending on images. Page completeness
+                    // is checked on the final illustrated draft, since a page can be image-only.
+                    let text_check = if raw_plan.images.is_empty() {
+                        Ok(())
+                    } else {
+                        simulate_scoped(&raw_plan, &base, &prefs, request.settings.output_mode, self.cancel, None)
+                    };
+                    if let Err(error) = text_check {
+                        (previous, error)
+                    } else {
+                        // Image failures fail the whole task. Never publish a partially illustrated layout.
+                        let expanded = self.expand_images(raw_plan, &request.settings, &mut image_cache, &mut image_bytes)?;
+                        self.progress("Validating commands and print preflight on a private document", 0.85)?;
+                        match simulate_scoped(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope) {
+                            Ok(()) => {
+                                check_cancel(self.cancel)?;
+                                if let Some(scope) = scope {
+                                    let proofs = batch_proofs(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope)?;
+                                    return Ok(Product::BatchPlan { plan: expanded, proofs });
+                                }
+                                return Ok(Product::Plan(expanded));
                             }
-                            return Ok(Product::Plan(expanded));
+                            Err(error) => (previous, error),
                         }
-                        Err(error) => (previous, error),
                     }
                 }
                 Err(error) => (response.text, error),
@@ -415,13 +426,15 @@ fn production_system(catalog: &Value, skills: &[SkillSnapshot], mode: OutputMode
     let native_catalog = compact_catalog(catalog)?;
     let instructions = bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?;
     let image_policy = match mode {
-        OutputMode::NativeOnly => "NATIVE ONLY: images must be empty. Do not use file.place or any raster commands.",
+        OutputMode::NativeOnly => "NATIVE ONLY: images must be empty. Do not use file.place or any raster commands.".into(),
         OutputMode::NativeWithImages => {
-            "NATIVE WITH IMAGES: optional images contains at most four individual illustration placements. Text and all page layout stay native. Do not emit file.place yourself; the host generates and inserts each requested illustration through the independently selected image provider. page is the zero-based native spread; rect is the exact target frame rectangle in points. Give each placement a meaningful label."
+            format!(
+                "NATIVE WITH IMAGES: optional images contains at most {MAX_IMAGES} individual illustration placements across this request, subject to the task budget and raster limits. Several illustrations may share a page; do not infer one picture per page. Text and all page layout stay native. Do not emit file.place yourself; the host generates and inserts each requested illustration through the independently selected image provider. page is the zero-based native spread; rect is the exact target frame rectangle in points. Give each placement a meaningful label."
+            )
         }
     };
     Ok(format!(
-        "{NATIVE_POLICY}\n{image_policy}\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
+        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. Allocate enough frame height for all lines and padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
         bounded_json(&native_catalog, MAX_PROMPT / 2)?
     ))
 }
@@ -532,7 +545,7 @@ fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<Productio
     // Provider-authored raster commands are always rejected. Only this worker inserts validated bytes.
     validate_actions(&plan.commands, catalog, OutputMode::NativeOnly)?;
     if (mode == OutputMode::NativeOnly && !plan.images.is_empty()) || plan.images.len() > MAX_IMAGES {
-        return Err("Plan image placements violate the output mode or four-image limit".into());
+        return Err(format!("Plan image placements violate the output mode or {MAX_IMAGES}-image limit"));
     }
     for image in &plan.images {
         if image.prompt.trim().is_empty()
@@ -1236,6 +1249,14 @@ mod tests {
     fn schema_and_parser_bound_images_and_rectangles() {
         let schema = plan_schema(&catalog(), OutputMode::NativeOnly).unwrap();
         assert_eq!(schema["properties"]["images"]["maxItems"], 0);
+        let illustrated = plan_schema(&catalog(), OutputMode::NativeWithImages).unwrap();
+        assert_eq!(illustrated["properties"]["images"]["maxItems"], 8);
+        let placement = json!({"prompt":"tree","page":0,"rect":[54,220,200,366],"label":"tree"});
+        let mut multi = plan();
+        multi["images"] = json!(vec![placement.clone(); 8]);
+        assert!(parse_plan(&multi.to_string(), OutputMode::NativeWithImages, &catalog()).is_ok());
+        multi["images"] = json!(vec![placement; 9]);
+        assert!(parse_plan(&multi.to_string(), OutputMode::NativeWithImages, &catalog()).is_err());
         let mut value = plan();
         value["images"] = json!([{"prompt":"tree","page":0,"rect":[100,0,0,100],"label":"tree"}]);
         assert!(parse_plan(&value.to_string(), OutputMode::NativeWithImages, &catalog()).is_err());
@@ -1393,6 +1414,53 @@ mod tests {
         assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
         assert_eq!(session.doc().unwrap().doc.spreads[0].items.len(), 0);
         assert!(provider.responses.borrow().is_empty());
+    }
+
+    #[test]
+    fn overset_layout_is_rejected_before_spending_on_images() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let original = base.doc.clone();
+        let catalog = session.execute("production.catalog", &json!({})).unwrap();
+        let invalid = json!({
+            "title":"Overset proof", "commands":[
+                {"command":"frame.create","params":{"rect":[54,54,70,60],"content":"text","text":"Text must remain fully visible","caret":false}},
+                {"command":"type.char","params":{"attrs":{"fontFamily":"Source Sans 3","size":24}}}
+            ],
+            "images":[{"prompt":"A realistic plant","page":0,"rect":[54,220,300,466],"label":"plant"}]
+        });
+        let provider = Mock {
+            responses: RefCell::new(vec![Ok(GenerationResponse {
+                text: invalid.to_string(),
+                usage: Usage { input_tokens: Some(100), output_tokens: Some(100), ..Default::default() },
+                error: None,
+            })]),
+        };
+        let budget = BudgetSpec { token_limit: 500_000, repair_attempts: 0, ..Default::default() };
+        let mut ledger = UsageLedger::new(budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let request = TaskRequest {
+            prompt: "Create an editable plant lesson".into(),
+            settings: AiSettings {
+                output_mode: OutputMode::NativeWithImages,
+                image_model: ModelSelection { provider: ProviderKind::Gemini, model: "fixture-image".into(), endpoint: None },
+                budget,
+                ..Default::default()
+            },
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let error = runner.production(request, json!({}), catalog, vec![], base, session.prefs.clone()).err().unwrap();
+        assert!(error.contains("overset"), "{error}");
+        assert_eq!(ledger.summary().requests, 1, "invalid typography must not launch an image request");
+        assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
     }
 
     #[test]
