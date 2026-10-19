@@ -213,6 +213,30 @@ impl ProductionRunner {
                 self.snapshot.message = "Skill imported as a draft; run and review its sample before approval".into();
             }
             AiRequest::InspectSkill { id, revision } => self.inspect_skill(&id, &revision)?,
+            AiRequest::AddDesignCorrection { id, revision, correction } => {
+                let latest = self
+                    .registry
+                    .catalog("")
+                    .into_iter()
+                    .find(|e| e.skill_id == id)
+                    .and_then(|entry| entry.revisions.last().map(|r| r.revision.clone()));
+                if latest.as_deref() != Some(revision.as_str()) {
+                    return Err("Inspect the latest style revision before adding a correction".into());
+                }
+                let mut files = self.registry.review_files(&id, &revision).map_err(|e| e.to_string())?;
+                let mut manifest = self.registry.revision(&id, &revision).map_err(|e| e.to_string())?.manifest.clone();
+                let profile = manifest.design_profile.as_mut().ok_or("This skill has no design profile")?;
+                profile.corrections.push(correction);
+                profile.validate()?;
+                files.insert("designcraft.json".into(), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?);
+                let draft = self
+                    .registry
+                    .import_files(files, Provenance { source: "Explicit local design correction".into(), ..Default::default() })
+                    .map_err(|e| e.to_string())?;
+                self.sample = None;
+                self.inspect_skill(&id, &draft.revision)?;
+                self.snapshot.message = "Correction saved in a new design-style draft; the active version and running task stay unchanged".into();
+            }
             AiRequest::PrepareSkills { prompt } => {
                 let ids = self.prepare_automatic_skills(session, &prompt)?;
                 self.snapshot.message = format!("Automatically prepared {} compatible skills locally; no provider request", ids.len());
@@ -235,12 +259,15 @@ impl ProductionRunner {
                 self.inspect_skill(&revised.skill_id, &revised.revision)?;
                 self.snapshot.message = "Draft saved; the previous approved revision remains active".into();
             }
-            AiRequest::GenerateSkill { prompt, reference_paths, settings } => self.start_skill(prompt, reference_paths, None, settings)?,
-            AiRequest::GenerateSkillFromDocument { prompt, settings } => {
-                let context = compact_context(session)?;
-                self.start_skill(prompt, Vec::new(), Some(context), settings)?;
+            AiRequest::GenerateSkill { prompt, reference_paths, settings, design_style } => {
+                self.start_skill(prompt, reference_paths, None, settings, design_style)?
+            }
+            AiRequest::GenerateSkillFromDocument { prompt, settings, design_style } => {
+                let context = if design_style { corrected_design_context(session)? } else { compact_context(session)? };
+                self.start_skill(prompt, Vec::new(), Some(context), settings, design_style)?;
             }
             AiRequest::RunSkillSample { id, revision } => self.run_sample(session, &id, &revision)?,
+            AiRequest::RunDesignTemplate { id, revision, template } => self.run_design_template(session, &id, &revision, Some(&template))?,
             AiRequest::ApproveSkill { id, revision } => {
                 let evidence = self
                     .sample
@@ -345,7 +372,18 @@ impl ProductionRunner {
                 (scratch.doc().map_err(|e| e.to_string())?.clone(), context)
             }
         };
-        let ids = if task.auto_select_skills { self.prepare_automatic_skills(session, &task.prompt)? } else { task.skill_ids.clone() };
+        let ids = if task.auto_select_skills {
+            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+        } else {
+            let mut ids = task.skill_ids.clone();
+            if let Some(id) = task.settings.design_style.as_deref() {
+                self.prepare_style(session, id)?;
+                if !ids.iter().any(|selected| selected == id) {
+                    ids.push(id.into());
+                }
+            }
+            ids
+        };
         if ids.len() > 8 {
             return Err("Select at most eight skills per task".into());
         }
@@ -369,6 +407,12 @@ impl ProductionRunner {
             snapshots.push(snapshot);
         }
         let pins = snapshots.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
+        if snapshots.iter().filter(|s| s.design_profile.is_some()).count() > 1 {
+            return Err("Choose one design style per task to avoid conflicting identities".into());
+        }
+        if let Some(profile) = snapshots.iter().find_map(|s| s.design_profile.as_ref()) {
+            crate::design::check_geometry(Some(&base), &base, profile)?;
+        }
         let settings = task.settings.clone();
         if let TaskTarget::NewA4 { pages } = task.target
             && settings.pages_per_batch > 0
@@ -387,7 +431,14 @@ impl ProductionRunner {
         self.launch(work, Some(task), expected, pins, settings)
     }
 
-    fn start_skill(&mut self, prompt: String, paths: Vec<String>, context: Option<Value>, settings: AiSettings) -> Result<(), String> {
+    fn start_skill(
+        &mut self,
+        prompt: String,
+        paths: Vec<String>,
+        context: Option<Value>,
+        settings: AiSettings,
+        design_style: bool,
+    ) -> Result<(), String> {
         for path in &paths {
             file_access::check_read(path)?;
         }
@@ -397,6 +448,7 @@ impl ProductionRunner {
             return Err("Enter a bounded description for the new skill".into());
         }
         let work = worker::Work::Skill {
+            design_style,
             prompt,
             reference_paths: paths,
             context,
@@ -558,6 +610,7 @@ impl ProductionRunner {
         let committed_export = matches!(&outcome.result, Ok(worker::Product::Indesign(_)));
         let cancelled = pending.worker.cancel.load(Ordering::Relaxed) && !committed_export;
         let mut report = TaskReport {
+            design_style: self.style_use(&pending.skills, pending.task.as_ref().map(|task| &task.target)),
             id: pending.id,
             status: "failed".into(),
             title: pending.task.as_ref().map(|t| t.prompt.chars().take(80).collect()).unwrap_or_else(|| "AI service operation".into()),
@@ -679,7 +732,7 @@ impl ProductionRunner {
                 write_json(
                     &self.profile_access,
                     &trace,
-                    &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"base":context,"plan":plan}),
+                    &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"designStyle":report.design_style,"base":context,"plan":plan}),
                 )?;
                 report.artifacts.push(trace.to_string_lossy().into_owned());
                 let previous_active = session.active_index();
@@ -724,9 +777,14 @@ impl ProductionRunner {
     }
 
     fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
+        self.prepare_skills_for_style(session, prompt, None)
+    }
+
+    fn prepare_skills_for_style(&mut self, session: &Session, prompt: &str, style_id: Option<&str>) -> Result<Vec<String>, String> {
         if prompt.trim().is_empty() || prompt.len() > 32_768 {
             return Err("Enter a prompt of at most 32768 UTF-8 bytes".into());
         }
+        self.snapshot.skill_warnings.clear();
         let supported = supported_commands();
         let mut candidates = self
             .registry
@@ -737,6 +795,9 @@ impl ProductionRunner {
                     return None;
                 }
                 let revision = entry.revisions.last()?;
+                if revision.manifest.design_profile.is_some() {
+                    return None;
+                }
                 if !skill_is_compatible(revision, &supported) {
                     return None;
                 }
@@ -749,9 +810,15 @@ impl ProductionRunner {
             if status == RevisionStatus::Approved {
                 continue;
             }
-            validate_skill_templates(&self.registry, session, &id, &revision)
-                .map_err(|error| format!("Automatic skill validation failed for {id}: {error}"))?;
-            self.run_sample(session, &id, &revision)?;
+            let validation =
+                validate_skill_templates(&self.registry, session, &id, &revision).and_then(|()| self.run_sample(session, &id, &revision));
+            if let Err(error) = validation {
+                self.snapshot.skill_warnings.push(format!(
+                    "Skipped invalid skill draft {id}: {}. A compatible active revision is retained when available.",
+                    error.chars().take(1024).collect::<String>()
+                ));
+                continue;
+            }
             let evidence = self.sample.as_ref().ok_or("Automatic sample evidence is unavailable")?;
             self.registry
                 .activate_automatically(
@@ -768,7 +835,84 @@ impl ProductionRunner {
                 .map_err(|error| error.to_string())?;
         }
         self.refresh_catalog();
-        Ok(self.choose_skills(prompt))
+        let mut ids = self.choose_skills(prompt);
+        let style = match style_id {
+            Some(id) => Some(id.to_owned()),
+            None => self
+                .registry
+                .catalog("")
+                .into_iter()
+                .filter(|entry| entry.enabled)
+                .filter_map(|entry| {
+                    let revision = design_revision(&entry)
+                        .filter(|r| skill_is_compatible(r, &supported))
+                        .or_else(|| active_design_revision(&entry).filter(|r| skill_is_compatible(r, &supported)))?;
+                    let profile = revision.manifest.design_profile.as_ref()?;
+                    let lower = prompt.to_lowercase();
+                    let score = profile.keywords.iter().filter(|word| lower.contains(&word.to_lowercase())).count();
+                    (score > 0).then_some((score, entry.skill_id))
+                })
+                .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                .map(|(_, id)| id),
+        };
+        if let Some(id) = style {
+            self.prepare_style(session, &id)?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    fn prepare_style(&mut self, session: &Session, id: &str) -> Result<(), String> {
+        let entry = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown design style: {id}"))?;
+        if !entry.enabled {
+            return Err(format!("Design style {id} is disabled"));
+        }
+        let revision = design_revision(&entry).ok_or("Design style has no revision")?;
+        let version = revision.revision.clone();
+        let result = (|| {
+            if revision.manifest.design_profile.is_none() || !skill_is_compatible(revision, &supported_commands()) {
+                return Err(format!("Design style {id} is incompatible or has no design profile"));
+            }
+            if revision.status == RevisionStatus::Approved {
+                return Ok(());
+            }
+            validate_skill_templates(&self.registry, session, id, &version)?;
+            self.run_sample(session, id, &version)?;
+            let sample = self.sample.as_ref().ok_or("Design style sample evidence is unavailable")?;
+            self.registry.activate_automatically(id, &version, ApprovalEvidence {
+                reviewer: String::new(), sample_artifact: sample.path.clone(), executed_actions: sample.actions.clone(),
+                supported_commands: supported_commands(), notes: "All page-family templates passed native preflight and print geometry checks. Educational and aesthetic review remains human.".into(),
+            }).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if active_design_revision(&entry).is_some_and(|active| active.revision != version && skill_is_compatible(active, &supported_commands())) {
+                self.snapshot.message = format!("New design-style draft failed validation; retained the active revision: {error}");
+            } else {
+                return Err(error);
+            }
+        }
+        self.refresh_catalog();
+        Ok(())
+    }
+
+    fn style_use(&self, pins: &[(String, String)], target: Option<&TaskTarget>) -> Option<designcraft_ai_types::DesignStyleUse> {
+        pins.iter().find_map(|(id, revision)| {
+            let record = self.registry.revision(id, revision).ok()?;
+            let profile = record.manifest.design_profile.as_ref()?;
+            Some(designcraft_ai_types::DesignStyleUse {
+                skill_id: id.clone(),
+                revision: revision.clone(),
+                name: profile.name.clone(),
+                execution_mode: if matches!(target, Some(TaskTarget::NewA4 { .. }))
+                    && profile.page_families.iter().all(|family| !family.text_slots.is_empty())
+                {
+                    "native_templates".into()
+                } else {
+                    "command_planner".into()
+                },
+            })
+        })
     }
     fn refresh_catalog(&mut self) {
         let supported = supported_commands();
@@ -781,6 +925,7 @@ impl ProductionRunner {
                 entry.revisions.into_iter().map(move |revision| {
                     let compatible = skill_is_compatible(&revision, supported);
                     SkillCard {
+                        design_profile: revision.manifest.design_profile.clone(),
                         id: entry.skill_id.clone(),
                         name: revision.name,
                         description: revision.description,
@@ -813,15 +958,33 @@ impl ProductionRunner {
         Ok(())
     }
     fn run_sample(&mut self, session: &Session, id: &str, revision: &str) -> Result<(), String> {
+        self.run_design_template(session, id, revision, None)
+    }
+
+    fn run_design_template(&mut self, session: &Session, id: &str, revision: &str, template: Option<&str>) -> Result<(), String> {
         let dir = self.root.join("samples");
-        let path = dir.join(format!("{id}-{revision}.png"));
+        let manifest = self.registry.revision(id, revision).map_err(|e| e.to_string())?.manifest.clone();
+        let template_actions = if let Some(template) = template {
+            if !manifest.design_profile.as_ref().is_some_and(|profile| profile.page_families.iter().any(|family| family.template == template)) {
+                return Err("Template is not a declared design page family".into());
+            }
+            Some(self.registry.review_templates(id, revision).map_err(|e| e.to_string())?.remove(template).ok_or("Missing native page template")?)
+        } else {
+            None
+        };
+        let suffix = template.and_then(|path| Path::new(path).file_stem()).and_then(|name| name.to_str()).unwrap_or("sample");
+        let path = dir.join(format!("{id}-{revision}-{suffix}.png"));
         self.profile_access.check(&dir, file_access::Access::Write)?;
         self.profile_access.check(&path, file_access::Access::Write)?;
         self.sample = None;
-        let actions = self.registry.sample_actions(id, revision).map_err(|e| e.to_string())?;
+        let actions = match template_actions {
+            Some(actions) => actions,
+            None => self.registry.sample_actions(id, revision).map_err(|e| e.to_string())?,
+        };
         let mut scratch = Session::new();
         scratch.prefs = session.prefs.clone();
-        scratch.execute("file.new", &new_a4(1)).map_err(|e| e.to_string())?;
+        let profile = self.registry.revision(id, revision).map_err(|e| e.to_string())?.manifest.design_profile.clone();
+        scratch.execute("file.new", &crate::design::document_params(profile.as_ref(), 1)).map_err(|e| e.to_string())?;
         scratch
             .execute(
                 "production.apply",
@@ -829,6 +992,9 @@ impl ProductionRunner {
             )
             .map_err(|e| e.to_string())?;
         ensure_preflight(&mut scratch)?;
+        if let Some(profile) = &profile {
+            crate::design::check_geometry(None, scratch.doc().map_err(|e| e.to_string())?, profile)?;
+        }
         let mut renderer = designcraft_render::Renderer::new();
         let doc = scratch.doc().map_err(|e| e.to_string())?;
         let raster = renderer
@@ -841,11 +1007,32 @@ impl ProductionRunner {
         self.profile_access.check(&dir, file_access::Access::Write)?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         write_profile(&self.profile_access, &path, &bytes)?;
-        self.sample = Some(SampleEvidence { id: id.into(), revision: revision.into(), actions, path });
+        let is_main = template.is_none() || template == manifest.sample_template.as_deref();
+        if is_main {
+            self.sample = Some(SampleEvidence { id: id.into(), revision: revision.into(), actions, path: path.clone() });
+        }
         self.inspect_skill(id, revision)?;
+        if let Some(review) = &mut self.snapshot.review {
+            review.sample_path = Some(path.to_string_lossy().into_owned());
+        }
         self.snapshot.message = "Sample executed with native tools and passed preflight; review its preview before approving".into();
         Ok(())
     }
+}
+
+fn design_revision(entry: &designcraft_ai_skills::CatalogEntry) -> Option<&designcraft_ai_skills::SkillRevision> {
+    let latest = entry.revisions.last()?;
+    if latest.status == RevisionStatus::Draft {
+        Some(latest)
+    } else {
+        entry.active_revision.as_ref().and_then(|id| entry.revisions.iter().find(|r| &r.revision == id)).or(Some(latest))
+    }
+}
+
+fn active_design_revision(entry: &designcraft_ai_skills::CatalogEntry) -> Option<&designcraft_ai_skills::SkillRevision> {
+    entry.active_revision.as_ref().and_then(|id| {
+        entry.revisions.iter().find(|r| &r.revision == id && r.status == RevisionStatus::Approved && r.manifest.design_profile.is_some())
+    })
 }
 
 fn selected_models(settings: &AiSettings) -> Vec<designcraft_ai_types::ModelSelection> {
@@ -904,16 +1091,21 @@ fn validate_skill_templates(registry: &SkillRegistry, session: &Session, id: &st
         let pages = u32::try_from(pages).map_err(|_| "Skill template review page count overflow")?;
         let mut scratch = Session::new();
         scratch.prefs = session.prefs.clone();
-        scratch.execute("file.new", &new_a4(pages)).map_err(|e| format!("Skill template {name}: {e}"))?;
+        scratch
+            .execute("file.new", &crate::design::document_params(record.manifest.design_profile.as_ref(), pages))
+            .map_err(|e| format!("Skill template {name}: {e}"))?;
         scratch
             .execute(
-                "production.validate",
+                "production.apply",
                 &json!({
                     "commands":actions,"outputMode":"native_only","allowedCommands":allowed,
                     "label":"Skill template compatibility review","requirePreflight":true
                 }),
             )
             .map_err(|e| format!("Skill template {name} is incompatible with the native engine: {e}"))?;
+        if let Some(profile) = &record.manifest.design_profile {
+            crate::design::check_geometry(None, scratch.doc().map_err(|e| e.to_string())?, profile)?;
+        }
     }
     Ok(())
 }
@@ -971,11 +1163,11 @@ fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::Ca
         .filter(|entry| {
             entry.enabled
                 && entry.active_revision.as_ref().is_some_and(|active| {
-                    entry
-                        .revisions
-                        .iter()
-                        .find(|revision| &revision.revision == active)
-                        .is_some_and(|revision| revision.status == RevisionStatus::Approved && skill_is_compatible(revision, supported))
+                    entry.revisions.iter().find(|revision| &revision.revision == active).is_some_and(|revision| {
+                        revision.status == RevisionStatus::Approved
+                            && revision.manifest.design_profile.is_none()
+                            && skill_is_compatible(revision, supported)
+                    })
                 })
         })
         .map(|entry| (skill_match_score(prompt, &entry), entry.skill_id))
@@ -1108,8 +1300,37 @@ fn compact_context(session: &Session) -> Result<Value, String> {
         }
     }
     Ok(
-        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"fontFaces":font_faces,"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
+        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
     )
+}
+
+fn corrected_design_context(session: &Session) -> Result<Value, String> {
+    let mut context = compact_context(session)?;
+    let doc = &session.doc().map_err(|e| e.to_string())?.doc;
+    let mut observations = Vec::new();
+    for (spread_index, spread) in doc.spreads.iter().enumerate() {
+        for item in &spread.items {
+            if observations.len() >= 48 {
+                break;
+            }
+            let typography=item.text_frame().and_then(|frame|doc.stories.get(&frame.story)).and_then(|story| {
+                let para=story.paras.first()?;
+                let (paragraph,base)=doc.styles.resolve_para(para);
+                let chars=doc.styles.resolve_char(&base,story.char_format_at(0));
+                Some(json!({"fontFamily":chars.font_family.chars().take(160).collect::<String>(),"fontStyle":chars.font_style.chars().take(80).collect::<String>(),"size":chars.size,"leading":chars.leading,"direction":paragraph.direction,"align":paragraph.align,"spaceBefore":paragraph.space_before,"spaceAfter":paragraph.space_after}))
+            });
+            let bounds = item.visible_bounds();
+            observations.push(json!({"spread":spread_index,"visibleBounds":[bounds.x0,bounds.y0,bounds.x1,bounds.y1],"fillSwatch":item.fill.swatch.chars().take(160).collect::<String>(),"fillTint":item.fill.tint,"strokeSwatch":item.stroke.swatch.chars().take(160).collect::<String>(),"strokeWeight":item.stroke.weight,"typography":typography}));
+        }
+        if observations.len() >= 48 {
+            break;
+        }
+    }
+    context["measuredDesignObservations"] = json!(observations);
+    context["designObservationScope"] = json!(
+        "At most 48 top-level items; first text paragraph/run only; values resolved from actual native styles. Not full-document coverage or inferred before-state."
+    );
+    Ok(context)
 }
 fn read_json(access: &std::sync::Arc<file_access::AutomationRoots>, path: &Path, max: u64) -> Result<Option<Value>, String> {
     access.check(path, file_access::Access::Read)?;
@@ -1132,6 +1353,82 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrected_design_context_uses_resolved_native_type_and_color_values() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        session.execute("frame.create", &json!({"rect":[60,60,400,120],"content":"text","text":"Native sample","caret":false})).unwrap();
+        session
+            .execute("type.char", &json!({"attrs":{"fontFamily":"Tahoma","fontStyle":"Regular","size":21,"leading":{"kind":"points","value":30}}}))
+            .unwrap();
+        session.execute("type.para", &json!({"attrs":{"align":"right","direction":"rightToLeft"}})).unwrap();
+        session.execute("object.fill", &json!({"swatch":"C=100 M=0 Y=0 K=0"})).unwrap();
+        let context = corrected_design_context(&session).unwrap();
+        let observed = &context["measuredDesignObservations"][0];
+        assert_eq!(observed["typography"]["fontFamily"], "Tahoma");
+        assert_eq!(observed["typography"]["size"].as_f64(), Some(21.0));
+        assert_eq!(observed["typography"]["align"], "right");
+        assert_eq!(observed["fillSwatch"], "C=100 M=0 Y=0 K=0");
+        assert!(context["swatchNames"].as_array().unwrap().iter().any(|v| v == "[Black]"));
+    }
+
+    #[test]
+    fn design_style_corrections_pin_revisions_preserve_rollback_and_reject_failed_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let original = runner.registry.catalog("").into_iter().flat_map(|e| e.revisions).find(|r| r.manifest.design_profile.is_some()).unwrap();
+        for entry in runner.registry.catalog("") {
+            runner.registry.set_enabled(&entry.skill_id, entry.skill_id == original.skill_id).unwrap();
+        }
+        let mut files = runner.registry.review_files(&original.skill_id, &original.revision).unwrap();
+        let mut manifest = original.manifest;
+        manifest.required_commands = vec!["frame.create".into()];
+        for family in &mut manifest.design_profile.as_mut().unwrap().page_families {
+            family.text_slots.clear();
+        }
+        files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+        for path in &manifest.templates {
+            files.insert(path.clone(), serde_json::to_vec(&json!([{"command":"frame.create","params":{"rect":[60,60,120,120]}}])).unwrap());
+        }
+        let record = runner.registry.import_files(files.clone(), Provenance::default()).unwrap();
+        let mut session = Session::new();
+        let selected = runner.prepare_skills_for_style(&session, "kindergarten", None).unwrap();
+        assert_eq!(selected.as_slice(), std::slice::from_ref(&record.skill_id));
+        let pinned = runner.registry.snapshot(&record.skill_id, &[]).unwrap();
+        runner
+            .dispatch(
+                &mut session,
+                AiRequest::AddDesignCorrection {
+                    id: record.skill_id.clone(),
+                    revision: record.revision.clone(),
+                    correction: designcraft_ai_types::DesignCorrection {
+                        before: "Crowded layout".into(),
+                        after: "Two aligned tasks with answer space".into(),
+                        reason: "Pencil room".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(runner.registry.snapshot(&record.skill_id, &[]).unwrap().revision, record.revision);
+        runner.prepare_style(&session, &record.skill_id).unwrap();
+        let revised = runner.registry.snapshot(&record.skill_id, &[]).unwrap();
+        assert_ne!(revised.revision, pinned.revision);
+        assert_eq!(revised.design_profile.unwrap().corrections.len(), pinned.design_profile.as_ref().unwrap().corrections.len() + 1);
+        assert_eq!(pinned.revision, record.revision);
+        runner.registry.rollback(&record.skill_id, &record.revision).unwrap();
+        runner.prepare_style(&session, &record.skill_id).unwrap();
+        assert_eq!(runner.registry.snapshot(&record.skill_id, &[]).unwrap().revision, record.revision);
+        // An invalid native template cannot replace the active style or break later tasks.
+        files.insert(manifest.templates[0].clone(), serde_json::to_vec(&json!([{"command":"frame.create","params":{"rect":[0,0,10,10]}}])).unwrap());
+        let broken = runner.registry.import_files(files, Provenance::default()).unwrap();
+        runner.prepare_style(&session, &record.skill_id).unwrap();
+        assert_eq!(runner.registry.snapshot(&record.skill_id, &[]).unwrap().revision, record.revision);
+        assert_eq!(runner.registry.revision(&record.skill_id, &broken.revision).unwrap().status, RevisionStatus::Draft);
+        assert!(runner.snapshot.reports.is_empty(), "Local style checks must not call a provider");
+        runner.registry.set_enabled(&record.skill_id, false).unwrap();
+        assert!(runner.prepare_style(&session, &record.skill_id).is_err());
+    }
 
     #[test]
     fn planning_context_reports_measured_font_glyph_coverage() {
@@ -1197,9 +1494,38 @@ mod tests {
             .unwrap(),
         );
         let rejected = runner.registry.import_files(broken, Provenance::default()).unwrap();
-        assert!(runner.prepare_automatic_skills(&session, "fixture layout").is_err());
+        assert!(runner.prepare_automatic_skills(&session, "fixture layout").unwrap().contains(&revision.skill_id));
+        assert_eq!(runner.snapshot.skill_warnings.len(), 1);
         assert_eq!(runner.registry.snapshot(&revision.skill_id, &[]).unwrap().revision, pinned.revision);
         assert_eq!(runner.registry.revision(&revision.skill_id, &rejected.revision).unwrap().status, RevisionStatus::Draft);
+        // A broken imported skill with no approved revision must not block the
+        // valid skill, acquire activation evidence, or alter the live document.
+        let bad_manifest = json!({"schema_version":1,"skill_id":"broken-fixture","required_commands":["frame.create"],
+            "templates":["templates/sample.json"],"sample_template":"templates/sample.json"});
+        let bad = runner
+            .registry
+            .import_files(
+                designcraft_ai_skills::PackageFiles::from([
+                    ("SKILL.md".into(), b"---\nname: broken-fixture\ndescription: fixture layout\n---\nNative sample.\n".to_vec()),
+                    ("designcraft.json".into(), serde_json::to_vec(&bad_manifest).unwrap()),
+                    (
+                        "templates/sample.json".into(),
+                        serde_json::to_vec(&json!([
+                            {"command":"frame.create","params":{"rect":"bad rectangle"}}
+                        ]))
+                        .unwrap(),
+                    ),
+                ]),
+                Provenance::default(),
+            )
+            .unwrap();
+        let selected = runner.prepare_automatic_skills(&session, "fixture layout").unwrap();
+        assert!(selected.contains(&revision.skill_id));
+        assert!(!selected.contains(&bad.skill_id));
+        assert_eq!(runner.snapshot.skill_warnings.len(), 2);
+        assert!(runner.registry.revision(&bad.skill_id, &bad.revision).unwrap().approval.is_none());
+        assert!(session.documents().is_empty());
+        assert_eq!(runner.snapshot.reports.len(), reports);
     }
 
     #[test]
@@ -1230,6 +1556,7 @@ mod tests {
             images: vec![],
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "ime-publication".into(),
             status: String::new(),
             title: String::new(),
@@ -1321,6 +1648,7 @@ mod tests {
             images: vec![],
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "profile-escape".into(),
             status: String::new(),
             title: String::new(),
@@ -1373,7 +1701,12 @@ mod tests {
         let requests = [
             AiRequest::ImportSkill { path: outside_path.clone() },
             AiRequest::ExportSkill { id: "missing".into(), revision: "missing".into(), path: outside_path.clone() },
-            AiRequest::GenerateSkill { prompt: "Review reference".into(), reference_paths: vec![outside_path.clone()], settings: Default::default() },
+            AiRequest::GenerateSkill {
+                design_style: false,
+                prompt: "Review reference".into(),
+                reference_paths: vec![outside_path.clone()],
+                settings: Default::default(),
+            },
             AiRequest::CreateScienceSample { directory: outside_path.clone() },
             AiRequest::ExportDocument { path: outside_path.clone(), pdf: false },
             AiRequest::Start(TaskRequest {
@@ -1392,7 +1725,7 @@ mod tests {
             assert!(runner.pending.is_none());
             assert!(session.documents().is_empty());
             assert!(!Path::new(&outside_path).exists());
-            assert_eq!(snapshot.skills.len(), 8);
+            assert_eq!(snapshot.skills.len(), 9);
         }
     }
 
@@ -1417,6 +1750,7 @@ mod tests {
         // Exercise the launch boundary directly: completion must recheck paths even if
         // an upstream validation is missing or a destination changed while generating.
         let work = worker::Work::Skill {
+            design_style: false,
             prompt: String::new(),
             reference_paths: vec![],
             context: None,
@@ -1630,7 +1964,7 @@ mod tests {
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         let snapshot = runner.handle(&mut session, AiRequest::Poll);
-        assert_eq!(snapshot.skills.len(), 8);
+        assert_eq!(snapshot.skills.len(), 9);
         assert!(snapshot.skills.iter().all(|s| !s.approved));
         let skill = &snapshot.skills[0];
         let denied = runner.handle(&mut session, AiRequest::ApproveSkill { id: skill.id.clone(), revision: skill.revision.clone() });
@@ -1646,6 +1980,7 @@ mod tests {
                 templates.push("templates/alternative.json".into());
             }
             let manifest = designcraft_ai_skills::NativeManifest {
+                design_profile: None,
                 schema_version: 1,
                 skill_id: "approval-variants".into(),
                 required_commands: vec!["frame.create".into(), "object.label".into()],
@@ -1901,6 +2236,7 @@ mod tests {
             images: Vec::new(),
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "test".into(),
             status: String::new(),
             title: String::new(),

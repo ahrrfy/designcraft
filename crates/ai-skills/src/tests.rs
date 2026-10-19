@@ -10,6 +10,46 @@ fn registry() -> (tempfile::TempDir, SkillRegistry) {
 }
 
 #[test]
+fn style_package_authenticates_profile_and_rejects_broken_family_links() {
+    let (temp, mut registry) = registry();
+    let mut files = crate::educational_style::package().unwrap();
+    let record = registry.import_files(files.clone(), Provenance::default()).unwrap();
+    assert_eq!(record.manifest.design_profile.as_ref().unwrap().page_families.len(), 3);
+    let path = temp.path().join("proof.png");
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.write_header().unwrap().write_image_data(&[255, 255, 255]).unwrap();
+    }
+    fs::write(&path, png_bytes).unwrap();
+    registry
+        .activate_automatically(
+            &record.skill_id,
+            &record.revision,
+            ApprovalEvidence {
+                reviewer: String::new(),
+                sample_artifact: path,
+                executed_actions: registry.sample_actions(&record.skill_id, &record.revision).unwrap(),
+                supported_commands: record.manifest.required_commands.iter().cloned().collect(),
+                notes: String::new(),
+            },
+        )
+        .unwrap();
+    let pinned = registry.snapshot(&record.skill_id, &[]).unwrap();
+    let profile = pinned.design_profile.clone().unwrap();
+    assert_eq!(profile.margin_mm, 15.0);
+    assert_eq!(pinned.templates.len(), 3);
+    let mut manifest: NativeManifest = serde_json::from_slice(files.get("designcraft.json").unwrap()).unwrap();
+    manifest.design_profile.as_mut().unwrap().page_families[0].template = "templates/missing.json".into();
+    files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+    assert!(registry.import_files(files, Provenance::default()).is_err());
+    registry.index.entries.get_mut(&record.skill_id).unwrap().revisions.last_mut().unwrap().manifest.design_profile.as_mut().unwrap().margin_mm = 1.0;
+    assert!(matches!(registry.snapshot(&record.skill_id, &[]), Err(SkillError::Integrity(_))));
+    assert_eq!(pinned.design_profile.unwrap().margin_mm, 15.0);
+}
+
+#[test]
 fn legacy_human_approval_is_not_relabelled_as_automatic() {
     let record: ApprovalRecord = serde_json::from_value(serde_json::json!({
         "reviewer":"Human reviewer","sample_sha256":"legacy","sample_format":"png","notes":"Reviewed"
@@ -48,7 +88,7 @@ fn approve(registry: &mut SkillRegistry, temp: &Path, record: &SkillRevision) {
 fn drafts_require_review_and_preserve_active_revision_on_edit() {
     let (temp, mut registry) = registry();
     let records = registry.install_builtin_drafts().unwrap();
-    assert_eq!(records.len(), 8);
+    assert_eq!(records.len(), 9);
     let first = records.first().unwrap();
     assert_eq!(first.status, RevisionStatus::Draft);
     assert!(registry.snapshot(&first.skill_id, &[]).is_err());

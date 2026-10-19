@@ -273,6 +273,7 @@ impl ProductionRunner {
         job.snapshot.elapsed_ms = job.snapshot.elapsed_ms.saturating_add(elapsed);
         job.ledger = Some(ledger);
         let mut report = TaskReport {
+            design_style: self.style_use(&pending.skills, pending.task.as_ref().map(|task| &task.target)),
             id: pending.id,
             status: "failed".into(),
             title: job.task.prompt.chars().take(80).collect(),
@@ -402,7 +403,7 @@ impl ProductionRunner {
             write_json(
                 &self.profile_access,
                 &trace,
-                &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plan":plan,"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
+                &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"designStyle":report.design_style,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plan":plan,"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
             )?;
             session.execute("production.apply",&json!({"commands":plan.commands,"outputMode":job.task.settings.output_mode,"label":format!("{} · batch {}",plan.title,job.snapshot.current_batch),"expectedDocumentUid":uid,"expectedRevision":revision,"requirePreflight":true,"minPpi":150})).map_err(|e|e.to_string())?;
             let state = session.doc().map_err(|e| e.to_string())?;
@@ -789,6 +790,7 @@ mod tests {
             images: vec![],
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "preference-proof".into(),
             status: String::new(),
             title: String::new(),
@@ -850,6 +852,7 @@ mod tests {
             worker::ProofArtifact { name: "page-1.png".into(), bytes: vec![3] },
         ];
         let mut report = TaskReport {
+            design_style: None,
             id: "preview-publication".into(),
             status: String::new(),
             title: String::new(),

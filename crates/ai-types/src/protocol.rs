@@ -35,6 +35,10 @@ pub struct TokenRates {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
+    /// Additional planning requests may be billed; opt in explicitly, including legacy settings.
+    pub allow_paid_repairs: bool,
+    /// None selects a relevant style locally; Some pins this skill's design profile at task start.
+    pub design_style: Option<String>,
     pub text_model: ModelSelection,
     pub image_model: ModelSelection,
     pub output_mode: OutputMode,
@@ -48,13 +52,15 @@ pub struct AiSettings {
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
+            allow_paid_repairs: false,
+            design_style: None,
             text_model: ModelSelection { provider: ProviderKind::Ollama, model: String::new(), endpoint: None },
             image_model: ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: None },
             output_mode: OutputMode::NativeOnly,
             budget: BudgetSpec::default(),
             image_rates: None,
             comfy_workflow: None,
-            pages_per_batch: 4,
+            pages_per_batch: 2,
             resources: crate::LocalResourcePolicy::default(),
         }
     }
@@ -147,18 +153,30 @@ pub enum AiRequest {
         skill_md: String,
         manifest_json: String,
     },
+    AddDesignCorrection {
+        id: String,
+        revision: String,
+        correction: crate::DesignCorrection,
+    },
     GenerateSkill {
         prompt: String,
         reference_paths: Vec<String>,
         settings: AiSettings,
+        design_style: bool,
     },
     GenerateSkillFromDocument {
         prompt: String,
         settings: AiSettings,
+        design_style: bool,
     },
     RunSkillSample {
         id: String,
         revision: String,
+    },
+    RunDesignTemplate {
+        id: String,
+        revision: String,
+        template: String,
     },
     ApproveSkill {
         id: String,
@@ -290,6 +308,8 @@ pub struct BatchSnapshot {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskReport {
+    #[serde(default)]
+    pub design_style: Option<crate::DesignStyleUse>,
     pub id: String,
     pub status: String,
     pub title: String,
@@ -307,6 +327,8 @@ pub struct TaskReport {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillCard {
+    #[serde(default)]
+    pub design_profile: Option<crate::DesignProfile>,
     pub id: String,
     pub name: String,
     pub description: String,
@@ -338,6 +360,8 @@ pub struct AiSnapshot {
     pub message: String,
     pub settings: AiSettings,
     pub skills: Vec<SkillCard>,
+    #[serde(default)]
+    pub skill_warnings: Vec<String>,
     pub review: Option<SkillReview>,
     pub models: Vec<String>,
     pub reports: Vec<TaskReport>,

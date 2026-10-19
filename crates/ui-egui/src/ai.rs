@@ -98,6 +98,10 @@ pub struct AiUiState {
     import_path: String,
     export_path: String,
     skill_prompt: String,
+    build_design_style: bool,
+    correction_before: String,
+    correction_after: String,
+    correction_reason: String,
     references: String,
     review_key: Option<(String, String)>,
     skill_md: String,
@@ -161,6 +165,10 @@ impl Default for AiUiState {
             import_path: String::new(),
             export_path: String::new(),
             skill_prompt: String::new(),
+            build_design_style: true,
+            correction_before: String::new(),
+            correction_after: String::new(),
+            correction_reason: String::new(),
             references: String::new(),
             review_key: None,
             skill_md: String::new(),
@@ -416,16 +424,24 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
         "inspect_skill" => AiRequest::InspectSkill { id: field("id")?, revision: field("revision")? },
         "prepare_skills" => AiRequest::PrepareSkills { prompt: field("prompt")? },
         "save_skill_draft" => AiRequest::SaveSkillDraft { id: field("id")?, skill_md: field("skill_md")?, manifest_json: field("manifest_json")? },
+        "add_design_correction" => AiRequest::AddDesignCorrection {
+            id: field("id")?,
+            revision: field("revision")?,
+            correction: serde_json::from_value(decode("correction")?).map_err(|e| e.to_string())?,
+        },
         "generate_skill" => AiRequest::GenerateSkill {
+            design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
             prompt: field("prompt")?,
             reference_paths: serde_json::from_value(decode("reference_paths")?).map_err(|e| e.to_string())?,
             settings: serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?,
         },
         "generate_skill_from_document" => AiRequest::GenerateSkillFromDocument {
+            design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
             prompt: field("prompt")?,
             settings: serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?,
         },
         "run_skill_sample" => AiRequest::RunSkillSample { id: field("id")?, revision: field("revision")? },
+        "run_design_template" => AiRequest::RunDesignTemplate { id: field("id")?, revision: field("revision")?, template: field("template")? },
         "approve_skill" | "approve_batch" => {
             return Err("Approval requires the human review button in the desktop panel.".into());
         }
@@ -874,6 +890,33 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
             );
         }
         label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
+        ui.horizontal_wrapped(|ui| {
+            label(ui, a, "Design style", "نمط التصميم");
+            let selected = s
+                .settings
+                .design_style
+                .as_ref()
+                .and_then(|id| s.snapshot.skills.iter().rev().find(|card| &card.id == id))
+                .and_then(|card| card.design_profile.as_ref())
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| {
+                    s.settings.design_style.clone().unwrap_or_else(|| text(a, "Automatic from the request", "تلقائي حسب المطلوب").into())
+                });
+            egui::ComboBox::from_id_salt("production_design_style").selected_text(selected).width(260.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.settings.design_style, None, rtl::widget(ui, text(a, "Automatic from the request", "تلقائي حسب المطلوب")));
+                let mut seen = BTreeSet::new();
+                for card in s.snapshot.skills.iter().rev().filter(|card| card.enabled && card.compatible) {
+                    if let Some(profile) = &card.design_profile
+                        && seen.insert(&card.id)
+                    {
+                        ui.selectable_value(&mut s.settings.design_style, Some(card.id.clone()), rtl::widget(ui, &profile.name));
+                    }
+                }
+            });
+            if button(ui, a, "Style library", "مكتبة الأنماط") {
+                s.tab = 1;
+            }
+        });
         // Long pasted briefs scroll inside the composer instead of hiding the production button.
         egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(180.0).show(ui, |ui| {
             ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(text(
@@ -892,6 +935,22 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
         if s.automatic_skills {
             label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
         }
+        if !s.snapshot.skill_warnings.is_empty() {
+            egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Skipped skill drafts — details", "مسودات مهارات مستبعدة — التفاصيل"))).show(
+                ui,
+                |ui| {
+                    for warning in &s.snapshot.skill_warnings {
+                        rtl::label(ui, warning);
+                    }
+                },
+            );
+        }
+        label(
+            ui,
+            a,
+            "Template styles use the model for content; native drawing and formatting commands are assembled locally.",
+            "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
+        );
         if let Some(cost) = s.settings.budget.max_cost_usd {
             rtl::label(ui, format!("{} ${cost:.2}", text(a, "Task cost ceiling (estimate):", "سقف كلفة المهمة (تقديري):")));
         }
@@ -1015,6 +1074,32 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
     };
     ui.separator();
     label(ui, a, "Batch production and proof", "إنتاج الدفعات والمراجعة");
+    if let Some(style) = s
+        .snapshot
+        .reports
+        .iter()
+        .rev()
+        .find(|report| report.id.starts_with(&format!("{}-batch-", batch.job_id)))
+        .and_then(|report| report.design_style.as_ref())
+    {
+        rtl::label(
+            ui,
+            format!(
+                "{}: {} · {}",
+                text(a, "Pinned design style", "نمط التصميم المثبّت"),
+                style.name,
+                style.revision.chars().take(12).collect::<String>()
+            ),
+        );
+        if style.execution_mode == "native_templates" {
+            label(
+                ui,
+                a,
+                "Native template execution — one content plan; no automatic paid command repairs.",
+                "تنفيذ قوالب أصلية — تخطيط محتوى واحد، دون تصحيح أوامر مدفوع تلقائياً.",
+            );
+        }
+    }
     rtl::label(
         ui,
         format!(
@@ -1127,19 +1212,24 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
 }
 
 fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
+    ui.checkbox(
+        &mut s.settings.allow_paid_repairs,
+        rtl::widget(ui, text(a, "Allow extra automatic planning requests (may be billed)", "السماح بطلبات تخطيط إضافية تلقائية قد تكون مدفوعة")),
+    );
+    let repairs = s.settings.allow_paid_repairs;
     let b = &mut s.settings.budget;
     egui::Grid::new("ai_limits").num_columns(2).show(ui, |ui| {
         label(ui, a, "Total tokens", "مجموع الرموز");
-        ui.add(egui::DragValue::new(&mut b.token_limit).range(1..=10_000_000));
+        ui.add(egui::DragValue::new(&mut b.token_limit).range(256..=4_000_000));
         ui.end_row();
         label(ui, a, "Output tokens per request", "رموز الإخراج لكل طلب");
-        ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=1_000_000));
+        ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=65_536));
         ui.end_row();
         label(ui, a, "Maximum requests", "أقصى عدد للطلبات");
-        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=100));
+        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=64));
         ui.end_row();
-        label(ui, a, "Repair attempts", "محاولات الإصلاح");
-        ui.add(egui::DragValue::new(&mut b.repair_attempts).range(0..=10));
+        label(ui, a, "Maximum extra planning requests", "أقصى طلبات تخطيط إضافية");
+        ui.add_enabled(repairs, egui::DragValue::new(&mut b.repair_attempts).range(0..=3));
         ui.end_row();
     });
     let mut cap = b.max_cost_usd.is_some();
@@ -1312,6 +1402,47 @@ fn export_print(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, enabled: bool, re
 
 fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, document: bool, requests: &mut Vec<AiRequest>) {
     ui.add_enabled_ui(available && !s.task_active(), |ui| {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Design style library", "مكتبة أنماط التصميم"))).default_open(true).show(ui, |ui| {
+            label(
+                ui,
+                a,
+                "Reusable rules, native page families and recorded corrections. Technical checks do not replace educator or visual review.",
+                "قواعد وقوالب أصلية وتصحيحات محفوظة. الفحص التقني لا يغني عن المراجعة التربوية والبصرية.",
+            );
+            let mut seen = BTreeSet::new();
+            for card in s.snapshot.skills.iter().rev() {
+                if let Some(profile) = &card.design_profile
+                    && seen.insert(&card.id)
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        rtl::label(ui, &profile.name);
+                        rtl::label(
+                            ui,
+                            format!(
+                                "{}–{} · {} × {} mm · {} mm · {} {}",
+                                profile.age_range[0],
+                                profile.age_range[1],
+                                profile.page_mm[0],
+                                profile.page_mm[1],
+                                profile.margin_mm,
+                                profile.page_families.len(),
+                                text(a, "page families", "قوالب صفحات")
+                            ),
+                        );
+                        if button(ui, a, "Inspect style", "فحص النمط") {
+                            requests.push(AiRequest::InspectSkill { id: card.id.clone(), revision: card.revision.clone() });
+                        }
+                        if ui
+                            .add_enabled(card.enabled && card.compatible, egui::Button::new(rtl::widget(ui, text(a, "Use style", "استخدام النمط"))))
+                            .clicked()
+                        {
+                            s.settings.design_style = Some(card.id.clone());
+                            s.tab = 0;
+                        }
+                    });
+                }
+            }
+        });
         field(ui, a, "Import skill folder or ZIP path", "مسار مجلد المهارة أو ملف ZIP", &mut s.import_path);
         if ui.add_enabled(!s.import_path.trim().is_empty(), egui::Button::new(rtl::widget(ui, text(a, "Import draft", "استيراد مسودة")))).clicked()
         {
@@ -1377,6 +1508,74 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         if let Some(r) = s.snapshot.review.clone() {
             ui.separator();
             rtl::label(ui, format!("{} / {}", r.id, r.revision));
+            if let Some(profile) =
+                s.snapshot.skills.iter().find(|card| card.id == r.id && card.revision == r.revision).and_then(|card| card.design_profile.as_ref())
+            {
+                egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Style rules and correction examples", "قواعد النمط وأمثلة التصحيح")))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (en, ar, rules) in [
+                            ("Typography", "الخطوط", &profile.typography),
+                            ("Layout", "التوزيع", &profile.layout),
+                            ("Pedagogy", "التدرج التعليمي", &profile.pedagogy),
+                            ("Illustrations", "الرسوم", &profile.illustration),
+                        ] {
+                            label(ui, a, en, ar);
+                            for rule in rules {
+                                ui.add(egui::Label::new(rtl::widget(ui, rule)).wrap());
+                            }
+                        }
+                        for family in &profile.page_families {
+                            ui.horizontal_wrapped(|ui| {
+                                rtl::label(ui, format!("{}: {}", family.id, family.purpose));
+                                if button(ui, a, "Preview page family", "معاينة قالب الصفحة") {
+                                    requests.push(AiRequest::RunDesignTemplate {
+                                        id: r.id.clone(),
+                                        revision: r.revision.clone(),
+                                        template: family.template.clone(),
+                                    });
+                                }
+                            });
+                        }
+                        for correction in &profile.corrections {
+                            ui.add(
+                                egui::Label::new(rtl::widget(ui, format!("{} → {} ({})", correction.before, correction.after, correction.reason)))
+                                    .wrap(),
+                            );
+                        }
+                    });
+                egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save a design correction", "حفظ تصحيح للنمط"))).show(ui, |ui| {
+                    field(ui, a, "Before", "قبل التصحيح", &mut s.correction_before);
+                    field(ui, a, "After", "المطلوب بعد التصحيح", &mut s.correction_after);
+                    field(ui, a, "Reason", "سبب التصحيح", &mut s.correction_reason);
+                    let ready = [&s.correction_before, &s.correction_after, &s.correction_reason]
+                        .iter()
+                        .all(|value| !value.trim().is_empty() && value.len() <= 512);
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(rtl::widget(ui, text(a, "Save correction as a new revision", "حفظ التصحيح بإصدار جديد"))),
+                        )
+                        .clicked()
+                    {
+                        requests.push(AiRequest::AddDesignCorrection {
+                            id: r.id.clone(),
+                            revision: r.revision.clone(),
+                            correction: designcraft_ai_types::DesignCorrection {
+                                before: s.correction_before.clone(),
+                                after: s.correction_after.clone(),
+                                reason: s.correction_reason.clone(),
+                            },
+                        });
+                    }
+                    label(
+                        ui,
+                        a,
+                        "Explicit reusable guidance; this does not train model weights or approve a page batch.",
+                        "توجيه محفوظ للاستعمال لاحقاً؛ لا يدرّب أوزان النموذج ولا يعتمد دفعة صفحات.",
+                    );
+                });
+            }
             label(ui, a, "SKILL.md — edits create a new draft", "SKILL.md — التعديل ينشئ مسودة جديدة");
             ui.add(egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY));
             label(ui, a, "Manifest JSON", "ملف الوصف JSON");
@@ -1435,6 +1634,10 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         }
         ui.separator();
         label(ui, a, "Generate a reviewable skill draft", "إنشاء مسودة مهارة للمراجعة");
+        ui.checkbox(
+            &mut s.build_design_style,
+            rtl::widget(ui, text(a, "Build a design style with multiple native page templates", "بناء نمط تصميم بقواعد وقوالب صفحات متعددة")),
+        );
         ui.add(egui::TextEdit::multiline(&mut s.skill_prompt).desired_rows(3).desired_width(f32::INFINITY));
         label(ui, a, "Reference paths (one per line)", "مسارات المراجع (مسار في كل سطر)");
         ui.add(egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY));
@@ -1445,6 +1648,7 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                 && (s.settings.budget.max_cost_usd.is_none() || s.rates_confirmed);
             if ui.add_enabled(ready, egui::Button::new(rtl::widget(ui, text(a, "Generate draft", "إنشاء المسودة")))).clicked() {
                 requests.push(AiRequest::GenerateSkill {
+                    design_style: s.build_design_style,
                     prompt: s.skill_prompt.clone(),
                     reference_paths: s.references.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned).collect(),
                     settings: s.settings.clone(),
@@ -1457,7 +1661,11 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                 )
                 .clicked()
             {
-                requests.push(AiRequest::GenerateSkillFromDocument { prompt: s.skill_prompt.clone(), settings: s.settings.clone() });
+                requests.push(AiRequest::GenerateSkillFromDocument {
+                    prompt: s.skill_prompt.clone(),
+                    settings: s.settings.clone(),
+                    design_style: s.build_design_style,
+                });
             }
         });
     });
@@ -1473,6 +1681,12 @@ fn usage(ui: &mut egui::Ui, s: &AiUiState, a: bool) {
     for r in s.snapshot.reports.iter().rev() {
         egui::CollapsingHeader::new(format!("{} · {} · {}", r.title, r.status, r.id)).default_open(true).show(ui, |ui| {
             rtl::label(ui, format!("{} / {} · {} ms · {} actions", provider_name(r.provider), r.model, r.elapsed_ms, r.actions));
+            if let Some(style) = &r.design_style {
+                rtl::label(
+                    ui,
+                    format!("{}: {} · {}", text(a, "Design style", "نمط التصميم"), style.name, style.revision.chars().take(12).collect::<String>()),
+                );
+            }
             let u = &r.usage;
             rtl::label(
                 ui,

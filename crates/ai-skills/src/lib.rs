@@ -8,6 +8,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod builtin;
+mod educational_style;
 mod package;
 
 use designcraft_ai_types::EngineAction;
@@ -91,6 +92,8 @@ pub struct NativeManifest {
     pub external_tools: Vec<String>,
     #[serde(default)]
     pub compatibility_notes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_profile: Option<designcraft_ai_types::DesignProfile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -148,6 +151,8 @@ pub struct SkillSnapshot {
     pub references: BTreeMap<String, String>,
     pub reference_hashes: BTreeMap<String, String>,
     pub templates: BTreeMap<String, Vec<EngineAction>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_profile: Option<designcraft_ai_types::DesignProfile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -406,6 +411,13 @@ impl SkillRegistry {
         if package_hash(&record.file_hashes) != record.revision {
             return Err(SkillError::Integrity("revision file list changed".into()));
         }
+        // Catalog metadata cannot inject a profile or change template permissions.
+        if record.file_hashes.contains_key("designcraft.json") {
+            let manifest: NativeManifest = serde_json::from_slice(&self.verified_file(record, "designcraft.json")?)?;
+            if serde_json::to_value(&manifest)? != serde_json::to_value(&record.manifest)? {
+                return Err(SkillError::Integrity("manifest metadata changed".into()));
+            }
+        }
         let skill_bytes = self.verified_file(record, "SKILL.md")?;
         let instructions = package::instructions(&skill_bytes)?;
         if instructions.len() > MAX_SNAPSHOT_TEXT_BYTES {
@@ -437,7 +449,15 @@ impl SkillRegistry {
         for name in &record.manifest.templates {
             templates.insert(name.clone(), package::parse_actions(&self.verified_file(record, name)?)?);
         }
-        Ok(SkillSnapshot { skill_id: skill_id.into(), revision: revision.clone(), instructions, references, reference_hashes, templates })
+        Ok(SkillSnapshot {
+            skill_id: skill_id.into(),
+            revision: revision.clone(),
+            instructions,
+            references,
+            reference_hashes,
+            templates,
+            design_profile: record.manifest.design_profile.clone(),
+        })
     }
 
     pub fn cache_analysis(&mut self, reference_sha256: &str, analyzer: &str, text: &str) -> Result<()> {

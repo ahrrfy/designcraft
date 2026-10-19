@@ -33,6 +33,7 @@ pub(crate) fn packages() -> Result<Vec<PackageFiles>> {
             append_text(&mut actions, line, [54.0, top, 540.0, top + 38.0], 18.0, rtl);
         }
         let manifest = NativeManifest {
+            design_profile: None,
             schema_version: 1, skill_id: id.into(), required_commands: vec!["frame.create".into(), "type.char".into(), "type.para".into()],
             references: vec!["references/review.md".into()], templates: vec!["templates/sample.json".into()],
             sample_template: Some("templates/sample.json".into()), external_tools: Vec::new(),
@@ -79,6 +80,7 @@ pub(crate) fn packages() -> Result<Vec<PackageFiles>> {
             ("references/NOTICE.md", include_bytes!("../skills/native-illustration/references/NOTICE.md")),
         ]),
     ]);
+    packages.push(crate::educational_style::package()?);
     Ok(packages)
 }
 

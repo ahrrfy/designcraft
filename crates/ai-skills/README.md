@@ -43,7 +43,21 @@ Example template:
 ```
 
 Templates contain concrete native commands; the registry does not interpolate or
-execute placeholders. Host-generated changes create a complete new draft package.
+execute placeholders. The native runtime can compile structured page content into declared text/image slots, preserving geometry and rebasing native command references. Host-generated changes create a complete new draft package.
+
+Native manifests may additionally contain a bounded `design_profile`: name, local
+matching keywords, age range, page size/margin in mm, palette and separate type,
+layout, pedagogy and illustration rules. Named `page_families` link only to declared
+native templates. Explicit before/after/reason corrections create new immutable
+revisions; they do not train model weights. Old manifests omit this field unchanged.
+The host automatically validates every template, renders its sample, then records
+machine activation separately from human approval. A task pins at most one profile.
+Snapshot loading authenticates the exact manifest as well as the loaded files.
+
+The ninth builtin, `early-years-clear-style`, is an original synthetic bilingual
+A4 style with cover, comparison/practice and review templates. No reference books,
+publisher artwork or font files are included. Technical validation does not certify
+pedagogical quality, aesthetic fidelity or exact generated-character consistency.
 Imported ZIPs are read into bounded memory without extracting untrusted entries.
 Limits are 256 files, 16 MiB per file, 32 MiB per package, 8 path components and
 4096 actions per template. Traversal, absolute paths, symbolic links, Windows
