@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI7 (2026-10-19): Batch publication pins the live document allocation so selection-only revision changes cannot discard a completed generation. Actual document replacement, content edits, preferences and human checkpoint guards remain enforced.
+
 - AI6 (2026-10-19): Template production pins selected skill instructions and references without retaining unused non-style command examples. The style's executable templates and the 64-KiB task-context guard remain intact; generic command planning retains its examples.
 
 - AI5 (2026-10-19): Explicitly continue the contiguous blank suffix of an existing single-page A4 book with the same scoped native execution, pinned skills, cumulative new-job ledger and human proof gates. Existing pages and recovered-checkpoint restrictions stay intact. An original five-unit curriculum-map template supports editable Scope and Sequence pages.

@@ -13,6 +13,9 @@ pub(super) struct BatchJob {
     before: UsageSummary,
     snapshot: BatchSnapshot,
     prefs: Prefs,
+    // Keeps the original allocation alive: selection/view revisions alone are
+    // not document edits, and an address cannot be recycled while pinned here.
+    publication_base: Option<DocState>,
 }
 impl BatchJob {
     pub(super) fn snapshot_elapsed(&self) -> u64 {
@@ -119,6 +122,7 @@ impl ProductionRunner {
             before: UsageSummary::default(),
             snapshot,
             prefs: session.prefs.clone(),
+            publication_base: existing.map(|_| base.clone()),
         };
         base.selection = Default::default();
         self.launch_batch(job, base, context)
@@ -411,7 +415,14 @@ impl ProductionRunner {
         }
         let result = (|| {
             let current = session.doc().map_err(|e| e.to_string())?;
-            if !first && (Some(current.uid) != job.snapshot.document_uid || Some(current.revision) != job.snapshot.document_revision) {
+            if !first
+                && (Some(current.uid) != job.snapshot.document_uid
+                    || !job.publication_base.as_ref().is_some_and(|original| {
+                        Arc::ptr_eq(&original.doc, &current.doc)
+                            && original.active_layer == current.active_layer
+                            && original.editing_parents == current.editing_parents
+                    }))
+            {
                 return Err("The book changed while its batch was generating; publication is refused".into());
             }
             let mut base = current.clone();
@@ -443,6 +454,7 @@ impl ProductionRunner {
             let state = session.doc().map_err(|e| e.to_string())?;
             job.snapshot.document_uid = Some(state.uid);
             job.snapshot.document_revision = Some(state.revision);
+            job.publication_base = Some(state.clone());
             report.title = plan.title.clone();
             batch_report.title = plan.title.clone();
             report.actions = plan.commands.len();
@@ -646,6 +658,7 @@ mod tests {
             before: UsageSummary::default(),
             snapshot,
             prefs: session.prefs.clone(),
+            publication_base: session.active().cloned(),
         });
         ("fixture-book".into(), 1)
     }
@@ -739,6 +752,12 @@ mod tests {
         let prior_undo = session.doc().map(|state| state.history.undo.len()).unwrap_or(0);
         let started = runner.handle(&mut session, AiRequest::Start(request));
         assert!(started.busy, "{}", started.message);
+        if initial_completed > 0 {
+            let original = session.doc().unwrap().clone();
+            session.execute("select.firstAbove", &json!({})).unwrap();
+            assert_ne!(session.doc().unwrap().revision, original.revision);
+            assert!(Arc::ptr_eq(&session.doc().unwrap().doc, &original.doc), "Selection changed without editing document content");
+        }
         let first = wait(&mut runner, &mut session);
         assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
         let checkpoint = first.batch.as_ref().unwrap();
@@ -846,14 +865,42 @@ mod tests {
 
     #[test]
     fn smart_quote_preferences_changed_during_generation_cannot_publish_different_text() {
+        rejected_changed_publication("preferences");
+    }
+
+    #[test]
+    fn document_content_changed_during_generation_cannot_be_overwritten() {
+        rejected_changed_publication("document");
+    }
+
+    #[test]
+    fn active_layer_changed_without_content_edits_cannot_change_the_published_layer() {
+        rejected_changed_publication("active-layer");
+    }
+
+    fn rejected_changed_publication(change: &str) {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
         let mut job = runner.batch.take().unwrap();
+        if change == "active-layer" {
+            session.execute("layer.new", &json!({"name":"Other layer"})).unwrap();
+            job.publication_base = session.active().cloned();
+        }
         let before = session.doc().unwrap().clone();
-        session.prefs.typographers_quotes = !session.prefs.typographers_quotes;
-        assert_eq!(session.doc().unwrap().revision, before.revision, "Preferences are independent of document revisions");
+        if change == "preferences" {
+            session.prefs.typographers_quotes = !session.prefs.typographers_quotes;
+            assert_eq!(session.doc().unwrap().revision, before.revision, "Preferences are independent of document revisions");
+        } else if change == "active-layer" {
+            session.execute("layer.activate", &json!({"id":1})).unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+            assert_ne!(before.active_layer, session.doc().unwrap().active_layer);
+        } else {
+            session.execute("frame.create", &json!({"spread":0,"rect":[200,60,300,180],"content":"unassigned"})).unwrap();
+            assert!(!Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        }
+        let before = session.doc().unwrap().clone();
         let plan = ProductionPlan {
             title: "Smart quotes".into(),
             commands: vec![
@@ -886,7 +933,7 @@ mod tests {
         let error = runner
             .publish_batch(&mut session, &mut job, &plan, proofs, worker::BatchScope { start: 1, count: 1 }, &mut BatchReport::default(), &mut report)
             .unwrap_err();
-        assert!(error.contains("preferences changed"), "{error}");
+        assert!(error.contains(if change == "preferences" { "preferences changed" } else { "book changed" }), "{error}");
         assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
         assert!(report.artifacts.is_empty());
         assert!(!runner.root.join("runs").exists(), "A mismatched proof cannot be persisted or published");
