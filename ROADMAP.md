@@ -346,6 +346,8 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 
 ## Progress log
 
+- **2026-10-19** · Gemini layout requests use JSON mode with the bounded native command contract in the prompt, avoiding schema endpoint rejection of dynamic engine parameters. Reference-image requests retain the same contract; command validation, print preflight, usage reservations and human batch approval remain enforced. A Windows GUI trial produced only the first two A4 pages through 89 engine commands, with 23 editable text frames and two generated photographic frames, then stopped at human proof review. Native edit/undo and independently rendered PDF proofs passed; educational acceptance and physical printing remain human checks.
+
 Newest first.
 
 - **2026-10-18** · Smart Design fork: human-reviewed book batches (default 4, maximum 32 pages per batch; up to 1,000 pages), cumulative budgets, pinned skills, endpoint-scoped Windows credentials, bounded local inference and owned Ollama lifecycle. Frozen PDF proofs retain fonts/color/queue settings and require human print submission. Four builtin skills remain drafts. Original eight-page native fixture round-tripped through installed InDesign 21.2 with matching content and 99 object bounds; Script labels are lost. Upstream review/CI/unsigned preview workflows are present; current-head CI/release and physical paper acceptance remain pending. No measured savings or pre-alpha stage change. [Arabic operating guide](docs/ai-production.ar.md).
