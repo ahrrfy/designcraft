@@ -1,5 +1,9 @@
 # DesignCraft roadmap
 
+- AI9 (2026-10-19): Batch proof approval requires a fresh, explicit desktop input gesture bound to the exact proof and widget. Its single-use dispatch permit expires with the UI frame; idle frames, repeated keys and a pointer release from a prior checkpoint cannot approve another batch.
+
+- AI8 (2026-10-19): Content templates set Latin-only replacement text to native LTR paragraph direction, preserving authored alignment and the existing Arabic fields. Local command counts include the explicit frame-selection and formatting steps before any provider call.
+
 - AI7 (2026-10-19): Batch publication pins the live document allocation so selection-only revision changes cannot discard a completed generation. Actual document replacement, content edits, preferences and human checkpoint guards remain enforced.
 
 - AI6 (2026-10-19): Template production pins selected skill instructions and references without retaining unused non-style command examples. The style's executable templates and the 64-KiB task-context guard remain intact; generic command planning retains its examples.

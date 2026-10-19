@@ -122,6 +122,8 @@ pub struct AiUiState {
     proof_document_version: Option<(u64, u64)>,
     proof_document_matches: bool,
     review_input_is_human: bool,
+    review_pointer_press: Option<(BatchReviewKey, egui::Id)>,
+    batch_approval_gesture: Option<(BatchReviewKey, egui::Context, u64)>,
     proof_path: Option<String>,
     proof_loaded: Option<String>,
     proof_texture: Option<egui::TextureHandle>,
@@ -190,6 +192,8 @@ impl Default for AiUiState {
             proof_document_version: None,
             proof_document_matches: false,
             review_input_is_human: false,
+            review_pointer_press: None,
+            batch_approval_gesture: None,
             proof_path: None,
             proof_loaded: None,
             proof_texture: None,
@@ -237,6 +241,8 @@ impl AiUiState {
         }
         let proof_key = snapshot.batch.as_ref().and_then(BatchReviewKey::from_batch);
         if self.proof_key != proof_key {
+            self.review_pointer_press = None;
+            self.batch_approval_gesture = None;
             self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
             self.reviewed_proofs.clear();
             self.proof_document_matches = false;
@@ -293,6 +299,51 @@ impl AiUiState {
             && self.proof_document_matches
             && self.proof_error.is_empty()
             && self.proof_key.as_ref().is_some_and(|key| key.pages().all(|page| self.reviewed_proofs.contains(page)))
+    }
+
+    /// A clicked response alone may come from accessibility or stale widget state.
+    /// Bind a primary press/release (or non-repeated focused key press) to this proof.
+    fn fresh_review_gesture(
+        human: bool,
+        key: Option<&BatchReviewKey>,
+        pointer_press: &mut Option<(BatchReviewKey, egui::Id)>,
+        response: &egui::Response,
+    ) -> bool {
+        if !human {
+            *pointer_press = None;
+            return false;
+        }
+        let Some(key) = key else { return false };
+        let pointer_down = response.is_pointer_button_down_on();
+        let pointer_clicked = response.clicked_by(egui::PointerButton::Primary);
+        let keyboard_clicked = response.clicked() && response.has_focus();
+        response.ctx.input(|input| {
+            let mut pointer = false;
+            for event in &input.events {
+                if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } = event {
+                    if *pressed {
+                        // A coalesced press+release has no held-button state at frame end.
+                        // Require egui to attribute the interaction to this widget as well.
+                        if response.rect.contains(*pos) && (pointer_down || pointer_clicked) {
+                            *pointer_press = Some((key.clone(), response.id));
+                        } else if pointer_press.as_ref().is_some_and(|(_, id)| *id == response.id) {
+                            *pointer_press = None;
+                        }
+                    } else if pointer_press.as_ref().is_some_and(|(_, id)| *id == response.id) {
+                        pointer = pointer_clicked
+                            && response.rect.contains(*pos)
+                            && pointer_press.as_ref().is_some_and(|(pressed_key, _)| pressed_key == key);
+                        *pointer_press = None;
+                    }
+                }
+            }
+            let keyboard = keyboard_clicked
+                && input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Key { key: egui::Key::Enter | egui::Key::Space, pressed: true, repeat: false, .. }));
+            pointer || keyboard
+        })
     }
 
     fn task_active(&self) -> bool {
@@ -373,9 +424,13 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
         return Err("This action requires a human gesture in the desktop panel; control-generated input is not approval.".into());
     }
     if let AiRequest::ApproveBatch { job_id, checkpoint } = &request {
+        let gesture = app.ui.ai.batch_approval_gesture.take();
         app.ui.ai.review_input_is_human = human_review_input(app);
         app.ui.ai.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
-        if !app.ui.ai.can_approve_batch() || !app.ui.ai.proof_key.as_ref().is_some_and(|key| key.job_id == *job_id && key.checkpoint == *checkpoint) {
+        if !gesture.is_some_and(|(key, ctx, frame)| app.ui.ai.proof_key.as_ref() == Some(&key) && ctx.cumulative_frame_nr() == frame)
+            || !app.ui.ai.can_approve_batch()
+            || !app.ui.ai.proof_key.as_ref().is_some_and(|key| key.job_id == *job_id && key.checkpoint == *checkpoint)
+        {
             return Err("Review and confirm every page of the current document proof before approving this checkpoint.".into());
         }
         app.ui.ai.reviewed_proofs.clear();
@@ -537,6 +592,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         return;
     }
     let mut state = std::mem::take(&mut app.ui.ai);
+    state.batch_approval_gesture = None;
     state.review_input_is_human = human_review_input(app);
     state.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
     let a = app.ui.language == "ar";
@@ -603,6 +659,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             });
         });
     state.open = open;
+    if ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary)) {
+        state.review_pointer_press = None;
+    }
     app.ui.ai = state;
     if std::mem::take(&mut app.ui.ai.pick_ollama)
         && let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ollama_executable"))
@@ -618,6 +677,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             app.ui.ai.error = e;
         }
     }
+    app.ui.ai.batch_approval_gesture = None;
     load_preview(app, ctx);
     load_proof_preview(app, ctx);
 }
@@ -1183,10 +1243,9 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                 "المستند النشط لا يطابق إصدار البروفة. ارجع إلى المستند نفسه أو أعد بدء المهمة بعد تعديلاته.",
             );
         }
-        if ui
-            .add_enabled(can_review, egui::Button::new(rtl::widget(ui, text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة"))))
-            .clicked()
-        {
+        let review_response =
+            ui.add_enabled(can_review, egui::Button::new(rtl::widget(ui, text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة"))));
+        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &review_response) {
             confirm_page = true;
         }
         let final_batch = batch.current_batch >= batch.total_batches;
@@ -1195,7 +1254,9 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
         } else {
             ("Approve proof and generate next batch", "اعتماد المراجعة وإنشاء الدفعة التالية")
         };
-        if ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar)))).clicked() {
+        let approve_response = ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar))));
+        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &approve_response) {
+            s.batch_approval_gesture = s.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
             requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
         }
     }
@@ -2156,11 +2217,123 @@ mod tests {
         assert!(fixture.app.ui.ai.can_approve_batch());
         assert!(fixture.app.run("ai.request", json!({"method":"approve_batch", "job_id":"two-page-proof", "checkpoint":1})).is_err());
         assert_eq!(fixture.calls.get(), 0);
-        dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).unwrap();
+        assert!(
+            dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err(),
+            "absence of control input is not a human gesture"
+        );
+        let ctx = fixture.ctx.clone();
+        let mut focused = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = ui.button("Approve proof");
+            response.request_focus();
+            focused = response.has_focus();
+        });
+        output.textures_delta.clear();
+        assert!(focused);
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let response = ui.button("Approve proof");
+            assert!(AiUiState::fresh_review_gesture(
+                true,
+                fixture.app.ui.ai.proof_key.as_ref(),
+                &mut fixture.app.ui.ai.review_pointer_press,
+                &response
+            ));
+            fixture.app.ui.ai.batch_approval_gesture =
+                fixture.app.ui.ai.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
+            dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).unwrap();
+        });
+        output.textures_delta.clear();
         assert_eq!(fixture.calls.get(), 1);
         assert!(fixture.app.ui.ai.reviewed_proofs.is_empty(), "the human approval is consumed once");
         assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
         assert_eq!(fixture.calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_batch_review_frames_never_confirm_or_approve_and_expired_gesture_is_rejected() {
+        let mut fixture = ProofFixture::new();
+        fixture.view("page-1.png");
+        let ctx = fixture.ctx.clone();
+        for reviewed in [false, true] {
+            if reviewed {
+                fixture.confirm_all();
+            }
+            let before = fixture.app.ui.ai.reviewed_proofs.clone();
+            for _ in 0..4 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let mut requests = Vec::new();
+                    batch_review(ui, &mut fixture.app.ui.ai, false, &mut requests);
+                    assert!(requests.is_empty());
+                    assert!(fixture.app.ui.ai.batch_approval_gesture.is_none());
+                });
+                output.textures_delta.clear();
+                assert_eq!(fixture.app.ui.ai.reviewed_proofs, before);
+            }
+        }
+        fixture.app.ui.ai.batch_approval_gesture = fixture.app.ui.ai.proof_key.clone().map(|key| (key, ctx.clone(), ctx.cumulative_frame_nr()));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
+        assert_eq!(fixture.calls.get(), 0);
+    }
+
+    #[test]
+    fn review_gesture_rejects_repeated_keys_and_pointer_press_from_previous_proof() {
+        fn frame(fixture: &mut ProofFixture, events: Vec<egui::Event>) -> (egui::Rect, bool) {
+            let ctx = fixture.ctx.clone();
+            let mut result = (egui::Rect::NOTHING, false);
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                let response = ui.button("Confirm proof");
+                response.request_focus();
+                result = (
+                    response.rect,
+                    AiUiState::fresh_review_gesture(
+                        true,
+                        fixture.app.ui.ai.proof_key.as_ref(),
+                        &mut fixture.app.ui.ai.review_pointer_press,
+                        &response,
+                    ),
+                );
+            });
+            output.textures_delta.clear();
+            result
+        }
+        let mut fixture = ProofFixture::new();
+        let (rect, activated) = frame(&mut fixture, vec![]);
+        assert!(!activated);
+        let key = |repeat| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat, modifiers: Default::default() };
+        assert!(frame(&mut fixture, vec![key(false)]).1);
+        assert!(!frame(&mut fixture, vec![key(true)]).1);
+        assert!(
+            !frame(
+                &mut fixture,
+                vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() }]
+            )
+            .1
+        );
+        assert!(frame(&mut fixture, vec![key(false)]).1);
+        let pointer =
+            |pressed| egui::Event::PointerButton { pos: rect.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        assert!(!frame(&mut fixture, vec![egui::Event::PointerMoved(rect.center()), pointer(true)]).1);
+        assert!(fixture.app.ui.ai.review_pointer_press.is_some());
+        let mut changed = fixture.checkpoint.clone();
+        changed.batch.as_mut().unwrap().checkpoint += 1;
+        fixture.app.ui.ai.accept(changed);
+        assert!(!frame(&mut fixture, vec![pointer(false)]).1, "release cannot approve a replacement proof");
+        assert!(!frame(&mut fixture, vec![pointer(true)]).1);
+        assert!(frame(&mut fixture, vec![pointer(false)]).1, "a fresh press and release on the current proof remains usable");
+        assert!(frame(&mut fixture, vec![pointer(true), pointer(false)]).1, "coalesced fresh pointer input remains usable");
+        let outside = egui::Event::PointerButton {
+            pos: rect.right_bottom() + egui::vec2(50.0, 50.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        assert!(!frame(&mut fixture, vec![outside, pointer(false)]).1, "a press originating outside the proof widget is not approval");
     }
 
     #[test]
