@@ -252,6 +252,19 @@ pub(crate) fn compile(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode
             }
             plan.commands.push(action);
         }
+        // A Latin-only replacement must not inherit an Arabic placeholder's
+        // paragraph direction. Preserve the template's authored alignment.
+        for slot in &family.text_slots {
+            let text = page.text.get(&slot.id).ok_or("Missing validated text slot")?;
+            if text.chars().any(|c| c.is_ascii_alphabetic()) && !text.chars().any(|c| c.is_alphabetic() && !c.is_ascii()) {
+                if plan.commands.len().checked_add(2).is_none_or(|count| count > MAX_ACTIONS) {
+                    return Err("Compiled text directions exceed 512 commands".into());
+                }
+                let target = offset.checked_add(slot.command).ok_or("Text slot target overflow")?;
+                plan.commands.push(EngineAction { command: "selection.set".into(), params: json!({"ids":[format!("${target}.id")]}) });
+                plan.commands.push(EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":"leftToRight"}}) });
+            }
+        }
         append_images(&mut plan, &page, family, mode)?;
     }
     crate::worker::validate_batch_plan(&plan, scope)?;
@@ -390,13 +403,30 @@ mod tests {
     fn compiles_native_metrics_explicit_pages_and_rebased_references() {
         let skill = skill();
         let plan = compile_value(&content(), &skill).unwrap();
-        assert_eq!(plan.commands.len(), 6);
+        assert_eq!(plan.commands.len(), 8);
         assert_eq!(plan.commands[0].params["spread"], 2);
         assert_eq!(plan.commands[3].params["spread"], 3);
         assert_eq!(plan.commands[4].params["ids"], json!(["$3.id"]));
         assert_eq!(plan.commands[3].params["rect"], json!([60, 60, 160, 100]));
         assert_eq!(plan.commands[5].params["text"], "Page 4");
         assert_eq!(skill.templates["templates/practice.json"][0].params["text"], "Original");
+    }
+
+    #[test]
+    fn latin_slot_content_does_not_inherit_arabic_template_direction() {
+        let mut skill = skill();
+        skill.templates.get_mut("templates/practice.json").unwrap()[1] =
+            EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":"rightToLeft","align":"right"}}) };
+        let mut value = content();
+        value["pages"][1]["text"]["heading"] = json!("Let's count!");
+        let plan = compile_value(&value, &skill).unwrap();
+        let mut session = designcraft_engine::Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":4,"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only"})).unwrap();
+        let stories = &session.doc().unwrap().doc.stories;
+        let latin = stories.values().find(|story| story.text == "Let's count!").unwrap();
+        let native = serde_json::to_value(latin).unwrap();
+        assert_eq!(native["paras"][0]["para"]["direction"], "leftToRight");
     }
     #[test]
     fn strict_slots_count_unicode_characters_and_reject_unknown_fields() {
