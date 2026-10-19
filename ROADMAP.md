@@ -638,3 +638,5 @@ The shared craft-installer UI preserves this revision's install options and prov
 
 - **2026-10-19** · Native AI composition supports multiple illustrations and related activities per page (up to eight image placements per request within existing guards). Text preflight now precedes image spending. Eight reviewed-draft skills include editable vector drawing, engine execution, visual composition and quality; pinned Apache-2.0/MIT adaptations retain upstream attribution without loading licenses into model context. Skill activation and batch approval remain human actions.
 - **2026-10-19** · AI production explains disabled-start prerequisites in Arabic and English while retaining budget and human-proof gates. The Windows native-preview launcher uses explicit UTF-8 and validates existing profile/document paths to preserve Arabic paths and protected-key scope on PowerShell 5.
+
+- 2026-10-19 · AI composer: inline provider/model, bounded prompt and production action; relevant skills validate native templates and activate automatically with separate machine evidence. Human batch-proof, budget and print guards remain enforced.

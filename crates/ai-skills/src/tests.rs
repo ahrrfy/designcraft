@@ -9,6 +9,15 @@ fn registry() -> (tempfile::TempDir, SkillRegistry) {
     (temporary, registry)
 }
 
+#[test]
+fn legacy_human_approval_is_not_relabelled_as_automatic() {
+    let record: ApprovalRecord = serde_json::from_value(serde_json::json!({
+        "reviewer":"Human reviewer","sample_sha256":"legacy","sample_format":"png","notes":"Reviewed"
+    }))
+    .unwrap();
+    assert!(!record.automatic);
+}
+
 fn approve(registry: &mut SkillRegistry, temp: &Path, record: &SkillRevision) {
     let sample = temp.join("sample.png");
     let mut bytes = Vec::new();

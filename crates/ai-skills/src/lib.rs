@@ -2,7 +2,8 @@
 //!
 //! Package content is data, never executable code. `SKILL.md` uses Agent Skills YAML
 //! frontmatter; `designcraft.json` adapts it to native DesignCraft commands. Importing,
-//! editing or generating a package always creates a draft. Only `approve` activates it.
+//! editing or generating a package creates a draft. Activation requires exact native sample
+//! evidence, either human review or automatic native validation recorded separately.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -108,6 +109,8 @@ pub struct SkillRevision {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApprovalRecord {
+    #[serde(default)]
+    pub automatic: bool,
     pub reviewer: String,
     pub sample_sha256: String,
     pub sample_format: String,
@@ -309,8 +312,19 @@ impl SkillRegistry {
     /// Explicit human approval after review. An existing approved revision is
     /// immutable; importing identical bytes is idempotent, never a review bypass.
     pub fn approve(&mut self, skill_id: &str, revision: &str, evidence: ApprovalEvidence) -> Result<()> {
+        self.activate(skill_id, revision, evidence, false)
+    }
+
+    /// Host-only local validation, never a claim that a human reviewed the sample.
+    pub fn activate_automatically(&mut self, skill_id: &str, revision: &str, mut evidence: ApprovalEvidence) -> Result<()> {
+        evidence.reviewer = "DesignCraft native validator".into();
+        evidence.notes = "Automatic native template execution, rendered sample and print preflight; no human approval claimed.".into();
+        self.activate(skill_id, revision, evidence, true)
+    }
+
+    fn activate(&mut self, skill_id: &str, revision: &str, evidence: ApprovalEvidence, automatic: bool) -> Result<()> {
         let record = self.revision(skill_id, revision)?.clone();
-        if record.status != RevisionStatus::Draft {
+        if record.status != RevisionStatus::Draft && (automatic || !record.approval.as_ref().is_some_and(|approval| approval.automatic)) {
             return Err(SkillError::Invalid("revision is already approved".into()));
         }
         if evidence.reviewer.trim().is_empty() || evidence.notes.trim().is_empty() {
@@ -350,7 +364,8 @@ impl SkillRegistry {
         let entry = next.entries.get_mut(skill_id).ok_or_else(|| SkillError::NotFound(skill_id.into()))?;
         let revised = entry.revisions.iter_mut().find(|r| r.revision == revision).ok_or_else(|| SkillError::NotFound(revision.into()))?;
         revised.status = RevisionStatus::Approved;
-        revised.approval = Some(ApprovalRecord { reviewer: evidence.reviewer, sample_sha256, sample_format: format.into(), notes: evidence.notes });
+        revised.approval =
+            Some(ApprovalRecord { automatic, reviewer: evidence.reviewer, sample_sha256, sample_format: format.into(), notes: evidence.notes });
         entry.active_revision = Some(revision.into());
         entry.name = revised.name.clone();
         entry.description = revised.description.clone();

@@ -213,6 +213,10 @@ impl ProductionRunner {
                 self.snapshot.message = "Skill imported as a draft; run and review its sample before approval".into();
             }
             AiRequest::InspectSkill { id, revision } => self.inspect_skill(&id, &revision)?,
+            AiRequest::PrepareSkills { prompt } => {
+                let ids = self.prepare_automatic_skills(session, &prompt)?;
+                self.snapshot.message = format!("Automatically prepared {} compatible skills locally; no provider request", ids.len());
+            }
             AiRequest::SaveSkillDraft { id, skill_md, manifest_json } => {
                 let review = self.snapshot.review.as_ref().filter(|r| r.id == id).ok_or("Inspect the skill before editing")?;
                 let mut files = self.registry.review_files(&id, &review.revision).map_err(|e| e.to_string())?;
@@ -341,7 +345,7 @@ impl ProductionRunner {
                 (scratch.doc().map_err(|e| e.to_string())?.clone(), context)
             }
         };
-        let ids = if task.auto_select_skills { self.choose_skills(&task.prompt) } else { task.skill_ids.clone() };
+        let ids = if task.auto_select_skills { self.prepare_automatic_skills(session, &task.prompt)? } else { task.skill_ids.clone() };
         if ids.len() > 8 {
             return Err("Select at most eight skills per task".into());
         }
@@ -718,6 +722,54 @@ impl ProductionRunner {
     fn choose_skills(&self, prompt: &str) -> Vec<String> {
         choose_compatible_skills(prompt, self.registry.catalog(""), &supported_commands())
     }
+
+    fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
+        if prompt.trim().is_empty() || prompt.len() > 32_768 {
+            return Err("Enter a prompt of at most 32768 UTF-8 bytes".into());
+        }
+        let supported = supported_commands();
+        let mut candidates = self
+            .registry
+            .catalog("")
+            .into_iter()
+            .filter_map(|entry| {
+                if !entry.enabled {
+                    return None;
+                }
+                let revision = entry.revisions.last()?;
+                if !skill_is_compatible(revision, &supported) {
+                    return None;
+                }
+                let score = skill_match_score(prompt, &entry);
+                (score > 0).then(|| (score, entry.skill_id.clone(), revision.revision.clone(), revision.status.clone()))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, id, revision, status) in candidates.into_iter().take(6) {
+            if status == RevisionStatus::Approved {
+                continue;
+            }
+            validate_skill_templates(&self.registry, session, &id, &revision)
+                .map_err(|error| format!("Automatic skill validation failed for {id}: {error}"))?;
+            self.run_sample(session, &id, &revision)?;
+            let evidence = self.sample.as_ref().ok_or("Automatic sample evidence is unavailable")?;
+            self.registry
+                .activate_automatically(
+                    &id,
+                    &revision,
+                    ApprovalEvidence {
+                        reviewer: String::new(),
+                        sample_artifact: evidence.path.clone(),
+                        executed_actions: evidence.actions.clone(),
+                        supported_commands: supported.clone(),
+                        notes: String::new(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        self.refresh_catalog();
+        Ok(self.choose_skills(prompt))
+    }
     fn refresh_catalog(&mut self) {
         let supported = supported_commands();
         self.snapshot.skills = self
@@ -735,6 +787,7 @@ impl ProductionRunner {
                         active: entry.active_revision.as_ref() == Some(&revision.revision),
                         revision: revision.revision,
                         approved: revision.status == RevisionStatus::Approved,
+                        automatically_validated: revision.approval.as_ref().is_some_and(|approval| approval.automatic),
                         enabled: entry.enabled,
                         compatible,
                     }
@@ -913,11 +966,6 @@ fn selected_skill_references(revision: &designcraft_ai_skills::SkillRevision) ->
 }
 
 fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::CatalogEntry>, supported: &BTreeSet<String>) -> Vec<String> {
-    let words = prompt
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 3 || word.eq_ignore_ascii_case("a4"))
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>();
     let mut ranked = entries
         .into_iter()
         .filter(|entry| {
@@ -930,14 +978,32 @@ fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::Ca
                         .is_some_and(|revision| revision.status == RevisionStatus::Approved && skill_is_compatible(revision, supported))
                 })
         })
-        .map(|entry| {
-            let haystack = format!("{} {} {}", entry.skill_id, entry.name, entry.description).to_lowercase();
-            (words.iter().filter(|word| haystack.contains(word.as_str())).count(), entry.skill_id)
-        })
+        .map(|entry| (skill_match_score(prompt, &entry), entry.skill_id))
         .filter(|(score, _)| *score > 0)
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    ranked.into_iter().take(3).map(|(_, id)| id).collect()
+    ranked.into_iter().take(6).map(|(_, id)| id).collect()
+}
+
+fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) -> usize {
+    let prompt = prompt.to_lowercase();
+    let haystack = format!("{} {} {}", entry.skill_id, entry.name, entry.description).to_lowercase();
+    let mut score = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 3 || *word == "a4")
+        .filter(|word| haystack.contains(word))
+        .count();
+    if entry.skill_id == "native-engine-workflow" {
+        score = score.saturating_add(4);
+    }
+    let book = ["كتاب", "كتيب", "منهج", "رياضيات", "book", "math", "science"].iter().any(|word| prompt.contains(word));
+    if book && ["early-years-booklet-planning", "early-years-activity-layout", "school-print-preflight"].contains(&entry.skill_id.as_str()) {
+        score = score.saturating_add(3);
+    }
+    if prompt.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c)) && entry.skill_id == "arabic-english-typography" {
+        score = score.saturating_add(2);
+    }
+    score
 }
 
 fn supported_commands() -> BTreeSet<String> {
@@ -1005,6 +1071,26 @@ fn ensure_publication_idle(session: &Session) -> Result<(), String> {
 fn compact_context(session: &Session) -> Result<Value, String> {
     let state = session.doc().map_err(|e| e.to_string())?;
     let doc = &state.doc;
+    // A small, measured font inventory prevents planning from assuming installed glyphs.
+    let fonts = designcraft_fonts::FontDb::global().scoped(doc.font_scope);
+    let mut families: Vec<String> = ["Tahoma", "Arial", "Noto Sans", "Noto Naskh Arabic", "DejaVu Sans"]
+        .into_iter()
+        .filter(|family| fonts.has_family(family))
+        .take(3)
+        .map(str::to_owned)
+        .collect();
+    if families.is_empty() {
+        families.extend(fonts.families().into_iter().take(3));
+    }
+    let mut font_faces = Vec::new();
+    for family in families {
+        for style in fonts.styles(&family).into_iter().take(3) {
+            let face = fonts.face(&family, &style);
+            let missing: String =
+                "ABCabc0123456789أابتثجحخدذرزسشصضطظعغفقكلمنهويىة★☆●✓".chars().filter(|character| face.glyph_for(*character) == 0).collect();
+            font_faces.push(json!({"family":family,"style":style,"missingProbeCharacters":missing}));
+        }
+    }
     let mut objects = Vec::new();
     for (spread_index, spread) in doc.spreads.iter().enumerate() {
         for item in &spread.items {
@@ -1022,7 +1108,7 @@ fn compact_context(session: &Session) -> Result<Value, String> {
         }
     }
     Ok(
-        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
+        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"fontFaces":font_faces,"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
     )
 }
 fn read_json(access: &std::sync::Arc<file_access::AutomationRoots>, path: &Path, max: u64) -> Result<Option<Value>, String> {
@@ -1046,6 +1132,75 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_context_reports_measured_font_glyph_coverage() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let context = compact_context(&session).unwrap();
+        let faces = context["fontFaces"].as_array().unwrap();
+        assert!(!faces.is_empty() && faces.len() <= 9);
+        let fonts = designcraft_fonts::FontDb::global().scoped(session.doc().unwrap().doc.font_scope);
+        for value in faces {
+            let face = fonts.face(value["family"].as_str().unwrap(), value["style"].as_str().unwrap());
+            assert_eq!(value["missingProbeCharacters"].as_str().unwrap().contains('★'), face.glyph_for('★') == 0);
+        }
+    }
+
+    #[test]
+    fn automatic_skills_validate_real_samples_without_human_approval_or_provider_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        for entry in runner.registry.catalog("") {
+            runner.registry.set_enabled(&entry.skill_id, false).unwrap();
+        }
+        let session = Session::new();
+        let manifest = json!({"schema_version":1,"skill_id":"automatic-fixture","required_commands":["frame.create"],
+            "templates":["templates/sample.json"],"sample_template":"templates/sample.json"});
+        let files = designcraft_ai_skills::PackageFiles::from([
+            (
+                "SKILL.md".into(),
+                b"---\nname: automatic-fixture\ndescription: fixture automatic layout\n---\nUse editable native elements.\n".to_vec(),
+            ),
+            ("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap()),
+            (
+                "templates/sample.json".into(),
+                serde_json::to_vec(&json!([
+                    {"command":"frame.create","params":{"rect":[54,54,120,120],"content":"unassigned"}}
+                ]))
+                .unwrap(),
+            ),
+        ]);
+        let revision = runner.registry.import_files(files.clone(), Provenance::default()).unwrap();
+        let reports = runner.snapshot.reports.len();
+        let ids = runner.prepare_automatic_skills(&session, "fixture layout").unwrap();
+        assert!(ids.contains(&revision.skill_id));
+        let pinned = runner.registry.snapshot(&revision.skill_id, &[]).unwrap();
+        let record = runner.registry.revision(&revision.skill_id, &revision.revision).unwrap();
+        assert!(record.approval.as_ref().unwrap().automatic);
+        runner.dispatch(&mut Session::new(), AiRequest::ApproveSkill { id: revision.skill_id.clone(), revision: revision.revision.clone() }).unwrap();
+        assert!(
+            !runner.registry.revision(&revision.skill_id, &revision.revision).unwrap().approval.as_ref().unwrap().automatic,
+            "a subsequent explicit human review must remain possible"
+        );
+        assert_eq!(runner.snapshot.reports.len(), reports, "local validation must not call a provider");
+        assert!(session.documents().is_empty(), "samples must not alter the user's document");
+        runner.registry.set_enabled(&revision.skill_id, false).unwrap();
+        assert!(!runner.prepare_automatic_skills(&session, "fixture layout").unwrap().contains(&revision.skill_id));
+        runner.registry.set_enabled(&revision.skill_id, true).unwrap();
+        let mut broken = files;
+        broken.insert(
+            "templates/sample.json".into(),
+            serde_json::to_vec(&json!([
+                {"command":"frame.create","params":{"rect":"bad rectangle"}}
+            ]))
+            .unwrap(),
+        );
+        let rejected = runner.registry.import_files(broken, Provenance::default()).unwrap();
+        assert!(runner.prepare_automatic_skills(&session, "fixture layout").is_err());
+        assert_eq!(runner.registry.snapshot(&revision.skill_id, &[]).unwrap().revision, pinned.revision);
+        assert_eq!(runner.registry.revision(&revision.skill_id, &rejected.revision).unwrap().status, RevisionStatus::Draft);
+    }
 
     #[test]
     fn new_document_publication_preserves_active_ime_before_any_side_effect() {

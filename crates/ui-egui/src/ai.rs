@@ -201,6 +201,9 @@ impl AiUiState {
     fn accept(&mut self, snapshot: AiSnapshot) {
         if !self.initialized && snapshot.available {
             self.settings = snapshot.settings.clone();
+            // Reuse explicitly configured prices; restarting does not require the same setup again.
+            self.rates_confirmed =
+                self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
             self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
             if self.settings.text_model.provider == ProviderKind::Ollama {
                 self.local_ollama = self.settings.text_model.clone();
@@ -319,7 +322,7 @@ impl AiUiState {
         } else if self.prompt.trim().is_empty() {
             ("Enter production instructions.", "أدخل تعليمات الإنتاج.")
         } else if self.settings.text_model.model.trim().is_empty() {
-            ("Choose a text model in Providers and keys.", "اختر نموذج النص من تبويب المزودين والمفاتيح.")
+            ("Choose a text model above.", "اختر نموذج النص من الحقل أعلاه.")
         } else if !self.new_document && !document {
             ("Open a document or choose New A4 document.", "افتح مستنداً أو اختر مستند A4 جديداً.")
         } else if self.settings.output_mode == OutputMode::NativeWithImages
@@ -330,7 +333,7 @@ impl AiUiState {
         } else if !self.workflow_ready() {
             ("Complete a valid ComfyUI API workflow in Providers and keys.", "أكمل مخطط ComfyUI API صالحاً في تبويب المزودين والمفاتيح.")
         } else if self.settings.budget.max_cost_usd.is_some() && !self.rates_confirmed {
-            ("Set and confirm the provider prices in Limits.", "أدخل أسعار المزود وأكّدها من قسم الحدود.")
+            ("Set and confirm provider prices in Advanced settings.", "أدخل أسعار المزود وأكّدها من الإعدادات المتقدمة.")
         } else {
             return None;
         };
@@ -411,6 +414,7 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
         "list_models" => AiRequest::ListModels { selection: serde_json::from_value(decode("selection")?).map_err(|e| e.to_string())? },
         "import_skill" => AiRequest::ImportSkill { path: field("path")? },
         "inspect_skill" => AiRequest::InspectSkill { id: field("id")?, revision: field("revision")? },
+        "prepare_skills" => AiRequest::PrepareSkills { prompt: field("prompt")? },
         "save_skill_draft" => AiRequest::SaveSkillDraft { id: field("id")?, skill_md: field("skill_md")?, manifest_json: field("manifest_json")? },
         "generate_skill" => AiRequest::GenerateSkill {
             prompt: field("prompt")?,
@@ -846,55 +850,62 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
 }
 
 fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, document: bool, requests: &mut Vec<AiRequest>) {
-    batch_review(ui, s, a, requests);
     ui.add_enabled_ui(!s.task_active(), |ui| {
-        rtl::label(ui, format!("{} / {}", provider_name(s.settings.text_model.provider), s.settings.text_model.model));
-        if button(ui, a, "Configure providers and keys", "إعداد المزودين والمفاتيح") {
-            s.tab = 3;
-        }
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Limits", "الحدود"))).show(ui, |ui| {
-            budgets(ui, s, a);
+        ui.horizontal_wrapped(|ui| {
+            provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
+            label(ui, a, "Model or agent", "النموذج أو الوكيل");
+            ui.add(egui::TextEdit::singleline(&mut s.settings.text_model.model).desired_width(230.0));
+            if button(ui, a, "Discover", "اكتشاف") {
+                s.pending_models = Some(s.settings.text_model.clone());
+                requests.push(AiRequest::ListModels { selection: s.settings.text_model.clone() });
+            }
+            if button(ui, a, "Keys and providers", "المفاتيح والمزودون") {
+                s.tab = 3;
+            }
         });
-        ui.separator();
-        label(ui, a, "Production instructions", "تعليمات الإنتاج");
-        ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(5).desired_width(f32::INFINITY));
-        ui.horizontal(|ui| {
+        if !s.snapshot.models.is_empty() && s.pending_models.as_ref() == Some(&s.settings.text_model) {
+            egui::ComboBox::from_id_salt("production_discovered_models").selected_text(text(a, "Available models", "النماذج المتاحة")).show_ui(
+                ui,
+                |ui| {
+                    for name in &s.snapshot.models {
+                        ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
+                    }
+                },
+            );
+        }
+        label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
+        // Long pasted briefs scroll inside the composer instead of hiding the production button.
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(180.0).show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(text(
+                a,
+                "Describe your design, audience and desired result...",
+                "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
+            )));
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.radio_value(&mut s.new_document, false, rtl::widget(ui, text(a, "Current document", "المستند الحالي")));
             ui.radio_value(&mut s.new_document, true, rtl::widget(ui, text(a, "New A4 document", "مستند A4 جديد")));
             ui.add_enabled(s.new_document, egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
-        });
-        ui.horizontal(|ui| {
             label(ui, a, "Pages per batch", "الصفحات في كل دفعة");
             ui.add_enabled(s.new_document, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=32));
         });
+        if s.automatic_skills {
+            label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
+        }
+        if let Some(cost) = s.settings.budget.max_cost_usd {
+            rtl::label(ui, format!("{} ${cost:.2}", text(a, "Task cost ceiling (estimate):", "سقف كلفة المهمة (تقديري):")));
+        }
         label(
             ui,
             a,
             "Each batch stops for your visual approval before another provider request.",
             "تتوقف كل دفعة لمراجعتك البصرية قبل أي طلب جديد إلى المزود.",
         );
-        ui.checkbox(
-            &mut s.automatic_skills,
-            rtl::widget(ui, text(a, "Automatically select compatible approved skills", "اختيار المهارات المعتمدة والمتوافقة تلقائياً")),
-        );
-        if !s.automatic_skills {
-            for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
-                let mut selected = s.selected_skills.contains(&card.id);
-                if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
-                    if selected {
-                        s.selected_skills.insert(card.id.clone());
-                    } else {
-                        s.selected_skills.remove(&card.id);
-                    }
-                }
-            }
-        }
-        field(ui, a, "Output/sample directory (optional for production)", "مجلد المخرجات والعينة (اختياري للإنتاج)", &mut s.directory);
         let issue = s.production_issue(available, document, a);
         if let Some(reason) = issue {
             rtl::label(ui, reason);
         }
-        if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Start production", "بدء الإنتاج")))).clicked() {
+        if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked() {
             requests.push(AiRequest::Start(TaskRequest {
                 prompt: s.prompt.clone(),
                 settings: s.settings.clone(),
@@ -904,18 +915,54 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
                 export_directory: (!s.directory.trim().is_empty()).then(|| s.directory.clone()),
             }));
         }
-        if ui
-            .add_enabled(
-                available && !s.directory.trim().is_empty(),
-                egui::Button::new(rtl::widget(ui, text(a, "Create original 8-page science example", "إنشاء مثال علوم أصلي من ٨ صفحات"))),
-            )
-            .clicked()
-        {
-            requests.push(AiRequest::CreateScienceSample { directory: s.directory.clone() });
-        }
-        ui.separator();
-        export_print(ui, s, a, available && document, requests);
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).show(ui, |ui| {
+            budgets(ui, s, a);
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut s.settings.output_mode, OutputMode::NativeOnly, text(a, "Editable elements", "عناصر قابلة للتحرير"));
+                ui.selectable_value(
+                    &mut s.settings.output_mode,
+                    OutputMode::NativeWithImages,
+                    text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور"),
+                );
+            });
+            if s.settings.output_mode == OutputMode::NativeWithImages {
+                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, requests);
+            }
+            ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
+            if !s.automatic_skills {
+                for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
+                    let mut selected = s.selected_skills.contains(&card.id);
+                    if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
+                        if selected {
+                            s.selected_skills.insert(card.id.clone());
+                        } else {
+                            s.selected_skills.remove(&card.id);
+                        }
+                    }
+                }
+            }
+            field(ui, a, "Output/sample directory (optional for production)", "مجلد المخرجات والعينة (اختياري للإنتاج)", &mut s.directory);
+            if ui
+                .add_enabled(
+                    available && !s.directory.trim().is_empty(),
+                    egui::Button::new(rtl::widget(ui, text(a, "Create original 8-page science example", "إنشاء مثال علوم أصلي من ٨ صفحات"))),
+                )
+                .clicked()
+            {
+                requests.push(AiRequest::CreateScienceSample { directory: s.directory.clone() });
+            }
+        });
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save, export and print", "الحفظ والتصدير والطباعة"))).show(ui, |ui| {
+            export_print(ui, s, a, available && document, requests);
+        });
     });
+    ui.separator();
+    if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") || s.task_active() {
+        batch_review(ui, s, a, requests);
+    } else if s.snapshot.batch.is_some() {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Previous task", "المهمة السابقة"))).show(ui, |ui| batch_review(ui, s, a, requests));
+    }
 }
 
 fn elapsed(ms: u64) -> String {
@@ -1290,7 +1337,12 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                     ui.add_sized([name_width, 20.0], egui::Label::new(rtl::widget(ui, &c.name)).truncate()).on_hover_text(&c.name);
                     let revision: String = c.revision.chars().take(12).collect();
                     ui.add_sized([version_width, 20.0], egui::Label::new(revision).truncate()).on_hover_text(&c.revision);
-                    let mut status = text(a, if c.approved { "Approved" } else { "Draft" }, if c.approved { "معتمدة" } else { "مسودة" }).to_owned();
+                    let mut status = if c.automatically_validated {
+                        text(a, "Auto checked", "فُحصت تلقائياً")
+                    } else {
+                        text(a, if c.approved { "Approved" } else { "Draft" }, if c.approved { "معتمدة" } else { "مسودة" })
+                    }
+                    .to_owned();
                     if c.active {
                         status.push_str(text(a, " / Active", " / نشطة"));
                     }
@@ -1301,9 +1353,9 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                     if button(ui, a, "Inspect", "مراجعة") {
                         requests.push(AiRequest::InspectSkill { id: c.id.clone(), revision: c.revision.clone() });
                     }
-                    let mut enabled = c.enabled && c.approved && c.compatible;
+                    let mut enabled = c.enabled && c.compatible;
                     if ui
-                        .add_enabled(c.approved && c.compatible, egui::Checkbox::new(&mut enabled, rtl::widget(ui, text(a, "Enabled", "مفعلة"))))
+                        .add_enabled(c.compatible, egui::Checkbox::new(&mut enabled, rtl::widget(ui, text(a, "Use skill", "استخدام المهارة"))))
                         .changed()
                     {
                         requests.push(AiRequest::SetSkillEnabled { id: c.id.clone(), enabled });
@@ -1526,6 +1578,21 @@ mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::json;
     #[test]
+    fn production_composer_exposes_model_prompt_and_action_without_advanced_settings() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.ui.ai.open = true;
+        app.ui.ai.snapshot.available = true;
+        app.ui.ai.initialized = true;
+        app.ui.ai.prompt = "A long request\n".repeat(200);
+        let mut harness = crate::test_window::open(app, egui::vec2(1200.0, 900.0));
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Model or agent").is_some());
+        assert!(harness.query_by_label("What would you like to create?").is_some());
+        assert!(harness.query_by_label("Produce").is_some());
+        assert!(harness.get_by_label("Produce").rect().max.y < 650.0, "long briefs must not push the action off screen");
+        assert!(harness.query_by_label("Input").is_none(), "pricing belongs in advanced settings");
+    }
+    #[test]
     fn disabled_production_button_explains_the_missing_model() {
         let mut app = DesignApp::new(
             Session::new(),
@@ -1535,12 +1602,12 @@ mod tests {
         app.ui.ai.prompt = "Create an editable activity".into();
         let mut harness = crate::test_window::open(app, egui::vec2(1500.0, 1100.0));
         harness.run_steps(3);
-        assert!(harness.get_by_label("Start production").accesskit_node().is_disabled());
-        assert!(harness.query_by_label("Choose a text model in Providers and keys.").is_some(), "a disabled button must explain what to fix");
+        assert!(harness.get_by_label("Produce").accesskit_node().is_disabled());
+        assert!(harness.query_by_label("Choose a text model above.").is_some(), "a disabled button must explain what to fix");
         harness.state_mut().app.ui.ai.settings.text_model.model = "fixture-model".into();
         harness.run_steps(3);
-        assert!(!harness.get_by_label("Start production").accesskit_node().is_disabled());
-        assert!(harness.query_by_label("Choose a text model in Providers and keys.").is_none());
+        assert!(!harness.get_by_label("Produce").accesskit_node().is_disabled());
+        assert!(harness.query_by_label("Choose a text model above.").is_none());
     }
 
     #[test]
@@ -1552,7 +1619,7 @@ mod tests {
         assert_eq!(state.production_issue(true, false, false), Some("Choose an image model in Providers and keys."));
         state.settings.image_model.model = "image-model".into();
         state.settings.budget.max_cost_usd = Some(1.8);
-        assert_eq!(state.production_issue(true, false, true), Some("أدخل أسعار المزود وأكّدها من قسم الحدود."));
+        assert_eq!(state.production_issue(true, false, true), Some("أدخل أسعار المزود وأكّدها من الإعدادات المتقدمة."));
         state.rates_confirmed = true;
         assert_eq!(state.production_issue(true, false, false), None);
         state.settings.image_model.provider = ProviderKind::ComfyUi;

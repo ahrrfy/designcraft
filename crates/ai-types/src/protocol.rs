@@ -139,6 +139,9 @@ pub enum AiRequest {
         id: String,
         revision: String,
     },
+    PrepareSkills {
+        prompt: String,
+    },
     SaveSkillDraft {
         id: String,
         skill_md: String,
@@ -309,6 +312,8 @@ pub struct SkillCard {
     pub description: String,
     pub revision: String,
     pub approved: bool,
+    #[serde(default)]
+    pub automatically_validated: bool,
     pub active: bool,
     pub enabled: bool,
     pub compatible: bool,
