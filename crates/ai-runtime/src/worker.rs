@@ -278,9 +278,6 @@ impl Runner<'_> {
                 preflight_profile_image_ratios(profile, &request.settings)?;
             }
         }
-        let geometry_profile = if current_document { None } else { profile };
-        let geometry_check =
-            if current_document { GeometryCheck::OpenedDocument } else { profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile) };
         if let Some(style) = skills.iter().find(|skill| crate::template_plan::eligible(skill))
             && matches!(
                 request.target,
@@ -312,15 +309,48 @@ impl Runner<'_> {
             object.insert("curriculum_blueprint".into(), crate::template_plan::curriculum_blueprint(&request.prompt, style, scope, total_pages)?);
             return self.template_production(request, template_context, style, base, prefs, scope);
         }
-        let mut system = production_system(&catalog, &skills, request.settings.output_mode, current_document)?;
+        if let Some(scope) = scope
+            && scope.count > generic_page_capacity(request.settings.output_mode)
+        {
+            return self.generic_review_group(&request, &context, &catalog, &skills, &base, &prefs, scope);
+        }
+        let plan = self.generic_production_plan(&request, &context, &catalog, &skills, &base, &prefs, scope)?;
+        if let Some(scope) = scope {
+            let proofs = batch_proofs(&plan, &base, &prefs, request.settings.output_mode, self.cancel, scope)?;
+            Ok(Product::BatchPlan { plan, proofs })
+        } else {
+            Ok(Product::Plan(plan))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generic_production_plan(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        catalog: &Value,
+        skills: &[SkillSnapshot],
+        base: &DocState,
+        prefs: &Prefs,
+        scope: Option<BatchScope>,
+    ) -> Result<ProductionPlan, String> {
+        let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
+        let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
+        let geometry_profile = if current_document { None } else { profile };
+        let geometry_check =
+            if current_document { GeometryCheck::OpenedDocument } else { profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile) };
+        let mut system = production_system(catalog, skills, request.settings.output_mode, current_document)?;
         if let Some(scope) = scope {
             system.push_str(&format!("\nBATCH SCOPE IS MANDATORY: create only spreads {}..{} (exclusive end); every object needs explicit spread; every object/story reference must name an earlier result created in this batch. No page/global/style/swatches operations. Render every requested page natively before the human proof checkpoint.",scope.start,scope.start.saturating_add(scope.count)));
+        }
+        if context.get("review_scope").is_some() {
+            system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
         }
         let original = bounded_json(&json!({"request":request.prompt,"target":request.target,"document":context}), MAX_PROMPT)?;
         let mut generation = GenerationRequest {
             system,
             prompt: original.clone(),
-            json_schema: plan_schema(&catalog, request.settings.output_mode)?,
+            json_schema: plan_schema(catalog, request.settings.output_mode)?,
             max_output_tokens: request.settings.budget.max_output_tokens,
             images: Vec::new(),
             resources: request.settings.resources.clone(),
@@ -331,10 +361,10 @@ impl Runner<'_> {
         for attempt in 0..=repair_attempts {
             self.progress(if attempt == 0 { "Generating editable native layout" } else { "Repairing native layout validation" }, 0.15)?;
             let response = self.generate(&request.settings.text_model, &generation)?;
-            let parsed = parse_plan(&response.text, request.settings.output_mode, &catalog).and_then(|mut plan| {
-                prepare_editorial_plan(&mut plan, &request.prompt, &context, scope)?;
+            let parsed = parse_plan(&response.text, request.settings.output_mode, catalog).and_then(|mut plan| {
+                prepare_editorial_plan(&mut plan, &request.prompt, context, scope)?;
                 if let Some(profile) = geometry_profile {
-                    crate::design::check_image_slots(&base, &plan.images, profile)?;
+                    crate::design::check_image_slots(base, &plan.images, profile)?;
                 }
                 if let Some(scope) = scope {
                     validate_batch_plan(&plan, scope)?;
@@ -349,7 +379,7 @@ impl Runner<'_> {
                     let text_check = if raw_plan.images.is_empty() {
                         Ok(())
                     } else {
-                        simulate_styled(&raw_plan, &base, &prefs, request.settings.output_mode, self.cancel, None, geometry_check)
+                        simulate_styled(&raw_plan, base, prefs, request.settings.output_mode, self.cancel, None, geometry_check)
                     };
                     if let Err(error) = text_check {
                         (previous, error)
@@ -364,14 +394,10 @@ impl Runner<'_> {
                             geometry_profile,
                         )?;
                         self.progress("Validating commands and print preflight on a private document", 0.85)?;
-                        match simulate_styled(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope, geometry_check) {
+                        match simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check) {
                             Ok(()) => {
                                 check_cancel(self.cancel)?;
-                                if let Some(scope) = scope {
-                                    let proofs = batch_proofs(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope)?;
-                                    return Ok(Product::BatchPlan { plan: expanded, proofs });
-                                }
-                                return Ok(Product::Plan(expanded));
+                                return Ok(expanded);
                             }
                             Err(error) => (previous, error),
                         }
@@ -387,6 +413,69 @@ impl Runner<'_> {
         }
         Err("AI plan was not produced".into())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generic_review_group(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        catalog: &Value,
+        skills: &[SkillSnapshot],
+        base: &DocState,
+        prefs: &Prefs,
+        review: BatchScope,
+    ) -> Result<Product, String> {
+        let end = review_end(review)?;
+        validate_batch_result(base, base, review)?;
+        let capacity = generic_page_capacity(request.settings.output_mode);
+        let mut scratch = Session::new();
+        scratch.prefs = prefs.clone();
+        scratch.add_document(base.clone());
+        let mut plans = Vec::new();
+        let mut plan_bytes = 0usize;
+        let mut next = review.start;
+        while next < end {
+            check_cancel(self.cancel)?;
+            let scope = BatchScope { start: next, count: capacity.min(end - next) };
+            let mut chunk_context = internal_template_context(context, scratch.doc().map_err(|e| e.to_string())?, review, scope)?;
+            let remaining_requests = request.settings.budget.max_requests.saturating_sub(self.ledger.summary().requests);
+            let source_limit = if request.settings.output_mode == OutputMode::NativeOnly {
+                0
+            } else {
+                MAX_IMAGES.min(usize::try_from(remaining_requests.saturating_sub(1)).map_err(|_| "Invalid remaining image request allowance")?)
+            };
+            let object = chunk_context.as_object_mut().ok_or("Invalid internal generic review context")?;
+            object.insert("batch_scope".into(), json!(scope));
+            object.insert("remainingImageSources".into(), json!(source_limit));
+            object.insert("remainingTaskRequests".into(), json!(remaining_requests));
+            // Explicit scope validation is independent of the context marker and proof policy.
+            // Every part uses this Runner's same ledger, keys, cancellation and pinned skills.
+            let plan = self.generic_production_plan(
+                request,
+                &chunk_context,
+                catalog,
+                skills,
+                scratch.doc().map_err(|e| e.to_string())?,
+                prefs,
+                Some(scope),
+            )?;
+            let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
+            plan_bytes =
+                plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
+            if plans.len() >= MAX_REVIEW_PAGES as usize {
+                return Err("Review plan count exceeds its bounded page limit".into());
+            }
+            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
+                .map_err(|e| e.to_string())?;
+            plans.push(plan);
+            next = next.checked_add(scope.count).ok_or("Internal generic review range overflow")?;
+        }
+        validate_batch_result(base, scratch.doc().map_err(|e| e.to_string())?, review)?;
+        self.progress("Preparing complete review proofs from all internal page parts", 0.9)?;
+        let proofs = batch_proofs_from_draft(&mut scratch, self.cancel, review)?;
+        Ok(Product::BatchGroup { plans, proofs })
+    }
+
     fn expand_images(
         &mut self,
         plan: ProductionPlan,
@@ -767,6 +856,13 @@ fn review_end(scope: BatchScope) -> Result<u32, String> {
         .checked_add(scope.count)
         .filter(|end| scope.count > 0 && scope.count <= MAX_REVIEW_PAGES && *end <= MAX_REVIEW_PAGES)
         .ok_or_else(|| "Review must contain 1 to 1000 native pages within the document".into())
+}
+
+fn generic_page_capacity(mode: OutputMode) -> u32 {
+    match mode {
+        OutputMode::NativeOnly => 32,
+        OutputMode::NativeWithImages => 4,
+    }
 }
 
 fn opened_document_geometry(context: &mut Value, state: &DocState) -> Result<(), String> {
@@ -2248,6 +2344,177 @@ mod tests {
                 }
                 assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
             }
+        }
+    }
+
+    #[test]
+    fn generic_review_beyond_one_plan_is_partitioned_before_provider_calls() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct GenericScopeProvider(RefCell<Vec<BatchScope>>);
+        impl Provider for GenericScopeProvider {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                let value: Value = serde_json::from_str(&request.prompt).unwrap();
+                let scope: BatchScope = serde_json::from_value(value["document"]["batch_scope"].clone()).unwrap();
+                assert!(scope.count <= 32, "Generic production must partition the review before buying its first plan");
+                assert!(u64::from(scope.count) <= request.json_schema["properties"]["commands"]["maxItems"].as_u64().unwrap());
+                assert_eq!(value["document"]["review_scope"]["start"], 1);
+                assert_eq!(value["document"]["review_scope"]["count"], 513);
+                assert!(request.system.contains("GENERIC_PIN_CONTEXT"));
+                assert!(request.system.contains("generic-reference-pin"));
+                if scope.start > 1 {
+                    assert_eq!(value["document"]["objects"][0]["spread"], scope.start - 1, "Continue from actual preceding internal content");
+                }
+                self.0.borrow_mut().push(scope);
+                let commands = (scope.start..scope.start + scope.count)
+                    .map(|page| json!({"command":"frame.create","params":{"spread":page,"rect":[8,8,16,16],"content":"unassigned"}}))
+                    .collect::<Vec<_>>();
+                Ok(GenerationResponse {
+                    text: json!({"title":"Generic review part","commands":commands,"images":[]}).to_string(),
+                    usage: Usage { input_tokens: Some(10), output_tokens: Some(10), ..Default::default() },
+                    error: None,
+                })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No images in native mock".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No model discovery".into())
+            }
+        }
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":64,"height":64,"margins":0,"pages":515,"facingPages":false})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[8,8,16,16],"content":"unassigned"})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let original = base.doc.clone();
+        let skill = SkillSnapshot {
+            skill_id: "generic-style".into(),
+            revision: "generic-reference-pin".into(),
+            instructions: "GENERIC_PIN_CONTEXT".into(),
+            references: BTreeMap::new(),
+            reference_hashes: BTreeMap::new(),
+            templates: BTreeMap::new(),
+            design_profile: None,
+        };
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 4_000_000, max_requests: 64, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt: "Continue every requested page using the same native layout".into(),
+            settings: settings.clone(),
+            skill_ids: vec![skill.skill_id.clone()],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::ContinueBook,
+            export_directory: None,
+        };
+        let provider = GenericScopeProvider(RefCell::new(vec![]));
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let scope = BatchScope { start: 1, count: 513 };
+        let product = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }
+            .production(request, json!({"batch_scope":scope}), catalog(), vec![skill], base.clone(), session.prefs.clone())
+            .unwrap();
+        let Product::BatchGroup { plans, proofs } = product else { panic!("Expected one complete generic review group") };
+        let scopes = provider.0.borrow();
+        assert_eq!(scopes.len(), 513_u32.div_ceil(32) as usize);
+        assert_eq!(scopes.first().unwrap().start, 1);
+        assert_eq!(scopes.last().unwrap().start + scopes.last().unwrap().count, 514);
+        assert!(scopes.windows(2).all(|parts| parts[0].start + parts[0].count == parts[1].start));
+        assert_eq!(scopes.iter().map(|part| part.count).sum::<u32>(), 513);
+        assert_eq!(plans.len(), scopes.len());
+        simulate_group_scoped(&plans, &base, &session.prefs, OutputMode::NativeOnly, &cancel, scope).unwrap();
+        assert_eq!(proofs.iter().filter(|proof| proof.name.ends_with(".png")).count(), 513);
+        assert_eq!(proofs.iter().filter(|proof| proof.name.ends_with(".pdf")).count(), 17);
+        let doc = designcraft_format::load(&proofs.iter().find(|proof| proof.name.ends_with(".designcraft")).unwrap().bytes).unwrap();
+        assert_eq!(doc.spreads[0], base.doc.spreads[0]);
+        assert!(doc.spreads.iter().skip(1).take(513).all(|spread| !spread.items.is_empty()));
+        assert!(doc.spreads[514].items.is_empty(), "The next review must stay untouched");
+        assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
+        assert_eq!(ledger.summary().requests, scopes.len() as u32);
+    }
+
+    #[test]
+    fn generic_internal_failure_or_cancellation_keeps_live_review_unpublished() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct AbortProvider {
+            cancel_second: bool,
+            calls: std::cell::Cell<u32>,
+        }
+        impl Provider for AbortProvider {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                cancel: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                let value: Value = serde_json::from_str(&request.prompt).unwrap();
+                let scope: BatchScope = serde_json::from_value(value["document"]["batch_scope"].clone()).unwrap();
+                assert!(scope.count <= 32);
+                self.calls.set(self.calls.get().saturating_add(1));
+                if self.calls.get() == 2 {
+                    assert_eq!(value["document"]["objects"][0]["spread"], 32);
+                    if self.cancel_second {
+                        cancel.store(true, Ordering::Relaxed);
+                    } else {
+                        return Err("synthetic second-part failure".into());
+                    }
+                }
+                let commands = (scope.start..scope.start + scope.count)
+                    .map(|page| json!({"command":"frame.create","params":{"spread":page,"rect":[8,8,16,16],"content":"unassigned"}}))
+                    .collect::<Vec<_>>();
+                Ok(GenerationResponse {
+                    text: json!({"title":"Unpublished generic part","commands":commands,"images":[]}).to_string(),
+                    usage: Usage { input_tokens: Some(10), output_tokens: Some(10), ..Default::default() },
+                    error: None,
+                })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No image request".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        for cancel_second in [false, true] {
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"width":64,"height":64,"margins":0,"pages":35,"facingPages":false})).unwrap();
+            let original = session.doc().unwrap().doc.clone();
+            let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, max_requests: 4, ..Default::default() }, ..Default::default() };
+            let request = TaskRequest {
+                prompt: "Create every page in this review".into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 35 },
+                export_directory: None,
+            };
+            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let provider = AbortProvider { cancel_second, calls: std::cell::Cell::new(0) };
+            let error = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }
+                .production(
+                    request,
+                    json!({"batch_scope":{"start":1,"count":33}}),
+                    catalog(),
+                    vec![],
+                    session.doc().unwrap().clone(),
+                    session.prefs.clone(),
+                )
+                .err()
+                .unwrap();
+            assert!(error.contains(if cancel_second { "cancelled" } else { "synthetic second-part failure" }), "{error}");
+            assert_eq!(provider.calls.get(), 2);
+            assert_eq!(ledger.summary().requests, 2);
+            assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
+            assert!(session.doc().unwrap().doc.spreads.iter().all(|spread| spread.items.is_empty()));
         }
     }
 
