@@ -120,6 +120,7 @@ jobs:
           Copy-Item -LiteralPath 'NOTICE', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-FOXIT', 'ASSETS.md' -Destination $stage
           'Portable Smart Design preview. Settings and recovery remain beside these executables.' | Set-Content -LiteralPath (Join-Path $stage 'portable.txt') -Encoding ascii
           Copy-Item -LiteralPath 'docs/ai-production.ar.md' -Destination $stage
+          Copy-Item -LiteralPath 'skills' -Destination $stage -Recurse
           $fontNotices = Join-Path $stage 'font-licenses'
           New-Item -ItemType Directory -Force -Path $fontNotices | Out-Null
           Copy-Item -LiteralPath 'licenses/epaint-default-fonts' -Destination $fontNotices -Recurse
@@ -152,6 +153,16 @@ jobs:
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           ($hash + '  ' + (Split-Path $zip -Leaf)) | Set-Content -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt') -Encoding ascii
+          $update = @{
+            schemaVersion = 1; repository = 'ahrrfy/designcraft'; sourceCommit = $sha
+            ciUrl = $env:VERIFIED_CI_URL
+            archive = @{ name = (Split-Path $zip -Leaf); sha256 = $hash; size = (Get-Item -LiteralPath $zip).Length }
+            binaries = @{
+              'designcraft.exe' = (Get-FileHash -LiteralPath (Join-Path $stage 'designcraft.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+              'designcraft-cli.exe' = (Get-FileHash -LiteralPath (Join-Path $stage 'designcraft-cli.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $update | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $releaseDir 'update.json') -Encoding utf8
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: smart-design-windows-x64-unsigned

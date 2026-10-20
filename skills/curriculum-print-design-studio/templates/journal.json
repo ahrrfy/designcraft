@@ -1,0 +1,760 @@
+[
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        45,
+        550,
+        112
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$0.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        59,
+        59,
+        536,
+        104
+      ],
+      "content": "text",
+      "text": "SCIENCE | Observe and record",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 24,
+        "leading": {
+          "kind": "points",
+          "value": 33.599999999999994
+        },
+        "fill": "[Paper]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$2.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        132,
+        550,
+        184
+      ],
+      "content": "text",
+      "text": "Ages 5–6  |  Editable native activity model",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 22.4
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$6.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        194,
+        285,
+        264
+      ],
+      "content": "text",
+      "text": "1  Predict and test.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 21,
+        "leading": {
+          "kind": "points",
+          "value": 29.4
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$10.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        287,
+        281,
+        413
+      ],
+      "content": "text",
+      "text": "With an adult, plant a bean and check it each day.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 18,
+        "leading": {
+          "kind": "points",
+          "value": 25.2
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$14.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        310,
+        197,
+        550,
+        418
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$18.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.08
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        325,
+        212,
+        535,
+        367
+      ],
+      "content": "text",
+      "text": "Illustration area\n\nIndependent picture frame in production.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 22.4
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$20.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        458,
+        550,
+        507
+      ],
+      "content": "text",
+      "text": "2  Keep an observation journal.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 21,
+        "leading": {
+          "kind": "points",
+          "value": 29.4
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$24.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        526,
+        132,
+        568
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$28.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.08
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        53,
+        532,
+        124,
+        564
+      ],
+      "content": "text",
+      "text": "Day",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 14,
+        "leading": {
+          "kind": "points",
+          "value": 19.599999999999998
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$30.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        45,
+        624
+      ],
+      "b": [
+        132,
+        624
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$34.id"
+      ],
+      "swatch": "[Black]",
+      "weight": 0.5
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        45,
+        684
+      ],
+      "b": [
+        132,
+        684
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$36.id"
+      ],
+      "swatch": "[Black]",
+      "weight": 0.5
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        142,
+        526,
+        325,
+        568
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$38.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.08
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        150,
+        532,
+        317,
+        564
+      ],
+      "content": "text",
+      "text": "What I see",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 14,
+        "leading": {
+          "kind": "points",
+          "value": 19.599999999999998
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$40.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        142,
+        624
+      ],
+      "b": [
+        325,
+        624
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$44.id"
+      ],
+      "swatch": "[Black]",
+      "weight": 0.5
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        142,
+        684
+      ],
+      "b": [
+        325,
+        684
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$46.id"
+      ],
+      "swatch": "[Black]",
+      "weight": 0.5
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        335,
+        526,
+        550,
+        568
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$48.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.08
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        343,
+        532,
+        542,
+        564
+      ],
+      "content": "text",
+      "text": "My drawing",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 14,
+        "leading": {
+          "kind": "points",
+          "value": 19.599999999999998
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$50.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        335,
+        624
+      ],
+      "b": [
+        550,
+        624
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$54.id"
+      ],
+      "swatch": "[Black]",
+      "weight": 0.5
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        335,
+        684
+      ],
+      "b": [
+        550,
+        684
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$56.id"
+      ],
+      "swatch": "[Black]",
+      "weight": 0.5
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        45,
+        754,
+        550,
+        794
+      ],
+      "content": "text",
+      "text": "Science inquiry • Teacher review before classroom use",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 11,
+        "leading": {
+          "kind": "points",
+          "value": 15.399999999999999
+        },
+        "fill": "[Black]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false
+      }
+    }
+  },
+  {
+    "command": "object.label",
+    "params": {
+      "ids": [
+        "$58.id"
+      ],
+      "label": "studio.editable.copy"
+    }
+  }
+]

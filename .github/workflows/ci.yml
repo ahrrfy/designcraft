@@ -40,6 +40,11 @@ jobs:
           key: windows-quality
       - name: Resolve only locked dependencies
         run: cargo fetch --locked
+      - name: Protected-profile launcher and updater regression checks
+        shell: powershell
+        run: |
+          & packaging/windows/test-preview-launcher.ps1
+          & packaging/windows/test-preview-updater.ps1
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy

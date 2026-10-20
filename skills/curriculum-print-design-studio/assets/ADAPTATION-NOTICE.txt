@@ -1,0 +1,1 @@
+User-supplied curriculum-print-design-studio adapted for native DesignCraft execution. Source folder preserved locally. Active references correct A4 proportions, preserve task margins/language and avoid unsupported certification claims. No source Python executable, book art, fonts, credentials or private absolute paths are distributed.

@@ -299,6 +299,20 @@
         "SKILL.md": "852a9fcfe0329dc78e31adcf5d3f52b10eca8af02a6b7abb9a5e2f20cd833b06",
         "templates/sample.json": "7da71cd68110ea102ac8ac734b2ed34344192558b70d1da057c2830f8660335b"
       }
+    },
+    {
+      "id": "curriculum-print-design-studio",
+      "files": {
+        "assets/ADAPTATION-NOTICE.txt": "b1ff57300b866ad4890f2c72e2c3238ceb426119a03a2cf081e94d4371720c0b",
+        "assets/PROVENANCE.json": "491354847bcfad06e5cc7dac6a3f322f606d07b3d433e4453174fe12a5ef5e55",
+        "designcraft.json": "41b340f48e9c4e91c23c05cc056518ce3b7ef541a8b7d7a9ddf8fec4a475dd7a",
+        "references/native-production-contract.md": "55e7d2e827438c3cfa94e4cc862b64ecdd287f9b1a8502f88a44a7a97be8a70f",
+        "references/prepress-and-grid-specs.md": "49fcccb63756a43c35d5563a97b8b7c002a1e348f839502289f3c4433cec2d72",
+        "references/subject-blueprints.md": "a3fa73439d6da7c612a9fc0bf75dea87865a5dd3570a89009aa576fe67503675",
+        "SKILL.md": "8bf3a789cbca50ac2e97bcdd57826a07e338e18def3fddd7a1be442a5df3adb3",
+        "templates/journal.json": "961c4e77c58a3a8d6dac7f0f96f143a8c7efa130a0550151c1f1cd2b774a2bb8",
+        "templates/sequence.json": "c579b66424a6a8eaed7faf0254fb79093b83c96a4ad7ad284b664b4d814d0ffd"
+      }
     }
   ]
 }

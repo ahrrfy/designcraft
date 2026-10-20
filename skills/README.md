@@ -1,6 +1,6 @@
 # Portable DesignCraft skills
 
-25 importable data packages accompany the native AI production runtime. Import a
+26 importable data packages accompany the native AI production runtime. Import a
 package folder from **AI Production and Skills → Skills**. The host validates the
 command allowlist, parameters and native sample before automatic activation for a
 matching task. A successful technical sample never approves a production batch.
@@ -11,6 +11,7 @@ matching task. A successful technical sample never approves a production batch.
 | `kg-oxford-cambridge-style` | Original curriculum architecture with ten editable page families; publisher names describe references, not endorsement or certification |
 | Eight `kg-*` guidance packages | Vocabulary/story layout, CPA thinking, phonics/handwriting, sensory colour, workbook print, integrated language skills, projects and computing |
 | `kg-international-curriculum-architect` | Suggested unit and lesson outlines, progression and connected activities; preserves the selected design profile and requires educator review |
+| `curriculum-print-design-studio` | Subject/age progression, complete page ledger, editable sequencing and observation templates, and task-specific print checks; adapted from the supplied desktop package |
 | `native-editorial-variety` | Varied activity and information layouts within one series identity |
 | Thirteen adapted illustration/STEM/lesson packages | Native alternatives to external SVG, image and teaching workflows, with pinned provenance and retained MIT/Apache notices where available |
 

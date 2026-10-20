@@ -1416,6 +1416,7 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "native-engine-workflow" => 64,
         "arabic-english-typography" if arabic => 56,
         "school-print-preflight" if print => 48,
+        "curriculum-print-design-studio" if book && print => 41,
         "kg-garnet-ict-computing" if kg && computing => 46,
         "kg-international-curriculum-architect" if (kg || book) && architecture => 45,
         "kg-cambridge-thinking-cpa"
@@ -2639,6 +2640,22 @@ mod tests {
         assert!(skill_match_score("تَصْمِيم صَفَحَات", &entry) > 0);
         entry.description = "تَصْمِيم صَفَحَات".into();
         assert!(skill_match_score("تصميم صفحات", &entry) > 0, "Search normalization must cover catalog text too");
+    }
+
+    #[test]
+    fn curriculum_studio_routes_to_books_without_claiming_unrelated_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entry = runner.registry.catalog("school-print-preflight").remove(0);
+        entry.skill_id = "curriculum-print-design-studio".into();
+        entry.name = "Curriculum studio".into();
+        entry.description = "Subject progression and page production".into();
+        entry.revisions[0].status = RevisionStatus::Approved;
+        entry.active_revision = Some(entry.revisions[0].revision.clone());
+        for prompt in ["كتيب علوم 48 صفحة للأطفال", "Create a 48 page science curriculum workbook"] {
+            assert_eq!(choose_compatible_skills(prompt, vec![entry.clone()], &supported_commands()), vec![entry.skill_id.clone()]);
+        }
+        assert!(choose_compatible_skills("Create a business invoice", vec![entry], &supported_commands()).is_empty());
     }
 
     #[test]
