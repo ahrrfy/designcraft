@@ -583,7 +583,20 @@ impl Runner<'_> {
         } else {
             profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
         };
-        let mut system = production_system(catalog, skills, request.settings.output_mode, current_document)?;
+        // Adaptive commands are planned against the actual document, not compiled
+        // from these fixed templates. Keep the host snapshots intact and omit only
+        // their unused executable examples from this model-context copy.
+        let mut planner_skills = skills.to_vec();
+        if adaptive_layout {
+            for skill in &mut planner_skills {
+                skill.templates.clear();
+            }
+        }
+        let mut system =
+            production_system(catalog, &planner_skills, request.settings.output_mode, current_document || adaptive_layout, adaptive_layout)?;
+        if adaptive_layout {
+            system.push_str("\nADAPTIVE SCRIPT/PRINT LAYOUT: the explicit page script and actual document geometry override profile page_mm, margin_mm and fixed example compositions. Keep the pinned profile's visual identity and complete guidance while constructing the required native page content. Executable template examples remain local host inputs and are not required for this adaptive command planner.");
+        }
         if let Some(scope) = scope {
             system.push_str(&format!("\nBATCH SCOPE IS MANDATORY: create only spreads {}..{} (exclusive end); every object needs explicit spread; every object/story reference must name an earlier result created in this batch. No page/global/style/swatches operations. Render every requested page natively before the human proof checkpoint.",scope.start,scope.start.saturating_add(scope.count)));
         }
@@ -596,6 +609,9 @@ impl Runner<'_> {
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
         let mut document_context = context.clone();
+        if current_document || adaptive_layout {
+            opened_document_geometry(&mut document_context, base)?;
+        }
         if request.settings.facing_pages
             && let Some(scope) = scope
         {
@@ -1312,6 +1328,10 @@ fn project_image_requests(
 
 /// Repeated shared reference bodies are sent once, without dropping ownership or pins.
 pub(crate) fn compact_skill_guidance(skills: &[SkillSnapshot]) -> Result<String, String> {
+    compact_skill_guidance_limit(skills, 32 * 1024)
+}
+
+fn compact_skill_guidance_limit(skills: &[SkillSnapshot], limit: usize) -> Result<String, String> {
     let mut bodies: BTreeMap<String, &str> = BTreeMap::new();
     let mut entries = Vec::new();
     for skill in skills {
@@ -1326,7 +1346,7 @@ pub(crate) fn compact_skill_guidance(skills: &[SkillSnapshot]) -> Result<String,
         }
         entries.push(json!({"id":skill.skill_id,"revision":skill.revision,"instructions":skill.instructions,"references":references,"reference_hashes":skill.reference_hashes}));
     }
-    bounded_json(&json!({"skills":entries,"reference_bodies":bodies}), 32 * 1024)
+    bounded_json(&json!({"skills":entries,"reference_bodies":bodies}), limit)
 }
 
 fn arabic_vowel_mark(c: char) -> bool {
@@ -1558,9 +1578,28 @@ fn context_has_vocalized_copy(context: &Value) -> bool {
     context.get("approvedPageBriefs").and_then(Value::as_array).is_some_and(|briefs| briefs.iter().any(|brief| brief.get(1).is_some_and(vocalized)))
 }
 
-fn production_system(catalog: &Value, skills: &[SkillSnapshot], mode: OutputMode, current_document: bool) -> Result<String, String> {
+fn production_system(
+    catalog: &Value,
+    skills: &[SkillSnapshot],
+    mode: OutputMode,
+    current_document: bool,
+    adaptive_layout: bool,
+) -> Result<String, String> {
     let native_catalog = compact_catalog(catalog)?;
-    let instructions = bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?;
+    let instructions = if adaptive_layout {
+        // Preserve every instruction, reference owner/hash and revision while
+        // sending a shared reference body once, as task admission already does.
+        let guidance: Value = serde_json::from_str(&compact_skill_guidance_limit(skills, 64 * 1024)?).map_err(|error| error.to_string())?;
+        let profiles: Vec<_> = skills
+            .iter()
+            .filter_map(|skill| {
+                skill.design_profile.as_ref().map(|profile| json!({"skill_id":skill.skill_id,"revision":skill.revision,"design_profile":profile}))
+            })
+            .collect();
+        bounded_json(&json!({"guidance":guidance,"profiles":profiles}), 64 * 1024)?
+    } else {
+        bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?
+    };
     let image_policy = match mode {
         OutputMode::NativeOnly => "NATIVE ONLY: images must be empty. Do not use file.place or any raster commands.".into(),
         OutputMode::NativeWithImages => {
@@ -5132,5 +5171,102 @@ mod tests {
             runner.generic_production_plan(&request, &json!({}), &catalog(), &skills, session.doc().unwrap(), &session.prefs, None).unwrap_err();
         assert!(error.contains("safe margin"), "{error}");
         assert_eq!(std::fs::read_dir(fresh.path()).unwrap().count(), 0, "Invalid fresh geometry must never be cached, including planning-only mode");
+    }
+
+    #[test]
+    fn adaptive_explicit_script_omits_large_template_examples_but_keeps_exact_pinned_guidance() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let body = "AUTHORITATIVE_SHARED_REFERENCE ".repeat(900);
+        let mut style = text_fit_style();
+        style.instructions = "EXACT_ORIGINAL_STYLE_INSTRUCTION".into();
+        style.revision = "immutable-style-revision".into();
+        style.references.insert("references/style.md".into(), body.clone());
+        style.reference_hashes.insert("references/style.md".into(), "original-reference-digest".into());
+        style.design_profile.as_mut().unwrap().name = "ORIGINAL_PROFILE_IDENTITY".into();
+        for actions in style.templates.values_mut() {
+            for action in actions.iter_mut().filter(|action| action.command == "object.label") {
+                action.params["label"] = json!("UNUSED_NATIVE_TEMPLATE_EXAMPLE".repeat(8));
+            }
+        }
+        crate::template_plan::preflight(&style, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
+        let mut support = style.clone();
+        support.skill_id = "support-guidance".into();
+        support.revision = "immutable-support-revision".into();
+        support.instructions = "EXACT_SUPPORT_INSTRUCTION".into();
+        support.templates.clear();
+        support.design_profile = None;
+        let skills = vec![style, support];
+        let original = serde_json::to_value(&skills).unwrap();
+        assert!(serde_json::to_vec(&skills).unwrap().len() > 64 * 1024);
+        assert!(compact_skill_guidance(&skills).unwrap().len() < 32 * 1024);
+        struct InspectAdaptive(std::cell::Cell<u32>);
+        impl Provider for InspectAdaptive {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                self.0.set(self.0.get() + 1);
+                for preserved in [
+                    "EXACT_ORIGINAL_STYLE_INSTRUCTION",
+                    "EXACT_SUPPORT_INSTRUCTION",
+                    "ORIGINAL_PROFILE_IDENTITY",
+                    "immutable-style-revision",
+                    "immutable-support-revision",
+                    "original-reference-digest",
+                ] {
+                    assert!(request.system.contains(preserved), "Lost pinned guidance: {preserved}");
+                }
+                assert_eq!(request.system.matches("AUTHORITATIVE_SHARED_REFERENCE").count(), 900, "Shared reference bodies must not be duplicated");
+                assert!(!request.system.contains("UNUSED_NATIVE_TEMPLATE_EXAMPLE"));
+                assert!(request.system.contains("CURRENT DOCUMENT GEOMETRY"));
+                assert!(!request.system.contains("Preserve page_mm and margin_mm"));
+                let input: Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["document"]["pageWidth"].as_f64(), Some(720.0));
+                assert_eq!(input["document"]["pageGeometry"][0]["margins"]["inside"].as_f64(), Some(51.0));
+                Err("Adaptive context reached the selected provider".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No image generation".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let provider = InspectAdaptive(std::cell::Cell::new(0));
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request=TaskRequest{prompt:"### PAGE 01 — Ownership\n* **English Print Copy (LTR):**\n > My book\n### PAGE 02 — Guide\n* **English Print Copy (LTR):**\n > Teacher guide\n".into(),settings:settings.clone(),skill_ids:vec![],auto_select_skills:false,target:designcraft_ai_types::protocol::TaskTarget::NewA4{pages:2},export_directory:None};
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":720,"height":960,"pages":2,"facingPages":false,"margins":51})).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let error = runner
+            .production(
+                request,
+                json!({"batch_scope":{"start":0,"count":2}}),
+                catalog(),
+                skills.clone(),
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("Adaptive context reached"), "{error}");
+        assert_eq!(provider.0.get(), 1);
+        assert_eq!(serde_json::to_value(&skills).unwrap(), original, "Host snapshots must remain immutable");
     }
 }
