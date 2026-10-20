@@ -13,7 +13,7 @@ fn main() {
         return;
     }
     let mut res = winresource::WindowsResource::new();
-    res.set_icon("../../assets/app-icon/designcraft.ico")
+    res.set_icon(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/app-icon/designcraft.ico"))
         .set("ProductName", "Smart Design")
         .set("FileDescription", "Smart Design page layout and AI production")
         .set("CompanyName", "Smart Design contributors")

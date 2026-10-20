@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI14 (2026-10-20): Resolve the Windows icon from the Cargo manifest directory instead of the toolkit's drive-root working directory. Native builds can require resource embedding; the preview updater also retains extensionless font-license notices from the release package.
+
 - AI13 (2026-10-20): Add the supplied curriculum print studio as a native skill, with subject/age guidance, a complete page-ledger workflow and two editable sample templates. Published previews carry a bounded, forward-only Windows update manifest with exact-commit CI proof and side-by-side installation; a live app/profile/document is never replaced. Upstream sync proposes a daily review branch while retaining fork changes.
 
 - AI12 (2026-10-20): Publish 25 portable native skill packages with per-file hashes and upstream notices, including curriculum planning guidance. The accepted science identity now has four distinct editable lesson compositions; reference-book artwork, private approvals and provider credentials remain local. Import validation and human batch-proof gates remain separate.

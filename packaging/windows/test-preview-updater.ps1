@@ -12,6 +12,8 @@ function JsonFile([string]$Path, $Value) { [IO.File]::WriteAllText($Path, ($Valu
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $source = Join-Path $testRoot 'source'
 [IO.Directory]::CreateDirectory($source) | Out-Null
+[IO.Directory]::CreateDirectory((Join-Path $source 'font-licenses')) | Out-Null
+[IO.File]::WriteAllText((Join-Path $source 'font-licenses/LICENSE-MIT'), 'Synthetic redistribution notice without a file extension.')
 foreach ($name in @('designcraft.exe', 'designcraft-cli.exe')) { [IO.File]::WriteAllText((Join-Path $source $name), ('synthetic fixture, never executable: ' + $name)) }
 $sha = 'a' * 40
 [IO.File]::WriteAllText((Join-Path $source 'SOURCE-COMMIT.txt'), $sha)

@@ -49,7 +49,8 @@ function Expand-VerifiedUpdate([string]$Archive, [string]$Destination, $Metadata
             $total += $entry.Length
             if ($entry.Length -gt 1073741824 -or $total -gt 2147483648) { throw 'Expanded archive exceeds 2 GiB.' }
             if (-not $name.EndsWith('/') -and $name -notin @('designcraft.exe', 'designcraft-cli.exe', 'NOTICE', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-FOXIT', 'ASSETS.md', 'portable.txt', 'SOURCE-COMMIT.txt', 'CI-RUN.txt', 'RUN-ME.txt', 'ai-production.ar.md') -and
-                $name -cnotmatch '^(skills|font-licenses)/[0-9A-Za-z_. /-]+\.(md|json|txt)$') { throw 'Unexpected executable or archive entry.' }
+                $name -cnotmatch '^(skills|font-licenses)/[0-9A-Za-z_. /-]+\.(md|json|txt)$' -and
+                $name -cnotmatch '^font-licenses/(?:[0-9A-Za-z_. /-]+/)?(?:OFL|LICENSE|COPYING|NOTICE|AUTHORS)[0-9A-Za-z_-]*$') { throw 'Unexpected executable or archive entry.' }
         }
         [IO.Directory]::CreateDirectory($Destination) | Out-Null
         foreach ($entry in $zip.Entries) {
