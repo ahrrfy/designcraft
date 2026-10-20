@@ -9,6 +9,9 @@ use crate::{HistoryEntry, Result, Session};
 const ID: &str = "production.apply";
 const MAX_ACTIONS: usize = 512;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
+const GROUP_ID: &str = "production.applyGroup";
+const MAX_GROUPS: usize = 1000;
+const MAX_GROUP_BYTES: usize = 512 * 1024 * 1024;
 
 fn object(fields: &[(&str, Value)], required: &[&str]) -> Value {
     json!({"type":"object", "properties": fields.iter().map(|(k,v)| (k.to_string(),v.clone())).collect::<serde_json::Map<_,_>>(),
@@ -401,25 +404,29 @@ fn check(schema: &Value, value: &Value, path: &str) -> Result<()> {
 
 // Iterative walk bounds recursion before calling the script reference resolver or cloning JSON.
 fn bounded(value: &Value) -> Result<()> {
+    bounded_limits(value, ID, MAX_BYTES, 65536, 24)
+}
+
+fn bounded_limits(value: &Value, id: &str, max_bytes: usize, max_nodes: usize, max_depth: usize) -> Result<()> {
     let mut stack = vec![(value, 0usize)];
     let mut bytes = 0usize;
     let mut nodes = 0usize;
     while let Some((v, depth)) = stack.pop() {
         nodes = nodes.saturating_add(1);
-        if depth > 24 || nodes > 65536 {
-            return Err(bad(ID, "plan nesting or node limit exceeded"));
+        if depth > max_depth || nodes > max_nodes {
+            return Err(bad(id, "plan nesting or node limit exceeded"));
         }
         match v {
             Value::String(s) => bytes = bytes.saturating_add(s.len()),
             Value::Array(a) => {
                 if a.len() > 65536 {
-                    return Err(bad(ID, "array too large"));
+                    return Err(bad(id, "array too large"));
                 }
                 stack.extend(a.iter().map(|x| (x, depth + 1)));
             }
             Value::Object(o) => {
                 if o.len() > 128 {
-                    return Err(bad(ID, "object too large"));
+                    return Err(bad(id, "object too large"));
                 }
                 for (key, x) in o {
                     bytes = bytes.saturating_add(key.len());
@@ -428,8 +435,8 @@ fn bounded(value: &Value) -> Result<()> {
             }
             _ => {}
         }
-        if bytes > MAX_BYTES {
-            return Err(bad(ID, "plan byte limit exceeded"));
+        if bytes > max_bytes {
+            return Err(bad(id, "plan byte limit exceeded"));
         }
     }
     Ok(())
@@ -774,9 +781,14 @@ pub fn validate_actions(s: &Session, p: &Value) -> Result<Value> {
 /// Atomic publication, with cooperative cancellation checked between actions and before commit.
 /// This public helper also records exactly one undo entry when called outside the registry.
 pub fn apply_actions(s: &mut Session, p: &Value, cancelled: impl FnMut() -> bool) -> Result<Value> {
-    let (mut finished, results) = draft(s, p, cancelled)?;
-    let original = s.doc()?;
+    let (finished, results) = draft(s, p, cancelled)?;
     let label = p.get("label").and_then(Value::as_str).unwrap_or("AI Production");
+    publish_draft(s, finished, label)?;
+    Ok(json!({"applied":true,"steps":results.len(),"results":results,"label":label,"documentUid":s.doc()?.uid,"revision":s.doc()?.revision}))
+}
+
+fn publish_draft(s: &mut Session, mut finished: crate::DocState, label: &str) -> Result<()> {
+    let original = s.doc()?;
     finished.history = original.history.clone();
     if !std::sync::Arc::ptr_eq(&finished.doc, &original.doc) {
         crate::record_undo(
@@ -787,7 +799,79 @@ pub fn apply_actions(s: &mut Session, p: &Value, cancelled: impl FnMut() -> bool
     *s.doc_mut()? = finished;
     s.typing_format = None;
     s.reset_find_scope();
-    Ok(json!({"applied":true,"steps":results.len(),"results":results,"label":label,"documentUid":s.doc()?.uid,"revision":s.doc()?.revision}))
+    Ok(())
+}
+
+/// Publish a human review group atomically. Every chunk retains the single-plan bounds and
+/// capabilities, including chunk-local `$N` references; no intermediate draft reaches `s`.
+/// Cancellation or a later chunk's error leaves the live document and its history untouched.
+pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<Value> {
+    let params = p.as_object().ok_or_else(|| bad(GROUP_ID, "parameters must be an object"))?;
+    for key in params.keys() {
+        if !["chunks", "outputMode", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi"].contains(&key.as_str()) {
+            return Err(bad(GROUP_ID, format!("unknown parameter `{key}`")));
+        }
+    }
+    let chunks = p
+        .get("chunks")
+        .and_then(Value::as_array)
+        .filter(|chunks| !chunks.is_empty() && chunks.len() <= MAX_GROUPS)
+        .ok_or_else(|| bad(GROUP_ID, "chunks must contain 1 to 1000 plans"))?;
+    // Two outer levels enclose the same per-plan shape: `chunks` and each chunk object.
+    bounded_limits(p, GROUP_ID, MAX_GROUP_BYTES, MAX_GROUPS * 65536, 26)?;
+    if let Some(label) = p.get("label")
+        && !label.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 256)
+    {
+        return Err(bad(GROUP_ID, "label must contain 1 to 256 bytes"));
+    }
+    let original = s.doc()?;
+    if original.interaction.is_some() || original.preview_stash.is_some() || s.tool.composing() {
+        return Err(bad(GROUP_ID, "finish the current interaction or preview first"));
+    }
+    for (key, actual) in [("expectedDocumentUid", original.uid), ("expectedRevision", original.revision)] {
+        if let Some(v) = p.get(key)
+            && v.as_u64() != Some(actual)
+        {
+            return Err(bad(GROUP_ID, format!("{key}: document changed while generation was pending")));
+        }
+    }
+    let mut work = Session::new();
+    work.cache = s.cache.clone();
+    work.prefs = s.prefs.clone();
+    work.docs.push(original.clone());
+    work.active = Some(0);
+    work.in_undo_step = true;
+    let mut results = Vec::with_capacity(chunks.len());
+    let mut steps = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if cancelled() {
+            return Err(bad(GROUP_ID, "production cancelled"));
+        }
+        bounded(chunk)?;
+        let chunk = chunk.as_object().ok_or_else(|| bad(GROUP_ID, format!("chunk {index}: expected an object")))?;
+        if let Some(key) = chunk.keys().find(|key| key.as_str() != "commands" && key.as_str() != "label") {
+            return Err(bad(GROUP_ID, format!("chunk {index}: unknown parameter `{key}`")));
+        }
+        let mut chunk_params = serde_json::Map::new();
+        for key in ["outputMode", "requirePreflight", "minPpi"] {
+            if let Some(value) = p.get(key) {
+                chunk_params.insert(key.into(), value.clone());
+            }
+        }
+        chunk_params.extend(chunk.clone());
+        let (finished, chunk_results) = draft(&work, &Value::Object(chunk_params), &mut cancelled)?;
+        *work.doc_mut()? = finished;
+        steps = steps.saturating_add(chunk_results.len());
+        results.push(chunk_results);
+    }
+    if cancelled() {
+        return Err(bad(GROUP_ID, "production cancelled"));
+    }
+    let label = p.get("label").and_then(Value::as_str).unwrap_or("AI Production Group");
+    publish_draft(s, work.doc()?.clone(), label)?;
+    Ok(
+        json!({"applied":true,"groups":results.len(),"steps":steps,"results":results,"label":label,"documentUid":s.doc()?.uid,"revision":s.doc()?.revision}),
+    )
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -795,6 +879,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "production.catalog","AI Production Commands",[],None,"{} → vetted commands with paramsSchema and examples",always,|_,_| Ok(catalog())),
         cmd!(query "production.validate","Validate AI Production",[],None,"{commands: [{command, params}], outputMode, allowedCommands?, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool (default false; refuse error-level issues before publication), minPpi?: 150 (1 to 2400)} → {valid, steps, results}",has_doc,|s,p| validate_actions(s,p)),
         cmd!(noundo "production.apply","Apply AI Production",[],None,"{commands: [{command, params}], outputMode, allowedCommands?, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool (default false; refuse error-level issues before publication), minPpi?: 150 (1 to 2400)} → {applied, steps, results}",has_doc,|s,p| apply_actions(s,p,|| false)),
+        cmd!(noundo "production.applyGroup","Apply AI Production Group",[],None,"{chunks: [{commands: [{command, params}], label?}] (1 to 1000 chunks, at most 512 commands each; references reset per chunk), outputMode, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool, minPpi?: 150 (1 to 2400)} → {applied, groups, steps, results: [chunk results], label, documentUid, revision}",has_doc,|s,p| apply_action_groups(s,p,|| false)),
     ]
 }
 
@@ -820,6 +905,142 @@ mod tests {
             {"command":"story.setDirection","params":{"story":"$0.story","direction":"rightToLeft"}}
         ]))
     }
+
+    fn grouped_plan() -> Value {
+        let chunks: Vec<_> = ["First chunk", "Second chunk"]
+            .into_iter()
+            .map(|label| {
+                let mut commands = vec![
+                    json!({"command":"frame.create","params":{"rect":[36,36,72,72],"caret":false}}),
+                    json!({"command":"object.label","params":{"ids":["$0.id"],"label":label}}),
+                ];
+                commands.extend((2..300).map(|_| json!({"command":"selection.set","params":{"ids":[]}})));
+                json!({"commands":commands,"label":label})
+            })
+            .collect();
+        json!({"outputMode":"native_only","chunks":chunks,"label":"Complete review group"})
+    }
+
+    #[test]
+    fn grouped_production_publishes_over_512_actions_with_independent_references_and_one_undo() {
+        let mut s = session();
+        s.execute("layout.pages.insert", &json!({"count":3})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let result = s.execute("production.applyGroup", &grouped_plan()).unwrap();
+        assert_eq!((result["groups"].as_u64(), result["steps"].as_u64()), (Some(2), Some(600)));
+        let finished = s.doc().unwrap();
+        assert_eq!(finished.doc.page_count(), before.doc.page_count(), "requested pages are preserved");
+        let labels: Vec<_> = finished.doc.spreads.iter().flat_map(|sp| sp.items.iter()).map(|it| it.label.as_str()).collect();
+        assert_eq!(labels, ["First chunk", "Second chunk"], "$0 starts again in each chunk");
+        assert_eq!(finished.history.undo.len(), before.history.undo.len() + 1);
+        assert_eq!(finished.history.undo.last().unwrap().label, "Complete review group");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.spreads.iter().map(|sp| sp.items.len()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn grouped_production_later_failure_preserves_live_document_history_selection_and_revision() {
+        let mut s = session();
+        s.execute("frame.create", &json!({"rect":[0,0,50,50]})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        let mut p = grouped_plan();
+        p["chunks"][1]["commands"][1]["params"]["ids"] = json!(["$0.missing"]);
+        let error = s.execute("production.applyGroup", &p).unwrap_err();
+        assert!(!error.to_string().contains("unknown command"), "the second chunk must be validated: {error}");
+        let after = s.doc().unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &after.doc));
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.history.undo.len(), before.history.undo.len());
+        assert_eq!(after.history.redo.len(), before.history.redo.len());
+        assert_eq!(format!("{:?}", after.selection), format!("{:?}", before.selection));
+        assert_eq!(s.journal.len(), journal);
+    }
+
+    #[test]
+    fn grouped_production_rejects_stale_identity_and_preserves_single_plan_limits_and_privileges() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        for key in ["expectedDocumentUid", "expectedRevision"] {
+            let mut p = grouped_plan();
+            p[key] = json!(if key == "expectedDocumentUid" { before.uid + 1 } else { before.revision + 1 });
+            let error = s.execute("production.applyGroup", &p).unwrap_err();
+            assert!(error.to_string().contains(key), "{error}");
+            assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        }
+        let mut p = grouped_plan();
+        p["chunks"][0]["commands"] = Value::Array(vec![json!({"command":"selection.set","params":{"ids":[]}}); MAX_ACTIONS + 1]);
+        assert!(s.execute("production.applyGroup", &p).unwrap_err().to_string().contains("512"));
+        for command in ["file.open", "production.apply", "production.applyGroup", "script.run"] {
+            p["chunks"][0]["commands"] = json!([{"command":command,"params":{}}]);
+            assert!(s.execute("production.applyGroup", &p).unwrap_err().to_string().contains("not permitted"));
+            assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        }
+        let catalog = s.execute("production.catalog", &json!({})).unwrap();
+        assert!(catalog["commands"].as_array().unwrap().iter().all(|c| c["command"] != "production.applyGroup"));
+    }
+
+    #[test]
+    fn grouped_production_bounds_group_count_and_rejects_unrecognized_envelopes() {
+        let mut s = session();
+        let before = s.doc().unwrap().doc.clone();
+        let chunk = json!({"commands":[{"command":"selection.set","params":{"ids":[]}}]});
+        for chunks in [json!([]), json!(null), Value::Array(vec![chunk.clone(); 1001])] {
+            let error = s.execute("production.applyGroup", &json!({"chunks":chunks,"outputMode":"native_only"})).unwrap_err();
+            assert!(error.to_string().contains("chunks"), "{error}");
+        }
+        for p in [
+            json!({"chunks":[chunk],"outputMode":"native_only","allowedCommands":["file.open"]}),
+            json!({"chunks":[{"commands":[],"outputMode":"native_with_images"}],"outputMode":"native_only"}),
+        ] {
+            let error = s.execute("production.applyGroup", &p).unwrap_err();
+            assert!(error.to_string().contains("unknown"), "{error}");
+            assert!(Arc::ptr_eq(&before, &s.doc().unwrap().doc));
+        }
+    }
+
+    #[test]
+    fn grouped_production_preflights_later_chunks_before_publication() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let p = json!({"outputMode":"native_only","requirePreflight":true,"minPpi":150,"chunks":[
+            {"commands":[{"command":"frame.create","params":{"rect":[72,72,100,100]}}]},
+            {"commands":[{"command":"frame.create","params":{"rect":[136,136,140,140],"content":"text","text":"overset text ".repeat(100)}}]}
+        ]});
+        let error = s.execute("production.applyGroup", &p).unwrap_err();
+        assert!(error.to_string().contains("overset"), "{error}");
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        assert_eq!(s.doc().unwrap().revision, before.revision);
+        assert_eq!(s.doc().unwrap().history.undo.len(), before.history.undo.len());
+    }
+
+    #[test]
+    fn grouped_production_cancellation_after_an_entire_chunk_keeps_live_state_pristine() {
+        let mut s = session();
+        s.execute("frame.create", &json!({"rect":[0,0,50,50]})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        let mut checks = 0usize;
+        let error = apply_action_groups(&mut s, &grouped_plan(), || {
+            checks += 1;
+            checks >= 350
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(checks > 300, "the first chunk was staged before cancellation");
+        let after = s.doc().unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &after.doc));
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.history.undo.len(), before.history.undo.len());
+        assert_eq!(after.history.redo.len(), before.history.redo.len());
+        assert_eq!(format!("{:?}", after.selection), format!("{:?}", before.selection));
+        assert_eq!(s.journal.len(), journal);
+    }
+
     #[test]
     fn native_production_has_one_labeled_undo_and_validates_without_edits() {
         let mut s = session();

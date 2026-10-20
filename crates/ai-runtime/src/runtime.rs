@@ -348,8 +348,8 @@ impl ProductionRunner {
         }
         validate_settings(&task.settings)?;
         require_text_model(&task.settings)?;
-        if task.prompt.trim().is_empty() || task.prompt.len() > 32_768 {
-            return Err("Enter a prompt of at most 32768 UTF-8 bytes".into());
+        if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
+            return Err(format!("Enter a nonempty brief of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
         }
         let expected = match task.target {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
@@ -408,13 +408,13 @@ impl ProductionRunner {
         if let TaskTarget::ContinueBook = task.target {
             batch::continuation_progress(&base, profile)?;
         }
-        if let Some(profile) = profile {
+        if !matches!(task.target, TaskTarget::CurrentDocument)
+            && let Some(profile) = profile
+        {
             crate::design::check_geometry(Some(&base), &base, profile)?;
         }
         let settings = task.settings.clone();
-        if matches!(task.target, TaskTarget::ContinueBook)
-            || matches!(task.target, TaskTarget::NewA4 { pages } if settings.pages_per_batch > 0 && pages > settings.pages_per_batch)
-        {
+        if matches!(task.target, TaskTarget::ContinueBook) || matches!(task.target, TaskTarget::NewA4 { .. } if settings.pages_per_batch > 0) {
             return self.start_batches(session, task, snapshots, base, context);
         }
         let work = worker::Work::Production {
@@ -441,8 +441,8 @@ impl ProductionRunner {
         }
         validate_settings(&settings)?;
         require_text_model(&settings)?;
-        if prompt.trim().is_empty() || prompt.len() > 32_768 {
-            return Err("Enter a bounded description for the new skill".into());
+        if prompt.trim().is_empty() || prompt.len() > MAX_BRIEF_BYTES {
+            return Err(format!("Enter a nonempty description of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
         }
         let work = worker::Work::Skill {
             design_style,
@@ -681,7 +681,9 @@ impl ProductionRunner {
                 report.message = resources.message.clone();
                 self.snapshot.resources = Some(resources);
             }
-            worker::Product::BatchPlan { .. } => return Err("Batch proof result requires its gated batch job".into()),
+            worker::Product::BatchPlan { .. } | worker::Product::BatchGroup { .. } => {
+                return Err("Batch proof result requires its gated batch job".into());
+            }
             worker::Product::Models(models) => {
                 self.snapshot.models = models;
                 report.message = "Model discovery completed".into();
@@ -797,8 +799,8 @@ impl ProductionRunner {
     }
 
     fn prepare_skills_for_style(&mut self, session: &Session, prompt: &str, style_id: Option<&str>) -> Result<Vec<String>, String> {
-        if prompt.trim().is_empty() || prompt.len() > 32_768 {
-            return Err("Enter a prompt of at most 32768 UTF-8 bytes".into());
+        if prompt.trim().is_empty() || prompt.len() > MAX_BRIEF_BYTES {
+            return Err(format!("Enter a nonempty brief of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
         }
         self.snapshot.skill_warnings.clear();
         let supported = supported_commands();
@@ -1041,6 +1043,16 @@ impl ProductionRunner {
 /// budget. Command planners can omit optional sample templates, largest first;
 /// the content compiler never needs non-style command examples.
 fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> Result<Vec<SkillSnapshot>, String> {
+    if matches!(target, TaskTarget::CurrentDocument) {
+        // The opened document supplies its actual geometry. Fixed page-template
+        // commands are examples, while instructions, references and profile
+        // identity remain pinned guidance for its command planner.
+        for skill in &mut skills {
+            if skill.design_profile.is_some() {
+                skill.templates.clear();
+            }
+        }
+    }
     if matches!(target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook) && skills.iter().any(crate::template_plan::eligible) {
         for skill in &mut skills {
             if skill.design_profile.is_none() {
@@ -1560,8 +1572,8 @@ fn validate_settings(settings: &AiSettings) -> Result<(), String> {
     if settings.text_model.provider == ProviderKind::Ollama && settings.budget.max_output_tokens >= settings.resources.context_tokens {
         return Err("Ollama output token limit must be smaller than the local context window".into());
     }
-    if settings.pages_per_batch > 32 {
-        return Err("Batch size must be 1–32 pages, or zero for a short one-shot task".into());
+    if settings.pages_per_batch > 1000 {
+        return Err("Human review groups must contain 1–1000 pages, or zero for a short one-shot task".into());
     }
     validate_endpoint(&settings.text_model)?;
     validate_endpoint(&settings.image_model)?;
@@ -1742,6 +1754,192 @@ mod tests {
         }
     }
 
+    fn automatic_template_batch_fixture() -> (tempfile::TempDir, ProductionRunner) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/kg-oxford-cambridge-style");
+        let revision = runner.registry.import_folder(source, Provenance::default()).unwrap();
+        // Isolated test evidence avoids font-dependent sample rendering. This
+        // approval exists only in this temporary fixture registry.
+        let artifact = directory.path().join("synthetic-capacity-review.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255])).save(&artifact).unwrap();
+        runner
+            .registry
+            .approve(
+                &revision.skill_id,
+                &revision.revision,
+                ApprovalEvidence {
+                    reviewer: "Synthetic capacity test".into(),
+                    sample_artifact: artifact,
+                    executed_actions: runner.registry.sample_actions(&revision.skill_id, &revision.revision).unwrap(),
+                    supported_commands: supported_commands(),
+                    notes: "Synthetic admission fixture; no human proof approval or provider request.".into(),
+                },
+            )
+            .unwrap();
+        let pinned = runner.registry.snapshot(&revision.skill_id, &[]).unwrap();
+        for mode in [designcraft_ai_types::OutputMode::NativeOnly, designcraft_ai_types::OutputMode::NativeWithImages] {
+            assert_eq!(crate::template_plan::capacity(&pinned, mode).unwrap(), 2);
+        }
+        (directory, runner)
+    }
+
+    fn no_provider_template_settings(requested: u32) -> AiSettings {
+        AiSettings {
+            text_model: designcraft_ai_types::ModelSelection {
+                provider: ProviderKind::Ollama,
+                model: "capacity-test-no-provider".into(),
+                endpoint: Some("http://127.0.0.1:9/".into()),
+            },
+            output_mode: designcraft_ai_types::OutputMode::NativeWithImages,
+            pages_per_batch: requested,
+            // Every reservation includes at least 1024 input tokens. This
+            // valid smaller budget prevents all provider traffic, even if
+            // the worker runs before the test inspects its pinned scope.
+            budget: BudgetSpec { token_limit: 256, max_output_tokens: 1, max_requests: 1, repair_attempts: 0, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    fn assert_automatic_template_batch(total_pages: u32, requested: u32, total_batches: u32) {
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let (_directory, mut runner) = automatic_template_batch_fixture();
+        let mut session = Session::new();
+        let request = TaskRequest {
+            prompt: "Create a complete editable kindergarten science book, preserving all requested pages.".into(),
+            settings: no_provider_template_settings(requested),
+            skill_ids: vec!["kg-oxford-cambridge-style".into()],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: total_pages },
+            export_directory: None,
+        };
+        runner.start(&mut session, request).unwrap();
+        let batch = runner.snapshot.batch.as_ref().expect("Positive review groups require proof approval even for a single group");
+        assert_eq!(batch.total_pages, total_pages, "Admission must preserve the complete book");
+        assert_eq!(batch.pages_per_batch, requested, "Internal capacity must never change the requested human review count");
+        assert_eq!(batch.total_batches, total_batches);
+        assert_eq!(batch.completed_pages, 0);
+        assert_eq!(batch.current_batch, 1);
+        let pending = runner.pending.as_ref().unwrap();
+        assert_eq!(pending.task.as_ref().unwrap().settings.pages_per_batch, requested, "Keep the user's requested preference in task evidence");
+        assert!(matches!(pending.task.as_ref().unwrap().target, TaskTarget::NewA4 { pages } if pages == total_pages));
+        assert!(session.documents().is_empty(), "Admission must not publish an unreviewed document");
+        pending.worker.cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn template_admission_48_pages_keeps_four_page_review_groups() {
+        assert_automatic_template_batch(48, 4, 12);
+    }
+
+    #[test]
+    fn template_admission_48_pages_keeps_twelve_page_review_groups() {
+        assert_automatic_template_batch(48, 12, 4);
+    }
+
+    #[test]
+    fn template_admission_48_pages_keeps_thirty_two_page_review_groups() {
+        assert_automatic_template_batch(48, 32, 2);
+    }
+
+    #[test]
+    fn template_admission_short_book_keeps_its_single_review_gate() {
+        assert_automatic_template_batch(4, 12, 1);
+    }
+
+    #[test]
+    fn template_admission_49_pages_keeps_the_review_remainder() {
+        assert_automatic_template_batch(49, 12, 5);
+    }
+
+    #[test]
+    fn template_admission_allows_requested_review_counts_above_internal_limits() {
+        assert_automatic_template_batch(48, 64, 1);
+        assert_automatic_template_batch(1000, 1000, 1);
+    }
+
+    #[test]
+    fn template_admission_preserves_long_arabic_briefs_verbatim() {
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let (_directory, mut runner) = automatic_template_batch_fixture();
+        let mut session = Session::new();
+        let prompt = "Create all 48 requested pages.\nصَمِّمْ مَنْهَجَ رِيَاضِيَّاتٍ مُتَكَامِلًا وَاحْفَظْ هَذَا النَّصَّ كَامِلًا.\n".repeat(512);
+        assert!(prompt.len() > 32_768 && prompt.len() < MAX_BRIEF_BYTES);
+        let request = TaskRequest {
+            prompt: prompt.clone(),
+            settings: no_provider_template_settings(12),
+            skill_ids: vec!["kg-oxford-cambridge-style".into()],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 48 },
+            export_directory: None,
+        };
+        runner.start(&mut session, request).unwrap();
+        let pending = runner.pending.as_ref().unwrap();
+        assert_eq!(pending.task.as_ref().unwrap().prompt, prompt);
+        assert!(session.documents().is_empty());
+        pending.worker.cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn template_admission_rejects_briefs_above_the_shared_byte_limit_before_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        let request = TaskRequest {
+            prompt: "x".repeat(MAX_BRIEF_BYTES + 1),
+            settings: no_provider_template_settings(12),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 48 },
+            export_directory: None,
+        };
+        let error = runner.start(&mut session, request).unwrap_err();
+        assert!(error.contains(&MAX_BRIEF_BYTES.to_string()), "{error}");
+        assert!(runner.pending.is_none());
+        assert!(session.documents().is_empty());
+    }
+
+    fn assert_current_document_template_guidance(has_content: bool) {
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let (_directory, mut runner) = automatic_template_batch_fixture();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":360,"height":480,"pages":2,"facingPages":false})).unwrap();
+        if has_content {
+            session.execute("frame.create", &json!({"spread":0,"rect":[20,30,100,120],"content":"unassigned"})).unwrap();
+        }
+        let original = session.doc().unwrap().clone();
+        let request = TaskRequest {
+            prompt: "Design one editable sample on page 2 of this opened document, preserving its actual geometry.".into(),
+            settings: no_provider_template_settings(12),
+            skill_ids: vec!["kg-oxford-cambridge-style".into()],
+            auto_select_skills: false,
+            target: TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        runner.start(&mut session, request).unwrap();
+        let pending = runner.pending.as_ref().unwrap();
+        assert_eq!(pending.expected, Some((original.uid, original.revision)));
+        assert!(matches!(pending.task.as_ref().unwrap().target, TaskTarget::CurrentDocument));
+        assert_eq!(pending.skills.len(), 1, "The selected style remains pinned guidance");
+        assert!(runner.snapshot.batch.is_none());
+        assert_eq!(session.documents().len(), 1);
+        let current = session.doc().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &current.doc), "Admission must not resize or edit the opened document");
+        assert_eq!((current.uid, current.revision), (original.uid, original.revision));
+        assert_eq!(current.history.undo.len(), original.history.undo.len());
+        pending.worker.cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn template_admission_current_blank_document_retains_its_actual_geometry() {
+        assert_current_document_template_guidance(false);
+    }
+
+    #[test]
+    fn template_admission_current_existing_document_retains_its_actual_geometry() {
+        assert_current_document_template_guidance(true);
+    }
+
     #[test]
     fn new_document_context_and_publication_use_the_same_pinned_profile_geometry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1884,9 +2082,12 @@ mod tests {
 
         let mut executable = native_style_context_fixture();
         executable.templates.insert("templates/required.json".into(), original.templates["templates/oversized.json"].clone());
-        assert!(
-            bounded_task_skills(vec![executable], &TaskTarget::CurrentDocument).is_err(),
-            "Command planners must retain executable profile templates"
+        let bounded = bounded_task_skills(vec![executable.clone()], &TaskTarget::CurrentDocument).unwrap();
+        executable.templates.clear();
+        assert_eq!(
+            serde_json::to_value(&bounded[0]).unwrap(),
+            serde_json::to_value(&executable).unwrap(),
+            "The current document keeps pinned style guidance without fixed page command examples"
         );
     }
 
@@ -1898,7 +2099,10 @@ mod tests {
             executable.templates.insert(format!("templates/valid-copy-{index}.json"), valid_actions.clone());
         }
         assert!(task_skill_context_bytes(std::slice::from_ref(&executable)).unwrap() > 64 * 1024);
-        assert!(bounded_task_skills(vec![executable.clone()], &TaskTarget::CurrentDocument).is_err());
+        let current = bounded_task_skills(vec![executable.clone()], &TaskTarget::CurrentDocument).unwrap();
+        assert!(current[0].templates.is_empty());
+        assert_eq!(current[0].instructions, executable.instructions);
+        assert_eq!(current[0].revision, executable.revision);
         for target in [TaskTarget::ContinueBook, TaskTarget::NewA4 { pages: 48 }] {
             let bounded = bounded_task_skills(vec![executable.clone()], &target).unwrap();
             assert_eq!(
@@ -2434,6 +2638,7 @@ mod tests {
                 endpoint: Some(endpoint),
             },
             budget: BudgetSpec { token_limit: 256_000, max_output_tokens: 512, max_requests: 1, repair_attempts: 0, ..Default::default() },
+            pages_per_batch: 0,
             ..Default::default()
         };
         let mut snapshot = runner.handle(

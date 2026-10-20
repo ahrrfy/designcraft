@@ -7,21 +7,64 @@ the result as PNG images. It speaks newline-delimited JSON-RPC 2.0 on stdin/stdo
 
 ## Register it
 
-Build the CLI (`cargo build --release -p designcraft-cli`), then:
+### From source (development)
+
+With Rust and Cargo installed, run this from the repository root:
+
+```sh
+cargo install --path apps/designcraft-cli --locked
+```
+
+Cargo copies the executable into its installation root's `bin` directory, normally
+`~/.cargo/bin` (Windows `%USERPROFILE%\.cargo\bin`). If you set `CARGO_INSTALL_ROOT`,
+Cargo's `install.root` configuration, or `CARGO_HOME`, use that installation's `bin`
+directory instead. Unlike a symlink into `target/release`, this copy survives
+`cargo clean`. Repeat the install command after source changes to update it.
+
+Ensure that directory is on `PATH`. For a default install in a POSIX shell:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+designcraft-cli --help
+```
+
+Persist the PATH setting in your shell configuration (on Windows, add the directory
+to your user Path). The **MCP client process** must inherit that PATH too; restart
+the client after changing it. A GUI-launched client may not read shell configuration.
+If it still reports `ENOENT` or "executable not found", use the absolute path to the
+installed binary in its registration instead of the bare name.
+
+### Headless and connected registration
+
+After installation, register the CLI by name:
 
 ```sh
 # Headless: an in-process engine, no window
-claude mcp add designcraft -- /path/to/target/release/designcraft-cli mcp
+claude mcp add designcraft -- designcraft-cli mcp
 
-# Drive the running desktop app (start it first with a control port)
+# Drive the running desktop app (install/start the desktop app separately)
 designcraft --control 7979
-claude mcp add designcraft-app -- /path/to/target/release/designcraft-cli mcp --connect 7979
+claude mcp add designcraft-app -- designcraft-cli mcp --connect 7979
 ```
 
 Other MCP clients use the same command line, e.g. in a JSON config:
 
 ```json
-{"mcpServers": {"designcraft": {"command": "/path/to/designcraft-cli", "args": ["mcp"]}}}
+{
+  "mcpServers": {
+    "designcraft": {
+      "command": "designcraft-cli",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+If the client cannot find the CLI on PATH, substitute the absolute installed path
+(not a path under `target/`), for example:
+
+```sh
+claude mcp add designcraft -- /absolute/install/root/bin/designcraft-cli mcp
 ```
 
 ### From an installed release
@@ -137,7 +180,9 @@ Positions in a story's text are **UTF-8 byte offsets**, not character counts: `a
 `start` / `end` of `story.replaceRange` and of `find.find` matches, the `pos` that `text.placeCaret`, `text.insert`
 and `text.move` return, a story's `length` in `get_story` and `inspect_document`, and its `overset` position in
 `get_story`. A character outside ASCII takes 2 to 4 bytes (é 2, — and は 3), so the story `はただ商店` has length 15
-and its second character starts at 3. An offset inside a character snaps back to the start of that character.
+and its second character starts at 3. An offset inside a character snaps back to the start of that character, except
+in `story.replaceRange`: there an offset inside a character, an `end` past the end of the story or a `start` after `end`
+is an error that gives the story length in bytes, and the story is left unchanged.
 
 ## Text and image fitting
 

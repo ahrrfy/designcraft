@@ -3,6 +3,9 @@ use crate::{EngineAction, ModelSelection, OutputMode, ProviderKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Full user briefs are retained verbatim; model context and spending have separate admission guards.
+pub const MAX_BRIEF_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetSpec {

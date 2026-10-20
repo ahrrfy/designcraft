@@ -1,5 +1,8 @@
 # DesignCraft roadmap
 
+- AI16 (2026-10-20): Keep the requested review group independent of bounded native/provider execution chunks, publish each group atomically with one undo, and require proof of every page before continuing. Full UTF-8 briefs up to 1 MiB share one admission limit; current-document work uses the selected open file's geometry and exposes its target in the production panel.
+- AI16 review follow-up (2026-10-20): Partition generic book reviews before provider calls as well as template-backed reviews; retain pinned guidance, cumulative budgets and atomic proof publication for large groups without a selected template.
+
 - AI15 (2026-10-20): Preserve vocalized source copy, format non-adjacent bilingual template slots through native selections, and reject oversized image batches, ambiguous source slots and model-incompatible shared-image ratios before provider spending. Planning and publication use the same pinned print geometry; continuation verifies that geometry without changing the existing book.
 
 - AI14 (2026-10-20): Resolve the Windows icon from the Cargo manifest directory instead of the toolkit's drive-root working directory. Native builds can require resource embedding; the preview updater also retains extensionless font-license notices from the release package.
@@ -208,7 +211,7 @@ DesignCraft aims at full Adobe InDesign parity — and to be better: faster, ope
 ## How far from full parity (estimate, 2026-10-04)
 
 **Breadth: ~99% weighted** (P0 core 99%, P1 100%, P2 97%) over the 275 features of the InDesign catalogue, scored
-row by row in [docs/parity.md](docs/parity.md) (`cargo xtask parity` recomputes it). Many features scored done still
+row by row in [docs/parity-checklist.md](docs/parity-checklist.md) (`cargo xtask parity` recomputes it). Many features scored done still
 lack some of InDesign's options or dialog details, so **overall parity including depth is about 83%**.
 
 **Remaining work: about 170 wall-clock hours of a single Claude Opus 5.5 agent** (±30%), or roughly 60–85 hours with
@@ -373,6 +376,13 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 Newest first.
 
 - **2026-10-18** · Smart Design fork: human-reviewed book batches (default 4, maximum 32 pages per batch; up to 1,000 pages), cumulative budgets, pinned skills, endpoint-scoped Windows credentials, bounded local inference and owned Ollama lifecycle. Frozen PDF proofs retain fonts/color/queue settings and require human print submission. Four builtin skills remain drafts. Original eight-page native fixture round-tripped through installed InDesign 21.2 with matching content and 99 object bounds; Script labels are lost. Upstream review/CI/unsigned preview workflows are present; current-head CI/release and physical paper acceptance remain pending. No measured savings or pre-alpha stage change. [Arabic operating guide](docs/ai-production.ar.md).
+
+- **2026-10-16** · Type › Reload Fonts (`font.reload`): fonts installed, edited or removed while DesignCraft runs are read again without a restart, and the open documents recompose with them (#328, #547). An edited font file is noticed by its length and modification time; bundled, added and document fonts stay as they are. InDesign does this by itself, so noticing changes automatically is still open (gap 6). No readiness percentage change.
+- **2026-10-16** · Parents can be deleted from their Pages-panel context menu or `layout.parents.delete {id}`. Applied-page and based-on references are cleared, local override copies survive, and Undo restores the parent. Addresses the deletion portion of #956; no readiness percentage change.
+- **2026-10-17** · File › Package writes the document's and the IDML's links relative to the package (`Links/logo.png`, `file:Links/logo.png`), so a package holds no path from the machine that made it; opening a document resolves them to the files beside it. Links › Copy Link(s) To still links by full path. (#340). No readiness percentage change.
+- **2026-10-18** · View › Screen Mode: Bleed and Slug do what they say. Both were selectable from the toolbar, the View menu and `view.screenMode` but drew the canvas exactly as Normal did, guides and all; they are preview modes now, and what each page shows reaches the bleed box or the slug box instead of stopping at the trim. The slug guide is drawn as well, in the Slug colour from Preferences › Guides & Pasteboard, which nothing had read. No readiness percentage change.
+- **2026-10-17** · Object strokes reject malformed types and unknown type fields before changing the document; command help lists every stroke kind and its required fields. No readiness percentage change.
+- **2026-10-17** · Docs: documented a persistent source CLI install with Cargo, MCP-client PATH setup and bare-name server registration in `docs/mcp.md`. No readiness percentage change.
 
 - **2026-10-16** · Threading: the loaded text cursor threads into a text frame inside a group (it hit the group and showed it could not thread); a plain click still selects the group (#1075). Gap 27 closed. No readiness percentage change.
 - **2026-10-16** · Greek text hyphenates. The patterns were never compiled in, so Greek set unhyphenated however narrow the column; `"Greek"`, `"Greek: Greece"`, `el` and `el-GR` all resolve now and ανθρωπος breaks αν-θρω-πος. They are the monotonic patterns (hyph-el-monoton, Dimitrios Filippou, under MIT), which is what polytonic text hyphenates by too. Five of InDesign's ~40 hyphenation languages. No readiness percentage change.

@@ -5,7 +5,7 @@ use designcraft_compose as compose;
 use designcraft_doc::{Content, Document, Item, SpreadRef};
 use designcraft_engine::doc::Selection;
 use designcraft_geom::{Affine, Point, Rect as DRect, Vec2 as DVec2};
-use designcraft_tools::{CanvasLayout, Cursor, Mods, Overlay, PointerEvent, PointerKind, ToolKey};
+use designcraft_tools::{CanvasLayout, Cursor, Mods, Overlay, PointerEvent, PointerKind, SpreadSlot, ToolKey};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
 
@@ -477,7 +477,10 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         layout.slots = layout.slots.get(cur).copied().into_iter().collect();
     }
     let painter = ui.painter_at(screen);
-    let preview = matches!(app.ui.screen_mode, ScreenMode::Preview | ScreenMode::Presentation);
+    // Preview, Bleed, Slug and Presentation are all preview modes: guides, frame edges and the
+    // other non-printing marks go, and only the shown area of each page keeps its content. They
+    // differ in how much of the page shows, which `shown_area` gives.
+    let preview = app.ui.screen_mode != ScreenMode::Normal;
     let bg = if app.ui.screen_mode == ScreenMode::Presentation { Color32::BLACK } else { t.pasteboard };
     painter.rect_filled(screen, 0.0, bg);
     // Page shadow: a hard 1.5 pt black offset on the right and bottom (InDesign 2026).
@@ -514,9 +517,9 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         }
         mesh.indices.extend([0, 1, 2, 0, 2, 3]);
         if preview {
-            // Preview: only page areas (trim) show content.
+            // Preview: only the shown area of each spread keeps its content.
             for slot in &layout.slots {
-                let r = xf.rect(slot.bounds);
+                let r = shown_area(app, &doc, &xf, slot);
                 painter.with_clip_rect(r.intersect(screen)).add(egui::Shape::mesh(mesh.clone()));
             }
         } else {
@@ -933,6 +936,20 @@ fn baseline_grid_lines(start: f64, increment: f64, height: f64) -> impl Iterator
     (0..MAX_BASELINES).map(move |n| first + n as f64 * step).take_while(move |y| *y < height)
 }
 
+/// What a screen mode shows of a spread, in screen coordinates: the trim, or out to the bleed or
+/// the slug box. Slug shows every printing element, so the bleed as well — and a slug narrower
+/// than the bleed does not pull the edge back in.
+fn shown_area(app: &DesignApp, doc: &Document, xf: &Xf, slot: &SpreadSlot) -> Rect {
+    let trim = xf.rect(slot.bounds);
+    let boxes: &[[f64; 4]] = match app.ui.screen_mode {
+        ScreenMode::Bleed => &[doc.settings.bleed],
+        ScreenMode::Slug => &[doc.settings.bleed, doc.settings.slug],
+        _ => &[],
+    };
+    let Some(sp) = doc.spread(slot.spread) else { return trim };
+    boxes.iter().filter_map(|o| sp.outset_rect(*o)).map(|r| xf.rect(slot.xf.transform_rect_bbox(r))).fold(trim, |a, b| a.union(b))
+}
+
 fn draw_guides(app: &DesignApp, painter: &egui::Painter, xf: &Xf, doc: &Document, layout: &CanvasLayout, t: &Tokens) {
     let s = &doc.settings;
     for slot in &layout.slots {
@@ -941,11 +958,14 @@ fn draw_guides(app: &DesignApp, painter: &egui::Painter, xf: &Xf, doc: &Document
         let m = slot.xf;
         let pt = |p: Point| xf.to_screen(m * p);
         let rect = |r: DRect| xf.rect(m.transform_rect_bbox(r));
-        // Bleed: one rectangle around the spread (inside bleed only applies at the spread's outer edges).
-        if app.ui.guides
-            && let Some(br) = sp.bleed_rect(s.bleed)
-        {
-            painter.rect_stroke(rect(br), 0.0, Stroke::new(hair(painter), c32(s.bleed_color)), StrokeKind::Middle);
+        // Bleed, then slug: one rectangle each around the spread (the inside offset only applies
+        // at the spread's outer edges).
+        if app.ui.guides {
+            for (r, color) in [(sp.bleed_rect(s.bleed), s.bleed_color), (sp.slug_rect(s.slug), s.slug_color)] {
+                if let Some(r) = r {
+                    painter.rect_stroke(rect(r), 0.0, Stroke::new(hair(painter), c32(color)), StrokeKind::Middle);
+                }
+            }
         }
         let pasteboard = m.inverse().transform_rect_bbox(layout.pasteboard);
         for (pi, p) in sp.pages.iter().enumerate() {
@@ -3025,6 +3045,81 @@ mod tests {
         for abs in 0..st.doc.page_count() {
             let want = xf.rect(layout.page_rect(&st.doc, abs).unwrap());
             assert!(paper.iter().any(|r| (r.min - want.min).length() < 0.01 && (r.max - want.max).length() < 0.01), "page {abs}");
+        }
+    }
+
+    /// Bleed and Slug are preview modes: like Preview they hide the guides, and what the page
+    /// shows widens to the bleed or the slug box. The slug guide is drawn in Normal, in its own
+    /// colour, beside the bleed guide.
+    #[test]
+    fn bleed_and_slug_are_preview_modes_that_show_their_area() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", serde_json::json!({"bleed": 9, "slug": 18})).unwrap();
+        let strokes = |app: &mut DesignApp, want: [u8; 3]| -> usize {
+            let ctx = egui::Context::default();
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0))), ..Default::default() };
+                let mut out = ctx.run_ui(raw, |ui| show(app, ui));
+                out.textures_delta.clear();
+                shapes = out.shapes;
+            }
+            let want = c32(want);
+            shapes.iter().filter(|c| matches!(&c.shape, egui::Shape::Rect(s) if s.stroke.color == want)).count()
+        };
+        let s = app.session.active().unwrap().doc.settings.clone();
+        // Normal draws every guide, the slug's among them.
+        app.ui.screen_mode = ScreenMode::Normal;
+        assert!(strokes(&mut app, s.margin_color) > 0, "Normal draws the margin guide");
+        assert!(strokes(&mut app, s.bleed_color) > 0, "Normal draws the bleed guide");
+        assert!(strokes(&mut app, s.slug_color) > 0, "Normal draws the slug guide");
+        // Every preview mode hides them.
+        for mode in [ScreenMode::Preview, ScreenMode::Bleed, ScreenMode::Slug, ScreenMode::Presentation] {
+            app.ui.screen_mode = mode;
+            assert_eq!(strokes(&mut app, s.margin_color), 0, "{mode:?} hides the margin guide");
+            assert_eq!(strokes(&mut app, s.slug_color), 0, "{mode:?} hides the slug guide");
+        }
+    }
+
+    /// Each preview mode's shown area: Preview stops at the trim, Bleed reaches the bleed box and
+    /// Slug the slug box. A slug narrower than the bleed never pulls the edge back in.
+    #[test]
+    fn shown_area_widens_to_the_bleed_and_slug_boxes() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", serde_json::json!({"bleed": 9, "slug": 18})).unwrap();
+        let doc = app.session.active().unwrap().doc.clone();
+        let layout = CanvasLayout::new(&doc, false);
+        let xf = Xf::new(Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0)), &View::default());
+        let slot = &layout.slots[0];
+        let area = |app: &mut DesignApp, mode| {
+            app.ui.screen_mode = mode;
+            shown_area(app, &doc, &xf, slot)
+        };
+        let trim = xf.rect(slot.bounds);
+        assert_eq!(area(&mut app, ScreenMode::Preview), trim, "Preview stops at the trim");
+        assert_eq!(area(&mut app, ScreenMode::Presentation), trim, "Presentation stops at the trim");
+        let bleed = area(&mut app, ScreenMode::Bleed);
+        let slug = area(&mut app, ScreenMode::Slug);
+        assert!(bleed.contains_rect(trim) && bleed != trim, "Bleed reaches past the trim");
+        assert!(slug.contains_rect(bleed) && slug != bleed, "Slug reaches past the bleed");
+        // 9 pt of bleed and 18 pt of slug at this zoom, on every edge.
+        let grew = |r: Rect, pt: f64| {
+            let d = (pt * xf.zoom) as f32;
+            (r.min - trim.min + vec2(d, d)).length() < 0.01 && (r.max - trim.max - vec2(d, d)).length() < 0.01
+        };
+        assert!(grew(bleed, 9.0), "Bleed grows by the bleed: {bleed:?}");
+        assert!(grew(slug, 18.0), "Slug grows by the slug: {slug:?}");
+        // A slug inside the bleed: Slug still shows every printing element, so the bleed too.
+        app.run("file.new", serde_json::json!({"bleed": 18, "slug": 9})).unwrap();
+        let doc = app.session.active().unwrap().doc.clone();
+        app.ui.screen_mode = ScreenMode::Slug;
+        assert!(grew(shown_area(&app, &doc, &xf, slot), 18.0), "the wider of the two boxes wins");
+        // No bleed and no slug: nothing to widen to.
+        app.run("file.new", serde_json::json!({})).unwrap();
+        let doc = app.session.active().unwrap().doc.clone();
+        for mode in [ScreenMode::Bleed, ScreenMode::Slug] {
+            app.ui.screen_mode = mode;
+            assert_eq!(shown_area(&app, &doc, &xf, slot), trim, "{mode:?} without a bleed or slug");
         }
     }
 

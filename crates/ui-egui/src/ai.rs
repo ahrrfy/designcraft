@@ -11,6 +11,13 @@ use serde_json::Value;
 /// Never persisted, and never included in a debug dump.
 #[derive(Clone, Default)]
 struct Secret(String);
+
+struct OpenDocument {
+    index: usize,
+    title: String,
+    pages: usize,
+    continuable: bool,
+}
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[redacted]")
@@ -43,7 +50,12 @@ impl BatchReviewKey {
         if reports.next().is_some() {
             return None;
         }
-        if current.proof_paths.len() != current.proof_sha256.len() || current.proof_paths.len() > 34 || !(1..=32).contains(&current.page_count) {
+        let max_proofs =
+            usize::try_from(current.page_count).ok()?.checked_add(usize::try_from(current.page_count.div_ceil(32)).ok()?)?.checked_add(1)?;
+        if current.proof_paths.len() != current.proof_sha256.len()
+            || current.proof_paths.len() > max_proofs
+            || !(1..=1000).contains(&current.page_count)
+        {
             return None;
         }
         let mut pages = BTreeSet::new();
@@ -382,6 +394,11 @@ impl AiUiState {
             )
         } else if self.prompt.trim().is_empty() {
             ("Enter production instructions.", "أدخل تعليمات الإنتاج.")
+        } else if self.prompt.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES {
+            (
+                "The full brief exceeds 1 MiB. Move large reference material into skill references.",
+                "تجاوز نص التعليمات الكامل 1 ميبيبايت. انقل المراجع الكبيرة إلى مراجع المهارة.",
+            )
         } else if self.settings.text_model.model.trim().is_empty() {
             ("Choose a text model above.", "اختر نموذج النص من الحقل أعلاه.")
         } else if !self.new_document && !document {
@@ -599,6 +616,24 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     let mut open = state.open;
     let mut requests = Vec::new();
     let available = app.services.ai.is_some() && state.snapshot.available;
+    let documents: Vec<_> = app
+        .session
+        .documents()
+        .iter()
+        .enumerate()
+        .map(|(index, document)| {
+            let first_blank = document.doc.spreads.iter().position(|spread| spread.items.is_empty());
+            OpenDocument {
+                index,
+                title: document.title(),
+                pages: document.doc.page_count(),
+                continuable: document.doc.spreads.iter().all(|spread| spread.pages.len() == 1)
+                    && first_blank.is_some_and(|first| first > 0 && document.doc.spreads.iter().skip(first).all(|spread| spread.items.is_empty())),
+            }
+        })
+        .collect();
+    let mut activate_document = app.session.active_index();
+    let original_document = activate_document;
     egui::Window::new(text(a, "AI Production and Skills", "الذكاء"))
         .id(egui::Id::new("ai_production"))
         .open(&mut open)
@@ -648,7 +683,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     2 => usage(ui, &state, a),
                     3 => providers(ui, &mut state, a, available, &mut requests),
                     4 => local_ai(ui, &mut state, a, available, app.services.pick_open.is_some(), &mut requests),
-                    _ => production(ui, &mut state, a, available, app.session.active().is_some(), &mut requests),
+                    _ => production(ui, &mut state, a, available, &documents, &mut activate_document, &mut requests),
                 }
                 if !state.error.is_empty() || !state.snapshot.message.is_empty() {
                     egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Details", "التفاصيل"))).show(ui, |ui| {
@@ -663,6 +698,15 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         state.review_pointer_press = None;
     }
     app.ui.ai = state;
+    if activate_document != original_document {
+        if let Some(index) = activate_document
+            && let Err(error) = app.run("file.activate", serde_json::json!({"index":index}))
+        {
+            app.ui.ai.error = error;
+        }
+        // A document choice is never implicit authority to start a task in that same frame.
+        requests.retain(|request| !matches!(request, AiRequest::Start(_)));
+    }
     if std::mem::take(&mut app.ui.ai.pick_ollama)
         && let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ollama_executable"))
     {
@@ -874,11 +918,10 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
             if button(ui, a, "Conservative CPU (Ollama)", "معالج محافظ (Ollama)") {
                 s.settings.resources = designcraft_ai_types::LocalResourcePolicy { cpu_threads: 2, context_tokens: 4096, batch_tokens: 32, use_gpu: false, min_free_ram_mb: 2048, max_memory_percent: 75, max_image_edge: 1024, keep_alive_seconds: 0 };
                 s.settings.budget.max_output_tokens = s.settings.budget.max_output_tokens.min(2048);
-                s.settings.pages_per_batch = if s.settings.pages_per_batch == 0 { 2 } else { s.settings.pages_per_batch.min(2) };
             }
             if button(ui, a, "Standard limits", "حدود قياسية") { s.settings.resources = designcraft_ai_types::LocalResourcePolicy::default(); }
         });
-        label(ui, a, "Conservative preset: 4096 context tokens, up to 2048 output tokens and up to 2 pages per batch.", "الإعداد المحافظ: سياق 4096 رمزاً وإخراج حتى 2048 رمزاً وصفحتان كحد أقصى في كل دفعة.");
+        label(ui, a, "Conservative preset: 4096 context tokens and up to 2048 output tokens. Your review page count stays unchanged.", "الإعداد المحافظ: سياق 4096 رمزاً وإخراج حتى 2048 رمزاً. يبقى عدد صفحات مراجعتك كما اخترته.");
         let resource = &mut s.settings.resources;
         egui::Grid::new("ai_resources").num_columns(2).show(ui, |ui| {
             label(ui, a, "Ollama CPU threads", "خيوط المعالج لـOllama"); ui.add(egui::DragValue::new(&mut resource.cpu_threads).range(1..=64)); ui.end_row();
@@ -927,7 +970,15 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
     }
 }
 
-fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, document: bool, requests: &mut Vec<AiRequest>) {
+fn production(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    available: bool,
+    documents: &[OpenDocument],
+    activate_document: &mut Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
     ui.add_enabled_ui(!s.task_active(), |ui| {
         ui.horizontal_wrapped(|ui| {
             provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
@@ -987,6 +1038,30 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
                 "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
             )));
         });
+        rtl::label(
+            ui,
+            format!(
+                "{} {} / {} UTF-8 bytes",
+                text(a, "Prompt length:", "طول التعليمات:"),
+                s.prompt.len(),
+                designcraft_ai_types::protocol::MAX_BRIEF_BYTES
+            ),
+        );
+        if s.prompt.len() > 32768 {
+            rtl::label(
+                ui,
+                format!(
+                    "{} {} {}",
+                    text(a, "Conservative input budget reservation starts at", "يبدأ حجز ميزانية الإدخال التحفظي من"),
+                    s.prompt.len().saturating_add(1024),
+                    text(
+                        a,
+                        "tokens; skill/document context is additional. Actual usage comes from the provider.",
+                        "توكن؛ يضاف سياق المهارات والمستند. الاستخدام الفعلي يبلغه المزود."
+                    )
+                ),
+            );
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Current document", "المستند الحالي"))).clicked() {
                 s.new_document = false;
@@ -1007,9 +1082,33 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
             if s.new_document {
                 ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
             }
-            label(ui, a, "Pages per batch", "الصفحات في كل دفعة");
-            ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=32));
+            label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
+            ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000));
         });
+        if !s.new_document {
+            ui.horizontal_wrapped(|ui| {
+                label(ui, a, "Target document", "المستند المستهدف");
+                let selected = documents.iter().find(|document| Some(document.index) == *activate_document);
+                egui::ComboBox::from_id_salt("ai_target_document")
+                    .selected_text(selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً")))
+                    .show_ui(ui, |ui| {
+                        for document in documents {
+                            ui.selectable_value(activate_document, Some(document.index), &document.title);
+                        }
+                    });
+                if let Some(selected) = selected {
+                    rtl::label(ui, format!("{} {}", selected.pages, text(a, "pages", "صفحة")));
+                }
+            });
+            if !s.continue_book {
+                label(
+                    ui,
+                    a,
+                    "Uses this document's pages, dimensions and editable content.",
+                    "يعمل على صفحات هذا المستند ومقاساته ومحتواه القابل للتحرير.",
+                );
+            }
+        }
         if s.automatic_skills {
             label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
         }
@@ -1035,10 +1134,17 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
         label(
             ui,
             a,
-            "Each batch stops for your visual approval before another provider request.",
-            "تتوقف كل دفعة لمراجعتك البصرية قبل أي طلب جديد إلى المزود.",
+            "Your review page count stays unchanged. Internal requests build this group, then stop for your approval before the next review group.",
+            "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
         );
-        let issue = s.production_issue(available, document, a);
+        let continuation_issue = (s.continue_book
+            && !documents.iter().any(|document| Some(document.index) == *activate_document && document.continuable))
+        .then_some(text(
+            a,
+            "Select a book with completed opening pages and remaining blank pages, or use Current document to edit any open file.",
+            "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر المستند الحالي للعمل على أي ملف مفتوح.",
+        ));
+        let issue = s.production_issue(available, activate_document.is_some(), a).or(continuation_issue);
         if let Some(reason) = issue {
             rtl::label(ui, reason);
         }
@@ -1097,7 +1203,7 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
             }
         });
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save, export and print", "الحفظ والتصدير والطباعة"))).show(ui, |ui| {
-            export_print(ui, s, a, available && document, requests);
+            export_print(ui, s, a, available && activate_document.is_some(), requests);
         });
     });
     ui.separator();
@@ -1179,8 +1285,8 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             label(
                 ui,
                 a,
-                "Native template execution — one content plan; no automatic paid command repairs.",
-                "تنفيذ قوالب أصلية — تخطيط محتوى واحد، دون تصحيح أوامر مدفوع تلقائياً.",
+                "Native template execution — bounded internal plans; one complete human review group.",
+                "تنفيذ قوالب أصلية — أجزاء داخلية محدودة، ومجموعة مراجعة بشرية كاملة.",
             );
         }
     }
@@ -1934,6 +2040,73 @@ mod tests {
         );
         assert!(!state.can_approve_batch());
     }
+    #[test]
+    fn long_bilingual_composer_keeps_the_full_brief_and_uses_the_shared_limit() {
+        let mut state = AiUiState { prompt: "تعليمات المنهج Mathematics\n".repeat(4000), ..Default::default() };
+        state.settings.text_model.model = "fixture-model".into();
+        let original = state.prompt.clone();
+        assert!(original.len() > 32768);
+        assert_eq!(state.production_issue(true, false, false), None);
+        assert_eq!(state.prompt, original);
+        state.prompt = "x".repeat(designcraft_ai_types::protocol::MAX_BRIEF_BYTES + 1);
+        assert!(state.production_issue(true, false, false).is_some());
+    }
+    #[test]
+    fn local_resource_preset_keeps_the_requested_human_review_size() {
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() },
+        );
+        app.ui.ai.open = true;
+        app.ui.ai.initialized = true;
+        app.ui.ai.snapshot.available = true;
+        app.ui.ai.tab = 4;
+        app.ui.ai.settings.pages_per_batch = 12;
+        let mut harness = crate::test_window::open(app, egui::vec2(1800.0, 1500.0));
+        harness.run_steps(3);
+        harness.get_by_label("Conservative CPU (Ollama)").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().app.ui.ai.settings.pages_per_batch, 12);
+        assert_eq!(harness.state().app.ui.ai.settings.resources.cpu_threads, 2);
+    }
+    #[test]
+    fn opened_document_target_is_visible_without_creating_or_resizing_it() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":360,"height":480,"pages":3,"facingPages":false})).unwrap();
+        let mut app = DesignApp::new(session, Services::default());
+        app.ui.ai.open = true;
+        app.ui.ai.initialized = true;
+        app.ui.ai.new_document = false;
+        let mut harness = crate::test_window::open(app, egui::vec2(1200.0, 900.0));
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Target document").is_some());
+        let state = harness.state().app.session.doc().unwrap();
+        assert_eq!(state.doc.page_count(), 3);
+        assert_eq!(state.doc.settings.page_width, 360.0);
+        assert!(!state.is_dirty());
+    }
+
+    #[test]
+    fn requested_large_review_group_keeps_every_page_in_the_human_proof() {
+        let fixture = ProofFixture::new();
+        let mut batch = fixture.checkpoint.batch.clone().unwrap();
+        batch.total_pages = 64;
+        batch.pages_per_batch = 64;
+        batch.total_batches = 1;
+        batch.completed_pages = 64;
+        let report = &mut batch.batches[0];
+        report.page_count = 64;
+        report.proof_paths = vec!["document.designcraft".into(), "proof-1.pdf".into(), "proof-2.pdf".into()];
+        report.proof_paths.extend((1..=64).map(|page| format!("page-{page}.png")));
+        report.proof_sha256 = vec!["a".repeat(64); report.proof_paths.len()];
+        let key = BatchReviewKey::from_batch(&batch).expect("A complete 64-page review group must not be rejected by an internal 32-page limit");
+        assert_eq!(key.pages().count(), 64);
+        let report = &mut batch.batches[0];
+        report.proof_paths.pop();
+        report.proof_sha256.pop();
+        assert!(BatchReviewKey::from_batch(&batch).is_none(), "Every requested page still needs its own proof");
+    }
+
     #[test]
     fn callback_dispatch_and_manual_settings_survive_poll() {
         let mut app = DesignApp::new(
