@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::{DesignApp, rtl};
-use designcraft_ai_types::protocol::{AiRequest, AiSettings, AiSnapshot, BatchSnapshot, TaskRequest, TaskTarget, TokenRates};
+use designcraft_ai_types::protocol::{AiRequest, AiSettings, AiSnapshot, BatchSnapshot, ProductionDraft, TaskRequest, TaskTarget, TokenRates};
 use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind};
 use serde_json::Value;
 
@@ -16,6 +16,8 @@ struct Secret(String);
 
 struct OpenDocument {
     index: usize,
+    uid: u64,
+    path: Option<String>,
     title: String,
     pages: usize,
     remaining_pages: usize,
@@ -27,6 +29,8 @@ impl OpenDocument {
         let first_blank = (0..pages).find(|page| !document.doc.page_has_items(*page));
         Self {
             index,
+            uid: document.uid,
+            path: document.path.clone(),
             title: document.title(),
             pages,
             remaining_pages: first_blank.map_or(0, |first| pages.saturating_sub(first)),
@@ -222,6 +226,12 @@ impl BatchReviewKey {
     fn pages(&self) -> impl Iterator<Item = &(String, String)> {
         self.proofs.iter().filter(|(path, _)| path.to_ascii_lowercase().ends_with(".png"))
     }
+
+    fn same_proof_except_revision(&self, other: &Self) -> bool {
+        let mut normalized = other.clone();
+        normalized.document.1 = self.document.1;
+        self == &normalized
+    }
 }
 
 #[derive(Clone)]
@@ -237,6 +247,7 @@ pub struct AiUiState {
     prompt: String,
     new_document: bool,
     continue_book: bool,
+    restored_target_unconfirmed: bool,
     pages: u32,
     automatic_skills: bool,
     selected_skills: BTreeSet<String>,
@@ -265,6 +276,7 @@ pub struct AiUiState {
     proof_key: Option<BatchReviewKey>,
     reviewed_proofs: BTreeSet<(String, String)>,
     proof_document_version: Option<(u64, u64)>,
+    proof_validation_requested: Option<(u64, u64)>,
     proof_document_matches: bool,
     proof_binding: Option<bool>,
     proof_pair_view: bool,
@@ -310,6 +322,7 @@ impl Default for AiUiState {
             prompt: String::new(),
             new_document: true,
             continue_book: false,
+            restored_target_unconfirmed: false,
             pages: 8,
             automatic_skills: true,
             selected_skills: BTreeSet::new(),
@@ -338,6 +351,7 @@ impl Default for AiUiState {
             proof_key: None,
             reviewed_proofs: BTreeSet::new(),
             proof_document_version: None,
+            proof_validation_requested: None,
             proof_document_matches: false,
             proof_binding: None,
             proof_pair_view: true,
@@ -363,6 +377,24 @@ impl Default for AiUiState {
 }
 
 impl AiUiState {
+    fn load_production_request(&mut self, request: &TaskRequest) {
+        self.prompt = request.prompt.clone();
+        self.settings = request.settings.clone();
+        self.automatic_skills = request.auto_select_skills;
+        self.selected_skills = request.skill_ids.iter().cloned().collect();
+        self.directory = request.export_directory.clone().unwrap_or_default();
+        self.new_document = matches!(request.target, TaskTarget::NewA4 { .. });
+        self.continue_book = matches!(request.target, TaskTarget::ContinueBook);
+        if let TaskTarget::NewA4 { pages } = request.target {
+            self.pages = pages;
+        }
+        self.rates_confirmed =
+            self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
+        self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
+        self.workflow_error.clear();
+        self.restored_target_unconfirmed = false;
+    }
+
     fn accept(&mut self, snapshot: AiSnapshot) {
         if !self.initialized && snapshot.available {
             self.settings = snapshot.settings.clone();
@@ -375,6 +407,10 @@ impl AiUiState {
             }
             if self.settings.image_model.provider == ProviderKind::ComfyUi {
                 self.local_comfy = self.settings.image_model.clone();
+            }
+            if let Some(draft) = &snapshot.production_draft {
+                self.load_production_request(&draft.request);
+                self.restored_target_unconfirmed = !self.new_document;
             }
             self.initialized = true;
         }
@@ -392,16 +428,24 @@ impl AiUiState {
         }
         let proof_key = snapshot.batch.as_ref().and_then(BatchReviewKey::from_batch);
         if self.proof_key != proof_key {
+            let preserve_review = self
+                .proof_key
+                .as_ref()
+                .zip(proof_key.as_ref())
+                .is_some_and(|(previous, next)| self.proof_document_version == Some(next.document) && previous.same_proof_except_revision(next));
             self.review_pointer_press = None;
             self.batch_approval_gesture = None;
-            self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
-            self.reviewed_proofs.clear();
+            self.proof_validation_requested = None;
+            if !preserve_review {
+                self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
+                self.reviewed_proofs.clear();
+                self.proof_binding = None;
+                self.proof_loaded = None;
+                self.proof_texture = None;
+                self.companion_proof = None;
+                self.proof_error.clear();
+            }
             self.proof_document_matches = false;
-            self.proof_binding = None;
-            self.proof_loaded = None;
-            self.proof_texture = None;
-            self.companion_proof = None;
-            self.proof_error.clear();
             self.proof_key = proof_key;
         }
         if !snapshot.busy
@@ -420,7 +464,9 @@ impl AiUiState {
 
     fn sync_proof_document(&mut self, document: Option<(u64, u64)>) {
         if self.proof_document_version != document {
-            self.reviewed_proofs.clear();
+            if self.proof_document_version.map(|(uid, _)| uid) != document.map(|(uid, _)| uid) {
+                self.reviewed_proofs.clear();
+            }
             self.proof_document_version = document;
         }
         self.proof_document_matches = self.proof_key.as_ref().is_some_and(|key| Some(key.document) == document);
@@ -570,6 +616,11 @@ impl AiUiState {
             ("Choose a text model above.", "اختر نموذج النص من الحقل أعلاه.")
         } else if !self.new_document && !document {
             ("Open a document or choose New document.", "افتح مستنداً أو اختر مستنداً جديداً.")
+        } else if self.restored_target_unconfirmed {
+            (
+                "Choose the target book or prepare its remaining pages before producing the saved request.",
+                "اختر الكتاب المستهدف أو جهّز صفحاته المتبقية قبل إنتاج التعليمات المحفوظة.",
+            )
         } else if self.settings.output_mode == OutputMode::NativeWithImages
             && self.settings.image_model.provider != ProviderKind::ComfyUi
             && self.settings.image_model.model.trim().is_empty()
@@ -671,9 +722,13 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
     {
         app.ui.ai.pending_models = Some(selection.clone());
     }
+    let production_request = if let AiRequest::Start(request) = &request { Some(request.clone()) } else { None };
     let snapshot = host(&mut app.session, request);
     let result = serde_json::to_value(&snapshot).map_err(|e| e.to_string());
     app.ui.ai.accept(snapshot);
+    if let Some(request) = production_request {
+        app.ui.ai.load_production_request(&request);
+    }
     result
 }
 
@@ -808,6 +863,22 @@ fn model(ui: &mut egui::Ui, a: bool, id: &str, m: &mut ModelSelection, images: b
 pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     if !app.ui.ai.open {
         return;
+    }
+    let document = app.session.active().map(|document| (document.uid, document.revision));
+    let needs_validation = !app.ui.ai.snapshot.busy
+        && app.ui.ai.snapshot.batch.as_ref().is_some_and(|batch| {
+            batch.status == "awaiting_human_proof"
+                && document.is_some_and(|(uid, revision)| Some(uid) == batch.document_uid && Some(revision) != batch.document_revision)
+        });
+    if needs_validation && app.ui.ai.proof_validation_requested != document && app.services.ai.is_some() {
+        app.ui.ai.proof_validation_requested = document;
+        // Selection and page navigation advance the cache revision without changing content.
+        // Keep review evidence disabled until the host validates the pinned document allocation,
+        // font cache and preferences; a rejected version is requested only once.
+        app.ui.ai.sync_proof_document(document);
+        if let Err(error) = dispatch(app, AiRequest::Poll) {
+            app.ui.ai.error = error;
+        }
     }
     let mut state = std::mem::take(&mut app.ui.ai);
     state.batch_approval_gesture = None;
@@ -953,7 +1024,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             app.ui.ai.error = error;
         }
         // A document choice is never implicit authority to start a task in that same frame.
-        requests.retain(|request| !matches!(request, AiRequest::Start(_)));
+        requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
     }
     if std::mem::take(&mut app.ui.ai.pick_ollama)
         && let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ollama_executable"))
@@ -1219,6 +1290,109 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
     }
 }
 
+fn same_document_path(left: &str, right: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        left.replace('\\', "/").eq_ignore_ascii_case(&right.replace('\\', "/"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+fn saved_book_document<'a>(draft: &ProductionDraft, documents: &'a [OpenDocument], selected: Option<usize>) -> Option<&'a OpenDocument> {
+    if let Some(path) = &draft.document_path {
+        documents.iter().find(|document| document.path.as_ref().is_some_and(|open| same_document_path(path, open)))
+    } else if let Some(uid) = draft.document_uid {
+        documents.iter().find(|document| document.uid == uid)
+    } else {
+        // Recovered unsaved documents have no durable identity. Only the user's selected target
+        // can be prepared; a matching title never selects a document or starts production.
+        documents.iter().find(|document| Some(document.index) == selected)
+    }
+}
+
+fn production_recovery(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    available: bool,
+    documents: &[OpenDocument],
+    activate_document: &mut Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
+    if let Some(batch) = &s.snapshot.batch
+        && !s.snapshot.busy
+        && (batch.status == "awaiting_human_proof" || (batch.status == "failed" && batch.retryable))
+        && let Some(document) = documents.iter().find(|document| Some(document.uid) == batch.document_uid)
+        && Some(document.index) != *activate_document
+        && button(ui, a, "Open proof document", "فتح مستند البروفة")
+    {
+        *activate_document = Some(document.index);
+    }
+    if s.task_active() {
+        return;
+    }
+    if let Some(draft) = &s.snapshot.production_draft
+        && matches!(draft.request.target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook)
+    {
+        let selected = saved_book_document(draft, documents, *activate_document).filter(|document| document.continuable);
+        ui.horizontal_wrapped(|ui| {
+            rtl::label(ui, format!("{} {}", text(a, "Saved book instructions:", "تعليمات الكتاب المحفوظة:"), draft.document_title));
+            if let Some(document) = selected {
+                rtl::label(ui, format!("{} {}", text(a, "Target:", "المستهدف:"), document.title));
+            }
+        });
+        if ui
+            .add_enabled(
+                available && selected.is_some(),
+                egui::Button::new(rtl::widget(ui, text(a, "Prepare saved book continuation", "تجهيز استكمال الكتاب المحفوظ"))),
+            )
+            .clicked()
+            && let Some(document) = selected
+        {
+            let request = draft.request.clone();
+            s.load_production_request(&request);
+            s.new_document = false;
+            s.continue_book = true;
+            *activate_document = Some(document.index);
+        }
+        if selected.is_none() {
+            label(ui, a, "Open and select the saved book with remaining blank pages.", "افتح الكتاب المحفوظ واختره مع وجود صفحات متبقية فارغة.");
+        }
+    }
+    if let (Some(batch), Some(draft)) = (&s.snapshot.batch, &s.snapshot.production_draft)
+        && batch.status == "failed"
+        && batch.retryable
+        && batch.job_id == draft.id
+    {
+        label(
+            ui,
+            a,
+            "Retry keeps this task's original settings and cumulative usage. To change the brief, model or limits, prepare Continue and press Produce for a new task.",
+            "تحتفظ إعادة المحاولة بإعدادات المهمة الأصلية واستخدامها التراكمي. لتغيير التعليمات أو النموذج أو الحدود، جهّز الاستكمال واضغط إنتاج لبدء مهمة جديدة.",
+        );
+        let unpublished_new_book = matches!(draft.request.target, TaskTarget::NewA4 { .. })
+            && batch.completed_pages == 0
+            && batch.document_uid.is_none()
+            && draft.document_uid.is_none();
+        let target_matches = unpublished_new_book
+            || documents.iter().any(|document| {
+                Some(document.index) == *activate_document && Some(document.uid) == batch.document_uid && Some(document.uid) == draft.document_uid
+            });
+        if ui
+            .add_enabled(
+                available && target_matches,
+                egui::Button::new(rtl::widget(ui, text(a, "Retry failed review group", "إعادة محاولة مجموعة المراجعة المتعثرة"))),
+            )
+            .clicked()
+        {
+            requests.push(AiRequest::RetryBatch { job_id: batch.job_id.clone() });
+        }
+    }
+}
+
 fn production(
     ui: &mut egui::Ui,
     s: &mut AiUiState,
@@ -1228,6 +1402,7 @@ fn production(
     activate_document: &mut Option<usize>,
     requests: &mut Vec<AiRequest>,
 ) {
+    production_recovery(ui, s, a, available, documents, activate_document, requests);
     if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
         batch_review(ui, s, a, requests);
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Production request", "تعليمات الإنتاج"))).show(ui, |ui| {
@@ -1238,6 +1413,17 @@ fn production(
         return;
     }
     ui.add_enabled_ui(!s.task_active(), |ui| {
+        if let Some(document) = documents.iter().find(|document| Some(document.index) == *activate_document && document.continuable) {
+            ui.horizontal_wrapped(|ui| {
+                let label = if a { format!("استكمال الصفحات {} المتبقية", document.remaining_pages) } else { format!("Continue remaining {} pages", document.remaining_pages) };
+                if ui.button(rtl::widget(ui, &label)).clicked() {
+                    s.new_document = false;
+                    s.continue_book = true;
+                    s.restored_target_unconfirmed = false;
+                }
+                rtl::label(ui, &document.title);
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
             label(ui, a, "Model or agent", "النموذج أو الوكيل");
@@ -1321,9 +1507,10 @@ fn production(
             );
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Current document", "المستند الحالي"))).clicked() {
+            if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Edit current document", "تحرير المستند الحالي"))).clicked() {
                 s.new_document = false;
                 s.continue_book = false;
+                s.restored_target_unconfirmed = false;
             }
             if ui
                 .radio(s.new_document, rtl::widget(ui, text(a, "New document (style size; A4 default)", "مستند جديد (مقاس النمط؛ الافتراضي A4)")))
@@ -1331,11 +1518,13 @@ fn production(
             {
                 s.new_document = true;
                 s.continue_book = false;
+                s.restored_target_unconfirmed = false;
             }
             if ui.radio(s.continue_book, rtl::widget(ui, text(a, "Continue remaining book pages", "استكمال صفحات الكتاب المتبقية"))).clicked()
             {
                 s.new_document = false;
                 s.continue_book = true;
+                s.restored_target_unconfirmed = false;
             }
             if s.new_document {
                 ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
@@ -1360,7 +1549,9 @@ fn production(
                     .selected_text(selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً")))
                     .show_ui(ui, |ui| {
                         for document in documents {
-                            ui.selectable_value(activate_document, Some(document.index), &document.title);
+                            if ui.selectable_value(activate_document, Some(document.index), &document.title).clicked() {
+                                s.restored_target_unconfirmed = false;
+                            }
                         }
                     });
                 if let Some(selected) = selected {
@@ -1371,8 +1562,8 @@ fn production(
                 label(
                     ui,
                     a,
-                    "Uses this document's pages, dimensions and editable content.",
-                    "يعمل على صفحات هذا المستند ومقاساته ومحتواه القابل للتحرير.",
+                    "Edits existing content in one task. Choose Continue remaining book pages for production in review groups.",
+                    "يحرر المحتوى الموجود بمهمة واحدة. اختر استكمال صفحات الكتاب المتبقية للإنتاج في مجموعات مراجعة.",
                 );
             }
         }
@@ -1467,8 +1658,8 @@ fn production(
             && !documents.iter().any(|document| Some(document.index) == *activate_document && document.continuable))
         .then_some(text(
             a,
-            "Select a book with completed opening pages and remaining blank pages, or use Current document to edit any open file.",
-            "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر المستند الحالي للعمل على أي ملف مفتوح.",
+            "Select a book with completed opening pages and remaining blank pages, or choose Edit current document.",
+            "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر تحرير المستند الحالي.",
         ));
         let issue = s.production_issue(available, activate_document.is_some(), a).or(continuation_issue);
         if let Some(reason) = issue {
@@ -1534,7 +1725,7 @@ fn production(
         });
     });
     ui.separator();
-    if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") || s.task_active() {
+    if s.snapshot.batch.as_ref().is_some_and(|batch| matches!(batch.status.as_str(), "running" | "awaiting_human_proof")) {
         batch_review(ui, s, a, requests);
     } else if s.snapshot.batch.is_some() {
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Previous task", "المهمة السابقة"))).show(ui, |ui| batch_review(ui, s, a, requests));
@@ -2479,6 +2670,337 @@ mod tests {
     use designcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::json;
+
+    fn continuation_request(target: TaskTarget) -> TaskRequest {
+        let mut settings = AiSettings::default();
+        settings.text_model.model = "continuation-fixture".into();
+        settings.pages_per_batch = 3;
+        TaskRequest {
+            prompt: "Keep the approved opening pages and finish the original book.".into(),
+            settings,
+            skill_ids: vec!["original-book-style".into()],
+            auto_select_skills: false,
+            target,
+            export_directory: Some("book-output".into()),
+        }
+    }
+
+    fn saved_production_snapshot(request: &TaskRequest, document: &designcraft_engine::DocState) -> AiSnapshot {
+        let mut snapshot = serde_json::to_value(AiSnapshot::default()).unwrap();
+        snapshot["available"] = json!(true);
+        snapshot["production_draft"] = json!({
+            "id": "saved-book", "request": request, "document_uid": document.uid,
+            "document_path": document.path, "document_title": document.title()
+        });
+        serde_json::from_value(snapshot).unwrap()
+    }
+
+    #[test]
+    fn continuation_ui_control_start_populates_the_composer_without_serializing_secrets() {
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() },
+        );
+        let request = continuation_request(TaskTarget::ContinueBook);
+        app.ui.ai.api_key.0 = "private-key-fixture".into();
+        app.run("ai.request", json!({"method":"start", "request": request})).unwrap();
+        assert_eq!(app.ui.ai.prompt, request.prompt);
+        assert!(!app.ui.ai.new_document);
+        assert!(app.ui.ai.continue_book);
+        assert_eq!(app.ui.ai.settings.pages_per_batch, 3);
+        assert!(!app.ui.ai.automatic_skills);
+        assert!(app.ui.ai.selected_skills.contains("original-book-style"));
+        assert_eq!(app.ui.ai.directory, "book-output");
+        let saved_ui = serde_json::to_string(&app.ui).unwrap();
+        assert!(!saved_ui.contains("private-key-fixture"));
+        assert!(!saved_ui.contains(&request.prompt));
+        assert!(app.ui.ai.reviewed_proofs.is_empty());
+        assert!(app.ui.ai.batch_approval_gesture.is_none());
+    }
+
+    #[test]
+    fn continuation_ui_saved_request_hydrates_once_and_keeps_subsequent_edits() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":4})).unwrap();
+        let request = continuation_request(TaskTarget::NewA4 { pages: 4 });
+        let snapshot = saved_production_snapshot(&request, session.active().unwrap());
+        let mut state = AiUiState::default();
+        state.accept(snapshot.clone());
+        assert_eq!(state.prompt, request.prompt);
+        assert_eq!(state.settings.pages_per_batch, 3);
+        assert_eq!(state.pages, 4);
+        state.prompt = "A manual revision awaiting Produce".into();
+        state.accept(snapshot);
+        assert_eq!(state.prompt, "A manual revision awaiting Produce");
+        assert!(state.reviewed_proofs.is_empty());
+        assert!(state.batch_approval_gesture.is_none());
+    }
+
+    #[test]
+    fn continuation_ui_explicit_action_keeps_current_document_edits_separate() {
+        let mut state = AiUiState { new_document: false, ..Default::default() };
+        state.prompt = "Edit the selected document".into();
+        state.settings.text_model.model = "fixture".into();
+        let documents = vec![OpenDocument { index: 0, uid: 1, path: None, title: "Book".into(), pages: 4, remaining_pages: 3, continuable: true }];
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
+            move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
+            (state, Vec::new(), Some(0)),
+        );
+        panel.run_steps(3);
+        panel.get_by_label("Continue remaining 3 pages").click();
+        panel.run_steps(3);
+        assert!(panel.state().1.is_empty(), "choosing continuation is not permission to start production");
+        assert_eq!(panel.state().2, Some(0));
+        assert_eq!(panel.state().0.prompt, "Edit the selected document");
+        panel.get_by_label("Produce").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::Start(TaskRequest { target: TaskTarget::ContinueBook, .. }))));
+        panel.get_by_label("Edit current document").click();
+        panel.run_steps(3);
+        panel.get_by_label("Produce").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::Start(TaskRequest { target: TaskTarget::CurrentDocument, .. }))));
+    }
+
+    #[test]
+    fn continuation_ui_busy_one_shot_keeps_failed_book_in_previous_task() {
+        let state = AiUiState {
+            snapshot: AiSnapshot { busy: true, batch: Some(BatchSnapshot { status: "failed".into(), ..Default::default() }), ..Default::default() },
+            ..Default::default()
+        };
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 1200.0))
+            .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Previous task").is_some());
+        assert!(panel.query_by_label("Page proof review").is_none(), "a failed old book is not the running one-shot task");
+    }
+
+    #[test]
+    fn continuation_ui_saved_book_preparation_requires_a_fresh_produce() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({"pages":4,"facingPages":false})).unwrap();
+        app.run("frame.create", json!({"spread":0,"rect":[20,20,100,80]})).unwrap();
+        let request = continuation_request(TaskTarget::NewA4 { pages: 4 });
+        app.ui.ai.accept(saved_production_snapshot(&request, app.session.active().unwrap()));
+        app.ui.ai.open = true;
+        let starts = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let host_starts = starts.clone();
+        let snapshot = app.ui.ai.snapshot.clone();
+        app.services.ai = Some(Box::new(move |_, request| {
+            if matches!(request, AiRequest::Start(_)) {
+                host_starts.set(host_starts.get() + 1);
+            }
+            snapshot.clone()
+        }));
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 1200.0)).build_ui_state(|ui, app| show(app, ui.ctx()), app);
+        panel.run_steps(3);
+        panel.get_by_label("Prepare saved book continuation").click();
+        panel.run_steps(3);
+        assert_eq!(starts.get(), 0);
+        assert!(panel.state().ui.ai.continue_book);
+        assert!(!panel.state().ui.ai.new_document);
+        assert_eq!(panel.state().ui.ai.prompt, request.prompt);
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        panel.get_by_label("Produce").click();
+        panel.run_steps(3);
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[test]
+    fn continuation_ui_proof_document_navigation_does_not_review_or_approve() {
+        let mut fixture = ProofFixture::new();
+        let proof_uid = fixture.app.session.active().unwrap().uid;
+        fixture.app.run("file.new", json!({"pages":2})).unwrap();
+        assert_ne!(fixture.app.session.active().unwrap().uid, proof_uid);
+        let calls = fixture.calls.clone();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        panel.get_by_label("Open proof document").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().session.active().unwrap().uid, proof_uid);
+        assert!(panel.state().ui.ai.proof_document_matches);
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        assert!(!panel.state().ui.ai.can_approve_batch());
+        assert_eq!(calls.get(), 0, "document navigation must not call the AI host");
+    }
+
+    #[test]
+    fn continuation_ui_saved_path_precedes_reused_uid_and_restored_targets_require_choice() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":4})).unwrap();
+        let request = continuation_request(TaskTarget::ContinueBook);
+        let mut snapshot = saved_production_snapshot(&request, session.active().unwrap());
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value["production_draft"]["document_path"] = json!("original-book.designcraft");
+        snapshot = serde_json::from_value(value).unwrap();
+        let mut state = AiUiState::default();
+        state.accept(snapshot);
+        let mut wrong = OpenDocument::from_document(0, session.active().unwrap());
+        wrong.path = Some("different-book.designcraft".into());
+        wrong.continuable = true;
+        let documents = [wrong];
+        assert!(saved_book_document(state.snapshot.production_draft.as_ref().unwrap(), &documents, Some(0)).is_none());
+        assert_eq!(
+            state.production_issue(true, true, false),
+            Some("Choose the target book or prepare its remaining pages before producing the saved request.")
+        );
+    }
+
+    #[test]
+    fn continuation_ui_retry_requires_live_retryability_and_exact_selected_document() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":4})).unwrap();
+        let document = session.active().unwrap();
+        let request = continuation_request(TaskTarget::ContinueBook);
+        let mut snapshot = saved_production_snapshot(&request, document);
+        snapshot.batch = Some(BatchSnapshot {
+            job_id: "saved-book".into(),
+            status: "failed".into(),
+            retryable: true,
+            document_uid: Some(document.uid),
+            document_revision: Some(document.revision),
+            ..Default::default()
+        });
+        let mut state = AiUiState::default();
+        state.accept(snapshot);
+        let documents = vec![OpenDocument::from_document(0, document)];
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
+            |ui, (state, requests, selected, documents)| production(ui, state, false, true, documents, selected, requests),
+            (state, Vec::new(), Some(0), documents),
+        );
+        panel.run_steps(3);
+        assert!(!panel.get_by_label("Retry failed review group").accesskit_node().is_disabled());
+        panel.get_by_label("Retry failed review group").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::RetryBatch { job_id }) if job_id == "saved-book"));
+        let batch = panel.state_mut().0.snapshot.batch.as_mut().unwrap();
+        batch.document_revision = batch.document_revision.map(|revision| revision + 1);
+        panel.run_steps(3);
+        assert!(
+            !panel.get_by_label("Retry failed review group").accesskit_node().is_disabled(),
+            "view revisions do not change the selected book's identity"
+        );
+        panel.state_mut().3.first_mut().unwrap().uid += 1;
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Retry failed review group").accesskit_node().is_disabled(), "a different book cannot retry this task");
+        panel.state_mut().2 = None;
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Retry failed review group").accesskit_node().is_disabled());
+        panel.state_mut().0.snapshot.batch.as_mut().unwrap().retryable = false;
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Retry failed review group").is_none(), "a persisted failure never grants retry authority");
+        assert!(panel.state().0.reviewed_proofs.is_empty());
+        assert!(panel.state().0.batch_approval_gesture.is_none());
+    }
+
+    #[test]
+    fn continuation_ui_unpublished_new_book_retry_does_not_require_an_open_document() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":4})).unwrap();
+        let request = continuation_request(TaskTarget::NewA4 { pages: 4 });
+        let mut snapshot = saved_production_snapshot(&request, session.active().unwrap());
+        snapshot.production_draft.as_mut().unwrap().document_uid = None;
+        snapshot.batch = Some(BatchSnapshot { job_id: "saved-book".into(), status: "failed".into(), retryable: true, ..Default::default() });
+        let mut state = AiUiState::default();
+        state.accept(snapshot);
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 1200.0))
+            .build_ui_state(|ui, (state, requests)| production(ui, state, false, true, &[], &mut None, requests), (state, Vec::new()));
+        panel.run_steps(3);
+        assert!(!panel.get_by_label("Retry failed review group").accesskit_node().is_disabled());
+        panel.get_by_label("Retry failed review group").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::RetryBatch { job_id }) if job_id == "saved-book"));
+        panel.state_mut().0.snapshot.production_draft.as_mut().unwrap().request.target = TaskTarget::ContinueBook;
+        panel.run_steps(3);
+        assert!(
+            panel.get_by_label("Retry failed review group").accesskit_node().is_disabled(),
+            "an existing book still needs an exact selected document"
+        );
+        panel.state_mut().0.snapshot.production_draft.as_mut().unwrap().request.target = TaskTarget::NewA4 { pages: 4 };
+        panel.state_mut().0.snapshot.batch.as_mut().unwrap().completed_pages = 1;
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Retry failed review group").accesskit_node().is_disabled(), "published pages cannot use document-free retry");
+    }
+
+    #[test]
+    fn continuation_ui_view_only_revision_requests_one_repin_and_preserves_exact_proof_review() {
+        let mut fixture = ProofFixture::new();
+        fixture.confirm_all();
+        let original = fixture.app.session.active().unwrap().doc.clone();
+        let pinned = original.clone();
+        let mut checkpoint = fixture.checkpoint.clone();
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let host_polls = polls.clone();
+        fixture.app.services.ai = Some(Box::new(move |session, request| {
+            assert!(matches!(request, AiRequest::Poll), "revision validation cannot approve or start work");
+            host_polls.set(host_polls.get() + 1);
+            let current = session.active().unwrap();
+            if std::sync::Arc::ptr_eq(&current.doc, &pinned) {
+                checkpoint.batch.as_mut().unwrap().document_revision = Some(current.revision);
+            }
+            checkpoint.clone()
+        }));
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        let reviewed = panel.state().ui.ai.reviewed_proofs.clone();
+        let proof_path = panel.state().ui.ai.proof_path.clone();
+        assert_eq!(reviewed.len(), 2);
+        for (expected_polls, command, params) in [(1, "selection.set", json!({"ids":[]})), (2, "layout.selectPage", json!({"page":1}))] {
+            let before = panel.state().session.active().unwrap().revision;
+            panel.state_mut().run(command, params).unwrap();
+            assert_ne!(panel.state().session.active().unwrap().revision, before);
+            assert!(std::sync::Arc::ptr_eq(&panel.state().session.active().unwrap().doc, &original));
+            panel.run_steps(5);
+            assert_eq!(polls.get(), expected_polls, "view-only revision changes request one local validation");
+            assert_eq!(panel.state().ui.ai.reviewed_proofs, reviewed);
+            assert_eq!(panel.state().ui.ai.proof_path, proof_path);
+            assert!(panel.state().ui.ai.can_approve_batch());
+            assert!(panel.state().ui.ai.batch_approval_gesture.is_none());
+        }
+        panel.state_mut().run("frame.create", json!({"spread":0,"rect":[20,20,80,80]})).unwrap();
+        panel.run_steps(5);
+        assert_eq!(polls.get(), 3);
+        assert!(!panel.state().ui.ai.proof_document_matches);
+        assert!(!panel.state().ui.ai.can_approve_batch(), "an actual content edit cannot be repinned by the host");
+        panel.run_steps(5);
+        assert_eq!(polls.get(), 3, "a rejected content revision must not trigger repeated validation polls");
+        assert!(panel.state().ui.ai.batch_approval_gesture.is_none());
+    }
+
+    #[test]
+    fn continuation_ui_changed_view_can_return_to_its_book_before_revision_validation() {
+        let mut fixture = ProofFixture::new();
+        let original = fixture.app.session.active().unwrap().clone();
+        let uid = original.uid;
+        let mut checkpoint = fixture.checkpoint.clone();
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let host_polls = polls.clone();
+        fixture.app.services.ai = Some(Box::new(move |session, request| {
+            assert!(matches!(request, AiRequest::Poll));
+            host_polls.set(host_polls.get() + 1);
+            let current = session.active().unwrap();
+            if current.uid == uid && std::sync::Arc::ptr_eq(&current.doc, &original.doc) {
+                checkpoint.batch.as_mut().unwrap().document_revision = Some(current.revision);
+            }
+            checkpoint.clone()
+        }));
+        fixture.app.run("selection.set", json!({"ids":[]})).unwrap();
+        fixture.app.run("file.new", json!({"pages":2})).unwrap();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        assert_eq!(polls.get(), 0);
+        panel.get_by_label("Open proof document").click();
+        panel.run_steps(5);
+        assert_eq!(panel.state().session.active().unwrap().uid, uid);
+        assert_eq!(polls.get(), 1);
+        assert!(panel.state().ui.ai.proof_document_matches);
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        assert!(!panel.state().ui.ai.can_approve_batch(), "returning to the book never reviews its pages");
+        assert!(panel.state().ui.ai.batch_approval_gesture.is_none());
+    }
     #[test]
     fn production_composer_exposes_model_prompt_and_action_without_advanced_settings() {
         let mut app = DesignApp::new(Session::new(), Services::default());
@@ -2616,7 +3138,7 @@ mod tests {
         let mut state = AiUiState { prompt, new_document: false, continue_book: true, ..Default::default() };
         state.settings.pages_per_batch = 6;
         state.settings.output_mode = OutputMode::NativeWithImages;
-        let document = OpenDocument { index: 3, title: "Book".into(), pages: 8, remaining_pages: 2, continuable: true };
+        let document = OpenDocument { index: 3, uid: 1, path: None, title: "Book".into(), pages: 8, remaining_pages: 2, continuable: true };
         let estimate = state.request_estimate(&[document], Some(3)).unwrap();
         assert_eq!(estimate.review_pages, 2);
         assert_eq!(estimate.image_allowance, 2);
@@ -3172,7 +3694,7 @@ mod tests {
         fixture.confirm_all();
         let document = fixture.app.ui.ai.proof_key.as_ref().unwrap().document;
         fixture.app.ui.ai.sync_proof_document(Some((document.0, document.1 + 1)));
-        assert!(fixture.app.ui.ai.reviewed_proofs.is_empty());
+        assert_eq!(fixture.app.ui.ai.reviewed_proofs.len(), 2, "review evidence stays disabled until the host validates this revision");
         assert!(!fixture.app.ui.ai.can_review_selected_proof());
         assert!(!fixture.app.ui.ai.can_approve_batch());
     }

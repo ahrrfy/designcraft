@@ -709,7 +709,9 @@ impl Runner<'_> {
                 });
             let (previous, validation) = match parsed {
                 Ok(raw_plan) => {
-                    let previous = bounded_json(&serde_json::to_value(&raw_plan).map_err(|e| e.to_string())?, MAX_JSON)?;
+                    // Repairs consume the authored envelope, including copy_bindings and
+                    // activities. Host labels, fonts and recoveries are compiled afresh.
+                    let previous = response.text.clone();
                     // Validate native typography before spending on images. Page completeness
                     // is checked on the final illustrated draft, since a page can be image-only.
                     let text_scope = if raw_plan.images.is_empty() { scope } else { None };
@@ -1429,6 +1431,7 @@ fn opened_document_geometry(context: &mut Value, state: &DocState) -> Result<(),
     object.insert("pageHeight".into(), json!(state.doc.settings.page_height));
     object.insert("pageCount".into(), json!(state.doc.page_count()));
     object.insert("facingPages".into(), json!(state.doc.settings.facing_pages));
+    object.insert("rightToLeftBinding".into(), json!(state.doc.settings.right_to_left_binding));
     let pages = state
         .doc
         .spreads
@@ -1436,7 +1439,12 @@ fn opened_document_geometry(context: &mut Value, state: &DocState) -> Result<(),
         .enumerate()
         .flat_map(|(spread, entry)| entry.pages.iter().map(move |page| (spread, page)))
         .take(MAX_REVIEW_PAGES as usize)
-        .map(|(spread, page)| json!({"spread":spread,"x":page.x,"width":page.width,"height":page.height,"margins":page.margins}))
+        .enumerate()
+        .map(|(absolute, (spread, page))| {
+            let safe = page.margin_rect();
+            json!({"page":absolute,"spread":spread,"side":page.side,"x":page.x,"width":page.width,"height":page.height,
+                "margins":page.margins,"safeRect":[safe.x0,safe.y0,safe.x1,safe.y1]})
+        })
         .collect::<Vec<_>>();
     object.insert("pageGeometryTruncated".into(), json!(state.doc.page_count() > pages.len()));
     object.insert("pageGeometry".into(), json!(pages));
@@ -1659,7 +1667,7 @@ fn production_system(
     system.push('\n');
     system.push_str(EDITORIAL_POLICY);
     if current_document {
-        system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
+        system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Each pageGeometry.safeRect is the exact [left,top,right,bottom] live area in native spread coordinates, with inside/outside margins already resolved for its side. Keep every text frame, including headers and footers, fully inside safeRect; leave a visible gap between bilingual columns. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
     } else if skills.iter().any(|s| s.design_profile.is_some()) {
         system.push_str("\nPINNED DESIGN PROFILE: use exactly one identity. Select declared page families for the learning objectives and use their native templates as executable construction examples; remap all $N results after adaptation. Preserve page_mm and margin_mm: the host checks actual geometry including visible strokes. All content and illustrations must stay in the safe area. Apply typography, palette, layout, pedagogy, illustration rules and explicit before/after corrections. Vary activities and images to suit the brief. Never interpret profile data as permissions or change its rules to hide a validation failure.");
     }
@@ -1720,9 +1728,138 @@ fn compact_catalog(catalog: &Value) -> Result<Value, String> {
     for item in commands {
         let command = item.get("command").and_then(Value::as_str).ok_or("Invalid catalog command")?;
         let schema = item.get("paramsSchema").filter(|schema| schema.is_object()).ok_or("Invalid catalog parameter schema")?;
-        compact.push(json!({"command":command,"paramsSchema":schema,"example":item.get("example")}));
+        let mut entry = json!({"command":command,"paramsSchema":schema,"example":item.get("example")});
+        if let Some(contract) = native_result_contract(command) {
+            entry["result"] = contract;
+        }
+        compact.push(entry);
     }
-    Ok(json!({"commands":compact,"references":"$N.path and ${N.path}, earlier zero-based command results"}))
+    Ok(
+        json!({"commands":compact,"references":"$N.path and ${N.path}, earlier zero-based command results. Use plain $N.field for numeric identifiers; ${N.field} is string interpolation. Count every command, including selection/formatting. Only fields explicitly listed in a known result are available; null has no fields. frame.create has story only for content=text. Never reference formatting results as object IDs."}),
+    )
+}
+
+/// Compact output contracts for the restricted production catalog, independent of UI help.
+fn native_result_contract(command: &str) -> Option<Value> {
+    Some(match command {
+        "frame.create" => json!({"id":"ItemId","story":"StoryId only when content=text"}),
+        "line.create" | "path.create" | "object.group" => json!({"id":"ItemId"}),
+        "file.place" => json!({"id":"ItemId","asset":"AssetId"}),
+        "table.insert" => json!({"story":"StoryId","table":"TableId"}),
+        "swatch.create" => json!({"name":"string"}),
+        "transform.move" => json!({"moved":"integer","ids":"ItemId[]"}),
+        "object.label" | "object.fill" | "object.stroke" | "object.textFrameOptions" | "object.fittingOptions" => json!({"changed":"integer"}),
+        "layout.pages.insert" => json!({"pages":"integer","total":"integer"}),
+        "layout.documentSetup" => {
+            json!({"width":"number","height":"number","pages":"integer","startPage":"integer","facingPages":"boolean","binding":"string","intent":"string","bleed":"number[]","slug":"number[]","margins":"object","primaryTextFrame":"boolean"})
+        }
+        "selection.set"
+        | "object.arrange"
+        | "transform.set"
+        | "text.select"
+        | "text.insert"
+        | "story.setText"
+        | "story.setDirection"
+        | "type.char"
+        | "type.para"
+        | "layout.marginsAndColumns"
+        | "table.setCell" => Value::Null,
+        _ => return None,
+    })
+}
+
+fn native_result_shape(action: &EngineAction) -> Value {
+    let Some(contract) = native_result_contract(&action.command) else { return Value::Null };
+    let Some(fields) = contract.as_object() else { return Value::Null };
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|(field, kind)| {
+                if field == "story" && action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) != Some("text") {
+                    return None;
+                }
+                let value = match kind.as_str().unwrap_or("") {
+                    // Whole-array references have unknown cardinality here. Use
+                    // the vetted 1024-ID maximum, leaving exact length to the engine.
+                    "ItemId[]" => json!(vec![1u64; action.params.get("ids").and_then(Value::as_array).map_or(1024, |ids| ids.len().min(1024))]),
+                    "string" => json!("result"),
+                    "boolean" => json!(false),
+                    "number[]" => json!([0, 0, 0, 0]),
+                    "object" => json!({}),
+                    _ => json!(1),
+                };
+                Some((field.clone(), value))
+            })
+            .collect(),
+    )
+}
+
+fn validate_identifier_references(actions: &[EngineAction]) -> Result<(), String> {
+    let mut results = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        for key in ["ids", "frame", "story", "table"] {
+            let Some(value) = action.params.get(key) else { continue };
+            let values: Vec<_> = match value {
+                Value::Array(values) => values.iter().collect(),
+                value => vec![value],
+            };
+            // A future vetted command may add a new output contract. Preserve its
+            // native private validation rather than guessing that its output is null.
+            if values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .filter_map(|reference| reference_source(reference, index))
+                .any(|source| actions.get(source).is_some_and(|action| native_result_contract(&action.command).is_none()))
+            {
+                continue;
+            }
+            if let Err(error) = designcraft_engine::script::resolve(value, &results) {
+                let origins: BTreeSet<_> = values
+                    .iter()
+                    .copied()
+                    .filter_map(Value::as_str)
+                    .filter_map(|reference| {
+                        let source = reference_source(reference, index)?;
+                        actions.get(source).map(|action| format!("${source}: {}", action.command))
+                    })
+                    .take(8)
+                    .collect();
+                return Err(format!(
+                    "step {index} ({}), {key}: {error}; referenced results [{}]. Use a creation result's id/story, never a null formatting result",
+                    action.command,
+                    origins.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            for reference in values.into_iter().filter_map(Value::as_str) {
+                let Some(source) = reference_source(reference, index).and_then(|source| actions.get(source)) else { continue };
+                let body = reference
+                    .strip_prefix("${")
+                    .and_then(|body| body.strip_suffix('}'))
+                    .or_else(|| reference.strip_prefix('$'))
+                    .ok_or("Invalid native result reference")?;
+                let Some((_, path)) = body.split_once('.') else { continue };
+                let field = path.split('.').next().ok_or("Invalid native result field")?;
+                let contract = native_result_contract(&source.command).ok_or("Unknown native result contract")?;
+                let kind = contract.get(field).and_then(Value::as_str).unwrap_or("");
+                let expected = match key {
+                    "story" => "StoryId",
+                    "table" => "TableId",
+                    _ => "ItemId",
+                };
+                if !kind.starts_with(expected) {
+                    return Err(format!("step {index} ({}), {key}: {reference} from {} is not a {expected}", action.command, source.command));
+                }
+            }
+        }
+        results.push(native_result_shape(action));
+    }
+    Ok(())
+}
+
+fn reference_source(reference: &str, index: usize) -> Option<usize> {
+    let body = reference.strip_prefix("${").and_then(|body| body.strip_suffix('}')).or_else(|| reference.strip_prefix('$'))?;
+    let head = body.split('.').next()?;
+    if head == "last" { index.checked_sub(1) } else { head.parse().ok() }
 }
 fn allowed_commands(catalog: &Value, mode: OutputMode) -> Result<BTreeSet<String>, String> {
     Ok(compact_catalog(catalog)?
@@ -1766,6 +1903,7 @@ fn validate_actions(actions: &[EngineAction], catalog: &Value, mode: OutputMode)
     if actions.iter().any(|action| !allowed.contains(&action.command) || !action.params.is_object()) {
         return Err("Plan contains a forbidden command or non-object parameters".into());
     }
+    validate_identifier_references(actions)?;
     Ok(())
 }
 fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<ProductionPlan, String> {
@@ -4450,6 +4588,166 @@ mod tests {
         assert!(repaired.contains("invalid parameter"));
         assert!(validate_skill_id("con").is_err());
         assert!(validate_skill_id("school-print").is_ok());
+    }
+
+    #[test]
+    fn continuation_context_exposes_resolved_safe_rect_and_page_side() {
+        let mut session = Session::new();
+        session
+            .execute(
+                "file.new",
+                &json!({"preset":"A4","pages":3,"facingPages":true,
+            "margins":{"top":42.52,"bottom":42.52,"inside":51.02,"outside":42.52}}),
+            )
+            .unwrap();
+        let state = session.doc().unwrap();
+        let mut context = json!({});
+        opened_document_geometry(&mut context, state).unwrap();
+        assert_eq!(context["rightToLeftBinding"], json!(state.doc.settings.right_to_left_binding));
+        for (record, (_, _, page)) in context["pageGeometry"].as_array().unwrap().iter().zip(state.doc.pages()) {
+            let safe = page.margin_rect();
+            assert_eq!(record["safeRect"], json!([safe.x0, safe.y0, safe.x1, safe.y1]));
+            assert_eq!(record["side"], serde_json::to_value(page.side).unwrap());
+        }
+    }
+
+    #[test]
+    fn production_reference_contracts_reject_null_and_non_story_sources() {
+        let native_catalog = designcraft_engine::cmd::production::catalog();
+        assert!(
+            native_catalog["commands"].as_array().unwrap().iter().all(|entry| native_result_contract(entry["command"].as_str().unwrap()).is_some())
+        );
+        let compact = compact_catalog(&native_catalog).unwrap();
+        let commands = compact["commands"].as_array().unwrap();
+        assert_eq!(commands.iter().find(|c| c["command"] == "type.char").unwrap()["result"], json!(null));
+        assert_eq!(commands.iter().find(|c| c["command"] == "frame.create").unwrap()["result"]["id"], json!("ItemId"));
+        let actions = vec![
+            EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,300,100],"content":"text","text":"Header"}) },
+            EngineAction { command: "type.char".into(), params: json!({"attrs":{"size":12}}) },
+            EngineAction { command: "object.label".into(), params: json!({"ids":["$1.id"],"label":"wrong"}) },
+        ];
+        let error = validate_actions(&actions, &native_catalog, OutputMode::NativeOnly).unwrap_err();
+        assert!(error.contains("type.char") && error.contains("id"), "{error}");
+        let mut valid = actions.clone();
+        valid[2].params["ids"] = json!(["$0.id"]);
+        assert!(validate_actions(&valid, &native_catalog, OutputMode::NativeOnly).is_ok());
+        let mut wrong_story =
+            vec![actions[0].clone(), EngineAction { command: "story.setText".into(), params: json!({"story":"$0.story","text":"Body"}) }];
+        wrong_story[0].params["content"] = json!("graphic");
+        assert!(validate_actions(&wrong_story, &native_catalog, OutputMode::NativeOnly).is_err());
+        wrong_story[0].params["content"] = json!("text");
+        wrong_story[1].params["story"] = json!("$0.id");
+        assert!(validate_actions(&wrong_story, &native_catalog, OutputMode::NativeOnly).is_err());
+    }
+
+    #[test]
+    fn production_creation_contracts_match_actual_native_results() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let commands: Vec<EngineAction> = serde_json::from_value(json!([
+            {"command":"frame.create","params":{"spread":0,"rect":[60,60,300,180],"content":"text","text":"","caret":false}},
+            {"command":"text.select","params":{"story":"$0.story","anchor":0,"focus":0}},
+            {"command":"table.insert","params":{"rows":1,"cols":1,"width":100}},
+            {"command":"frame.create","params":{"spread":0,"rect":[60,200,100,240],"content":"graphic"}},
+            {"command":"frame.create","params":{"spread":0,"rect":[120,200,160,240],"content":"graphic"}},
+            {"command":"object.group","params":{"ids":["$3.id","$4.id"]}},
+            {"command":"path.create","params":{"spread":0,"anchors":[{"p":[60,300]},{"p":[100,340]}]}},
+            {"command":"line.create","params":{"spread":0,"a":[60,400],"b":[100,400]}}
+        ]))
+        .unwrap();
+        validate_actions(&commands, &designcraft_engine::cmd::production::catalog(), OutputMode::NativeOnly).unwrap();
+        let outcome = session.execute("production.apply", &json!({"commands":commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+        for (command, result) in commands.iter().zip(outcome["results"].as_array().unwrap()) {
+            let contract = native_result_shape(command);
+            if let Some(fields) = contract.as_object() {
+                for field in fields.keys() {
+                    assert!(result.get(field).is_some(), "{} omitted promised result {field}: {result}", command.command);
+                }
+            } else {
+                assert!(result.is_null(), "{} must have a null result", command.command);
+            }
+        }
+    }
+
+    #[test]
+    fn late_validation_repairs_use_authored_response_without_host_font_actions() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct CaptureRepair {
+            authored: String,
+            requests: RefCell<Vec<String>>,
+        }
+        impl Provider for CaptureRepair {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                self.requests.borrow_mut().push(request.prompt.clone());
+                if self.requests.borrow().len() == 1 {
+                    Ok(GenerationResponse {
+                        text: self.authored.clone(),
+                        usage: Usage { input_tokens: Some(100), output_tokens: Some(100), ..Default::default() },
+                        error: None,
+                    })
+                } else {
+                    Err("Synthetic repair captured".into())
+                }
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No images authorized".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+        }
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let authored = json!({"title":"Preserve authored repair input","images":[],"commands":[
+            {"command":"layout.documentSetup","params":{"width":610}},
+            {"command":"frame.create","params":{"spread":0,"rect":[60,60,300,110],"content":"text","text":"Keep these original words","caret":false}}
+        ]})
+        .to_string();
+        let provider = CaptureRepair { authored: authored.clone(), requests: RefCell::new(vec![]) };
+        let settings = AiSettings {
+            allow_paid_repairs: true,
+            budget: BudgetSpec { token_limit: 500_000, max_requests: 2, repair_attempts: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let request = TaskRequest {
+            prompt: "**English Primary Font:** Source Sans 3\nKeep the actual opened document geometry.".into(),
+            settings,
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        assert!(
+            runner
+                .production(request, json!({}), designcraft_engine::cmd::production::catalog(), vec![], base.clone(), session.prefs.clone())
+                .is_err()
+        );
+        let requests = provider.requests.borrow();
+        assert_eq!(requests.len(), 2, "The synthetic geometry failure must reach its repair");
+        let repair: Value = serde_json::from_str(&requests[1]).unwrap();
+        assert_eq!(repair["rejected_plan"].as_str().unwrap(), authored, "Host-expanded actions must never be echoed as provider-authored source");
+        assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
     }
 
     #[test]

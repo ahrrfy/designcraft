@@ -103,6 +103,16 @@ pub struct TaskRequest {
 fn auto_skills() -> bool {
     true
 }
+/// Recoverable instructions only. Reopening never restores a live worker or proof approval.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDraft {
+    pub id: String,
+    pub request: TaskRequest,
+    pub document_uid: Option<u64>,
+    pub document_path: Option<String>,
+    pub document_title: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImagePlacement {
@@ -130,6 +140,10 @@ pub enum AiRequest {
     ApproveBatch {
         job_id: String,
         checkpoint: u32,
+    },
+    /// Retry an unpublished failed group with its original cumulative admission ledger.
+    RetryBatch {
+        job_id: String,
     },
     UpdateSettings(AiSettings),
     SetApiKey {
@@ -316,6 +330,9 @@ pub struct BatchSnapshot {
     pub total_batches: u32,
     pub completed_pages: u32,
     pub status: String,
+    /// Live failed-job authority only; always false for recovered checkpoints.
+    #[serde(default)]
+    pub retryable: bool,
     pub checkpoint: u32,
     pub document_uid: Option<u64>,
     pub document_revision: Option<u64>,
@@ -382,6 +399,8 @@ pub struct AiSnapshot {
     pub current_issues: Vec<Value>,
     pub message: String,
     pub settings: AiSettings,
+    #[serde(default)]
+    pub production_draft: Option<ProductionDraft>,
     pub skills: Vec<SkillCard>,
     #[serde(default)]
     pub skill_warnings: Vec<String>,

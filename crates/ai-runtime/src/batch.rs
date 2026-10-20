@@ -9,6 +9,7 @@ const MAX_PROOF_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGE_PROOF_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROOF_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 
+#[derive(Clone)]
 pub(super) struct BatchJob {
     task: TaskRequest,
     skills: Vec<SkillSnapshot>,
@@ -23,6 +24,7 @@ pub(super) struct BatchJob {
     // Keeps the original allocation alive: selection/view revisions alone are
     // not document edits, and an address cannot be recycled while pinned here.
     publication_base: Option<DocState>,
+    retry_sequence: u32,
 }
 impl BatchJob {
     pub(super) fn snapshot_elapsed(&self) -> u64 {
@@ -33,6 +35,7 @@ impl BatchJob {
 pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRoots>, root: &Path) -> Result<Option<BatchSnapshot>, String> {
     let Some(value) = read_json(access, &root.join("batch-checkpoint.json"), 8 * 1024 * 1024)? else { return Ok(None) };
     let mut snapshot: BatchSnapshot = serde_json::from_value(value).map_err(|e| format!("Batch checkpoint: {e}"))?;
+    snapshot.retryable = false;
     if snapshot.batches.len() > 1000 {
         return Err("Batch checkpoint exceeds its batch limit".into());
     }
@@ -86,6 +89,35 @@ pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraf
 }
 
 impl ProductionRunner {
+    pub(super) fn refresh_unchanged_proof(&mut self, session: &Session) -> Result<(), String> {
+        let Some(job) = self.batch.as_ref().filter(|job| job.snapshot.status == "awaiting_human_proof" && self.pending.is_none()) else {
+            return Ok(());
+        };
+        let Some(current) = session.active() else { return Ok(()) };
+        if Some(current.uid) != job.snapshot.document_uid
+            || Some(current.revision) == job.snapshot.document_revision
+            || !job.publication_base.as_ref().is_some_and(|published| {
+                Arc::ptr_eq(&published.doc, &current.doc)
+                    && published.active_layer == current.active_layer
+                    && published.editing_parents == current.editing_parents
+            })
+            || !Arc::ptr_eq(&job.publication_cache, &session.cache)
+            || serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&session.prefs).map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        // Native selection/navigation may bump the session revision. Rebind only
+        // the exact still-pinned document allocation; changed content never passes.
+        let mut snapshot = job.snapshot.clone();
+        snapshot.document_revision = Some(current.revision);
+        self.persist_batch(&snapshot)?;
+        if let Some(job) = &mut self.batch {
+            job.snapshot = snapshot.clone();
+        }
+        self.snapshot.batch = Some(snapshot);
+        Ok(())
+    }
+
     pub(super) fn start_batches(
         &mut self,
         session: &mut Session,
@@ -135,12 +167,44 @@ impl ProductionRunner {
             prefs: session.prefs.clone(),
             publication_cache: session.cache.clone(),
             publication_base: if existing.is_some() { Some(session.doc().map_err(|e| e.to_string())?.clone()) } else { None },
+            retry_sequence: 0,
         };
+        if let Some(mut draft) = self.snapshot.production_draft.clone() {
+            draft.id = job.snapshot.job_id.clone();
+            self.persist_production_draft(&draft)?;
+            self.snapshot.production_draft = Some(draft);
+        }
         base.selection = Default::default();
         self.launch_batch(job, base, context)
     }
 
-    fn launch_batch(&mut self, mut job: BatchJob, base: DocState, mut context: Value) -> Result<(), String> {
+    fn launch_batch(&mut self, job: BatchJob, base: DocState, context: Value) -> Result<(), String> {
+        let backup = job.clone();
+        if let Err(error) = self.launch_batch_inner(job, base, context) {
+            let mut failed = self.batch.take().unwrap_or(backup);
+            failed.snapshot.status = "failed".into();
+            if !failed.snapshot.batches.last().is_some_and(|batch| batch.page_start == failed.snapshot.completed_pages && batch.status == "failed") {
+                failed.snapshot.batches.push(BatchReport {
+                    batch: failed.snapshot.current_batch,
+                    page_start: failed.snapshot.completed_pages,
+                    page_count: scope(&failed.snapshot).map(|scope| scope.count).unwrap_or(0),
+                    status: "failed".into(),
+                    ..Default::default()
+                });
+            }
+            failed.snapshot.retryable = retry_candidate(&failed);
+            self.snapshot.batch = Some(failed.snapshot.clone());
+            let persisted = self.persist_batch(&failed.snapshot);
+            self.batch = Some(failed);
+            return Err(match persisted {
+                Ok(()) => error,
+                Err(write_error) => format!("{error}; could not persist failed checkpoint: {write_error}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn launch_batch_inner(&mut self, mut job: BatchJob, base: DocState, mut context: Value) -> Result<(), String> {
         if self.pending.is_some() {
             return Err("A provider request is already active".into());
         }
@@ -155,10 +219,11 @@ impl ProductionRunner {
         let settings = job.task.settings.clone();
         // Durable intent precedes the network request; recovery still cannot resume it.
         job.snapshot.status = "running".into();
+        job.snapshot.retryable = false;
         self.persist_batch(&job.snapshot)?;
         self.prepare_credentials(&[settings.text_model.clone(), settings.image_model.clone()])?;
         let keys = self.worker_keys();
-        let ledger = job.ledger.take().ok_or("Batch admission ledger is unavailable")?;
+        let ledger = job.ledger.as_ref().ok_or("Batch admission ledger is unavailable")?.clone();
         job.before = ledger.summary();
         let task = job.task.clone();
         let pins = job.skills.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
@@ -170,8 +235,18 @@ impl ProductionRunner {
             base,
             prefs: job.prefs.clone(),
         };
-        let worker = worker::spawn_with_ledger(work, keys, job.roots.clone(), ledger)?;
-        let id = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
+        let worker = match worker::spawn_with_ledger(work, keys, job.roots.clone(), ledger) {
+            Ok(worker) => worker,
+            Err(error) => {
+                job.snapshot.status = "failed".into();
+                job.snapshot.retryable = retry_candidate(&job);
+                self.snapshot.batch = Some(job.snapshot.clone());
+                self.batch = Some(job);
+                return Err(error);
+            }
+        };
+        job.ledger = None;
+        let id = batch_report_id(&job);
         let expected = job.snapshot.document_uid.zip(job.snapshot.document_revision);
         self.pending = Some(Pending {
             roots: job.roots.clone(),
@@ -195,6 +270,47 @@ impl ProductionRunner {
         self.snapshot.batch = Some(job.snapshot.clone());
         self.batch = Some(job);
         Ok(())
+    }
+
+    pub(super) fn retry_batch(&mut self, session: &mut Session, id: &str) -> Result<(), String> {
+        let job = self.batch.as_ref().ok_or("This task is no longer live; select its book and explicitly Continue with a new task")?;
+        if job.snapshot.job_id != id || !retry_candidate(job) || self.pending.is_some() {
+            return Err("Only an unpublished failed group with its original admission ledger can be retried".into());
+        }
+        ensure_publication_idle(session)?;
+        let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
+        let (base, mut context) = if let Some(uid) = job.snapshot.document_uid {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            if current.uid != uid {
+                return Err("Select this failed task's book before Retry; another open document will not be modified".into());
+            }
+            let (base, context) = task_document_context(session, &TaskTarget::ContinueBook, profile, &job.task.prompt, &job.task.settings)?;
+            let (total, completed) = continuation_progress(&base, profile)?;
+            if total != job.snapshot.total_pages || completed != job.snapshot.completed_pages {
+                return Err("The target pages or book page count changed; prepare a fresh continuation instead of overwriting content".into());
+            }
+            (base, context)
+        } else {
+            if !matches!(job.task.target, TaskTarget::NewA4 { .. }) || job.snapshot.completed_pages != 0 {
+                return Err("The failed task has no matching book authority".into());
+            }
+            task_document_context(session, &job.task.target, profile, &job.task.prompt, &job.task.settings)?
+        };
+        context["_production_cache_root"] = json!(self.root.join("production-cache-v1"));
+        let mut job = self.batch.take().ok_or("The failed task disappeared")?;
+        job.retry_sequence = job.retry_sequence.checked_add(1).ok_or("Too many retries for this task")?;
+        if job.snapshot.document_uid.is_some() {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            job.snapshot.document_revision = Some(current.revision);
+            job.publication_base = Some(current.clone());
+        }
+        job.publication_cache = session.cache.clone();
+        job.prefs = session.prefs.clone();
+        // Failed attempts stay in history; proof lookup must see only the new attempt.
+        if job.snapshot.batches.last().is_some_and(|batch| batch.status == "failed" && batch.page_start == job.snapshot.completed_pages) {
+            job.snapshot.batches.pop();
+        }
+        self.launch_batch(job, base, context)
     }
 
     pub(super) fn approve_batch(&mut self, session: &mut Session, id: &str, checkpoint: u32) -> Result<(), String> {
@@ -252,8 +368,8 @@ impl ProductionRunner {
         if let Some(last) = job.snapshot.batches.last_mut() {
             last.status = "approved".into();
         }
-        let approved_id = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
-        if let Some(report) = self.snapshot.reports.iter_mut().find(|report| report.id == approved_id) {
+        let approved_id = batch_report_id(&job);
+        if let Some(report) = self.snapshot.reports.iter_mut().rev().find(|report| report.id == approved_id) {
             report.status = "approved".into();
             report.message = "Human approved the exact native/PDF/PNG proof checkpoint".into();
         }
@@ -303,6 +419,7 @@ impl ProductionRunner {
 
     pub(super) fn cancel_batch(&mut self) {
         let Some(mut job) = self.batch.take() else { return };
+        job.snapshot.retryable = false;
         if let Some(pending) = &self.pending {
             pending.worker.cancel.store(true, Ordering::Relaxed);
             job.snapshot.status = "cancelling".into();
@@ -320,8 +437,10 @@ impl ProductionRunner {
     pub(super) fn lose_batch_worker(&mut self) {
         if let Some(mut job) = self.batch.take() {
             job.snapshot.status = "failed".into();
+            job.snapshot.retryable = retry_candidate(&job);
             self.snapshot.batch = Some(job.snapshot.clone());
             let _ = self.persist_batch(&job.snapshot);
+            self.batch = Some(job);
         }
     }
 
@@ -392,6 +511,9 @@ impl ProductionRunner {
                 report.status = "awaiting_human_proof".into();
                 report.message =
                     "Batch published with native/PDF/PNG proofs. Human approval is required before any subsequent provider request".into();
+                if let Err(error) = self.bind_production_draft(session, &job.snapshot.job_id) {
+                    report.message.push_str(&format!("; saved continuation instructions could not be updated: {error}"));
+                }
             }
             Err(error) => {
                 job.snapshot.status = if cancelled { "cancelled" } else { "failed" }.into();
@@ -401,6 +523,7 @@ impl ProductionRunner {
             }
         }
         job.snapshot.batches.push(batch_report);
+        job.snapshot.retryable = retry_candidate(&job);
         self.snapshot.stage = job.snapshot.status.clone();
         self.snapshot.message = report.message.clone();
         self.snapshot.progress = job.snapshot.completed_pages as f32 / job.snapshot.total_pages as f32;
@@ -418,7 +541,7 @@ impl ProductionRunner {
             self.snapshot.message = format!("Batch evidence could not be persisted; continuation is disabled: {error}");
             self.snapshot.batch = Some(job.snapshot.clone());
         }
-        if job.snapshot.status == "awaiting_human_proof" {
+        if matches!(job.snapshot.status.as_str(), "awaiting_human_proof" | "failed") {
             self.batch = Some(job);
         }
     }
@@ -546,7 +669,12 @@ impl ProductionRunner {
             crate::facing_pages::validate_mapped_result(projected_base, projected.doc().map_err(|e| e.to_string())?, scope)?;
             let uid = current.uid;
             let revision = current.revision;
-            let directory = self.root.join("runs").join(&job.snapshot.job_id).join(format!("batch-{}", job.snapshot.current_batch));
+            let directory_name = if job.retry_sequence == 0 {
+                format!("batch-{}", job.snapshot.current_batch)
+            } else {
+                format!("batch-{}-retry-{}", job.snapshot.current_batch, job.retry_sequence)
+            };
+            let directory = self.root.join("runs").join(&job.snapshot.job_id).join(directory_name);
             self.profile_access.check(&directory, file_access::Access::Write)?;
             std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
             for proof in proofs {
@@ -608,6 +736,20 @@ impl ProductionRunner {
         session.execute("file.exportPdf", &params).map_err(|e| e.to_string())?;
         Ok(vec![source.to_string_lossy().into_owned(), pdf.to_string_lossy().into_owned()])
     }
+}
+fn batch_report_id(job: &BatchJob) -> String {
+    let base = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
+    if job.retry_sequence == 0 { base } else { format!("{base}-retry-{}", job.retry_sequence) }
+}
+fn retry_candidate(job: &BatchJob) -> bool {
+    job.snapshot.status == "failed"
+        && job.ledger.is_some()
+        && job.snapshot.completed_pages < job.snapshot.total_pages
+        && job
+            .snapshot
+            .batches
+            .last()
+            .is_some_and(|batch| batch.status == "failed" && batch.page_start == job.snapshot.completed_pages && batch.page_count > 0)
 }
 fn scope(snapshot: &BatchSnapshot) -> Result<worker::BatchScope, String> {
     let count = snapshot.total_pages.checked_sub(snapshot.completed_pages).ok_or("Invalid completed page count")?.min(snapshot.pages_per_batch);
@@ -801,8 +943,67 @@ mod tests {
             prefs: session.prefs.clone(),
             publication_cache: session.cache.clone(),
             publication_base: session.active().cloned(),
+            retry_sequence: 0,
         });
         ("fixture-book".into(), 1)
+    }
+
+    #[test]
+    fn continuation_failed_worker_retains_budget_and_book_for_explicit_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let before = runner.batch.as_ref().unwrap().ledger.as_ref().unwrap().summary();
+        runner.lose_batch_worker();
+        assert_eq!(runner.snapshot.batch.as_ref().unwrap().status, "failed");
+        assert!(runner.batch.is_some(), "A failed live job needs an explicit retry path without resetting its ledger");
+        let retained = runner.batch.as_ref().unwrap();
+        assert_eq!(retained.snapshot.completed_pages, 1);
+        assert_eq!(retained.ledger.as_ref().unwrap().summary().requests, before.requests);
+        assert!(runner.pending.is_none(), "Failure retention cannot auto-launch another request");
+    }
+
+    #[test]
+    fn continuation_view_only_changes_do_not_invalidate_unchanged_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let before = session.doc().unwrap().clone();
+        session.execute("select.firstAbove", &json!({})).unwrap();
+        let current = session.doc().unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &current.doc));
+        assert_ne!(before.revision, current.revision);
+        let revision = current.revision;
+        let result = runner.handle(&mut session, AiRequest::Poll);
+        let batch = result.batch.unwrap();
+        assert_eq!(batch.document_revision, Some(revision), "An unchanged native allocation must remain reviewable after selection/navigation");
+        assert_eq!(batch.status, "awaiting_human_proof");
+        assert_eq!(batch.cumulative_usage.requests, 1);
+        assert!(runner.pending.is_none(), "Refreshing unchanged proof authority must not request production");
+    }
+
+    #[test]
+    fn continuation_proof_repin_refuses_content_font_cache_and_preference_changes() {
+        for change in ["content", "cache", "preferences"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(dir.path()).unwrap();
+            let mut session = Session::new();
+            waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            let original = runner.snapshot.batch.as_ref().unwrap().document_revision;
+            match change {
+                "content" => {
+                    session.execute("frame.create", &json!({"spread":0,"rect":[200,60,300,150],"content":"unassigned"})).unwrap();
+                }
+                "cache" => session.cache = Arc::new(designcraft_engine::compose::Cache::new()),
+                _ => session.prefs.typographers_quotes = !session.prefs.typographers_quotes,
+            }
+            session.execute("select.firstAbove", &json!({})).unwrap();
+            let result = runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(result.batch.unwrap().document_revision, original, "{change} must invalidate unchanged-proof rebinding");
+            assert!(runner.pending.is_none());
+        }
     }
 
     #[test]
@@ -907,6 +1108,7 @@ mod tests {
             prefs: session.prefs.clone(),
             publication_cache: session.cache.clone(),
             publication_base: continuing.then_some(before.clone()),
+            retry_sequence: 0,
         });
         runner.snapshot.batch = Some(snapshot.clone());
         runner.snapshot.busy = true;
@@ -1007,12 +1209,22 @@ mod tests {
 
     #[test]
     fn explicit_approval_is_the_only_path_between_real_http_batches() {
-        reviewed_http_batches(0);
+        reviewed_http_batches(0, false);
     }
 
     #[test]
     fn continuing_an_existing_book_preserves_its_prefix_and_human_http_checkpoints() {
-        reviewed_http_batches(2);
+        reviewed_http_batches(2, false);
+    }
+
+    #[test]
+    fn continuation_retry_keeps_failed_usage_prefix_and_human_checkpoints() {
+        reviewed_http_batches(2, true);
+    }
+
+    #[test]
+    fn continuation_retry_before_first_publication_creates_only_its_new_book() {
+        reviewed_http_batches(0, true);
     }
 
     #[test]
@@ -1173,7 +1385,7 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
-    fn reviewed_http_batches(initial_completed: u32) {
+    fn reviewed_http_batches(initial_completed: u32, fail_first: bool) {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1219,11 +1431,14 @@ mod tests {
                     }
                 }
                 let request_index = server_calls.fetch_add(1, Ordering::Relaxed);
-                if request_index > 1 {
+                if request_index > 1 + u32::from(fail_first) {
                     return Err("Unexpected unapproved provider request".into());
                 }
-                let page = initial_completed + request_index;
-                let plan = json!({"title":"Reviewed native book","commands":[{"command":"frame.create","params":{"spread":page,"rect":[50,60,200,180],"content":"unassigned"}},{"command":"object.label","params":{"ids":["$0.id"],"label":format!("page-{}",page+1)}}],"images":[]});
+                let page = initial_completed + request_index.saturating_sub(u32::from(fail_first));
+                let mut plan = json!({"title":"Reviewed native book","commands":[{"command":"frame.create","params":{"spread":page,"rect":[50,60,200,180],"content":"unassigned"}},{"command":"object.label","params":{"ids":["$0.id"],"label":format!("page-{}",page+1)}}],"images":[]});
+                if fail_first && request_index == 0 {
+                    plan["commands"][0]["command"] = json!("unsupported.fixture.command");
+                }
                 let reply =
                     json!({"done":true,"message":{"content":plan.to_string()},"prompt_eval_count":120,"eval_count":30,"prompt_eval_cached_count":10})
                         .to_string();
@@ -1258,11 +1473,29 @@ mod tests {
             assert_ne!(session.doc().unwrap().revision, original.revision);
             assert!(Arc::ptr_eq(&session.doc().unwrap().doc, &original.doc), "Selection changed without editing document content");
         }
-        let first = wait(&mut runner, &mut session);
+        let mut first = wait(&mut runner, &mut session);
+        if fail_first {
+            assert_eq!(first.stage, "failed", "{}", first.message);
+            let failed = first.batch.as_ref().unwrap();
+            assert!(failed.retryable);
+            assert_eq!(failed.completed_pages, initial_completed);
+            assert_eq!(failed.cumulative_usage.requests, 1);
+            assert_eq!(session.doc().map(|state| state.history.undo.len()).unwrap_or(0), prior_undo);
+            let recovered = ProductionRunner::open(dir.path()).unwrap();
+            assert!(!recovered.snapshot.batch.as_ref().unwrap().retryable);
+            assert!(recovered.batch.is_none() && recovered.pending.is_none());
+            let id = failed.job_id.clone();
+            runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "Failure cannot retry automatically");
+            let started = runner.handle(&mut session, AiRequest::RetryBatch { job_id: id });
+            assert!(started.busy, "{}", started.message);
+            first = wait(&mut runner, &mut session);
+        }
+        let prior_requests = u32::from(fail_first);
         assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
         let checkpoint = first.batch.as_ref().unwrap();
         assert_eq!(checkpoint.completed_pages, initial_completed + 1);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         assert_eq!(checkpoint.batches[0].proof_paths.len(), 3);
         let approved_page = session.doc().unwrap().doc.spreads[initial_completed as usize].clone();
         assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
@@ -1270,17 +1503,17 @@ mod tests {
             runner.handle(&mut session, AiRequest::Poll);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "Polling must never prefetch the next batch");
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests, "Polling must never prefetch the next batch");
         let wrong = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint + 1 });
         assert!(!wrong.busy);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         let mut reopened = ProductionRunner::open(dir.path()).unwrap();
         assert_eq!(reopened.snapshot.batch.as_ref().unwrap().status, "interrupted");
         assert!(reopened.pending.is_none());
         assert!(reopened.batch.is_none());
         let denied = reopened.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
         assert!(!denied.busy);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         drop(reopened);
         let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
         assert!(approved.busy, "{}", approved.message);
@@ -1288,9 +1521,9 @@ mod tests {
         assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
         let final_checkpoint = second.batch.as_ref().unwrap();
         assert_eq!(final_checkpoint.completed_pages, initial_completed + 2);
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(final_checkpoint.cumulative_usage.requests, 2);
-        assert_eq!(final_checkpoint.cumulative_usage.input_tokens, 240);
+        assert_eq!(calls.load(Ordering::Relaxed), 2 + prior_requests);
+        assert_eq!(final_checkpoint.cumulative_usage.requests, 2 + prior_requests);
+        assert_eq!(final_checkpoint.cumulative_usage.input_tokens, u64::from(2 + prior_requests) * 120);
         assert!(final_checkpoint.batches.iter().all(|batch| batch.usage.requests == 1));
         assert_eq!(session.doc().unwrap().doc.spreads[initial_completed as usize], approved_page);
         assert_eq!(session.doc().unwrap().doc.spreads[(initial_completed + 1) as usize].items[0].label, format!("page-{}", initial_completed + 2));
@@ -1305,7 +1538,7 @@ mod tests {
         for _ in 0..4 {
             runner.handle(&mut session, AiRequest::Poll);
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "Final or repeated approval cannot issue another request");
+        assert_eq!(calls.load(Ordering::Relaxed), 2 + prior_requests, "Final or repeated approval cannot issue another request");
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap().unwrap();
     }
@@ -1321,7 +1554,7 @@ mod tests {
         let mut session = Session::new();
         let (job_id, checkpoint) = waiting(&mut runner, &mut session, format!("http://{}/", listener.local_addr().unwrap()));
         let before = session.doc().unwrap().doc.clone();
-        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint });
         assert!(approved.busy, "{}", approved.message);
         let result = wait(&mut runner, &mut session);
         assert_eq!(result.batch.as_ref().unwrap().status, "failed");
@@ -1329,6 +1562,13 @@ mod tests {
         assert_eq!(result.batch.as_ref().unwrap().cumulative_usage.requests, 1);
         assert_eq!(result.batch.as_ref().unwrap().batches.last().unwrap().usage.requests, 0);
         assert!(listener.accept().is_err(), "Exhausted cumulative budget must stop before HTTP");
+        assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+        let retried = runner.handle(&mut session, AiRequest::RetryBatch { job_id });
+        assert!(retried.busy, "{}", retried.message);
+        let stopped = wait(&mut runner, &mut session);
+        assert!(stopped.message.contains("request limit"), "{}", stopped.message);
+        assert_eq!(stopped.batch.as_ref().unwrap().cumulative_usage.requests, 1, "Retry cannot reset exhausted allowances");
+        assert!(listener.accept().is_err());
         assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
     }
 

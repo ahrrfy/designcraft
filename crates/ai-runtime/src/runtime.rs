@@ -87,11 +87,37 @@ impl ProductionRunner {
             .map_err(|e| format!("Print attempt history: {e}"))?
             .unwrap_or_default();
         let recovered_batch = batch::recover_snapshot(&profile_access, &root)?;
+        let (production_draft, draft_warning) = match read_json(&profile_access, &root.join("production-draft.json"), 2 * 1024 * 1024)
+            .and_then(|value| value.map(serde_json::from_value::<ProductionDraft>).transpose().map_err(|e| e.to_string()))
+            .and_then(|draft| {
+                if let Some(draft) = &draft {
+                    validate_production_draft(draft)?;
+                }
+                Ok(draft)
+            }) {
+            Ok(mut draft) => {
+                if let Some(draft) = &mut draft {
+                    // UIDs are process-local. A saved path helps the human choose a book;
+                    // neither it nor this draft authorizes publication or paid requests.
+                    draft.document_uid = None;
+                }
+                (draft, String::new())
+            }
+            Err(error) => (None, format!("Saved production instructions could not be restored: {error}")),
+        };
         let mut host = Self {
             root,
             profile_access,
             registry,
-            snapshot: AiSnapshot { available: true, settings, reports, batch: recovered_batch, ..Default::default() },
+            snapshot: AiSnapshot {
+                available: true,
+                settings,
+                reports,
+                production_draft,
+                message: draft_warning,
+                batch: recovered_batch,
+                ..Default::default()
+            },
             keys: Vec::new(),
             vault,
             pending: None,
@@ -115,8 +141,13 @@ impl ProductionRunner {
             job.worker.cancel.store(true, Ordering::Relaxed);
         }
         self.poll(session);
+        if let Err(error) = self.refresh_unchanged_proof(session) {
+            self.snapshot.message = format!("Unchanged proof could not be refreshed: {error}");
+        }
         self.refresh_local_server();
+        let failed_job = self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed") && self.pending.is_none();
         if self.batch.is_some()
+            && !failed_job
             && !matches!(request, AiRequest::Poll | AiRequest::Cancel | AiRequest::ApproveBatch { .. } | AiRequest::InspectSkill { .. })
         {
             self.snapshot.message = "Finish reviewing or cancel the current production batch before another operation".into();
@@ -147,6 +178,7 @@ impl ProductionRunner {
                 self.snapshot.message = "Cancellation requested; a request already sent may still be billed".into();
             }
             AiRequest::ApproveBatch { job_id, checkpoint } => self.approve_batch(session, &job_id, checkpoint)?,
+            AiRequest::RetryBatch { job_id } => self.retry_batch(session, &job_id)?,
             AiRequest::UpdateSettings(settings) => {
                 validate_settings(&settings)?;
                 write_json(&self.profile_access, &self.root.join("settings.json"), &settings)?;
@@ -371,10 +403,11 @@ impl ProductionRunner {
             file_access::check_write(directory)?;
         }
         validate_settings(&task.settings)?;
-        require_text_model(&task.settings)?;
         if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
             return Err(format!("Enter a nonempty brief of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
         }
+        self.save_production_draft(session, &task)?;
+        require_text_model(&task.settings)?;
         let expected = match task.target {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
             TaskTarget::ContinueBook => {
@@ -459,6 +492,11 @@ impl ProductionRunner {
             crate::design::check_geometry(Some(&base), &base, profile)?;
         }
         let settings = task.settings.clone();
+        if self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed") {
+            // An explicit new Produce may replace a failed task; Retry instead keeps
+            // its original pinned skills and cumulative ledger.
+            self.cancel_batch();
+        }
         if matches!(task.target, TaskTarget::ContinueBook) || matches!(task.target, TaskTarget::NewA4 { .. } if settings.pages_per_batch > 0) {
             return self.start_batches(session, task, snapshots, base, context);
         }
@@ -471,6 +509,44 @@ impl ProductionRunner {
             prefs: session.prefs.clone(),
         };
         self.launch(work, Some(task), expected, pins, settings)
+    }
+
+    fn save_production_draft(&mut self, session: &Session, task: &TaskRequest) -> Result<(), String> {
+        let current = if matches!(task.target, TaskTarget::NewA4 { .. }) { None } else { Some(session.doc().map_err(|e| e.to_string())?) };
+        self.sequence = self.sequence.saturating_add(1);
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis();
+        let draft = ProductionDraft {
+            id: format!("draft-{stamp}-{}-{}", std::process::id(), self.sequence),
+            request: task.clone(),
+            document_uid: current.map(|doc| doc.uid),
+            document_path: current.and_then(|doc| doc.path.clone()),
+            document_title: current.map(|doc| doc.title()).unwrap_or_default(),
+        };
+        validate_production_draft(&draft)?;
+        self.persist_production_draft(&draft)?;
+        self.snapshot.production_draft = Some(draft);
+        Ok(())
+    }
+
+    fn persist_production_draft(&self, draft: &ProductionDraft) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(draft).map_err(|e| e.to_string())?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err("Saved production instructions exceed their 2 MiB storage limit".into());
+        }
+        write_profile(&self.profile_access, &self.root.join("production-draft.json"), &bytes)
+    }
+
+    fn bind_production_draft(&mut self, session: &Session, id: &str) -> Result<(), String> {
+        let Some(mut draft) = self.snapshot.production_draft.clone() else { return Ok(()) };
+        let current = session.doc().map_err(|e| e.to_string())?;
+        draft.id = id.into();
+        draft.document_uid = Some(current.uid);
+        draft.document_path = current.path.clone();
+        draft.document_title = current.title();
+        draft.request.target = TaskTarget::ContinueBook;
+        self.persist_production_draft(&draft)?;
+        self.snapshot.production_draft = Some(draft);
+        Ok(())
     }
 
     fn start_skill(
@@ -1703,6 +1779,22 @@ fn validate_settings(settings: &AiSettings) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_production_draft(draft: &ProductionDraft) -> Result<(), String> {
+    validate_settings(&draft.request.settings)?;
+    if draft.id.len() > 256
+        || draft.request.prompt.trim().is_empty()
+        || draft.request.prompt.len() > MAX_BRIEF_BYTES
+        || draft.document_title.len() > 4096
+        || draft.document_path.as_ref().is_some_and(|path| path.len() > 32_768)
+        || draft.request.export_directory.as_ref().is_some_and(|path| path.len() > 32_768)
+        || draft.request.skill_ids.len() > 8
+        || draft.request.skill_ids.iter().any(|id| id.len() > 256)
+        || matches!(draft.request.target, TaskTarget::NewA4 { pages } if !(1..=1000).contains(&pages))
+    {
+        return Err("Saved production instructions contain invalid or oversized fields".into());
+    }
+    Ok(())
+}
 fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     if settings.text_model.model.trim().is_empty() {
         return Err("Choose a text model before starting generation".into());
@@ -1898,6 +1990,34 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_saved_draft_survives_model_validation_and_restart_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(4)).unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let request = TaskRequest {
+            prompt: "Keep the exact bilingual book instructions العربية without losing this draft".into(),
+            target: TaskTarget::ContinueBook,
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            export_directory: None,
+        };
+        let state = runner.handle(&mut session, AiRequest::Start(request.clone()));
+        assert!(!state.busy, "Missing model must not launch a provider");
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["production_draft"]["request"]["prompt"], request.prompt);
+        assert!(dir.path().join("production-draft.json").is_file());
+        drop(runner);
+        let mut reopened = ProductionRunner::open(dir.path()).unwrap();
+        let state = reopened.handle(&mut session, AiRequest::Poll);
+        let value = serde_json::to_value(state).unwrap();
+        assert_eq!(value["production_draft"]["request"]["prompt"], request.prompt);
+        assert!(value["production_draft"]["document_uid"].is_null(), "A process-local UID is never resumed from disk");
+        assert!(reopened.pending.is_none() && reopened.batch.is_none());
+    }
 
     // Context bounding is a pure transformation of a pinned snapshot. Load the
     // verified draft data without activating/rendering a bilingual sample: font
