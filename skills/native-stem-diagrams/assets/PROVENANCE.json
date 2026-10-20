@@ -1,0 +1,15 @@
+{
+  "skill_id": "native-stem-diagrams",
+  "source": null,
+  "license": "Original",
+  "adaptation": "Original local guidance and sample, independently authored; no upstream adaptation.",
+  "upstream_sha256": null,
+  "related_upstream": {
+    "repo": "liangdabiao/stem-illustration-skill",
+    "commit": "80bc2bb1919db51f3afe67cd5921ccdfc850e733",
+    "url": "https://github.com/liangdabiao/stem-illustration-skill/tree/80bc2bb1919db51f3afe67cd5921ccdfc850e733",
+    "status": "Not adopted: no clear license. No upstream text, code or templates copied.",
+    "api_license": null,
+    "license_files_in_pinned_tree": []
+  }
+}

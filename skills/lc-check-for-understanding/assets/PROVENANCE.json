@@ -1,0 +1,12 @@
+{
+  "skill_id": "lc-check-for-understanding",
+  "source": {
+    "repo": "learning-commons-org/agent-skills",
+    "commit": "5894a3c9dcda8d4499bb73fad85b2b11a2b78344",
+    "path": "skills/k12-check-for-understanding/SKILL.md",
+    "url": "https://github.com/learning-commons-org/agent-skills/blob/5894a3c9dcda8d4499bb73fad85b2b11a2b78344/skills/k12-check-for-understanding/SKILL.md"
+  },
+  "license": "Apache-2.0",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "343a07f69c2b1f5007ad37d19831f27f9dffbbc08872348102785137005c44d3"
+}

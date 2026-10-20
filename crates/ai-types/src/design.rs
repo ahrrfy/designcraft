@@ -47,6 +47,27 @@ pub struct DesignImageSlot {
     pub id: String,
     pub purpose: String,
     pub rect: [f64; 4],
+    /// Normalized source rectangle [left, top, right, bottom]; pixels stay unmodified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<[f64; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_aspect_ratio: Option<f64>,
+    /// Additional native frames sharing this one generated source image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<DesignImageView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesignImageView {
+    pub rect: [f64; 4],
+    pub crop: [f64; 4],
+}
+
+impl DesignImageSlot {
+    pub fn placement_count(&self) -> usize {
+        self.views.len().saturating_add(1)
+    }
 }
 
 /// Explicitly recorded before/after guidance; never inferred approval or weight training.
@@ -72,7 +93,7 @@ impl DesignProfile {
             return Err("Design profile name, age or print geometry is invalid".into());
         }
         for (values, max_count, max_text) in [
-            (&self.keywords, 24, 80),
+            (&self.keywords, 48, 80),
             (&self.palette, 12, 80),
             (&self.typography, 16, 512),
             (&self.layout, 16, 512),
@@ -100,8 +121,8 @@ impl DesignProfile {
             {
                 return Err("Design profile page family or template path is invalid".into());
             }
-            if family.text_slots.len() > 12 || family.image_slots.len() > 4 {
-                return Err("A design page family supports at most 12 text slots and 4 image slots".into());
+            if family.text_slots.len() > 24 || family.image_slots.len() > 4 {
+                return Err("A design page family supports at most 24 text slots and 4 image slots".into());
             }
             let mut names = BTreeSet::new();
             let mut commands = BTreeSet::new();
@@ -119,17 +140,27 @@ impl DesignProfile {
             }
             for slot in &family.image_slots {
                 let margin = self.margin_mm * 72.0 / 25.4;
+                let safe_rect = |rect: &[f64; 4]| {
+                    rect.iter().all(|n| n.is_finite())
+                        && rect[0] >= margin
+                        && rect[1] >= margin
+                        && rect[2] > rect[0]
+                        && rect[3] > rect[1]
+                        && rect[2] <= self.page_mm[0] * 72.0 / 25.4 - margin
+                        && rect[3] <= self.page_mm[1] * 72.0 / 25.4 - margin
+                };
+                let safe_crop = |crop: &[f64; 4]| {
+                    crop.iter().all(|n| n.is_finite() && (0.0..=1.0).contains(n)) && crop[2] - crop[0] >= 0.01 && crop[3] - crop[1] >= 0.01
+                };
                 if !text(&slot.id, 64)
                     || !slot.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
                     || !names.insert(&slot.id)
                     || !text(&slot.purpose, 256)
-                    || slot.rect.iter().any(|n| !n.is_finite())
-                    || slot.rect[0] < margin
-                    || slot.rect[1] < margin
-                    || slot.rect[2] <= slot.rect[0]
-                    || slot.rect[3] <= slot.rect[1]
-                    || slot.rect[2] > (self.page_mm[0] * 72.0 / 25.4 - margin)
-                    || slot.rect[3] > (self.page_mm[1] * 72.0 / 25.4 - margin)
+                    || !safe_rect(&slot.rect)
+                    || slot.crop.as_ref().is_some_and(|crop| !safe_crop(crop))
+                    || slot.source_aspect_ratio.is_some_and(|ratio| !ratio.is_finite() || !(0.25..=4.0).contains(&ratio))
+                    || slot.views.len() > 7
+                    || slot.views.iter().any(|view| !safe_rect(&view.rect) || !safe_crop(&view.crop))
                 {
                     return Err("Invalid design image slot or unsafe geometry".into());
                 }
@@ -157,6 +188,27 @@ pub struct DesignStyleUse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_illustration_views_are_bounded_and_stay_inside_print_margins() {
+        let mut p = profile();
+        let slot = serde_json::json!({"id":"atlas","purpose":"Four individual objects",
+            "rect":[54,180,154,280],"crop":[0,0,0.25,1],"source_aspect_ratio":4,
+            "views":[{"rect":[180,180,280,280],"crop":[0.25,0,0.5,1]}]});
+        p.page_families[0].image_slots = vec![serde_json::from_value(slot.clone()).unwrap()];
+        p.validate().unwrap();
+        for (key, bad) in [
+            ("crop", serde_json::json!([0, 0, 0, 1])),
+            ("crop", serde_json::json!([0, 0, 1.1, 1])),
+            ("source_aspect_ratio", serde_json::json!(10000)),
+            ("views", serde_json::json!([{"rect":[0,0,100,100],"crop":[0,0,1,1]}])),
+            ("views", serde_json::json!(vec![serde_json::json!({"rect":[54,180,154,280],"crop":[0,0,1,1]}); 8])),
+        ] {
+            let mut changed = slot.clone();
+            changed[key] = bad;
+            p.page_families[0].image_slots = vec![serde_json::from_value(changed).unwrap()];
+            assert!(p.validate().is_err(), "{key}");
+        }
+    }
     fn profile() -> DesignProfile {
         DesignProfile {
             name: "School".into(),

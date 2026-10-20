@@ -53,6 +53,21 @@ mod native_tests {
         }
     }
 
+    #[test]
+    fn gemini_image_aspect_ratio_is_sent_in_the_native_request() {
+        let request = ImageRequest {
+            prompt: "Four isolated plant growth stages".into(),
+            size: Some("4:1".into()),
+            quality: None,
+            comfy: None,
+            resources: Default::default(),
+        };
+        let body = crate::native::image_generation_body(ProviderKind::Gemini, "test-model", &request).unwrap();
+        assert_eq!(body["generationConfig"]["imageConfig"]["aspectRatio"], "4:1");
+        let invalid = ImageRequest { size: Some("not-a-ratio".into()), ..request };
+        assert!(crate::native::image_generation_body(ProviderKind::Gemini, "test-model", &invalid).unwrap_err().contains("aspect ratio"));
+    }
+
     /// Minimal synthetic server captures complete request and returns fixed data.
     fn mock(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
         mock_cancellable(responses, None)

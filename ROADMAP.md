@@ -1,5 +1,9 @@
 # DesignCraft roadmap
 
+- AI12 (2026-10-20): Publish 25 portable native skill packages with per-file hashes and upstream notices, including curriculum planning guidance. The accepted science identity now has four distinct editable lesson compositions; reference-book artwork, private approvals and provider credentials remain local. Import validation and human batch-proof gates remain separate.
+
+- AI11 (2026-10-20): Pinned illustration slots support bounded shared-source native crop views, with all placement commands budgeted before generation. Restricted proportional fitting preserves editable frames; Gemini receives an explicit validated image aspect ratio. Template content retains authored type sizes and leading, with real native overset checks before image spending. Human proof gates remain unchanged.
+
 - AI9 (2026-10-19): Batch proof approval requires a fresh, explicit desktop input gesture bound to the exact proof and widget. Its single-use dispatch permit expires with the UI frame; idle frames, repeated keys and a pointer release from a prior checkpoint cannot approve another batch.
 
 - AI8 (2026-10-19): Content templates set Latin-only replacement text to native LTR paragraph direction, preserving authored alignment and the existing Arabic fields. Local command counts include the explicit frame-selection and formatting steps before any provider call.
@@ -652,3 +656,4 @@ The shared craft-installer UI preserves this revision's install options and prov
 - **2026-10-19** · AI production explains disabled-start prerequisites in Arabic and English while retaining budget and human-proof gates. The Windows native-preview launcher uses explicit UTF-8 and validates existing profile/document paths to preserve Arabic paths and protected-key scope on PowerShell 5.
 
 - 2026-10-19 · AI composer: inline provider/model, bounded prompt and production action; relevant skills validate native templates and activate automatically with separate machine evidence. Human batch-proof, budget and print guards remain enforced.
+- **2026-10-20** · AI skill routing counts distinct meaningful terms and follows lesson purpose; bounded context keeps pinned guidance and executable profiles. New Arabic copy defaults to plain text, repeated major body layouts stop before image spending, and generated art fills authored graphic slots without covering native dialogue. Technical validation remains separate from human editorial acceptance.

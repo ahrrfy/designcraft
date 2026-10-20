@@ -1,0 +1,1091 @@
+{
+  "schema_version": 1,
+  "skill_id": "kg-oxford-cambridge-style",
+  "required_commands": [
+    "frame.create",
+    "line.create",
+    "object.fill",
+    "object.group",
+    "object.label",
+    "object.stroke",
+    "path.create",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/cognitive-sensory-style-guide.md",
+    "references/vector-vs-generative-matrix.md",
+    "references/independence.md"
+  ],
+  "templates": [
+    "templates/international-curriculum-cover.json",
+    "templates/international-scope-sequence.json",
+    "templates/garnet-computing-systems-lab.json",
+    "templates/oxford-vocab-story.json",
+    "templates/oxford-phonics-maze.json",
+    "templates/cambridge-cpa-grammar.json",
+    "templates/oxford-song-colours.json",
+    "templates/oxford-workbook-print.json",
+    "templates/oxford-skills-time.json",
+    "templates/oxford-fluency-project.json",
+    "templates/sample_native_only.json"
+  ],
+  "sample_template": "templates/sample_native_only.json",
+  "external_tools": [],
+  "compatibility_notes": "Primary Executable International Curriculum Design Style for DesignCraft (Oxford, Cambridge, Family and Friends & Garnet Education). Contains 10 executable page families with 100% bound dynamic text_slots (0 unslotted words), pre-authored graphic frames for image_slots underneath native speech bubbles, and single-level decomposable vector groups (object.group <-> object.ungroup) within A4 15mm safe margins.",
+  "design_profile": {
+    "name": "Oxford, Cambridge & Garnet International Style / نمط أكسفورد وكامبريدج وكارنيت",
+    "keywords": [
+      "منهج",
+      "دولي",
+      "حاسوب",
+      "كمبيوتر",
+      "برمجة",
+      "تقنية",
+      "أكسفورد",
+      "اكسفورد",
+      "كامبريدج",
+      "كارنيت",
+      "فاملي",
+      "كتاب",
+      "math",
+      "كراس",
+      "روضة",
+      "أطفال",
+      "علوم",
+      "رياضيات",
+      "تصميم",
+      "curriculum",
+      "computer",
+      "oxford",
+      "cambridge",
+      "garnet"
+    ],
+    "age_range": [
+      4,
+      14
+    ],
+    "page_mm": [
+      210.0,
+      297.0
+    ],
+    "margin_mm": 15.0,
+    "palette": [
+      "[Paper]",
+      "[Black]",
+      "C=100 M=90 Y=10 K=0",
+      "C=100 M=0 Y=0 K=0",
+      "C=75 M=5 Y=100 K=0",
+      "C=15 M=100 Y=100 K=0",
+      "C=0 M=0 Y=100 K=0",
+      "C=0 M=100 Y=0 K=0"
+    ],
+    "typography": [
+      "All typography uses native editable Tahoma Regular/Bold frames with explicit leading and automatic paragraph direction (RTL for Arabic, LTR for English). Never rasterize text into images.",
+      "Adapt 100% of the 12 declared text slots on every page to the exact requested curriculum subject (e.g. Computer Science / ICT, Science, Math, Languages) and target language."
+    ],
+    "layout": [
+      "A4 portrait (210x297 mm) with strict 15 mm safe margins. Every page family uses single-level decomposable vector groups (object.group <-> object.ungroup) with 3-10 labeled part.* atomic objects.",
+      "For complete curricula or multi-page books, sequence the 10 families logically: open with international-curriculum-cover and international-scope-sequence, then rotate across garnet-computing-systems-lab, oxford-vocab-story, cambridge-cpa-grammar, oxford-phonics-maze, oxford-song-colours, oxford-skills-time, oxford-fluency-project, and oxford-workbook-print.",
+      "Every image slot has an exact pre-authored native graphic frame placed BEFORE overlaid native speech bubbles, number badges, and lyric cards so generated illustrations sit cleanly underneath editable overlays."
+    ],
+    "pedagogy": [
+      "Combine Oxford (First Friends, Family and Friends, Oxford International Computing), Cambridge (CPA Concrete-Pictorial-Abstract & Primary Computing), and Garnet Education (Topic-Banner & Systems Progression) methodologies.",
+      "Move systematically from visual vocabulary/hardware discovery to systems/IPO/CPA logic, guided skill practice, collaborative lab projects, and print-ready workbook assessment."
+    ],
+    "illustration": [
+      "Warm international textbook watercolor-and-ink digital illustration with friendly expressive characters, clear technical/educational objects, and pure white (#FFFFFF) backgrounds for isolated flashcard cutouts.",
+      "For story panels, computer lab scenes, grammar scenes, and song spreads, reserve the top 28% (or right 34% on song spreads) as calm light background space so native vector speech bubbles and cards remain 100% legible.",
+      "Strictly NO text, NO letters, NO numbers, and NO speech bubbles inside generated raster pixels."
+    ],
+    "page_families": [
+      {
+        "id": "international-curriculum-cover",
+        "purpose": "Oxford, Cambridge & Garnet International Curriculum Cover & Book Opener: top publisher ribbon, main course title & subtitle card, central hero illustration with overlaid badge, 4 curriculum pillar cards, and student registration panel.",
+        "template": "templates/international-curriculum-cover.json",
+        "text_slots": [
+          {
+            "id": "series-badge",
+            "purpose": "International series/publisher header badge.",
+            "command": 7,
+            "max_chars": 31
+          },
+          {
+            "id": "level-tag",
+            "purpose": "Stage, grade or level badge on the cover.",
+            "command": 14,
+            "max_chars": 28
+          },
+          {
+            "id": "book-title",
+            "purpose": "Main curriculum book title on the cover.",
+            "command": 28,
+            "max_chars": 48
+          },
+          {
+            "id": "book-subtitle",
+            "purpose": "Subtitle describing the curriculum scope and methodology.",
+            "command": 32,
+            "max_chars": 79
+          },
+          {
+            "id": "hero-caption",
+            "purpose": "Overlay badge caption on the cover hero illustration.",
+            "command": 49,
+            "max_chars": 35
+          },
+          {
+            "id": "pillars-heading",
+            "purpose": "Heading above the 4 curriculum pillar cards.",
+            "command": 55,
+            "max_chars": 52
+          },
+          {
+            "id": "pillar-1",
+            "purpose": "Curriculum pillar 1 summary title.",
+            "command": 63,
+            "max_chars": 39
+          },
+          {
+            "id": "pillar-2",
+            "purpose": "Curriculum pillar 2 summary title.",
+            "command": 71,
+            "max_chars": 37
+          },
+          {
+            "id": "pillar-3",
+            "purpose": "Curriculum pillar 3 summary title.",
+            "command": 79,
+            "max_chars": 36
+          },
+          {
+            "id": "pillar-4",
+            "purpose": "Curriculum pillar 4 summary title.",
+            "command": 87,
+            "max_chars": 36
+          },
+          {
+            "id": "student-card",
+            "purpose": "Student name and class registration line on the cover.",
+            "command": 101,
+            "max_chars": 74
+          },
+          {
+            "id": "edition-footer",
+            "purpose": "Bottom curriculum alignment and methodology note.",
+            "command": 105,
+            "max_chars": 78
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "cover-hero",
+            "purpose": "Vibrant international textbook cover illustration in warm watercolor-and-digital style showing cheerful students exploring the subject with modern tools and discovery icons. Leave top-right corner. No text.",
+            "rect": [
+              48.0,
+              238.0,
+              547.0,
+              516.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "international-scope-sequence",
+        "purpose": "Oxford, Cambridge & Garnet International Scope & Sequence Syllabus Map: panoramic curriculum header banner and 4 structured unit rows detailing Unit Topic, Core Vocabulary, Systems/Grammar Logic, and Practical Lab/Project Outcomes.",
+        "template": "templates/international-scope-sequence.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 109
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "map-intro",
+            "purpose": "Introductory heading above the Scope & Sequence table.",
+            "command": 39,
+            "max_chars": 89
+          },
+          {
+            "id": "col-headers",
+            "purpose": "Column headers for the Scope & Sequence syllabus table.",
+            "command": 53,
+            "max_chars": 91
+          },
+          {
+            "id": "unit-1-title",
+            "purpose": "Unit 1 number and topic title.",
+            "command": 67,
+            "max_chars": 36
+          },
+          {
+            "id": "unit-1-details",
+            "purpose": "Unit 1 vocabulary, systems/logic concepts, and practical lab project.",
+            "command": 75,
+            "max_chars": 110
+          },
+          {
+            "id": "unit-2-title",
+            "purpose": "Unit 2 number and topic title.",
+            "command": 89,
+            "max_chars": 36
+          },
+          {
+            "id": "unit-2-details",
+            "purpose": "Unit 2 vocabulary, systems/logic concepts, and practical lab project.",
+            "command": 97,
+            "max_chars": 110
+          },
+          {
+            "id": "unit-3-title",
+            "purpose": "Unit 3 number and topic title.",
+            "command": 111,
+            "max_chars": 36
+          },
+          {
+            "id": "unit-3-details",
+            "purpose": "Unit 3 vocabulary, systems/logic concepts, and practical lab project.",
+            "command": 119,
+            "max_chars": 110
+          },
+          {
+            "id": "unit-4-title",
+            "purpose": "Unit 4 number and topic title.",
+            "command": 133,
+            "max_chars": 36
+          },
+          {
+            "id": "unit-4-details",
+            "purpose": "Unit 4 vocabulary, systems/logic concepts, and practical lab project.",
+            "command": 141,
+            "max_chars": 110
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "syllabus-banner-art",
+            "purpose": "Wide panoramic textbook header illustration showing 4 colourful unit icons/scenes side by side on a pure white (#FFFFFF) background representing the 4 curriculum units. No text or letters.",
+            "rect": [
+              48.0,
+              138.0,
+              547.0,
+              224.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "garnet-computing-systems-lab",
+        "purpose": "Garnet Education, Oxford & Cambridge International Computing & Systems Lab Spread: top 4 technical concept flashcards, middle decomposable vector Input-Process-Output (IPO) system flowchart, computer lab scene with callout bubbles, and bottom step-by-step practical lab task.",
+        "template": "templates/garnet-computing-systems-lab.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 113
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "term-1",
+            "purpose": "Technical concept or hardware card 1 label.",
+            "command": 47,
+            "max_chars": 22
+          },
+          {
+            "id": "term-2",
+            "purpose": "Technical concept or hardware card 2 label.",
+            "command": 55,
+            "max_chars": 19
+          },
+          {
+            "id": "term-3",
+            "purpose": "Technical concept or hardware card 3 label.",
+            "command": 63,
+            "max_chars": 19
+          },
+          {
+            "id": "term-4",
+            "purpose": "Technical concept or hardware card 4 label.",
+            "command": 71,
+            "max_chars": 22
+          },
+          {
+            "id": "ipo-input",
+            "purpose": "Stage 1 Input node in the system flowchart.",
+            "command": 85,
+            "max_chars": 56
+          },
+          {
+            "id": "ipo-process",
+            "purpose": "Stage 2 Process node in the system flowchart.",
+            "command": 96,
+            "max_chars": 56
+          },
+          {
+            "id": "ipo-output",
+            "purpose": "Stage 3 Output node in the system flowchart.",
+            "command": 107,
+            "max_chars": 58
+          },
+          {
+            "id": "lab-bubble-1",
+            "purpose": "Left student callout in the lab scene.",
+            "command": 125,
+            "max_chars": 42
+          },
+          {
+            "id": "lab-bubble-2",
+            "purpose": "Right student callout in the lab scene.",
+            "command": 139,
+            "max_chars": 46
+          },
+          {
+            "id": "lab-steps",
+            "purpose": "Hands-on computer lab step-by-step activity and verification task.",
+            "command": 157,
+            "max_chars": 105
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "computing-terms",
+            "purpose": "Row of 4 isolated educational computing/technical illustrations on a pure white (#FFFFFF) background in clean modern textbook illustration style (e.g. keyboard, mouse, CPU chip, monitor). No text or borders.",
+            "rect": [
+              48.0,
+              118.0,
+              547.0,
+              214.0
+            ]
+          },
+          {
+            "id": "computing-lab-scene",
+            "purpose": "Bright modern school computer lab illustration in warm Oxford/Cambridge/Garnet textbook style showing two students working at a desktop computer and tablet, pointing at the screen and keyboard. Leave. No text.",
+            "rect": [
+              48.0,
+              406.0,
+              547.0,
+              636.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "oxford-vocab-story",
+        "purpose": "Oxford First Friends & Family and Friends Vocabulary & 4-Panel Story/Scenario Spread: top 4-item flashcard strip, 2x2 story/scenario grid with native overlaid speech bubbles, and bottom consolidation bar.",
+        "template": "templates/oxford-vocab-story.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 72
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "vocab-1",
+            "purpose": "Flashcard 1 vocabulary term.",
+            "command": 47,
+            "max_chars": 16
+          },
+          {
+            "id": "vocab-2",
+            "purpose": "Flashcard 2 vocabulary term.",
+            "command": 55,
+            "max_chars": 16
+          },
+          {
+            "id": "vocab-3",
+            "purpose": "Flashcard 3 vocabulary term.",
+            "command": 63,
+            "max_chars": 16
+          },
+          {
+            "id": "vocab-4",
+            "purpose": "Flashcard 4 vocabulary term.",
+            "command": 71,
+            "max_chars": 16
+          },
+          {
+            "id": "story-prompt",
+            "purpose": "Section heading for the 4-panel visual story or scenario.",
+            "command": 77,
+            "max_chars": 56
+          },
+          {
+            "id": "bubble-1",
+            "purpose": "Panel 1 speech bubble.",
+            "command": 129,
+            "max_chars": 40
+          },
+          {
+            "id": "bubble-2",
+            "purpose": "Panel 2 speech bubble.",
+            "command": 143,
+            "max_chars": 40
+          },
+          {
+            "id": "bubble-3",
+            "purpose": "Panel 3 speech bubble.",
+            "command": 157,
+            "max_chars": 40
+          },
+          {
+            "id": "bubble-4",
+            "purpose": "Panel 4 speech bubble.",
+            "command": 171,
+            "max_chars": 40
+          },
+          {
+            "id": "trace-words",
+            "purpose": "Bottom consolidation task instruction and 4 key terms.",
+            "command": 188,
+            "max_chars": 92
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "vocab-strip",
+            "purpose": "Horizontal row of 4 isolated educational flashcard illustrations on a pure solid white (#FFFFFF) background in warm textbook watercolor-and-ink style, evenly spaced. No text or borders.",
+            "rect": [
+              48.0,
+              118.0,
+              547.0,
+              224.0
+            ]
+          },
+          {
+            "id": "story-grid",
+            "purpose": "2x2 grid of 4 textbook story/scenario panels separated by thin white borders in warm illustration style. Leave top 28% of each panel calm light background for speech bubbles. No text.",
+            "rect": [
+              48.0,
+              288.0,
+              547.0,
+              632.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "oxford-phonics-maze",
+        "purpose": "Oxford Phonics, Symbols & Sequence Maze Spread: top 4-card sound/symbol strip, middle red/blue 4-line guided writing staves, and bottom path/algorithm maze puzzle with goal illustration.",
+        "template": "templates/oxford-phonics-maze.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 72
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "phonics-prompt",
+            "purpose": "Instruction for the 4-card symbol/phonics strip.",
+            "command": 39,
+            "max_chars": 60
+          },
+          {
+            "id": "phonics-1",
+            "purpose": "Card 1 symbol/letter and example word.",
+            "command": 51,
+            "max_chars": 16
+          },
+          {
+            "id": "phonics-2",
+            "purpose": "Card 2 symbol/letter and example word.",
+            "command": 59,
+            "max_chars": 16
+          },
+          {
+            "id": "phonics-3",
+            "purpose": "Card 3 symbol/letter and example word.",
+            "command": 67,
+            "max_chars": 16
+          },
+          {
+            "id": "phonics-4",
+            "purpose": "Card 4 symbol/letter and example word.",
+            "command": 75,
+            "max_chars": 16
+          },
+          {
+            "id": "writing-prompt",
+            "purpose": "Guided writing/tracing instruction.",
+            "command": 81,
+            "max_chars": 58
+          },
+          {
+            "id": "trace-row-1",
+            "purpose": "Guided writing stave row 1 target letters, symbols or terms.",
+            "command": 107,
+            "max_chars": 44
+          },
+          {
+            "id": "trace-row-2",
+            "purpose": "Guided writing stave row 2 target letters, symbols or terms.",
+            "command": 135,
+            "max_chars": 44
+          },
+          {
+            "id": "maze-prompt",
+            "purpose": "Instruction for the bottom sequence/path maze activity.",
+            "command": 141,
+            "max_chars": 58
+          },
+          {
+            "id": "maze-row-1",
+            "purpose": "Maze sequence steps and completion instruction (3 lines showing path from start to goal).",
+            "command": 160,
+            "max_chars": 110
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "phonics-cards",
+            "purpose": "Row of 4 isolated educational flashcard illustrations on a pure white (#FFFFFF) background in warm textbook style, evenly spaced across 4 columns. No text or borders.",
+            "rect": [
+              48.0,
+              138.0,
+              547.0,
+              236.0
+            ]
+          },
+          {
+            "id": "maze-goal-art",
+            "purpose": "Cheerful student character next to the activity goal object on a pure white background, warm textbook illustration. No text or letters.",
+            "rect": [
+              380.0,
+              504.0,
+              547.0,
+              762.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "cambridge-cpa-grammar",
+        "purpose": "Oxford 'Let's learn!' Rule Box & Cambridge CPA (Concrete-Pictorial-Abstract) Thinking Spread: top concept dialogue scene with native speech bubbles and rule synthesis card, bottom 3-stage Concrete-Pictorial-Abstract ten-frame and part-whole workspace.",
+        "template": "templates/cambridge-cpa-grammar.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 75
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "grammar-prompt",
+            "purpose": "Instruction for the top concept scene and rule card.",
+            "command": 39,
+            "max_chars": 52
+          },
+          {
+            "id": "grammar-q",
+            "purpose": "Left student question in the concept scene.",
+            "command": 55,
+            "max_chars": 30
+          },
+          {
+            "id": "grammar-a",
+            "purpose": "Right student answer in the concept scene.",
+            "command": 69,
+            "max_chars": 30
+          },
+          {
+            "id": "grammar-rule-1",
+            "purpose": "Primary concept or grammar rule box.",
+            "command": 83,
+            "max_chars": 52
+          },
+          {
+            "id": "grammar-rule-2",
+            "purpose": "Secondary rule or verification pattern.",
+            "command": 91,
+            "max_chars": 52
+          },
+          {
+            "id": "grammar-focus",
+            "purpose": "Key summary equation or rule highlight.",
+            "command": 99,
+            "max_chars": 48
+          },
+          {
+            "id": "cpa-prompt",
+            "purpose": "Instruction for the 3-stage Concrete-Pictorial-Abstract workspace.",
+            "command": 105,
+            "max_chars": 64
+          },
+          {
+            "id": "cpa-concrete-label",
+            "purpose": "Stage 1 Concrete title and item count.",
+            "command": 121,
+            "max_chars": 36
+          },
+          {
+            "id": "cpa-pictorial-label",
+            "purpose": "Stage 2 Pictorial diagram label.",
+            "command": 157,
+            "max_chars": 40
+          },
+          {
+            "id": "cpa-bond-label",
+            "purpose": "Stage 3 Abstract formula or symbolic representation.",
+            "command": 193,
+            "max_chars": 38
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "grammar-scene",
+            "purpose": "Warm textbook classroom illustration showing two students demonstrating the lesson concept at a desk. Leave top 28% calm light background for native speech bubbles. No text.",
+            "rect": [
+              48.0,
+              138.0,
+              332.0,
+              404.0
+            ]
+          },
+          {
+            "id": "cpa-concrete",
+            "purpose": "Three tangible educational objects arranged neatly side by side on a tray on a pure white background, warm textbook illustration. No text or numbers.",
+            "rect": [
+              48.0,
+              440.0,
+              206.0,
+              684.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "oxford-song-colours",
+        "purpose": "Oxford Visual Swatches, Wide Hero Scene & Classification Spread: top 4 visual concept swatches, middle wide hero illustration with overlaid summary/chant card, and bottom vector shape classification activity.",
+        "template": "templates/oxford-song-colours.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 81
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "colours-prompt",
+            "purpose": "Instruction for the top 4 visual concept items.",
+            "command": 39,
+            "max_chars": 52
+          },
+          {
+            "id": "colour-1",
+            "purpose": "Concept item 1 short label.",
+            "command": 51,
+            "max_chars": 16
+          },
+          {
+            "id": "colour-2",
+            "purpose": "Concept item 2 short label.",
+            "command": 59,
+            "max_chars": 16
+          },
+          {
+            "id": "colour-3",
+            "purpose": "Concept item 3 short label.",
+            "command": 67,
+            "max_chars": 16
+          },
+          {
+            "id": "colour-4",
+            "purpose": "Concept item 4 short label.",
+            "command": 75,
+            "max_chars": 16
+          },
+          {
+            "id": "song-prompt",
+            "purpose": "Instruction for the wide hero scene and summary card.",
+            "command": 81,
+            "max_chars": 60
+          },
+          {
+            "id": "song-title",
+            "purpose": "Title of the classroom chant or concept summary card.",
+            "command": 96,
+            "max_chars": 26
+          },
+          {
+            "id": "song-verse-1",
+            "purpose": "First stanza or key points (3-4 short lines).",
+            "command": 100,
+            "max_chars": 84
+          },
+          {
+            "id": "song-verse-2",
+            "purpose": "Second stanza or closing summary (3-4 short lines).",
+            "command": 104,
+            "max_chars": 84
+          },
+          {
+            "id": "colour-key",
+            "purpose": "Bottom classification instruction and 1-4 coding key.",
+            "command": 118,
+            "max_chars": 92
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "paint-pots",
+            "purpose": "Row of 4 colourful isolated educational concept icons/illustrations on a pure white (#FFFFFF) background. No text or letters.",
+            "rect": [
+              48.0,
+              138.0,
+              547.0,
+              232.0
+            ]
+          },
+          {
+            "id": "song-scene",
+            "purpose": "Wide textbook watercolor-and-ink illustration showing happy students exploring the lesson topic in a bright scene. Keep the right 34% lighter background space for the native overlay card. No text.",
+            "rect": [
+              48.0,
+              290.0,
+              547.0,
+              566.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "oxford-workbook-print",
+        "purpose": "Oxford Print-Ready Workbook Spread: top word bank and 2x2 black-and-white line-art scenes for numbering/matching, bottom decomposable vector crossword grid and guided writing practice.",
+        "template": "templates/oxford-workbook-print.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 72
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "wb-prompt-1",
+            "purpose": "First workbook exercise instruction (read and number).",
+            "command": 39,
+            "max_chars": 69
+          },
+          {
+            "id": "word-bank-1",
+            "purpose": "Word bank items 1 and 2.",
+            "command": 47,
+            "max_chars": 38
+          },
+          {
+            "id": "word-bank-2",
+            "purpose": "Word bank items 3 and 4.",
+            "command": 51,
+            "max_chars": 39
+          },
+          {
+            "id": "scene-1",
+            "purpose": "Short caption for left workbook pictures.",
+            "command": 87,
+            "max_chars": 26
+          },
+          {
+            "id": "scene-2",
+            "purpose": "Short caption for right workbook pictures.",
+            "command": 91,
+            "max_chars": 26
+          },
+          {
+            "id": "wb-prompt-2",
+            "purpose": "Second workbook exercise instruction.",
+            "command": 97,
+            "max_chars": 64
+          },
+          {
+            "id": "crossword-grid",
+            "purpose": "Three 4-letter puzzle rows.",
+            "command": 126,
+            "max_chars": 45
+          },
+          {
+            "id": "crossword-clues",
+            "purpose": "Three short numbered puzzle clues.",
+            "command": 130,
+            "max_chars": 78
+          },
+          {
+            "id": "writing-model",
+            "purpose": "First guided sentence model for student writing.",
+            "command": 140,
+            "max_chars": 44
+          },
+          {
+            "id": "writing-answer",
+            "purpose": "Second guided sentence prompt for student completion.",
+            "command": 153,
+            "max_chars": 44
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "workbook-lineart",
+            "purpose": "2x2 grid of 4 clean black-and-white workbook line-art illustrations on a pure solid white (#FFFFFF) background with crisp ink outlines for school printing and colouring. No text or numbers.",
+            "rect": [
+              48.0,
+              180.0,
+              547.0,
+              456.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "oxford-skills-time",
+        "purpose": "Oxford 'Skills Time!' Integrated Four-Skills Spread: top spiral-notebook reading passage with narrator portrait slot, middle 'Listen and tick' picture grid, and bottom 'Ask and answer' pair dialogue.",
+        "template": "templates/oxford-skills-time.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 87
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "reading-prompt",
+            "purpose": "Reading instruction above the notebook passage.",
+            "command": 39,
+            "max_chars": 56
+          },
+          {
+            "id": "article-title",
+            "purpose": "Heading of the reading passage.",
+            "command": 59,
+            "max_chars": 38
+          },
+          {
+            "id": "reading-p1",
+            "purpose": "First short paragraph (2 lines) of the reading passage.",
+            "command": 63,
+            "max_chars": 84
+          },
+          {
+            "id": "reading-p2",
+            "purpose": "Second short paragraph (2 lines) of the reading passage.",
+            "command": 67,
+            "max_chars": 84
+          },
+          {
+            "id": "reading-p3",
+            "purpose": "Closing short paragraph (2 lines) of the reading passage.",
+            "command": 71,
+            "max_chars": 76
+          },
+          {
+            "id": "listening-prompt",
+            "purpose": "Listening comprehension instruction.",
+            "command": 81,
+            "max_chars": 58
+          },
+          {
+            "id": "speaking-prompt",
+            "purpose": "Speaking pair-work instruction.",
+            "command": 132,
+            "max_chars": 52
+          },
+          {
+            "id": "speak-q",
+            "purpose": "Speaking model question for pair work.",
+            "command": 140,
+            "max_chars": 50
+          },
+          {
+            "id": "speak-a",
+            "purpose": "Speaking model answer for pair work.",
+            "command": 148,
+            "max_chars": 52
+          },
+          {
+            "id": "word-pool",
+            "purpose": "Substitution word pool for speaking and writing practice.",
+            "command": 156,
+            "max_chars": 77
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "reading-portrait",
+            "purpose": "Cheerful student sitting at a classroom desk proudly presenting the lesson topic, warm textbook watercolor-and-ink illustration on white background. No text.",
+            "rect": [
+              58.0,
+              174.0,
+              224.0,
+              396.0
+            ]
+          },
+          {
+            "id": "listening-grid",
+            "purpose": "Row of 3 textbook illustrations on a pure white (#FFFFFF) background showing 3 distinct examples from the lesson for listening identification. No text or numbers.",
+            "rect": [
+              48.0,
+              442.0,
+              547.0,
+              582.0
+            ]
+          }
+        ]
+      },
+      {
+        "id": "oxford-fluency-project",
+        "purpose": "Oxford 'Fluency Time!' Communication & Hands-On Project Spread: top functional dialogue strip with overlaid speech bubbles, middle 3-step hands-on project & presentation, and bottom self-assessment bar.",
+        "template": "templates/oxford-fluency-project.json",
+        "text_slots": [
+          {
+            "id": "title-main",
+            "purpose": "Unit & lesson heading (1-2 short lines, Arabic or English).",
+            "command": 13,
+            "max_chars": 77
+          },
+          {
+            "id": "header-tag",
+            "purpose": "Top-right lesson/module badge label.",
+            "command": 21,
+            "max_chars": 22
+          },
+          {
+            "id": "fluency-prompt",
+            "purpose": "Instruction for the top functional dialogue strip.",
+            "command": 39,
+            "max_chars": 56
+          },
+          {
+            "id": "dialogue-1",
+            "purpose": "Panel 1 collaborative offer or request.",
+            "command": 55,
+            "max_chars": 38
+          },
+          {
+            "id": "dialogue-2",
+            "purpose": "Panel 2 polite response.",
+            "command": 69,
+            "max_chars": 38
+          },
+          {
+            "id": "project-prompt",
+            "purpose": "Instruction for the hands-on project and presentation.",
+            "command": 75,
+            "max_chars": 58
+          },
+          {
+            "id": "step-1",
+            "purpose": "Project step 1 label.",
+            "command": 87,
+            "max_chars": 20
+          },
+          {
+            "id": "step-2",
+            "purpose": "Project step 2 label.",
+            "command": 95,
+            "max_chars": 19
+          },
+          {
+            "id": "step-3",
+            "purpose": "Project step 3 presentation label.",
+            "command": 103,
+            "max_chars": 30
+          },
+          {
+            "id": "present-speech",
+            "purpose": "Student presentation speech bubble.",
+            "command": 117,
+            "max_chars": 39
+          },
+          {
+            "id": "ican-badge",
+            "purpose": "Self-assessment badge title (e.g. 'I can!' or 'أنا أستطيع!').",
+            "command": 130,
+            "max_chars": 15
+          },
+          {
+            "id": "self-check",
+            "purpose": "Student 'I can...' self-assessment statement.",
+            "command": 134,
+            "max_chars": 74
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "everyday-dialogue",
+            "purpose": "2-panel horizontal textbook illustration of two polite students collaborating at a table. Leave top 28% calm light background for native speech bubbles. No text.",
+            "rect": [
+              48.0,
+              138.0,
+              547.0,
+              366.0
+            ]
+          },
+          {
+            "id": "craft-project",
+            "purpose": "2-panel textbook project illustration: left panel shows hands assembling and labelling a colourful educational project card; right panel shows two students proudly presenting their finished project.. No text.",
+            "rect": [
+              48.0,
+              400.0,
+              547.0,
+              662.0
+            ]
+          }
+        ]
+      }
+    ],
+    "corrections": [
+      {
+        "before": "Repeating a generic layout or leaving stock topic words from another subject when generating a specialized curriculum such as Computer Science (الحاسوب).",
+        "after": "Sequence the 10 specialized Oxford, Cambridge & Garnet page families (Cover, Scope & Sequence, Computing Lab/IPO, Vocab & Story, Symbols & Maze, CPA & Rules, Visual & Chant, Skills Time, Fluency & Project, Workbook Print) and adapt 100% of text slots and image prompts to the requested subject.",
+        "reason": "Original curriculum page architecture for Computer Science, STEM and Languages; actual educational and visual quality requires human review."
+      }
+    ]
+  }
+}

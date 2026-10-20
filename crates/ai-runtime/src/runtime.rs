@@ -850,9 +850,10 @@ impl ProductionRunner {
                         .filter(|r| skill_is_compatible(r, &supported))
                         .or_else(|| active_design_revision(&entry).filter(|r| skill_is_compatible(r, &supported)))?;
                     let profile = revision.manifest.design_profile.as_ref()?;
-                    let lower = prompt.to_lowercase();
-                    let score = profile.keywords.iter().filter(|word| lower.contains(&word.to_lowercase())).count();
-                    (score > 0).then_some((score, entry.skill_id))
+                    let lower = normalize_skill_search(prompt);
+                    let hits = profile.keywords.iter().filter(|word| lower.contains(&normalize_skill_search(word))).count();
+                    let bonus = usize::from(hits > 0 && entry.skill_id == "kg-oxford-cambridge-style") * 16;
+                    (hits > 0).then_some((hits.saturating_add(bonus), entry.skill_id))
                 })
                 .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
                 .map(|(_, id)| id),
@@ -1022,9 +1023,9 @@ impl ProductionRunner {
     }
 }
 
-/// The content compiler executes only the design style's immutable templates.
-/// Other selected skills contribute guidance, references and pinned identities;
-/// their native command examples are not needed by this execution path.
+/// Preserve immutable guidance and executable design profiles within the task
+/// budget. Command planners can omit optional sample templates, largest first;
+/// the content compiler never needs non-style command examples.
 fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> Result<Vec<SkillSnapshot>, String> {
     if matches!(target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook) && skills.iter().any(crate::template_plan::eligible) {
         for skill in &mut skills {
@@ -1032,16 +1033,50 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
                 skill.templates.clear();
             }
         }
+        // Compiler commands remain immutable local inputs. The model receives
+        // only deduplicated guidance and the serialized design-profile rules.
+        let mut bytes = worker::compact_skill_guidance(&skills)?.len();
+        for profile in skills.iter().filter_map(|skill| skill.design_profile.as_ref()) {
+            let rules = serde_json::to_vec(profile).map_err(|e| e.to_string())?.len();
+            if rules > 32 * 1024 {
+                return Err("Template style rules exceed the bounded context limit".into());
+            }
+            bytes = bytes.checked_add(rules).ok_or("Selected skill context size overflow")?;
+            if bytes > 64 * 1024 {
+                return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
+            }
+        }
+        return Ok(skills);
     }
-    let mut bytes = 2usize;
-    for skill in &skills {
-        let size = serde_json::to_vec(skill).map_err(|e| e.to_string())?.len();
-        bytes = bytes.checked_add(size.saturating_add(1)).ok_or("Selected skill context size overflow")?;
-        if bytes > 64 * 1024 {
-            return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
+    if task_skill_context_bytes(&skills)? <= 64 * 1024 {
+        return Ok(skills);
+    }
+    let mut optional_examples = Vec::new();
+    for (index, skill) in skills.iter().enumerate().filter(|(_, skill)| skill.design_profile.is_none()) {
+        for (path, actions) in &skill.templates {
+            let size = serde_json::to_vec(&(path, actions)).map_err(|e| e.to_string())?.len();
+            optional_examples.push((size, index, path.clone()));
         }
     }
-    Ok(skills)
+    optional_examples.sort_by_key(|example| std::cmp::Reverse(example.0));
+    for (_, index, path) in optional_examples {
+        if let Some(skill) = skills.get_mut(index) {
+            skill.templates.remove(&path);
+        }
+        if task_skill_context_bytes(&skills)? <= 64 * 1024 {
+            return Ok(skills);
+        }
+    }
+    Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into())
+}
+
+fn task_skill_context_bytes(skills: &[SkillSnapshot]) -> Result<usize, String> {
+    let mut bytes = 2usize;
+    for (index, skill) in skills.iter().enumerate() {
+        let size = serde_json::to_vec(skill).map_err(|e| e.to_string())?.len();
+        bytes = bytes.checked_add(size).and_then(|size| size.checked_add(usize::from(index > 0))).ok_or("Selected skill context size overflow")?;
+    }
+    Ok(bytes)
 }
 
 fn design_revision(entry: &designcraft_ai_skills::CatalogEntry) -> Option<&designcraft_ai_skills::SkillRevision> {
@@ -1202,24 +1237,298 @@ fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::Ca
 }
 
 fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) -> usize {
-    let prompt = prompt.to_lowercase();
-    let haystack = format!("{} {} {}", entry.skill_id, entry.name, entry.description).to_lowercase();
-    let mut score = prompt
+    let prompt = normalize_skill_search(prompt);
+    let haystack = normalize_skill_search(&format!("{} {} {}", entry.skill_id, entry.name, entry.description));
+    let words = prompt
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| word.chars().count() >= 3 || *word == "a4")
-        .filter(|word| haystack.contains(word))
-        .count();
-    if entry.skill_id == "native-engine-workflow" {
-        score = score.saturating_add(4);
+        .filter(|word| {
+            !matches!(
+                *word,
+                "the"
+                    | "and"
+                    | "with"
+                    | "for"
+                    | "from"
+                    | "that"
+                    | "this"
+                    | "into"
+                    | "without"
+                    | "are"
+                    | "you"
+                    | "your"
+                    | "not"
+                    | "all"
+                    | "use"
+                    | "على"
+                    | "الى"
+                    | "إلى"
+                    | "هذا"
+                    | "هذه"
+                    | "ذلك"
+                    | "التي"
+                    | "الذي"
+                    | "لكل"
+                    | "لكي"
+                    | "كما"
+                    | "بعد"
+                    | "قبل"
+                    | "بين"
+                    | "فقط"
+                    | "جدا"
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    // Repetition cannot multiply relevance, and a long brief cannot displace
+    // core native/typography/print guidance merely by matching more words.
+    let lexical = words.into_iter().filter(|word| haystack.contains(*word)).count().min(8);
+    let mentions = |terms: &[&str]| terms.iter().any(|term| prompt.contains(term));
+    let arabic = prompt.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c) && c.is_alphabetic());
+    let intl = mentions(&[
+        "دولي",
+        "دولية",
+        "عالمي",
+        "عالمية",
+        "أكسفورد",
+        "اكسفورد",
+        "كامبريدج",
+        "كامبردج",
+        "فاملي اند فريندز",
+        "فرست فريندز",
+        "كارنيت",
+        "جارنيت",
+        "international",
+        "oxford",
+        "cambridge",
+        "family and friends",
+        "first friends",
+        "garnet",
+    ]);
+    let computing = mentions(&[
+        "حاسوب",
+        "الحاسوب",
+        "كمبيوتر",
+        "برمجة",
+        "تقنية",
+        "رقمي",
+        "رقمية",
+        "ذكاء اصطناعي",
+        "خوارزميات",
+        "بيانات",
+        "شبكات",
+        "روبوت",
+        "computer",
+        "computing",
+        "ict",
+        "coding",
+        "programming",
+        "software",
+        "hardware",
+        "algorithm",
+        "digital",
+        "robotics",
+    ]);
+    let book = mentions(&[
+        "كتاب",
+        "كتيب",
+        "كراس",
+        "منهج",
+        "مناهج",
+        "مقرر",
+        "وحدة",
+        "درس",
+        "رياضيات",
+        "علوم",
+        "حاسوب",
+        "الحاسوب",
+        "كمبيوتر",
+        "برمجة",
+        "تقنية",
+        "curriculum",
+        "book",
+        "workbook",
+        "coursebook",
+        "textbook",
+        "math",
+        "science",
+        "computer",
+        "computing",
+        "ict",
+    ]);
+    let children = mentions(&[
+        "أطفال",
+        "اطفال",
+        "طفل",
+        "روضة",
+        "للصغار",
+        "ابتدائي",
+        "مدرسي",
+        "طلاب",
+        "تلاميذ",
+        "kindergarten",
+        "preschool",
+        "children",
+        "early years",
+        "early-years",
+        "primary",
+    ]);
+    let visual = (children || intl || computing) && book
+        || mentions(&[
+            "تصميم",
+            "صمم",
+            "توزيع",
+            "بصري",
+            "مصور",
+            "صور",
+            "رسوم",
+            "بطاقات",
+            "illustrat",
+            "visual",
+            "layout",
+            "design",
+            "picture",
+            "flashcard",
+        ]);
+    let print = book || mentions(&["طباعة", "للطباعة", "مطبعة", "مطبوع", "print", "a4"]);
+    let kg = (children || intl || computing) && (book || visual);
+    let architecture = mentions(&[
+        "تسلسل",
+        "وتسلسله",
+        "وتسلسة",
+        "وحدات",
+        "ووحداته",
+        "ووحداتة",
+        "فصول",
+        "وفصوله",
+        "وفصولة",
+        "ربط سلسلي",
+        "ربط ذهني",
+        "السلسلي الذهني",
+        "خريطة منهج",
+        "هيكلة المنهج",
+        "بناء المنهج",
+        "scope and sequence",
+        "syllabus",
+        "curriculum map",
+        "spiral curriculum",
+    ]);
+    let purpose = match entry.skill_id.as_str() {
+        "native-engine-workflow" => 64,
+        "arabic-english-typography" if arabic => 56,
+        "school-print-preflight" if print => 48,
+        "kg-garnet-ict-computing" if kg && computing => 46,
+        "kg-international-curriculum-architect" if (kg || book) && architecture => 45,
+        "kg-cambridge-thinking-cpa"
+            if kg
+                && (computing
+                    || intl
+                    || mentions(&[
+                        "رياضيات",
+                        "حساب",
+                        "العد",
+                        "كميات",
+                        "منطق",
+                        "محسوس",
+                        "قواعد",
+                        "math",
+                        "mathematics",
+                        "counting",
+                        "subitiz",
+                        "grammar",
+                        "cpa",
+                    ])) =>
+        {
+            44
+        }
+        "kg-international-curriculum-architect" if kg && (intl || book) => {
+            if intl {
+                43
+            } else {
+                39
+            }
+        }
+        "kg-oxford-phonics-handwriting"
+            if kg && mentions(&["حروف", "أصوات", "الأصوات", "صوتيات", "خط اليد", "تأسيس الكتابة", "phonics", "handwriting", "letter maze"]) =>
+        {
+            44
+        }
+        "kg-oxford-skills-time"
+            if kg && (intl || computing || mentions(&["قراءة", "استماع", "تحدث", "مهارات", "reading", "listening", "speaking", "skills time"])) =>
+        {
+            if mentions(&["قراءة", "استماع", "تحدث", "مهارات", "reading", "listening", "speaking", "skills time"]) {
+                44
+            } else {
+                38
+            }
+        }
+        "kg-oxford-fluency-time"
+            if kg && (intl || computing || mentions(&["محادثة", "حوار", "مشروع يدوي", "بمشروع يدوي", "craft", "fluency", "conversation"])) =>
+        {
+            if mentions(&["محادثة", "حوار", "مشروع يدوي", "بمشروع يدوي", "craft", "fluency", "conversation"]) {
+                44
+            } else {
+                36
+            }
+        }
+        "kg-sensory-illustration-vector"
+            if kg
+                && mentions(&[
+                    "ألوان",
+                    "الألوان",
+                    "للألوان",
+                    "الوان",
+                    "قوس",
+                    "فني",
+                    "الفن",
+                    "رسم",
+                    "colour",
+                    "color",
+                    "rainbow",
+                    "song",
+                    "sensory art",
+                ]) =>
+        {
+            44
+        }
+        "kg-school-print-prepress" if kg && mentions(&["كراس", "كلمات متقاطعة", "workbook", "crossword", "word bank"]) => 44,
+        "native-editorial-variety" if visual && mentions(&["تنويع", "متنوع", "توزيع", "variety", "varied", "different layouts"]) => 42,
+        "kg-cognitive-sensory-layout" if kg && visual => 40,
+        "native-design-composition" if visual => 32,
+        "kg-school-print-prepress" if kg && print => 24,
+        "early-years-booklet-planning" | "early-years-activity-layout" if book => 12,
+        _ => 0,
+    };
+    lexical.saturating_add(purpose)
+}
+
+/// Search-only normalization; task copy and pinned skill contents stay exact.
+fn normalize_skill_search(text: &str) -> String {
+    let stripped = text
+        .chars()
+        .filter(|c| !matches!(*c, '\u{0610}'..='\u{061a}' | '\u{0640}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}'))
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let mut normalized = String::with_capacity(stripped.len().saturating_add(8));
+    let mut prev_arabic = None;
+    for ch in stripped.chars() {
+        let is_arabic = ('\u{0600}'..='\u{06ff}').contains(&ch);
+        let is_latin_or_digit = ch.is_ascii_alphanumeric();
+        if let Some(was_arabic) = prev_arabic
+            && ((was_arabic && is_latin_or_digit) || (!was_arabic && is_arabic))
+            && !normalized.ends_with(' ')
+        {
+            normalized.push(' ');
+        }
+        normalized.push(ch);
+        prev_arabic = if is_arabic {
+            Some(true)
+        } else if is_latin_or_digit {
+            Some(false)
+        } else {
+            None
+        };
     }
-    let book = ["كتاب", "كتيب", "منهج", "رياضيات", "book", "math", "science"].iter().any(|word| prompt.contains(word));
-    if book && ["early-years-booklet-planning", "early-years-activity-layout", "school-print-preflight"].contains(&entry.skill_id.as_str()) {
-        score = score.saturating_add(3);
-    }
-    if prompt.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c)) && entry.skill_id == "arabic-english-typography" {
-        score = score.saturating_add(2);
-    }
-    score
+    normalized
 }
 
 fn supported_commands() -> BTreeSet<String> {
@@ -1378,14 +1687,30 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 mod tests {
     use super::*;
 
+    // Context bounding is a pure transformation of a pinned snapshot. Load the
+    // verified draft data without activating/rendering a bilingual sample: font
+    // availability and system-font initialization order belong to sample tests.
+    fn native_style_context_fixture() -> SkillSnapshot {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let id = "early-years-clear-style";
+        let card = runner.snapshot.skills.iter().find(|card| card.id == id).unwrap();
+        let record = runner.registry.revision(id, &card.revision).unwrap();
+        let files = runner.registry.review_files(id, &card.revision).unwrap();
+        SkillSnapshot {
+            skill_id: id.into(),
+            revision: card.revision.clone(),
+            instructions: String::from_utf8(files.get("SKILL.md").unwrap().clone()).unwrap(),
+            references: Default::default(),
+            reference_hashes: Default::default(),
+            templates: runner.registry.review_templates(id, &card.revision).unwrap(),
+            design_profile: record.manifest.design_profile.clone(),
+        }
+    }
+
     #[test]
     fn template_tasks_keep_skill_guidance_without_loading_unused_command_examples() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut runner = ProductionRunner::open(dir.path()).unwrap();
-        let session = Session::new();
-        runner.registry.set_enabled("early-years-clear-style", true).unwrap();
-        runner.prepare_style(&session, "early-years-clear-style").unwrap();
-        let style = runner.registry.snapshot("early-years-clear-style", &[]).unwrap();
+        let style = native_style_context_fixture();
         assert!(crate::template_plan::eligible(&style));
         let mut guidance = style.clone();
         guidance.skill_id = "large-native-guidance".into();
@@ -1397,8 +1722,10 @@ mod tests {
             vec![designcraft_ai_types::EngineAction { command: "frame.create".into(), params: json!({"text":"x".repeat(65 * 1024)}) }],
         )]);
         let originals = vec![guidance.clone(), style.clone()];
-        assert!(bounded_task_skills(originals.clone(), &TaskTarget::CurrentDocument).is_err());
-        assert!(bounded_task_skills(vec![guidance.clone()], &TaskTarget::ContinueBook).is_err(), "No compiler style means command examples remain");
+        let command_plan = bounded_task_skills(originals.clone(), &TaskTarget::CurrentDocument).unwrap();
+        assert!(command_plan[0].templates.is_empty(), "Oversized optional examples must not exclude actual guidance");
+        let command_plan = bounded_task_skills(vec![guidance.clone()], &TaskTarget::ContinueBook).unwrap();
+        assert!(command_plan[0].templates.is_empty());
         for target in [TaskTarget::ContinueBook, TaskTarget::NewA4 { pages: 48 }] {
             let bounded = bounded_task_skills(originals.clone(), &target).unwrap();
             assert!(bounded[0].templates.is_empty());
@@ -1410,6 +1737,75 @@ mod tests {
         }
         guidance.instructions = "x".repeat(65 * 1024);
         assert!(bounded_task_skills(vec![guidance, style], &TaskTarget::ContinueBook).is_err(), "The context guard still limits actual guidance");
+    }
+
+    #[test]
+    fn bounded_skill_context_keeps_guidance_pins_small_examples_and_executable_profiles() {
+        let mut guidance = SkillSnapshot {
+            skill_id: "kg-guidance".into(),
+            revision: "immutable-revision".into(),
+            instructions: "Keep Arabic copy exactly: تَصْمِيم صَفَحَات".into(),
+            references: std::collections::BTreeMap::from([("references/layout.md".into(), "Exact safe-area guidance".into())]),
+            reference_hashes: std::collections::BTreeMap::from([("references/layout.md".into(), "pinned-sha256".into())]),
+            templates: std::collections::BTreeMap::from([
+                (
+                    "templates/oversized.json".into(),
+                    vec![EngineAction { command: "frame.create".into(), params: json!({"text":"x".repeat(111_399)}) }],
+                ),
+                ("templates/small.json".into(), vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[54,54,100,100]}) }]),
+            ]),
+            design_profile: None,
+        };
+        let original = guidance.clone();
+        let bounded = bounded_task_skills(vec![guidance.clone()], &TaskTarget::CurrentDocument).unwrap();
+        assert!(!bounded[0].templates.contains_key("templates/oversized.json"));
+        assert_eq!(
+            serde_json::to_value(&bounded[0].templates["templates/small.json"]).unwrap(),
+            serde_json::to_value(&original.templates["templates/small.json"]).unwrap()
+        );
+        guidance.templates.remove("templates/oversized.json");
+        assert_eq!(serde_json::to_value(&bounded[0]).unwrap(), serde_json::to_value(&guidance).unwrap());
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= 64 * 1024);
+        assert_eq!(
+            serde_json::to_value(&bounded_task_skills(vec![guidance.clone()], &TaskTarget::CurrentDocument).unwrap()[0]).unwrap(),
+            serde_json::to_value(&guidance).unwrap()
+        );
+        guidance.references.insert("references/oversized.md".into(), "x".repeat(65 * 1024));
+        assert!(
+            bounded_task_skills(vec![guidance], &TaskTarget::CurrentDocument).is_err(),
+            "Actual reference guidance must never be silently truncated"
+        );
+
+        let mut executable = native_style_context_fixture();
+        executable.templates.insert("templates/required.json".into(), original.templates["templates/oversized.json"].clone());
+        assert!(
+            bounded_task_skills(vec![executable], &TaskTarget::CurrentDocument).is_err(),
+            "Command planners must retain executable profile templates"
+        );
+    }
+
+    #[test]
+    fn compiler_context_bounds_guidance_and_profile_rules_without_sending_native_templates() {
+        let mut executable = native_style_context_fixture();
+        let valid_actions = executable.templates.values().max_by_key(|actions| actions.len()).unwrap().clone();
+        for index in 0..12 {
+            executable.templates.insert(format!("templates/valid-copy-{index}.json"), valid_actions.clone());
+        }
+        assert!(task_skill_context_bytes(std::slice::from_ref(&executable)).unwrap() > 64 * 1024);
+        assert!(bounded_task_skills(vec![executable.clone()], &TaskTarget::CurrentDocument).is_err());
+        for target in [TaskTarget::ContinueBook, TaskTarget::NewA4 { pages: 48 }] {
+            let bounded = bounded_task_skills(vec![executable.clone()], &target).unwrap();
+            assert_eq!(
+                serde_json::to_value(&bounded[0]).unwrap(),
+                serde_json::to_value(&executable).unwrap(),
+                "Compiler templates remain immutable local inputs"
+            );
+        }
+        let mut oversized = executable.clone();
+        oversized.instructions = "x".repeat(33 * 1024);
+        assert!(bounded_task_skills(vec![oversized], &TaskTarget::NewA4 { pages: 1 }).is_err());
+        executable.design_profile.as_mut().unwrap().layout.push("x".repeat(33 * 1024));
+        assert!(bounded_task_skills(vec![executable], &TaskTarget::ContinueBook).is_err());
     }
 
     #[test]
@@ -2227,6 +2623,154 @@ mod tests {
         let mut draft = entry;
         draft.revisions[0].status = RevisionStatus::Draft;
         assert!(choose_compatible_skills("A4 طباعة", vec![draft], &supported).is_empty());
+    }
+
+    #[test]
+    fn skill_relevance_counts_distinct_meaningful_terms_and_normalizes_only_search_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entry = runner.registry.catalog("school-print-preflight").remove(0);
+        entry.skill_id = "search-fixture".into();
+        entry.name = "fixture".into();
+        entry.description = "layout picture typography تصميم صفحات and the with".into();
+        assert_eq!(skill_match_score("layout picture", &entry), skill_match_score(&"layout picture ".repeat(100), &entry));
+        assert_eq!(skill_match_score("and the with", &entry), 0, "Common instruction words are not evidence of relevance");
+        assert_eq!(skill_match_score("تَصْمِيم صَفَحَات", &entry), skill_match_score("تصميم صفحات", &entry));
+        assert!(skill_match_score("تَصْمِيم صَفَحَات", &entry) > 0);
+        entry.description = "تَصْمِيم صَفَحَات".into();
+        assert!(skill_match_score("تصميم صفحات", &entry) > 0, "Search normalization must cover catalog text too");
+    }
+
+    #[test]
+    fn automatic_curriculum_routing_retains_native_arabic_print_and_visual_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entries =
+            runner.registry.catalog("").into_iter().filter(|entry| entry.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed = entries[0].clone();
+        for (id, description) in [
+            (
+                "kg-cognitive-sensory-layout",
+                "Unit opener, vocabulary flashcards and 4-panel story grid. تخطيط صفحات الوحدات والبطاقات المصورة والشبكة القصصية",
+            ),
+            ("kg-school-print-prepress", "Workbook architecture, word banks and school print preflight. هندسة كراس الأنشطة المدرسي"),
+        ] {
+            let mut entry = seed.clone();
+            entry.skill_id = id.into();
+            entry.name = id.into();
+            entry.description = description.into();
+            entries.push(entry);
+        }
+        for index in 0..8 {
+            let mut distractor = seed.clone();
+            distractor.skill_id = format!("distractor-{index}");
+            distractor.name = distractor.skill_id.clone();
+            distractor.description = "واقعي كامل مستقل توليدي متنوع دقيق واضح جذاب مناسب منظم متكامل أصلي".into();
+            entries.push(distractor);
+        }
+        for entry in &mut entries {
+            entry.enabled = true;
+            let record = entry.revisions.first_mut().unwrap();
+            record.status = RevisionStatus::Approved;
+            entry.active_revision = Some(record.revision.clone());
+        }
+        let brief = "صمم منهج علوم مصور للأطفال بعمر 5-6 سنوات مع صور ورسوم متنوعة للطباعة A4. ";
+        let repeated = "واقعي كامل مستقل توليدي متنوع دقيق واضح جذاب مناسب منظم متكامل أصلي ".repeat(60);
+        let selected = choose_compatible_skills(&format!("{brief}{repeated}"), entries.clone(), &supported_commands());
+        for id in [
+            "native-engine-workflow",
+            "arabic-english-typography",
+            "school-print-preflight",
+            "kg-cognitive-sensory-layout",
+            "native-design-composition",
+            "kg-school-print-prepress",
+        ] {
+            assert!(selected.iter().any(|selected| selected == id), "Missing {id} in {selected:?}");
+        }
+        assert_eq!(selected.len(), 6);
+        let unrelated = choose_compatible_skills("Create a business invoice", entries, &supported_commands());
+        assert!(!unrelated.iter().any(|id| id.starts_with("kg-")), "KG skills require a matching educational brief");
+    }
+
+    #[test]
+    fn automatic_kg_routing_follows_the_educational_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entries =
+            runner.registry.catalog("").into_iter().filter(|entry| entry.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed = entries[0].clone();
+        for (id, description) in [
+            ("kg-cognitive-sensory-layout", "Unit opener, vocabulary cards and story grids"),
+            ("kg-cambridge-thinking-cpa", "Grammar puzzle pieces and sensory mathematics"),
+            ("kg-oxford-phonics-handwriting", "Phonics letter maze and handwriting rows"),
+            ("kg-oxford-skills-time", "Integrated reading listening speaking writing"),
+            ("kg-oxford-fluency-time", "Everyday conversation and hands-on craft project"),
+            ("kg-sensory-illustration-vector", "Colour song, sensory art and rainbow illustration"),
+            ("kg-school-print-prepress", "Workbook picture crosswords and school print preflight"),
+            ("kg-garnet-ict-computing", "Garnet, Oxford and Cambridge international ICT and computing systems lab"),
+            (
+                "kg-international-curriculum-architect",
+                "International curriculum authoring, units, chapters, scope and sequence, and spiral mental chain",
+            ),
+        ] {
+            let mut entry = seed.clone();
+            entry.skill_id = id.into();
+            entry.name = id.into();
+            entry.description = description.into();
+            entries.push(entry);
+        }
+        for entry in &mut entries {
+            let record = entry.revisions.first_mut().unwrap();
+            record.status = RevisionStatus::Approved;
+            entry.active_revision = Some(record.revision.clone());
+        }
+        for (prompt, expected) in [
+            ("منهج رياضيات للأطفال لتعليم العد ومقارنة الكميات والتفكير المحسوس", "kg-cambridge-thinking-cpa"),
+            ("اريد منهج دولي لمادةmath", "kg-cambridge-thinking-cpa"),
+            ("منهج للأطفال عن الحروف والأصوات وتدريب خط اليد", "kg-oxford-phonics-handwriting"),
+            ("منهج أطفال لدمج القراءة والاستماع والتحدث والكتابة", "kg-oxford-skills-time"),
+            ("منهج للأطفال بمشروع يدوي ومحادثة يومية", "kg-oxford-fluency-time"),
+            ("منهج أطفال للألوان والفن والرسم وقوس قزح", "kg-sensory-illustration-vector"),
+            ("كراس أنشطة للأطفال مع شبكة كلمات متقاطعة وتجهيز المطبعة", "kg-school-print-prepress"),
+            ("صمم منهج علوم مصور للأطفال مع بطاقات وقصة مصورة", "kg-cognitive-sensory-layout"),
+            ("إنشاء منهج دولي متكامل في مادة الحاسوب بأسلوب أكسفورد وكامبريدج وكارنيت", "kg-garnet-ict-computing"),
+            ("خوارزمية ومهارة كتابة المنهج وإنشائه وتسلسله ووحداته وفصوله والربط السلسلي الذهني", "kg-international-curriculum-architect"),
+        ] {
+            let selected = choose_compatible_skills(prompt, entries.clone(), &supported_commands());
+            assert_eq!(selected.iter().find(|id| id.starts_with("kg-")).map(String::as_str), Some(expected), "{prompt}: {selected:?}");
+        }
+        let math_selected = choose_compatible_skills("اريد منهج دولي لمادةmath", entries, &supported_commands());
+        assert!(math_selected.iter().any(|id| id == "kg-international-curriculum-architect"), "{math_selected:?}");
+    }
+
+    #[test]
+    fn automatic_arabic_book_brief_selects_kg_layout_and_editorial_variety() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entries =
+            runner.registry.catalog("").into_iter().filter(|entry| entry.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed = entries[0].clone();
+        for (id, description) in [
+            ("kg-cognitive-sensory-layout", "Unit opener, vocabulary cards and story grids"),
+            ("native-editorial-variety", "Choose different editable page compositions"),
+        ] {
+            let mut entry = seed.clone();
+            entry.skill_id = id.into();
+            entry.name = id.into();
+            entry.description = description.into();
+            entries.push(entry);
+        }
+        for entry in &mut entries {
+            let record = entry.revisions.first_mut().unwrap();
+            record.status = RevisionStatus::Approved;
+            entry.active_revision = Some(record.revision.clone());
+        }
+        let selected = choose_compatible_skills("كتيب علوم متنوع للأطفال48صفحةA4", entries.clone(), &supported_commands());
+        for expected in ["kg-cognitive-sensory-layout", "native-editorial-variety", "native-design-composition"] {
+            assert!(selected.iter().any(|id| id == expected), "Missing {expected}: {selected:?}");
+        }
+        let unrelated = choose_compatible_skills("Create a business invoice", entries, &supported_commands());
+        assert!(!unrelated.iter().any(|id| id == "native-editorial-variety" || id.starts_with("kg-")));
     }
 
     #[test]

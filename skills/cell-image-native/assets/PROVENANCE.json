@@ -1,0 +1,12 @@
+{
+  "skill_id": "cell-image-native",
+  "source": {
+    "repo": "butterflylittle/cell-image-skill",
+    "commit": "0c0cd491f49d9720d7b03ee79073e06217c13a52",
+    "path": "SKILL.md",
+    "url": "https://github.com/butterflylittle/cell-image-skill/blob/0c0cd491f49d9720d7b03ee79073e06217c13a52/SKILL.md"
+  },
+  "license": "Apache-2.0",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "b90ef1bfcf247f10867f2d5c93bbd1722db02795fb2014a755b9856adcf00e72"
+}

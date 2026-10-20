@@ -491,8 +491,15 @@ pub(super) fn generate_images(
         return Err("Image size or quality option exceeds length limit".into());
     }
     let model = model_id(selection)?;
+    let body = image_generation_body(selection.provider, model, request)?;
+    let path = if selection.provider == ProviderKind::OpenAi { "images/generations".into() } else { format!("models/{model}:generateContent") };
     let transport = Transport::new(selection, key)?;
-    let (path, body) = if selection.provider == ProviderKind::OpenAi {
+    let value = transport.post(&path, &body, cancel, IMAGE_JSON_LIMIT)?;
+    parse_images(selection.provider, &value, cancel)
+}
+
+pub(super) fn image_generation_body(provider: ProviderKind, model: &str, request: &ImageRequest) -> Result<Value, String> {
+    if provider == ProviderKind::OpenAi {
         // GPT Image models return base64 by default. No URL download is followed.
         let mut body = json!({"model":model,"prompt":request.prompt,"n":1});
         if let Some(size) = &request.size {
@@ -501,15 +508,22 @@ pub(super) fn generate_images(
         if let Some(quality) = &request.quality {
             body["quality"] = json!(quality);
         }
-        ("images/generations".into(), body)
+        Ok(body)
     } else {
-        (
-            format!("models/{model}:generateContent"),
-            json!({"contents":[{"parts":[{"text":request.prompt}]}],"generationConfig":{"responseModalities":["TEXT","IMAGE"]}}),
-        )
-    };
-    let value = transport.post(&path, &body, cancel, IMAGE_JSON_LIMIT)?;
-    parse_images(selection.provider, &value, cancel)
+        let mut config = json!({"responseModalities":["TEXT","IMAGE"]});
+        // Gemini's native image config uses an aspect ratio, not an OpenAI pixel size.
+        // https://ai.google.dev/gemini-api/docs/image-generation
+        if let Some(ratio) = &request.size {
+            if !matches!(
+                ratio.as_str(),
+                "1:1" | "1:4" | "1:8" | "2:3" | "3:2" | "3:4" | "4:1" | "4:3" | "4:5" | "5:4" | "8:1" | "9:16" | "16:9" | "21:9"
+            ) {
+                return Err("Unsupported Gemini image aspect ratio".into());
+            }
+            config["imageConfig"] = json!({"aspectRatio":ratio});
+        }
+        Ok(json!({"contents":[{"parts":[{"text":request.prompt}]}],"generationConfig":config}))
+    }
 }
 
 /// Bind only explicit user-supplied placeholders; never infer graph node IDs.

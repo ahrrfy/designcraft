@@ -1,0 +1,12 @@
+{
+  "skill_id": "lc-lesson-plan-creation",
+  "source": {
+    "repo": "learning-commons-org/agent-skills",
+    "commit": "5894a3c9dcda8d4499bb73fad85b2b11a2b78344",
+    "path": "skills/k12-lesson-plan-creation/SKILL.md",
+    "url": "https://github.com/learning-commons-org/agent-skills/blob/5894a3c9dcda8d4499bb73fad85b2b11a2b78344/skills/k12-lesson-plan-creation/SKILL.md"
+  },
+  "license": "Apache-2.0",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "fcd441052a15a42fee6ab151cf1d829ec77bf7302cf2f79736b81e7223484efb"
+}

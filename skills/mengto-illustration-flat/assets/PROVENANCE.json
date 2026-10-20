@@ -1,0 +1,12 @@
+{
+  "skill_id": "mengto-illustration-flat",
+  "source": {
+    "repo": "MengTo/Skills",
+    "commit": "398cd41c86ba42fbb30e944ae507f463648f08b7",
+    "path": "agent-skills/illustration/illustration-flat/SKILL.md",
+    "url": "https://github.com/MengTo/Skills/blob/398cd41c86ba42fbb30e944ae507f463648f08b7/agent-skills/illustration/illustration-flat/SKILL.md"
+  },
+  "license": "MIT",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "a9b06cd733a2e5f8429747f12816057377faf2ecbf55940ea23d213577c30744"
+}

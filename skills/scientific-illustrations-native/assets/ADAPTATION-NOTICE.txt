@@ -1,0 +1,3 @@
+Source: https://github.com/fmschulz/scientific-illustrations-skill/blob/7113ca6e238ed789fd6e86310d2bb98a658a7e95/skill/SKILL.md
+License: MIT
+Modifications: concise native DesignCraft workflow and original geometric sample; external image-generation, Penpot/SVG-runtime and script requirements replaced. Full source is archival material, not active instructions. No upstream NOTICE file was found in the pinned repository tree.

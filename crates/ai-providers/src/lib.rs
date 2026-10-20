@@ -107,7 +107,8 @@ pub struct ComfyRequest {
 #[derive(Clone, Debug)]
 pub struct ImageRequest {
     pub prompt: String,
-    /// OpenAI Images options; None delegates to the selected model's default.
+    /// OpenAI pixel size, or a Gemini native aspect ratio (e.g. 4:1).
+    /// None delegates to the selected model's default.
     pub size: Option<String>,
     pub quality: Option<String>,
     /// Required only for ComfyUI; no workflow or model is installed implicitly.

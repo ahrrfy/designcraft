@@ -1,0 +1,3711 @@
+[
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            44,
+            44
+          ]
+        },
+        {
+          "p": [
+            551,
+            44
+          ]
+        },
+        {
+          "p": [
+            551,
+            111
+          ],
+          "out": [
+            410,
+            124
+          ]
+        },
+        {
+          "p": [
+            44,
+            102
+          ],
+          "in": [
+            175,
+            100
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$0.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$0.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            44,
+            105
+          ],
+          "out": [
+            185,
+            104
+          ]
+        },
+        {
+          "p": [
+            551,
+            114
+          ],
+          "in": [
+            423,
+            127
+          ]
+        },
+        {
+          "p": [
+            551,
+            120
+          ],
+          "out": [
+            425,
+            133
+          ]
+        },
+        {
+          "p": [
+            44,
+            111
+          ],
+          "in": [
+            180,
+            110
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$3.id"
+      ],
+      "swatch": "C=0 M=0 Y=100 K=0",
+      "tint": 0.85
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$3.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            514,
+            53
+          ]
+        },
+        {
+          "p": [
+            529,
+            53
+          ],
+          "out": [
+            533.97056275,
+            53
+          ]
+        },
+        {
+          "p": [
+            538,
+            62
+          ],
+          "in": [
+            538,
+            57.02943725
+          ]
+        },
+        {
+          "p": [
+            538,
+            82
+          ],
+          "out": [
+            538,
+            86.97056275
+          ]
+        },
+        {
+          "p": [
+            529,
+            91
+          ],
+          "in": [
+            533.97056275,
+            91
+          ]
+        },
+        {
+          "p": [
+            514,
+            91
+          ],
+          "out": [
+            509.02943725,
+            91
+          ]
+        },
+        {
+          "p": [
+            505,
+            82
+          ],
+          "in": [
+            505,
+            86.97056275
+          ]
+        },
+        {
+          "p": [
+            505,
+            62
+          ],
+          "out": [
+            505,
+            57.02943725
+          ]
+        },
+        {
+          "p": [
+            514,
+            53
+          ],
+          "in": [
+            509.02943725,
+            53
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$6.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$6.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        505,
+        54,
+        538,
+        91
+      ],
+      "content": "text",
+      "text": "١",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 23,
+        "leading": {
+          "kind": "points",
+          "value": 30
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$9.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        255,
+        53,
+        490,
+        92
+      ],
+      "content": "text",
+      "text": "حاجات النبتة",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 28,
+        "leading": {
+          "kind": "points",
+          "value": 35
+        },
+        "fill": "[Paper]",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$13.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        61,
+        62,
+        253,
+        90
+      ],
+      "content": "text",
+      "text": "PLANTS NEED",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 13,
+        "leading": {
+          "kind": "points",
+          "value": 20
+        },
+        "fill": "[Paper]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "left",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$17.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            69,
+            105
+          ]
+        },
+        {
+          "p": [
+            249,
+            105
+          ],
+          "out": [
+            253.418278,
+            105
+          ]
+        },
+        {
+          "p": [
+            257,
+            113
+          ],
+          "in": [
+            257,
+            108.581722
+          ]
+        },
+        {
+          "p": [
+            257,
+            124
+          ],
+          "out": [
+            257,
+            128.418278
+          ]
+        },
+        {
+          "p": [
+            249,
+            132
+          ],
+          "in": [
+            253.418278,
+            132
+          ]
+        },
+        {
+          "p": [
+            69,
+            132
+          ],
+          "out": [
+            64.581722,
+            132
+          ]
+        },
+        {
+          "p": [
+            61,
+            124
+          ],
+          "in": [
+            61,
+            128.418278
+          ]
+        },
+        {
+          "p": [
+            61,
+            113
+          ],
+          "out": [
+            61,
+            108.581722
+          ]
+        },
+        {
+          "p": [
+            69,
+            105
+          ],
+          "in": [
+            64.581722,
+            105
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$21.id"
+      ],
+      "swatch": "C=0 M=0 Y=100 K=0",
+      "tint": 0.22
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$21.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        69,
+        107,
+        249,
+        133
+      ],
+      "content": "text",
+      "text": "أكتشف وأجرب",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 12,
+        "leading": {
+          "kind": "points",
+          "value": 19
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$24.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "object.group",
+    "params": {
+      "ids": [
+        "$0.id",
+        "$3.id",
+        "$6.id",
+        "$9.id",
+        "$13.id",
+        "$17.id",
+        "$21.id",
+        "$24.id"
+      ]
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        516,
+        145,
+        541,
+        169
+      ],
+      "content": "unassigned",
+      "shape": "ellipse"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$29.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$29.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "align": "inside",
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        516,
+        144,
+        541,
+        170
+      ],
+      "content": "text",
+      "text": "1",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 23
+        },
+        "fill": "[Paper]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$32.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        54,
+        144,
+        505,
+        174
+      ],
+      "content": "text",
+      "text": "ألاحظ وأفكر.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 19,
+        "leading": {
+          "kind": "points",
+          "value": 26
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$36.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            58,
+            180
+          ]
+        },
+        {
+          "p": [
+            537,
+            180
+          ],
+          "out": [
+            542.5228475,
+            180
+          ]
+        },
+        {
+          "p": [
+            547,
+            190
+          ],
+          "in": [
+            547,
+            184.4771525
+          ]
+        },
+        {
+          "p": [
+            547,
+            353
+          ],
+          "out": [
+            547,
+            358.5228475
+          ]
+        },
+        {
+          "p": [
+            537,
+            363
+          ],
+          "in": [
+            542.5228475,
+            363
+          ]
+        },
+        {
+          "p": [
+            58,
+            363
+          ],
+          "out": [
+            52.4771525,
+            363
+          ]
+        },
+        {
+          "p": [
+            48,
+            353
+          ],
+          "in": [
+            48,
+            358.5228475
+          ]
+        },
+        {
+          "p": [
+            48,
+            190
+          ],
+          "out": [
+            48,
+            184.4771525
+          ]
+        },
+        {
+          "p": [
+            58,
+            180
+          ],
+          "in": [
+            52.4771525,
+            180
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$40.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$40.id"
+      ],
+      "swatch": "C=100 M=0 Y=0 K=0",
+      "weight": 1,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        53,
+        185,
+        391,
+        358
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            70,
+            190
+          ]
+        },
+        {
+          "p": [
+            207,
+            190
+          ],
+          "out": [
+            212.5228475,
+            190
+          ]
+        },
+        {
+          "p": [
+            217,
+            200
+          ],
+          "in": [
+            217,
+            194.4771525
+          ]
+        },
+        {
+          "p": [
+            217,
+            225
+          ],
+          "out": [
+            217,
+            230.5228475
+          ]
+        },
+        {
+          "p": [
+            207,
+            235
+          ],
+          "in": [
+            212.5228475,
+            235
+          ]
+        },
+        {
+          "p": [
+            70,
+            235
+          ],
+          "out": [
+            64.4771525,
+            235
+          ]
+        },
+        {
+          "p": [
+            60,
+            225
+          ],
+          "in": [
+            60,
+            230.5228475
+          ]
+        },
+        {
+          "p": [
+            60,
+            200
+          ],
+          "out": [
+            60,
+            194.4771525
+          ]
+        },
+        {
+          "p": [
+            70,
+            190
+          ],
+          "in": [
+            64.4771525,
+            190
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$44.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$44.id"
+      ],
+      "swatch": "C=100 M=0 Y=0 K=0",
+      "weight": 0.8,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            103,
+            234
+          ]
+        },
+        {
+          "p": [
+            114,
+            246
+          ]
+        },
+        {
+          "p": [
+            123,
+            234
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$47.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$47.id"
+      ],
+      "swatch": "C=100 M=0 Y=0 K=0",
+      "weight": 0.8,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        69,
+        198,
+        208,
+        228
+      ],
+      "content": "text",
+      "text": "أسقي نبتتي.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 15,
+        "leading": {
+          "kind": "points",
+          "value": 22
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$50.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "object.group",
+    "params": {
+      "ids": [
+        "$44.id",
+        "$47.id",
+        "$50.id"
+      ]
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            234,
+            190
+          ]
+        },
+        {
+          "p": [
+            371,
+            190
+          ],
+          "out": [
+            376.5228475,
+            190
+          ]
+        },
+        {
+          "p": [
+            381,
+            200
+          ],
+          "in": [
+            381,
+            194.4771525
+          ]
+        },
+        {
+          "p": [
+            381,
+            225
+          ],
+          "out": [
+            381,
+            230.5228475
+          ]
+        },
+        {
+          "p": [
+            371,
+            235
+          ],
+          "in": [
+            376.5228475,
+            235
+          ]
+        },
+        {
+          "p": [
+            234,
+            235
+          ],
+          "out": [
+            228.4771525,
+            235
+          ]
+        },
+        {
+          "p": [
+            224,
+            225
+          ],
+          "in": [
+            224,
+            230.5228475
+          ]
+        },
+        {
+          "p": [
+            224,
+            200
+          ],
+          "out": [
+            224,
+            194.4771525
+          ]
+        },
+        {
+          "p": [
+            234,
+            190
+          ],
+          "in": [
+            228.4771525,
+            190
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$55.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$55.id"
+      ],
+      "swatch": "C=100 M=0 Y=0 K=0",
+      "weight": 0.8,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            267,
+            234
+          ]
+        },
+        {
+          "p": [
+            278,
+            246
+          ]
+        },
+        {
+          "p": [
+            287,
+            234
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$58.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$58.id"
+      ],
+      "swatch": "C=100 M=0 Y=0 K=0",
+      "weight": 0.8,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        233,
+        198,
+        372,
+        228
+      ],
+      "content": "text",
+      "text": "أبحث عن الضوء.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 15,
+        "leading": {
+          "kind": "points",
+          "value": 22
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$61.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "object.group",
+    "params": {
+      "ids": [
+        "$55.id",
+        "$58.id",
+        "$61.id"
+      ]
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            408,
+            187
+          ]
+        },
+        {
+          "p": [
+            533,
+            187
+          ],
+          "out": [
+            537.418278,
+            187
+          ]
+        },
+        {
+          "p": [
+            541,
+            195
+          ],
+          "in": [
+            541,
+            190.581722
+          ]
+        },
+        {
+          "p": [
+            541,
+            348
+          ],
+          "out": [
+            541,
+            352.418278
+          ]
+        },
+        {
+          "p": [
+            533,
+            356
+          ],
+          "in": [
+            537.418278,
+            356
+          ]
+        },
+        {
+          "p": [
+            408,
+            356
+          ],
+          "out": [
+            403.581722,
+            356
+          ]
+        },
+        {
+          "p": [
+            400,
+            348
+          ],
+          "in": [
+            400,
+            352.418278
+          ]
+        },
+        {
+          "p": [
+            400,
+            195
+          ],
+          "out": [
+            400,
+            190.581722
+          ]
+        },
+        {
+          "p": [
+            408,
+            187
+          ],
+          "in": [
+            403.581722,
+            187
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$66.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.06
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$66.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        408,
+        197,
+        533,
+        229
+      ],
+      "content": "text",
+      "text": "ماذا تحتاج؟",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 17,
+        "leading": {
+          "kind": "points",
+          "value": 24
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$69.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        408,
+        239,
+        533,
+        314
+      ],
+      "content": "text",
+      "text": "أشير إلى الماء.\nأبحث عن الضوء.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 15,
+        "leading": {
+          "kind": "points",
+          "value": 22
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$73.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        408,
+        322,
+        533,
+        346
+      ],
+      "content": "text",
+      "text": "Water • Light",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 11,
+        "leading": {
+          "kind": "points",
+          "value": 18
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$77.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        516,
+        384,
+        541,
+        408
+      ],
+      "content": "unassigned",
+      "shape": "ellipse"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$81.id"
+      ],
+      "swatch": "C=100 M=0 Y=0 K=0",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$81.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "align": "inside",
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        516,
+        383,
+        541,
+        409
+      ],
+      "content": "text",
+      "text": "2",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 23
+        },
+        "fill": "[Paper]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$84.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        54,
+        383,
+        505,
+        413
+      ],
+      "content": "text",
+      "text": "أختار ما تحتاجه النبتة.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 19,
+        "leading": {
+          "kind": "points",
+          "value": 26
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$88.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            69,
+            421
+          ]
+        },
+        {
+          "p": [
+            186,
+            421
+          ],
+          "out": [
+            190.97056275,
+            421
+          ]
+        },
+        {
+          "p": [
+            195,
+            430
+          ],
+          "in": [
+            195,
+            425.02943725
+          ]
+        },
+        {
+          "p": [
+            195,
+            544
+          ],
+          "out": [
+            195,
+            548.97056275
+          ]
+        },
+        {
+          "p": [
+            186,
+            553
+          ],
+          "in": [
+            190.97056275,
+            553
+          ]
+        },
+        {
+          "p": [
+            69,
+            553
+          ],
+          "out": [
+            64.02943725,
+            553
+          ]
+        },
+        {
+          "p": [
+            60,
+            544
+          ],
+          "in": [
+            60,
+            548.97056275
+          ]
+        },
+        {
+          "p": [
+            60,
+            430
+          ],
+          "out": [
+            60,
+            425.02943725
+          ]
+        },
+        {
+          "p": [
+            69,
+            421
+          ],
+          "in": [
+            64.02943725,
+            421
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$92.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$92.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.7,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        70,
+        427,
+        185,
+        503
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        64,
+        506,
+        191,
+        531
+      ],
+      "content": "text",
+      "text": "ضوء",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 23
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$96.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        64,
+        533,
+        191,
+        551
+      ],
+      "content": "text",
+      "text": "Light",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 11,
+        "leading": {
+          "kind": "points",
+          "value": 18
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$100.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        202,
+        474,
+        211,
+        483
+      ],
+      "content": "unassigned",
+      "shape": "ellipse"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$104.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$104.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.8,
+      "align": "inside",
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            239,
+            421
+          ]
+        },
+        {
+          "p": [
+            356,
+            421
+          ],
+          "out": [
+            360.97056275,
+            421
+          ]
+        },
+        {
+          "p": [
+            365,
+            430
+          ],
+          "in": [
+            365,
+            425.02943725
+          ]
+        },
+        {
+          "p": [
+            365,
+            544
+          ],
+          "out": [
+            365,
+            548.97056275
+          ]
+        },
+        {
+          "p": [
+            356,
+            553
+          ],
+          "in": [
+            360.97056275,
+            553
+          ]
+        },
+        {
+          "p": [
+            239,
+            553
+          ],
+          "out": [
+            234.02943725,
+            553
+          ]
+        },
+        {
+          "p": [
+            230,
+            544
+          ],
+          "in": [
+            230,
+            548.97056275
+          ]
+        },
+        {
+          "p": [
+            230,
+            430
+          ],
+          "out": [
+            230,
+            425.02943725
+          ]
+        },
+        {
+          "p": [
+            239,
+            421
+          ],
+          "in": [
+            234.02943725,
+            421
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$107.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$107.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.7,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        240,
+        427,
+        355,
+        503
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        234,
+        506,
+        361,
+        531
+      ],
+      "content": "text",
+      "text": "ماء",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 23
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$111.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        234,
+        533,
+        361,
+        551
+      ],
+      "content": "text",
+      "text": "Water",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 11,
+        "leading": {
+          "kind": "points",
+          "value": 18
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$115.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        372,
+        474,
+        381,
+        483
+      ],
+      "content": "unassigned",
+      "shape": "ellipse"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$119.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$119.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.8,
+      "align": "inside",
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            409,
+            421
+          ]
+        },
+        {
+          "p": [
+            526,
+            421
+          ],
+          "out": [
+            530.97056275,
+            421
+          ]
+        },
+        {
+          "p": [
+            535,
+            430
+          ],
+          "in": [
+            535,
+            425.02943725
+          ]
+        },
+        {
+          "p": [
+            535,
+            544
+          ],
+          "out": [
+            535,
+            548.97056275
+          ]
+        },
+        {
+          "p": [
+            526,
+            553
+          ],
+          "in": [
+            530.97056275,
+            553
+          ]
+        },
+        {
+          "p": [
+            409,
+            553
+          ],
+          "out": [
+            404.02943725,
+            553
+          ]
+        },
+        {
+          "p": [
+            400,
+            544
+          ],
+          "in": [
+            400,
+            548.97056275
+          ]
+        },
+        {
+          "p": [
+            400,
+            430
+          ],
+          "out": [
+            400,
+            425.02943725
+          ]
+        },
+        {
+          "p": [
+            409,
+            421
+          ],
+          "in": [
+            404.02943725,
+            421
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$122.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$122.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.7,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        410,
+        427,
+        525,
+        503
+      ],
+      "content": "graphic"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        404,
+        506,
+        531,
+        531
+      ],
+      "content": "text",
+      "text": "حجارة",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 23
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$126.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        404,
+        533,
+        531,
+        551
+      ],
+      "content": "text",
+      "text": "Stones",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 11,
+        "leading": {
+          "kind": "points",
+          "value": 18
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$130.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        542,
+        474,
+        551,
+        483
+      ],
+      "content": "unassigned",
+      "shape": "ellipse"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$134.id"
+      ],
+      "swatch": "[Paper]",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$134.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.8,
+      "align": "inside",
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        516,
+        575,
+        541,
+        599
+      ],
+      "content": "unassigned",
+      "shape": "ellipse"
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$137.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 1
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$137.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "align": "inside",
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        516,
+        574,
+        541,
+        600
+      ],
+      "content": "text",
+      "text": "3",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 16,
+        "leading": {
+          "kind": "points",
+          "value": 23
+        },
+        "fill": "[Paper]",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$140.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        54,
+        574,
+        505,
+        604
+      ],
+      "content": "text",
+      "text": "أجرب مع معلمي.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 19,
+        "leading": {
+          "kind": "points",
+          "value": 26
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$144.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            58,
+            613
+          ]
+        },
+        {
+          "p": [
+            537,
+            613
+          ],
+          "out": [
+            542.5228475,
+            613
+          ]
+        },
+        {
+          "p": [
+            547,
+            623
+          ],
+          "in": [
+            547,
+            617.4771525
+          ]
+        },
+        {
+          "p": [
+            547,
+            719
+          ],
+          "out": [
+            547,
+            724.5228475
+          ]
+        },
+        {
+          "p": [
+            537,
+            729
+          ],
+          "in": [
+            542.5228475,
+            729
+          ]
+        },
+        {
+          "p": [
+            58,
+            729
+          ],
+          "out": [
+            52.4771525,
+            729
+          ]
+        },
+        {
+          "p": [
+            48,
+            719
+          ],
+          "in": [
+            48,
+            724.5228475
+          ]
+        },
+        {
+          "p": [
+            48,
+            623
+          ],
+          "out": [
+            48,
+            617.4771525
+          ]
+        },
+        {
+          "p": [
+            58,
+            613
+          ],
+          "in": [
+            52.4771525,
+            613
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$148.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.045
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$148.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "weight": 0.7,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            387,
+            626
+          ]
+        },
+        {
+          "p": [
+            521,
+            626
+          ],
+          "out": [
+            524.86599325,
+            626
+          ]
+        },
+        {
+          "p": [
+            528,
+            633
+          ],
+          "in": [
+            528,
+            629.13400675
+          ]
+        },
+        {
+          "p": [
+            528,
+            645
+          ],
+          "out": [
+            528,
+            648.86599325
+          ]
+        },
+        {
+          "p": [
+            521,
+            652
+          ],
+          "in": [
+            524.86599325,
+            652
+          ]
+        },
+        {
+          "p": [
+            387,
+            652
+          ],
+          "out": [
+            383.13400675,
+            652
+          ]
+        },
+        {
+          "p": [
+            380,
+            645
+          ],
+          "in": [
+            380,
+            648.86599325
+          ]
+        },
+        {
+          "p": [
+            380,
+            633
+          ],
+          "out": [
+            380,
+            629.13400675
+          ]
+        },
+        {
+          "p": [
+            387,
+            626
+          ],
+          "in": [
+            383.13400675,
+            626
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$151.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.12
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$151.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        388,
+        628,
+        520,
+        650
+      ],
+      "content": "text",
+      "text": "1",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 12,
+        "leading": {
+          "kind": "points",
+          "value": 19
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$154.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        385,
+        663,
+        523,
+        708
+      ],
+      "content": "text",
+      "text": "نبتتان في نفس الضوء.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 15,
+        "leading": {
+          "kind": "points",
+          "value": 22
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$158.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            223,
+            626
+          ]
+        },
+        {
+          "p": [
+            357,
+            626
+          ],
+          "out": [
+            360.86599325,
+            626
+          ]
+        },
+        {
+          "p": [
+            364,
+            633
+          ],
+          "in": [
+            364,
+            629.13400675
+          ]
+        },
+        {
+          "p": [
+            364,
+            645
+          ],
+          "out": [
+            364,
+            648.86599325
+          ]
+        },
+        {
+          "p": [
+            357,
+            652
+          ],
+          "in": [
+            360.86599325,
+            652
+          ]
+        },
+        {
+          "p": [
+            223,
+            652
+          ],
+          "out": [
+            219.13400675,
+            652
+          ]
+        },
+        {
+          "p": [
+            216,
+            645
+          ],
+          "in": [
+            216,
+            648.86599325
+          ]
+        },
+        {
+          "p": [
+            216,
+            633
+          ],
+          "out": [
+            216,
+            629.13400675
+          ]
+        },
+        {
+          "p": [
+            223,
+            626
+          ],
+          "in": [
+            219.13400675,
+            626
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$162.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.12
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$162.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        224,
+        628,
+        356,
+        650
+      ],
+      "content": "text",
+      "text": "2",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 12,
+        "leading": {
+          "kind": "points",
+          "value": 19
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$165.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        221,
+        663,
+        359,
+        708
+      ],
+      "content": "text",
+      "text": "أسقي نبتة واحدة فقط.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 15,
+        "leading": {
+          "kind": "points",
+          "value": 22
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$169.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "path.create",
+    "params": {
+      "spread": 0,
+      "anchors": [
+        {
+          "p": [
+            59,
+            626
+          ]
+        },
+        {
+          "p": [
+            193,
+            626
+          ],
+          "out": [
+            196.86599325,
+            626
+          ]
+        },
+        {
+          "p": [
+            200,
+            633
+          ],
+          "in": [
+            200,
+            629.13400675
+          ]
+        },
+        {
+          "p": [
+            200,
+            645
+          ],
+          "out": [
+            200,
+            648.86599325
+          ]
+        },
+        {
+          "p": [
+            193,
+            652
+          ],
+          "in": [
+            196.86599325,
+            652
+          ]
+        },
+        {
+          "p": [
+            59,
+            652
+          ],
+          "out": [
+            55.13400675,
+            652
+          ]
+        },
+        {
+          "p": [
+            52,
+            645
+          ],
+          "in": [
+            52,
+            648.86599325
+          ]
+        },
+        {
+          "p": [
+            52,
+            633
+          ],
+          "out": [
+            52,
+            629.13400675
+          ]
+        },
+        {
+          "p": [
+            59,
+            626
+          ],
+          "in": [
+            55.13400675,
+            626
+          ]
+        }
+      ],
+      "closed": true
+    }
+  },
+  {
+    "command": "object.fill",
+    "params": {
+      "ids": [
+        "$173.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 0.12
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$173.id"
+      ],
+      "swatch": "[None]",
+      "weight": 0,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        60,
+        628,
+        192,
+        650
+      ],
+      "content": "text",
+      "text": "3",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 12,
+        "leading": {
+          "kind": "points",
+          "value": 19
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$176.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        57,
+        663,
+        195,
+        708
+      ],
+      "content": "text",
+      "text": "أراقب عدة أيام.",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Regular",
+        "size": 15,
+        "leading": {
+          "kind": "points",
+          "value": 22
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "center",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$180.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        54,
+        743,
+        541,
+        774
+      ],
+      "content": "text",
+      "text": "أتوقع: أي نبتة تنمو أفضل؟",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 17,
+        "leading": {
+          "kind": "points",
+          "value": 24
+        },
+        "fill": "C=100 M=90 Y=10 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$184.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "line.create",
+    "params": {
+      "spread": 0,
+      "a": [
+        44,
+        779
+      ],
+      "b": [
+        551,
+        779
+      ]
+    }
+  },
+  {
+    "command": "object.stroke",
+    "params": {
+      "ids": [
+        "$188.id"
+      ],
+      "swatch": "C=75 M=5 Y=100 K=0",
+      "tint": 1,
+      "weight": 0.8,
+      "cap": "round",
+      "join": "round"
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        300,
+        781,
+        472,
+        799
+      ],
+      "content": "text",
+      "text": "أكتشف العلوم • النباتات",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 10,
+        "leading": {
+          "kind": "points",
+          "value": 17
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "ar"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "rightToLeft",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$190.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  },
+  {
+    "command": "frame.create",
+    "params": {
+      "spread": 0,
+      "rect": [
+        480,
+        781,
+        541,
+        799
+      ],
+      "content": "text",
+      "text": "{{page}}",
+      "caret": false
+    }
+  },
+  {
+    "command": "type.char",
+    "params": {
+      "attrs": {
+        "fontFamily": "Tahoma",
+        "fontStyle": "Bold",
+        "size": 11,
+        "leading": {
+          "kind": "points",
+          "value": 18
+        },
+        "fill": "C=75 M=5 Y=100 K=0",
+        "language": "en"
+      }
+    }
+  },
+  {
+    "command": "type.para",
+    "params": {
+      "attrs": {
+        "direction": "leftToRight",
+        "align": "right",
+        "hyphenate": false,
+        "spaceBefore": 0,
+        "spaceAfter": 0
+      }
+    }
+  },
+  {
+    "command": "object.textFrameOptions",
+    "params": {
+      "ids": [
+        "$194.id"
+      ],
+      "inset": 0,
+      "verticalJustification": "top",
+      "ignoreWrap": true
+    }
+  }
+]

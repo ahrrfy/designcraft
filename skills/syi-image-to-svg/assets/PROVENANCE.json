@@ -1,0 +1,12 @@
+{
+  "skill_id": "syi-image-to-svg",
+  "source": {
+    "repo": "syi0808/svg-skills",
+    "commit": "c5937c2bed48aff98c12cda43ccba2ed6f2880f0",
+    "path": "image-to-svg/SKILL.md",
+    "url": "https://github.com/syi0808/svg-skills/blob/c5937c2bed48aff98c12cda43ccba2ed6f2880f0/image-to-svg/SKILL.md"
+  },
+  "license": "MIT",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "038828ea59fe3b4c8cbae940990f545c7d916302bbfc45d1e54659b9742a9839"
+}

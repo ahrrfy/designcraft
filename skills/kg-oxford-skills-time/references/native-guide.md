@@ -1,0 +1,1 @@
+Inspect reading direction, glyphs, overset, safe margins, response space and image resolution. This package contains an original native sample and no reference-book images, credentials, publisher characters or automatic approval.

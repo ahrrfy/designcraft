@@ -1,0 +1,12 @@
+{
+  "skill_id": "scientific-illustrations-native",
+  "source": {
+    "repo": "fmschulz/scientific-illustrations-skill",
+    "commit": "7113ca6e238ed789fd6e86310d2bb98a658a7e95",
+    "path": "skill/SKILL.md",
+    "url": "https://github.com/fmschulz/scientific-illustrations-skill/blob/7113ca6e238ed789fd6e86310d2bb98a658a7e95/skill/SKILL.md"
+  },
+  "license": "MIT",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "3114e9c52bcd0777cdb498016ad755b2e20c7c5f77b35877f6c15b8c0b8b55dc"
+}

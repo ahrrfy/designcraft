@@ -1,0 +1,1 @@
+Native adaptation of linyaosky/svg-skill@2103b92cb47f588a97a6c38aa6c40571fadbd4f8/SKILL.md. Upstream MIT notice retained. Original native sample, not copied artwork. Upstream scripts and dependencies are not executed or installed.

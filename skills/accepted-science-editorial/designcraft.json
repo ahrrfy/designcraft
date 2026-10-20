@@ -1,0 +1,617 @@
+{
+  "schema_version": 1,
+  "skill_id": "accepted-science-editorial",
+  "required_commands": [
+    "frame.create",
+    "line.create",
+    "object.fill",
+    "object.fittingOptions",
+    "object.group",
+    "object.stroke",
+    "object.textFrameOptions",
+    "path.create",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/art-direction.md"
+  ],
+  "templates": [
+    "templates/observe-growth-sequence.json",
+    "templates/discover-test-needs.json",
+    "templates/explore-plant-parts.json",
+    "templates/observe-record-change.json"
+  ],
+  "sample_template": "templates/observe-growth-sequence.json",
+  "external_tools": [],
+  "compatibility_notes": "Four original native science page families. Shared-source image views require the AI11 host crop schema. Profiles and references are data, never permissions or human proof approvals.",
+  "design_profile": {
+    "name": "Science editorial / الاكتشاف المصور",
+    "keywords": [
+      "علوم",
+      "كتيب علوم",
+      "نباتات",
+      "نبات",
+      "علوم الأطفال",
+      "رياض الأطفال",
+      "science",
+      "plants",
+      "kindergarten",
+      "تصميم مقبول"
+    ],
+    "age_range": [
+      5,
+      6
+    ],
+    "page_mm": [
+      210,
+      297
+    ],
+    "margin_mm": 15,
+    "palette": [
+      "C=75 M=5 Y=100 K=0",
+      "C=100 M=90 Y=10 K=0",
+      "C=0 M=0 Y=100 K=0",
+      "C=100 M=0 Y=0 K=0",
+      "[Paper]"
+    ],
+    "typography": [
+      "Live editable Tahoma Arabic and English in separate frames. Arabic without optional harakat; preserve spelling hamza.",
+      "Keep authored font sizes; short slot copy must fit readable child-facing frames."
+    ],
+    "layout": [
+      "User-accepted green wave header, yellow accent, white unit badge, exact 15 mm safe margins.",
+      "Purposeful variation: vocabulary, paired observation and sequencing vs wide scene, choosing and experiment. Never repeat the same family on adjacent pages in this trial.",
+      "All captions, activity numbers, instructions, arrows, footer and card geometry are native editable objects.",
+      "Pages 3 and 4 use plant-parts/rubbing then seed investigation/journal. Preserve completed pages. Drawing and connection areas remain blank for the learner; no repeated vocabulary grid."
+    ],
+    "pedagogy": [
+      "Age 5–6: notice, name, talk with a partner, sequence; then predict and investigate with a teacher.",
+      "Do not imply a plant grows in minutes; observe over several days. No unsupported educational certification.",
+      "Adult supervises soaked-bean and cotton activity. No tasting seeds or unattended water. Observe over days; do not promise a fixed germination date."
+    ],
+    "illustration": [
+      "Original full-colour warm painted textbook art: precise soft shading, lively original children, purposeful actions, realistic objects and clear bean plant anatomy. Natural age 5–6 proportions, detailed gouache rendering. No publisher characters, logos, copied artwork, chibi proportions or plastic 3D look.",
+      "Recurring original pair: girl with straight dark-brown chin-length hair, orange pinafore over cream shirt; boy with short curly black hair, teal shirt. Keep faces, hair, clothes consistent. Warm cream classroom, terracotta bean pot, fresh green leaves. Believable hands, contact shadows and perspective.",
+      "Each image has only the composition requested by its own slot prompt. Scene slots contain ONE continuous scene and exactly one instance of each child. Atlas slots alone use separated cells. Do not mix scene and atlas layouts; no illustration contains text."
+    ],
+    "page_families": [
+      {
+        "id": "observe-growth-sequence",
+        "purpose": "Page 1 only: opening plant vocabulary, partner observation and seed/root/seedling sequencing. Already reviewed in this book.",
+        "template": "templates/observe-growth-sequence.json",
+        "text_slots": [
+          {
+            "id": "title-ar",
+            "purpose": "Short Arabic plant growth title",
+            "command": 13,
+            "max_chars": 14
+          },
+          {
+            "id": "title-en",
+            "purpose": "Short English growth title",
+            "command": 17,
+            "max_chars": 16
+          },
+          {
+            "id": "lesson-tag",
+            "purpose": "Three short Arabic learning verbs",
+            "command": 24,
+            "max_chars": 20
+          },
+          {
+            "id": "vocab-task",
+            "purpose": "Short Arabic picture naming instruction",
+            "command": 36,
+            "max_chars": 30
+          },
+          {
+            "id": "leaves-ar",
+            "purpose": "Arabic word for leaves; match fixed illustration atlas",
+            "command": 47,
+            "max_chars": 9
+          },
+          {
+            "id": "leaves-en",
+            "purpose": "English word for leaves; match fixed illustration atlas",
+            "command": 51,
+            "max_chars": 10
+          },
+          {
+            "id": "seedling-ar",
+            "purpose": "Arabic word for seedling; match fixed illustration atlas",
+            "command": 63,
+            "max_chars": 9
+          },
+          {
+            "id": "seedling-en",
+            "purpose": "English word for seedling; match fixed illustration atlas",
+            "command": 67,
+            "max_chars": 10
+          },
+          {
+            "id": "root-ar",
+            "purpose": "Arabic word for root; match fixed illustration atlas",
+            "command": 79,
+            "max_chars": 9
+          },
+          {
+            "id": "root-en",
+            "purpose": "English word for root; match fixed illustration atlas",
+            "command": 83,
+            "max_chars": 10
+          },
+          {
+            "id": "seed-ar",
+            "purpose": "Arabic word for seed; match fixed illustration atlas",
+            "command": 95,
+            "max_chars": 9
+          },
+          {
+            "id": "seed-en",
+            "purpose": "English word for seed; match fixed illustration atlas",
+            "command": 99,
+            "max_chars": 10
+          },
+          {
+            "id": "scene-task",
+            "purpose": "Short Arabic scene observation instruction",
+            "command": 111,
+            "max_chars": 30
+          },
+          {
+            "id": "partner-title",
+            "purpose": "Short Arabic partner task heading, e.g. مهمتي مع زميلي",
+            "command": 122,
+            "max_chars": 14
+          },
+          {
+            "id": "partner-step-1",
+            "purpose": "Arabic leaf observation task: أشير إلى الأوراق.",
+            "command": 129,
+            "max_chars": 18
+          },
+          {
+            "id": "partner-step-2",
+            "purpose": "Arabic stem observation task: أبحث عن الساق.",
+            "command": 136,
+            "max_chars": 16
+          },
+          {
+            "id": "partner-step-3",
+            "purpose": "Arabic plant colour observation task: أصف لون النبتة.",
+            "command": 143,
+            "max_chars": 16
+          },
+          {
+            "id": "sequence-task",
+            "purpose": "Arabic sequence instruction; right to left",
+            "command": 156,
+            "max_chars": 32
+          },
+          {
+            "id": "sequence-seedling",
+            "purpose": "Arabic seedling caption, repeat the same vocabulary",
+            "command": 164,
+            "max_chars": 9
+          },
+          {
+            "id": "sequence-root",
+            "purpose": "Arabic root caption, repeat the same vocabulary",
+            "command": 175,
+            "max_chars": 9
+          },
+          {
+            "id": "sequence-seed",
+            "purpose": "Arabic seed caption, repeat the same vocabulary",
+            "command": 186,
+            "max_chars": 9
+          },
+          {
+            "id": "reflection-title",
+            "purpose": "Short Arabic oral reflection question",
+            "command": 200,
+            "max_chars": 22
+          },
+          {
+            "id": "reflection-task",
+            "purpose": "Short Arabic prediction and observation prompt",
+            "command": 204,
+            "max_chars": 36
+          },
+          {
+            "id": "footer",
+            "purpose": "Original science series and current topic, Arabic",
+            "command": 210,
+            "max_chars": 28
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "growth-atlas",
+            "purpose": "4:1 strip, FOUR equal isolated cells LEFT TO RIGHT: leaves, whole seedling, germinating bean/root, dry seed. Each complete object centred within middle 60% of canvas height, generous blank margins. No text, borders or objects crossing cells.",
+            "rect": [
+              59,
+              185,
+              164,
+              258
+            ],
+            "crop": [
+              0.01,
+              0.2,
+              0.24,
+              0.8
+            ],
+            "source_aspect_ratio": 4,
+            "views": [
+              {
+                "rect": [
+                  199,
+                  185,
+                  272,
+                  258
+                ],
+                "crop": [
+                  0.26,
+                  0.2,
+                  0.49,
+                  0.8
+                ]
+              },
+              {
+                "rect": [
+                  307,
+                  185,
+                  412,
+                  258
+                ],
+                "crop": [
+                  0.51,
+                  0.2,
+                  0.74,
+                  0.8
+                ]
+              },
+              {
+                "rect": [
+                  431,
+                  185,
+                  536,
+                  258
+                ],
+                "crop": [
+                  0.76,
+                  0.2,
+                  0.99,
+                  0.8
+                ]
+              },
+              {
+                "rect": [
+                  77,
+                  613,
+                  146,
+                  675
+                ],
+                "crop": [
+                  0.26,
+                  0.2,
+                  0.49,
+                  0.8
+                ]
+              },
+              {
+                "rect": [
+                  244,
+                  613,
+                  347,
+                  675
+                ],
+                "crop": [
+                  0.51,
+                  0.2,
+                  0.74,
+                  0.8
+                ]
+              },
+              {
+                "rect": [
+                  428,
+                  613,
+                  531,
+                  675
+                ],
+                "crop": [
+                  0.76,
+                  0.2,
+                  0.99,
+                  0.8
+                ]
+              }
+            ]
+          },
+          {
+            "id": "observation-scene",
+            "purpose": "ONE continuous painted classroom scene: exactly one girl and one boy observe one bean plant at a table. Visible leaves and stem. Natural child proportions and detailed warm shading. No panels, repetition or text.",
+            "rect": [
+              52,
+              361,
+              345,
+              549
+            ],
+            "source_aspect_ratio": 1.5
+          }
+        ]
+      },
+      {
+        "id": "discover-test-needs",
+        "purpose": "Page 2 only: plant needs, choosing water/light and teacher-supported investigation. Already reviewed in this book.",
+        "template": "templates/discover-test-needs.json",
+        "text_slots": [
+          {
+            "id": "title-ar",
+            "purpose": "Short Arabic plant needs title",
+            "command": 13,
+            "max_chars": 14
+          },
+          {
+            "id": "title-en",
+            "purpose": "Short English plant needs title",
+            "command": 17,
+            "max_chars": 16
+          },
+          {
+            "id": "lesson-tag",
+            "purpose": "Arabic discovery verbs",
+            "command": 24,
+            "max_chars": 24
+          },
+          {
+            "id": "scene-task",
+            "purpose": "Short Arabic task instruction",
+            "command": 36,
+            "max_chars": 32
+          },
+          {
+            "id": "speech-water",
+            "purpose": "Short original Arabic dialogue about watering",
+            "command": 50,
+            "max_chars": 16
+          },
+          {
+            "id": "speech-light",
+            "purpose": "Short original Arabic dialogue about light",
+            "command": 61,
+            "max_chars": 16
+          },
+          {
+            "id": "question",
+            "purpose": "Short Arabic plant needs question; e.g. ماذا تحتاج؟",
+            "command": 69,
+            "max_chars": 12
+          },
+          {
+            "id": "observe",
+            "purpose": "Two brief observation prompts; one per line. أشير للماء. / أبحث عن الضوء.",
+            "command": 73,
+            "max_chars": 28
+          },
+          {
+            "id": "needs-en",
+            "purpose": "English Water and Light vocabulary",
+            "command": 77,
+            "max_chars": 15
+          },
+          {
+            "id": "choice-task",
+            "purpose": "Short Arabic task instruction",
+            "command": 88,
+            "max_chars": 32
+          },
+          {
+            "id": "choice-0-ar",
+            "purpose": "Arabic word for Light; match atlas order",
+            "command": 96,
+            "max_chars": 9
+          },
+          {
+            "id": "choice-0-en",
+            "purpose": "English word for Light",
+            "command": 100,
+            "max_chars": 8
+          },
+          {
+            "id": "choice-1-ar",
+            "purpose": "Arabic word for Water; match atlas order",
+            "command": 111,
+            "max_chars": 9
+          },
+          {
+            "id": "choice-1-en",
+            "purpose": "English word for Water",
+            "command": 115,
+            "max_chars": 8
+          },
+          {
+            "id": "choice-2-ar",
+            "purpose": "Arabic word for Stones; match atlas order",
+            "command": 126,
+            "max_chars": 9
+          },
+          {
+            "id": "choice-2-en",
+            "purpose": "English word for Stones",
+            "command": 130,
+            "max_chars": 8
+          },
+          {
+            "id": "prediction",
+            "purpose": "Short Arabic prediction question, do not state unobserved results",
+            "command": 184,
+            "max_chars": 34
+          },
+          {
+            "id": "footer",
+            "purpose": "Original science series and topic in Arabic",
+            "command": 190,
+            "max_chars": 28
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "needs-scene",
+            "purpose": "ONE continuous classroom scene, one girl and one boy watering one bean plant near a window. Faces/action in lower two thirds; upper third has airy wall/window for native speech. Natural painted proportions. No split panels, duplicated children or text.",
+            "rect": [
+              53,
+              185,
+              391,
+              358
+            ],
+            "source_aspect_ratio": 1.7777777777777777
+          },
+          {
+            "id": "needs-atlas",
+            "purpose": "4:1 strip, THREE equal isolated cells LEFT TO RIGHT: sun, water in a small watering can, stones. Complete objects with 20% blank clearance above/below and generous side clearance, clean cream background. No text or borders.",
+            "rect": [
+              70,
+              427,
+              185,
+              503
+            ],
+            "crop": [
+              0.01,
+              0.15,
+              0.3233333333333333,
+              0.85
+            ],
+            "source_aspect_ratio": 4,
+            "views": [
+              {
+                "rect": [
+                  240,
+                  427,
+                  355,
+                  503
+                ],
+                "crop": [
+                  0.3433333333333333,
+                  0.15,
+                  0.6566666666666666,
+                  0.85
+                ]
+              },
+              {
+                "rect": [
+                  410,
+                  427,
+                  525,
+                  503
+                ],
+                "crop": [
+                  0.6766666666666666,
+                  0.15,
+                  0.99,
+                  0.85
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "explore-plant-parts",
+        "purpose": "Page 3 / zero-based 2: label real plant parts with learner-drawn connectors, leaf rubbing and comparing shapes. Tall diagram and generous original drawing response space.",
+        "template": "templates/explore-plant-parts.json",
+        "text_slots": [
+          {
+            "id": "title-ar",
+            "purpose": "Arabic title for this lesson, at most 14 characters",
+            "command": 13,
+            "max_chars": 14
+          },
+          {
+            "id": "title-en",
+            "purpose": "Short English lesson heading",
+            "command": 17,
+            "max_chars": 16
+          },
+          {
+            "id": "compare-question",
+            "purpose": "Short oral question comparing leaf shapes, no optional Arabic marks",
+            "command": 111,
+            "max_chars": 32
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "plant-parts",
+            "purpose": "ONE whole young bean plant, portrait 4:5 botanical painting. Two broad leaves at top, clear green stem, complete branching roots below a clean soil cutaway. Uncropped with 12% blank margins. No pot, arrows, numbers, text or panels.",
+            "rect": [
+              263,
+              189,
+              505,
+              480
+            ],
+            "source_aspect_ratio": 0.8
+          },
+          {
+            "id": "leaf-rubbing",
+            "purpose": "ONE close-up painted demonstration: child hands gently rub sideways yellow wax crayon over white paper covering a fresh leaf. Visible leaf-vein impression; believable hands, clean tabletop. No text, frames or panels.",
+            "rect": [
+              390,
+              556,
+              528,
+              635
+            ],
+            "source_aspect_ratio": 1.7777777777777777
+          }
+        ]
+      },
+      {
+        "id": "observe-record-change",
+        "purpose": "Page 4 / zero-based 3: seed investigation with adult support, before/after comparison, three procedural steps and blank observation journal. Narrative top strip and three learner drawing cells, not a repeated picture-card page.",
+        "template": "templates/observe-record-change.json",
+        "text_slots": [
+          {
+            "id": "title-ar",
+            "purpose": "Arabic title for this lesson, at most 14 characters",
+            "command": 13,
+            "max_chars": 14
+          },
+          {
+            "id": "title-en",
+            "purpose": "Short English lesson heading",
+            "command": 17,
+            "max_chars": 16
+          },
+          {
+            "id": "prediction",
+            "purpose": "Short prediction about a later observation, no invented timetable or results",
+            "command": 152,
+            "max_chars": 36
+          }
+        ],
+        "image_slots": [
+          {
+            "id": "seed-investigation",
+            "purpose": "ONE continuous 16:9 warm classroom scene: original girl orange pinafore and boy teal shirt compare a few dry beans in small dish with soaked swollen beans in clear dish, beside a transparent cotton germination cup. Natural hands. No text or panels.",
+            "rect": [
+              54,
+              188,
+              355,
+              359
+            ],
+            "source_aspect_ratio": 1.7777777777777777
+          }
+        ]
+      }
+    ],
+    "corrections": [
+      {
+        "before": "Repeated one-image layouts and flattened page art",
+        "after": "Purposeful multiple activities; shared art sources in independently editable native crops",
+        "reason": "Accepted visual direction from the user, with lower image request count and preserved live type"
+      }
+    ]
+  }
+}

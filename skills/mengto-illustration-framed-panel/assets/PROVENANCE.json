@@ -1,0 +1,12 @@
+{
+  "skill_id": "mengto-illustration-framed-panel",
+  "source": {
+    "repo": "MengTo/Skills",
+    "commit": "398cd41c86ba42fbb30e944ae507f463648f08b7",
+    "path": "agent-skills/illustration/illustration-framed-panel/SKILL.md",
+    "url": "https://github.com/MengTo/Skills/blob/398cd41c86ba42fbb30e944ae507f463648f08b7/agent-skills/illustration/illustration-framed-panel/SKILL.md"
+  },
+  "license": "MIT",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "b5333635a651587a9b4bdc8d75f82f2f510257bff280ad567248a3a30d502102"
+}

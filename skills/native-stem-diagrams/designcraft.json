@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "skill_id": "native-stem-diagrams",
+  "required_commands": [
+    "frame.create",
+    "object.fill",
+    "object.label",
+    "object.stroke",
+    "path.create",
+    "swatch.create",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/native-guide.md"
+  ],
+  "templates": [
+    "templates/sample.json"
+  ],
+  "sample_template": "templates/sample.json",
+  "external_tools": [],
+  "compatibility_notes": "Data-only original local skill; not an upstream installation. Original scratch A4 sample uses Tahoma, editable geometry and explicit direction. Related repository not adopted due to no clear license. Native sample/preflight must pass before automatic activation. Human scientific review and reference verification remain required."
+}
