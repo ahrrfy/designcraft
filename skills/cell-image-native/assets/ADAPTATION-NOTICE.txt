@@ -1,0 +1,3 @@
+Source: https://github.com/butterflylittle/cell-image-skill/blob/0c0cd491f49d9720d7b03ee79073e06217c13a52/SKILL.md
+License: Apache-2.0
+Modifications: concise native DesignCraft workflow and original geometric sample; external image-generation, Penpot/SVG-runtime and script requirements replaced. Full source is archival material, not active instructions. No upstream NOTICE file was found in the pinned repository tree.

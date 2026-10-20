@@ -1,5 +1,33 @@
 # Windows installer UI
 
+Native development previews can be launched with `start-native-preview.ps1 -ManifestPath <absolute-json-path>`.
+The launcher reads and writes UTF-8 explicitly, including on Windows PowerShell 5, and preserves
+the existing profile used to scope protected provider keys. Missing profile/document/executable
+paths stop startup instead of creating an unrelated blank session. `-ValidateOnly` checks the
+paths and recorded executable hash without starting the app or contacting providers; automated
+probes can use `-Hidden`. Run `powershell.exe -NoProfile -File packaging/windows/test-preview-launcher.ps1`
+to verify Arabic paths, UTF-8 with and without a BOM, read-only validation and missing-path rejection.
+
+`update-native-preview.ps1 -ManifestPath <absolute-json-path>` checks published
+`v*-ai*` previews only in `ahrrfy/designcraft`. Release packaging supplies
+`update.json` with archive and executable SHA-256, size, source commit and a
+successful exact-commit main/manual Rust CI URL. The updater verifies that proof
+and forward-only ancestry, bounds archive expansion, rejects traversal/scripts,
+installs side by side and retains the old version. These previews are unsigned;
+hashes and GitHub CI prove source/channel integrity, not a code-signing identity.
+Upstream releases are integrated into the fork before becoming eligible.
+
+A running app is never closed: the update is staged, and a later check changes
+only the launcher pointer after the app has closed. Existing profile, provider
+vault scope and document paths remain unchanged. No generated pages, approval or
+print action is resumed. Missing metadata, unsuccessful CI, an unknown installed
+commit, network failure or a divergent/downgrade candidate stops installation.
+Published drafts are not eligible. `test-preview-updater.ps1` exercises the
+archive/source/digest guards and preservation with synthetic local files and no
+provider or network requests. A per-user scheduled task can invoke the updater;
+launch the app through the stable `start-native-preview.ps1` manifest shortcut.
+Source development and publication remain separate from user installation.
+
 `installer-ui.wxs` is generated from the shared `craft-installer` crate in
 [craft-libs](https://github.com/storytold/craft-libs/tree/main/crates/installer).
 `package.ps1` compiles it with this app's package source. The common UI provides progress,

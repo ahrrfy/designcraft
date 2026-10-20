@@ -2,6 +2,8 @@ name: Propose upstream sync
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * *'
 
 permissions:
   contents: read

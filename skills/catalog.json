@@ -1,0 +1,318 @@
+{
+  "schema_version": 1,
+  "packages": [
+    {
+      "id": "cell-image-native",
+      "files": {
+        "assets/ADAPTATION-NOTICE.txt": "ebcb51802d3486bfd684714efe6ab5815c956728766eb6898ae1f84eb1e57af6",
+        "assets/fullsource.md": "b90ef1bfcf247f10867f2d5c93bbd1722db02795fb2014a755b9856adcf00e72",
+        "assets/LICENSE.txt": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "assets/PROVENANCE.json": "220b6bd9fdf71649f8e5ce10460d01deeb1b7ac2cd3e35b3c802d05b448937dd",
+        "assets/upstream-SKILL.md": "b90ef1bfcf247f10867f2d5c93bbd1722db02795fb2014a755b9856adcf00e72",
+        "designcraft.json": "810d3c26137d4c9f3e512b9d320f9282d255243ad439a881d7abf5505b7e7288",
+        "references/native-guide.md": "22a1bdcf27465de397323b7c61b8a6425ae192af1fa4b16651d22cf56d47a16c",
+        "SKILL.md": "e723185ee56d23681b7074bd0b1b80afb1c561070f8c4ae47c96c32e02fe079b",
+        "templates/sample.json": "25253d1e9d542cf061211840e18cb2425d4236bed6fd4e49c93fb6bafe6ade7f"
+      }
+    },
+    {
+      "id": "lc-check-for-understanding",
+      "files": {
+        "assets/LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "assets/NOTICE.txt": "069fd4b90c886db2dbed74fcf5ebf45f886d7fec194b63a3f0d3186833cf2c09",
+        "assets/PROVENANCE.json": "f47c7896f64abcb476dc6163e50f108f12c5fbf6128ab77318709e8bbc3e0613",
+        "assets/UPSTREAM-ROOT-NOTICE.txt": "41ba8d629c455312521be8c6367c008a81a9f6b49efebfc14fe755690e199be1",
+        "assets/upstream-SKILL.md": "343a07f69c2b1f5007ad37d19831f27f9dffbbc08872348102785137005c44d3",
+        "designcraft.json": "ac3e8667261b4aeeb369262ffd37d25e910a6c73d13ca069785d7eb7049cdfd4",
+        "references/native-guide.md": "6579e8cff654a90a20bdd4f8264b2d76887f4cc8c6ed80422144ac0bc7d50f2f",
+        "SKILL.md": "6bb8ad864bc80fc0ee37c975b69af7ac1bd662d227a04060723fbf08408ab296",
+        "templates/sample.json": "8e79c34b80095d3da49190c4d3208541377a33f7ec405c36907bbf6576966aa1"
+      }
+    },
+    {
+      "id": "lc-lesson-differentiation",
+      "files": {
+        "assets/LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "assets/NOTICE.txt": "25f5d605c8b6c8729dfaa9c969d93bcfbd4cd2d91e1753a2e60f207b695b6c19",
+        "assets/PROVENANCE.json": "e889a2b137100e06dc52828d3d331ade210f1cc003e6f05586257dedcf84eeee",
+        "assets/UPSTREAM-ROOT-NOTICE.txt": "41ba8d629c455312521be8c6367c008a81a9f6b49efebfc14fe755690e199be1",
+        "assets/upstream-SKILL.md": "d0e9f125c31b65bca2ff6ec2ed1e00d074641a38188f5340727b66d57f556bb7",
+        "designcraft.json": "2b17849e56b2bf0a83888064a3e0685e54b5ee0822d4d3b7c4b8bd80b08351eb",
+        "references/native-guide.md": "844334b9d5610395deb7e9171895ddbc59f0d2381ad3a14a2a1a603604c5dfb5",
+        "SKILL.md": "7a77290df2ce853fb5c8cc74e01837215f550a9553b0e335950e90325246571b",
+        "templates/sample.json": "f45fa9286857dc6b8d81103001a89b61042746e1f50782d8568c3baca0e07fd7"
+      }
+    },
+    {
+      "id": "lc-lesson-plan-creation",
+      "files": {
+        "assets/LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "assets/NOTICE.txt": "25f5d605c8b6c8729dfaa9c969d93bcfbd4cd2d91e1753a2e60f207b695b6c19",
+        "assets/PROVENANCE.json": "ed55cec56212fac7dcd3f90837ed9ed029c845f60e5fe3c1777addcf72b9c564",
+        "assets/UPSTREAM-ROOT-NOTICE.txt": "41ba8d629c455312521be8c6367c008a81a9f6b49efebfc14fe755690e199be1",
+        "assets/upstream-SKILL.md": "fcd441052a15a42fee6ab151cf1d829ec77bf7302cf2f79736b81e7223484efb",
+        "designcraft.json": "5504e9237c55e3d0a78474a5c254fc04f390ee19905c04a47a628c0772519ff1",
+        "references/native-guide.md": "00e5e28e6eed9cab730b66be3e322fc830f694c66964e6db054024327ed13a0c",
+        "SKILL.md": "010bed7a66de63e46931c73577df944282adeaa8ecb4cd17f8bff8a7625d8218",
+        "templates/sample.json": "fb0bdc83380d8fa69e2082b9695181911cbbbf9f2ed0de20b02e86dda89a1f74"
+      }
+    },
+    {
+      "id": "lc-lesson-prep",
+      "files": {
+        "assets/LICENSE.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "assets/NOTICE.txt": "25f5d605c8b6c8729dfaa9c969d93bcfbd4cd2d91e1753a2e60f207b695b6c19",
+        "assets/PROVENANCE.json": "58b30dc3b0438c92dba922abc4e773b0124f21e649a30f66cebe9ed70d9268c8",
+        "assets/sample-lesson.md": "8cf7f017b96aaa77edf73625d0994640b35c07ae6e21e633d0bb7a0941e49d5b",
+        "assets/UPSTREAM-ROOT-NOTICE.txt": "41ba8d629c455312521be8c6367c008a81a9f6b49efebfc14fe755690e199be1",
+        "assets/upstream-SKILL.md": "cfca47967fc70625f92756a7f1228ed1176050772a46e43e73e38112c85354a3",
+        "designcraft.json": "6cd054b51ed7f76a6005254e8fb0fa964466c7cbe13be1aba93cf5cd565e81bd",
+        "references/native-guide.md": "f21e7e86c64cfb054df8abe9c6b91f9d071c590fbe841a24e1fb448b56e08dfe",
+        "SKILL.md": "110206f16f72c128c98cfba898e3efa5ef52d74fc7b27acb5106b86a194f2918",
+        "templates/sample.json": "87df3658c8fab65334d61a5f34a3630adaf446142aafb10cec42ef3c6b8c44ca"
+      }
+    },
+    {
+      "id": "linyaosky-svg-design",
+      "files": {
+        "assets/LICENSE.txt": "5be104c85711cbc4ccd2d9a0134bed453ff5e1d421e553979f43f4e8d3737cd0",
+        "assets/NOTICE.md": "6242b39d633c0b28cb3cb3b5166ed216dc9e81b884360da182d957433f8e09b1",
+        "assets/PROVENANCE.json": "59e85208afc02140fc6201212cabf8e709f7db7c49cf799364db9249b2f5d45f",
+        "assets/upstream-SKILL.md": "9a3c1508abb8eaeaa603aed2f407a7ac1c43c769cf333e1644db5424a9697690",
+        "designcraft.json": "e64147d1ec6df40bb3bdf2c1b3989af09845df4fdc8a667d1b3b2c4837aa4f20",
+        "references/native-guide.md": "7abe044a27cdef024489f53f231091ed05b8b3b5ecaf8bc94354ab637194535a",
+        "SKILL.md": "e4a55a3a15f9af5b8fab9be094943ecfaa1f0eb5dfd39451f1c0b2c6c5403d48",
+        "templates/sample.json": "0c5d4ca4cc7ede3ec79f7436650f3bf8bf92dc0749241dd3178a8087d70433ec"
+      }
+    },
+    {
+      "id": "mengto-illustration-flat",
+      "files": {
+        "assets/LICENSE.txt": "b2a071ba22fefd803f4e9d1f5c777dd79c62d191695586a1a73fd4d0ebd051c6",
+        "assets/NOTICE.md": "1e67857d78dfedd8fc9bfa6cc58bf5b95bcaf75a78d8ab5ac6e66d1d4e0aadae",
+        "assets/PROVENANCE.json": "640a1544f4e58773a1f969f857fe0d88ed35ad362de2bc5579781f114223efdd",
+        "assets/upstream-SKILL.md": "a9b06cd733a2e5f8429747f12816057377faf2ecbf55940ea23d213577c30744",
+        "designcraft.json": "760c5611a2307b0dd4c8133559d1ec9b6853e4a75036b50b902f50fcc1b8ae4c",
+        "references/native-guide.md": "3e84ccf3b913d4fb7036b37db664f4af9eae23e76c4d8b485bc55527626ff10b",
+        "SKILL.md": "7012fa52a2bcafc8a45b767ef461caaa4b159e614f88e8ec628089ca00fe9ee8",
+        "templates/sample.json": "83c897cbbc0954819395a74028cd06fe5d136a603d2b137c083487f9d5a540fe"
+      }
+    },
+    {
+      "id": "mengto-illustration-framed-panel",
+      "files": {
+        "assets/LICENSE.txt": "b2a071ba22fefd803f4e9d1f5c777dd79c62d191695586a1a73fd4d0ebd051c6",
+        "assets/NOTICE.md": "5e98003a97f68eeb9a60a58753c5fe606a9cdf224244085309f2bcad95a2fa51",
+        "assets/PROVENANCE.json": "0a4857045e28f232f75d8956a708311f8f18976945737946cfbd03f6732b490c",
+        "assets/upstream-SKILL.md": "b5333635a651587a9b4bdc8d75f82f2f510257bff280ad567248a3a30d502102",
+        "designcraft.json": "6a1723eede76ce6b32dad80733128ffd981f6980120f5832f745119722f79b1b",
+        "references/native-guide.md": "50f15165cbe463ad23eca7ab0ac92a8f3fbdc6d91e0c37548d3f4474547f1896",
+        "SKILL.md": "a97881c028fe78750f962b2ce32969decc70a6d6cbc65021fa83e2b259494c1b",
+        "templates/sample.json": "d400772ecf8c6f75ace62f02ca420cfd15eaa7b7fd83e9e8dd7171883bd0124c"
+      }
+    },
+    {
+      "id": "native-stem-diagrams",
+      "files": {
+        "assets/ORIGINAL-CONTENT-NOTICE.txt": "32a087f976e1da86c1fa82e9f8e4ea555d11fe7c902b8b7f0607ef51ed227f0c",
+        "assets/PROVENANCE.json": "7a25c28cf61d1e4236cfb06387bee2223d65f381bcd512dc7662660ba69c84b8",
+        "designcraft.json": "6d2509d3122eea57fcd1b592250b23aba24d68842eb72bd941e6c8734b262973",
+        "references/native-guide.md": "4c7879583c399626ba4ffd82a0e053f494dbad8cded3e9c0b2e5f25f607de084",
+        "SKILL.md": "32e2150b6c10e30b4257c314efaedcf038a1a47e1e51ee0376013fe52be6cdf6",
+        "templates/sample.json": "49345079f3e3811745fc2a235a44c2b84062a24ea047f28e0a2125ca364acf96"
+      }
+    },
+    {
+      "id": "scientific-illustrations-native",
+      "files": {
+        "assets/ADAPTATION-NOTICE.txt": "1284eed7435f25685508ab791d41c5bb238d527400a2553f9abc16770f4fa430",
+        "assets/fullsource.md": "3114e9c52bcd0777cdb498016ad755b2e20c7c5f77b35877f6c15b8c0b8b55dc",
+        "assets/LICENSE.txt": "5bb25820263461292be64d515071e530f7c619de172c3601d53dd886b7e11f90",
+        "assets/PROVENANCE.json": "006cd803700ec384ce68c6f76fa658593704fa2952624b998a7b66a78bd8a9cf",
+        "assets/upstream-SKILL.md": "3114e9c52bcd0777cdb498016ad755b2e20c7c5f77b35877f6c15b8c0b8b55dc",
+        "designcraft.json": "23ce9de0a3c7d8f4597665aed22385513c6988184fca02c335b18ce783f58eb2",
+        "references/native-guide.md": "5abe21b1fb5becb4e045e0980d1e9d0700e9bb0aaa64813ba4b0bfa77017b5ef",
+        "SKILL.md": "05ffec29f03f6e8f0df293f81ca49523081c5899efd07108a155f2ff5f73cb2d",
+        "templates/sample.json": "cb0feceec1c565a4335b0a6ebe57a14c262bcb64301fd7677ee61fefa1a2e56f"
+      }
+    },
+    {
+      "id": "syi-illustration-plan",
+      "files": {
+        "assets/LICENSE.txt": "0d4dd2ed18a03a2992af5b12a5f2893875fbe3b112609ffe73cec9d30938c166",
+        "assets/NOTICE.md": "9143884e26e094d700388c0b7210888f0e36657177f2b6a8239f39fa69285c56",
+        "assets/PROVENANCE.json": "3fbf6d3586f301e69133e4a808714c413f814dbf7f7e953c6ed812cae787b407",
+        "assets/upstream-SKILL.md": "3272cbc509ebd0f24b55fc426e7b3e124df495fc5073ef10ca1b8ff6f0ce2251",
+        "designcraft.json": "da0bf5b99698a9f58f9ae4ed71e9690eceb0beb221a4585958b7765ddecae139",
+        "references/native-guide.md": "d4a00918256103ec76671dca917897d693a663ce6caf895e1900b817986428d1",
+        "SKILL.md": "aac6528973c37016093d080c2e1dba8c712e4970fab2c387962f12d2669da049",
+        "templates/sample.json": "46e33fb9fa7a5a3e9f05d6cb720e9d580c07be28f6b94f9d69e4bb8d7fd8f96f"
+      }
+    },
+    {
+      "id": "syi-image-to-svg",
+      "files": {
+        "assets/LICENSE.txt": "0d4dd2ed18a03a2992af5b12a5f2893875fbe3b112609ffe73cec9d30938c166",
+        "assets/NOTICE.md": "6a264b319ab6b2b1d72d73cbd07f55182e8c5b723012adff306b4b3434169d6a",
+        "assets/PROVENANCE.json": "21b58b6e8e0537b4c61f44364b127a369b0f371f2259f778e08f07c13d95eaae",
+        "assets/upstream-SKILL.md": "038828ea59fe3b4c8cbae940990f545c7d916302bbfc45d1e54659b9742a9839",
+        "designcraft.json": "f19059b5f11e0eca7221306e96a9daad4da4699c687fb8bfd9a2c09cc3101976",
+        "references/native-guide.md": "ebd5e770f52775269b377b5bcb08b9b6b7fdd57666a6e73895e610ec14dc6332",
+        "SKILL.md": "5e3e90b7605a0f71280637fedb8e46aed97fada2121a32744df33b420cc22fab",
+        "templates/sample.json": "7cb22fd22ae33e38b25ddb8f34b0b59ec2c047016bca047ea36b6eda75c5e92d"
+      }
+    },
+    {
+      "id": "syi-vector-illustration",
+      "files": {
+        "assets/LICENSE.txt": "0d4dd2ed18a03a2992af5b12a5f2893875fbe3b112609ffe73cec9d30938c166",
+        "assets/NOTICE.md": "2eb16d03be61b05ddd0e3bdcb76d7f7e8bf01c1b484c3b454f5505039d3190bf",
+        "assets/PROVENANCE.json": "e2a9c076c80a71476f1f5a62bb44286a18a76e2c59dcde7438b7ad38ad264320",
+        "assets/upstream-SKILL.md": "c6a84ed5788a28d0975d97a59fbbee2d1b4a23e9c642d5a4b79d5817946620c3",
+        "designcraft.json": "f26e9e1c433d7afe9b8f4f7e845ad242dce362904e639cf264d7e98699d66b8a",
+        "references/native-guide.md": "8774e4139e1ef1eb37972ad20b8dbb1b6c1db89c8929ec6711e62ee0c46ee4af",
+        "SKILL.md": "657871d6a30429ac866d3109ce65a6fbf8a526a822d4043999d0a6f228279cfb",
+        "templates/sample.json": "2fd5a723dae6f48e7f7197c400fc51d23847bcd2dadce692de41fff3e96dd07f"
+      }
+    },
+    {
+      "id": "native-editorial-variety",
+      "files": {
+        "assets/PROVENANCE.json": "e8378fd932694cfc33aeb62ada32317834d7c4233be6bf58983efbb0be240864",
+        "designcraft.json": "039d50ba46058c7fccb594e055a83d0a239d15cb61c6949439f2fce983475666",
+        "references/native-guide.md": "ade2f0bf44782b17d91c0f21a545355d6ca41b7249807a0da40303963073cc35",
+        "SKILL.md": "fad88df1b51598ae8514a181d15f8fb2aab98e4f61af22fabd53b0c0d6db13f0",
+        "templates/sample.json": "718fded0162c461c93fd1024d6e36f53200fa76114e6c4077a6eb4f769772e17"
+      }
+    },
+    {
+      "id": "kg-oxford-cambridge-style",
+      "files": {
+        "designcraft.json": "c693d1737fe5a583b4bf1488530ce5a311fe49d7130b3a485704d36173ae08e2",
+        "references/cognitive-sensory-style-guide.md": "71a6268992f3dff639a1a8fd77bb5f900cba4158ecc521307d6ef620b3cb4d00",
+        "references/independence.md": "600d649586a46d468573eb6f92f601a1932e5cbf70942295431f1cd3ba151ea7",
+        "references/vector-vs-generative-matrix.md": "570a1de0a1ec4d4340948fb740ed730e8e47306b5cdbe99acd2bb9cd104caa31",
+        "SKILL.md": "9612d881a9ef3ecd308fe6593afe51ddace6bbbf42f52baa96d71ae98060e65f",
+        "templates/cambridge-cpa-grammar.json": "105dd10d825b974c997cd8bcf23f6a0e8a4bc5e91553c117254bc281ffc37f2f",
+        "templates/garnet-computing-systems-lab.json": "6de41380de3f8aa47540294a9008026cb8fb158f0fed3a420a673f57828c36e8",
+        "templates/international-curriculum-cover.json": "fa7c9d6558441fd5c737774fd399a479785a78201fedaaf8608cd3a08695a9f3",
+        "templates/international-scope-sequence.json": "e984f2556edea31636fb4264e37de3fd29d3c4f4a34a93b21cbb68108600d4ac",
+        "templates/oxford-fluency-project.json": "4e64a5697bef16ae592e748e18e0dece1ca85c9aa2603a6f4e792d10ce79b84d",
+        "templates/oxford-phonics-maze.json": "0802937b731c72a1e5915a4eb36dcefb31ba719d9fbdb687d9b52dd36ec211c6",
+        "templates/oxford-skills-time.json": "750672c8384f79bb4d9b98fa22c9fa1ac80cf221f1222699ac22694e89e21e8f",
+        "templates/oxford-song-colours.json": "504c6ddf40cd89ca3c71e3dba22ef0882fc1d96a4943bbd5d7a3228a5b3917fc",
+        "templates/oxford-vocab-story.json": "a13490e9e9693e7c8c70e5d395313149cd20ddf763320f381110ae6fed91204b",
+        "templates/oxford-workbook-print.json": "d071c68e631457a7806f618e7ca6a2dd51abc1e5db078ed7e643a39bbb2ba9fa",
+        "templates/sample_native_only.json": "60f56bce3b7dad7c975f1954d66d10d32f37616f713495a2e5972c8e0079f9b2"
+      }
+    },
+    {
+      "id": "kg-cognitive-sensory-layout",
+      "files": {
+        "designcraft.json": "c467e1e113a45109a7e58cf672a577169520836c0a357a99b56d71bddd39743b",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "40001257844f17ab25768eee4dea569773595d4a33a94b17cc8120efa3914bd0",
+        "templates/sample.json": "c6ed1f0425142ce0862e56a2473b1f85886b709a68cc17821e4ecc1f49ff33d1"
+      }
+    },
+    {
+      "id": "kg-cambridge-thinking-cpa",
+      "files": {
+        "designcraft.json": "2e95fe19882c947a79a1e10c877e9044a61db550fa504b723a019feccb62bc29",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "30457880d0dee21225fcdf35c21f8df627e77c120329654aa65f6ebf2fa1c8c1",
+        "templates/sample.json": "1c4da3965c3a65baee32a072a6a5d6f5f3e1be7fc4e95fa8c8fc2bc899f006bf"
+      }
+    },
+    {
+      "id": "kg-oxford-phonics-handwriting",
+      "files": {
+        "designcraft.json": "2bfd3440cfb9b094786ae3503bddfdfc4512038e040da1ab66686521f2842337",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "28c2d35002e1858d33931a3bf687ad50d7f76cd988996cd9bfb7bc7e38619fad",
+        "templates/sample.json": "b60c13a163d0c1fabad4f61fcd2ad4f0b68648f8aae0e3604908e0b317420e72"
+      }
+    },
+    {
+      "id": "kg-sensory-illustration-vector",
+      "files": {
+        "designcraft.json": "f23f38c6587c4eda91769b245ebd8fe4afd2d0a50757f95574c3089925f2243c",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "da8f7e3c044e59aa71b8132c6fa436e0fa75b5443052cf45418bbe07ad667541",
+        "templates/sample.json": "d980d98c7c8a05846b987b745cf8ead4e13b4f44035f3fb515c685b0cc9be7e7"
+      }
+    },
+    {
+      "id": "kg-school-print-prepress",
+      "files": {
+        "designcraft.json": "46f8c5b26f265870a7673445633320558c7d53089a0efc572cb723f6e92fbf8a",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "a431a851150fe59d54ec86d1a2350c9f45d2d9d134084dbeb619b8188829b24c",
+        "templates/sample.json": "daf91923a00954b8358822047188c1c086e402da79004be8ff5b68628318d671"
+      }
+    },
+    {
+      "id": "kg-oxford-skills-time",
+      "files": {
+        "designcraft.json": "0d124511b790f327269cd99589d4fde8691ed1423565604385b4905d82d9c8d7",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "daefca9f11ca902e84efa7efa70f0a31c2478b31949008dbb6bad33ad71792bb",
+        "templates/sample.json": "8838de3b9c652eac28a1a0a3ec86f3d19b044125b2620bd3c04385ab694e5ed0"
+      }
+    },
+    {
+      "id": "kg-oxford-fluency-time",
+      "files": {
+        "designcraft.json": "b3664cff26567424bb06ef3069d5c05a5d311e82b6f2e9a1fe5d0b2a857cb8dd",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "d0d53d2fb58f729699070e7f65f9d2c9f83b5fcc7e85318245e2fd7ea4ab96ca",
+        "templates/sample.json": "45cb2097912c69a79925f581646af8978372c58bc3919047170c4715abec5305"
+      }
+    },
+    {
+      "id": "kg-garnet-ict-computing",
+      "files": {
+        "designcraft.json": "b37109caf6abeb266b14af36c1c82be41bacc2e11773fdd32531bcbed9d4d9ab",
+        "references/native-guide.md": "d1d9df5812d5859bf62845aae8bbeb7a5ead17d509918aa084d02fa911c0da5c",
+        "SKILL.md": "23e57872709bf828633aacc3bb2586292f31e40a8eaacae6e754509e01856a08",
+        "templates/sample.json": "d3643023e95c8e2c2c329cfdb476cadfd3b72d074e998f39333c7cfa82e1dd38"
+      }
+    },
+    {
+      "id": "accepted-science-editorial",
+      "files": {
+        "designcraft.json": "7f6c4c48c1fb75339bf0b7349f6104be6ed0f7286a9e65065f86a8a19ec61a9f",
+        "references/art-direction.md": "ebb1b80ff1d9071b3b03b02af4dae801c4e7adebc909eb55ec397e5deba3efb2",
+        "SKILL.md": "2ac51f543c050982ee92f874641706053dd6716059f57ecd01d04a970eff4b76",
+        "templates/discover-test-needs.json": "02b7aa509b6cccf1fb9bc1ef8c5e1c599287d2f0b68c431b4bda64a1e1e0d72f",
+        "templates/explore-plant-parts.json": "6c2526d903c8dbe18a076e28a4d8480e5e1e9cb39c33c8f3ea9d79c0aab5bb01",
+        "templates/observe-growth-sequence.json": "78c0e86c5f370d8a0d2de3f7e43bbb5def92fa7ebb338b5bc774d26c8d11cead",
+        "templates/observe-record-change.json": "9a15c19dd11e205189d5f63631904495e1e053168b936001a7704e82c3318c06"
+      }
+    },
+    {
+      "id": "kg-international-curriculum-architect",
+      "files": {
+        "designcraft.json": "cadb3bef32a2055a2e135a41b8d28d8a3748fbcc8ad123ed00bfab7bb1123503",
+        "references/curriculum-sequencing-algorithm.md": "ee7b1dfb14f035e6ffd0e329415c896a1fb7911f6320bc8b0421486ce0571b8c",
+        "references/dialogue-activity-typography-contract.md": "ee7b1dfb14f035e6ffd0e329415c896a1fb7911f6320bc8b0421486ce0571b8c",
+        "SKILL.md": "852a9fcfe0329dc78e31adcf5d3f52b10eca8af02a6b7abb9a5e2f20cd833b06",
+        "templates/sample.json": "7da71cd68110ea102ac8ac734b2ed34344192558b70d1da057c2830f8660335b"
+      }
+    },
+    {
+      "id": "curriculum-print-design-studio",
+      "files": {
+        "assets/ADAPTATION-NOTICE.txt": "b1ff57300b866ad4890f2c72e2c3238ceb426119a03a2cf081e94d4371720c0b",
+        "assets/PROVENANCE.json": "491354847bcfad06e5cc7dac6a3f322f606d07b3d433e4453174fe12a5ef5e55",
+        "designcraft.json": "41b340f48e9c4e91c23c05cc056518ce3b7ef541a8b7d7a9ddf8fec4a475dd7a",
+        "references/native-production-contract.md": "55e7d2e827438c3cfa94e4cc862b64ecdd287f9b1a8502f88a44a7a97be8a70f",
+        "references/prepress-and-grid-specs.md": "49fcccb63756a43c35d5563a97b8b7c002a1e348f839502289f3c4433cec2d72",
+        "references/subject-blueprints.md": "a3fa73439d6da7c612a9fc0bf75dea87865a5dd3570a89009aa576fe67503675",
+        "SKILL.md": "8bf3a789cbca50ac2e97bcdd57826a07e338e18def3fddd7a1be442a5df3adb3",
+        "templates/journal.json": "961c4e77c58a3a8d6dac7f0f96f143a8c7efa130a0550151c1f1cd2b774a2bb8",
+        "templates/sequence.json": "c579b66424a6a8eaed7faf0254fb79093b83c96a4ad7ad284b664b4d814d0ffd"
+      }
+    }
+  ]
+}

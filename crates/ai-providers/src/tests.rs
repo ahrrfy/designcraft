@@ -53,6 +53,21 @@ mod native_tests {
         }
     }
 
+    #[test]
+    fn gemini_image_aspect_ratio_is_sent_in_the_native_request() {
+        let request = ImageRequest {
+            prompt: "Four isolated plant growth stages".into(),
+            size: Some("4:1".into()),
+            quality: None,
+            comfy: None,
+            resources: Default::default(),
+        };
+        let body = crate::native::image_generation_body(ProviderKind::Gemini, "test-model", &request).unwrap();
+        assert_eq!(body["generationConfig"]["imageConfig"]["aspectRatio"], "4:1");
+        let invalid = ImageRequest { size: Some("not-a-ratio".into()), ..request };
+        assert!(crate::native::image_generation_body(ProviderKind::Gemini, "test-model", &invalid).unwrap_err().contains("aspect ratio"));
+    }
+
     /// Minimal synthetic server captures complete request and returns fixed data.
     fn mock(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
         mock_cancellable(responses, None)
@@ -103,6 +118,40 @@ mod native_tests {
     }
 
     #[test]
+    fn gemini_layout_json_mode_keeps_the_native_contract_without_a_schema_endpoint_requirement() {
+        let mut request = request();
+        request.prompt = "أنشئ صفحات أصلية قابلة للتحرير".into();
+        request.json_schema = json!({"type":"object","required":["title","commands","images"],"properties":{
+            "title":{"type":"string"},
+            "commands":{"type":"array","items":{"type":"object","properties":{
+                "command":{"type":"string","enum":["frame.create","type.char"]},"params":{"type":"object"}}}},
+            "images":{"type":"array","maxItems":0,"items":{"type":"object"}}
+        }});
+        let body = generation_body(&selection(ProviderKind::Gemini, None), &request).unwrap();
+        assert_eq!(body.pointer("/generationConfig/responseMimeType"), Some(&json!("application/json")));
+        assert!(
+            body.pointer("/generationConfig/responseJsonSchema").is_none(),
+            "Observed Gemini endpoint rejects the layout schema before generation"
+        );
+        let prompt = body.pointer("/contents/0/parts/0/text").and_then(Value::as_str).unwrap();
+        assert!(prompt.starts_with(&request.prompt));
+        let contract = prompt.split_once("OUTPUT JSON CONTRACT:\n").unwrap().1;
+        assert_eq!(serde_json::from_str::<Value>(contract).unwrap(), request.json_schema);
+        assert_eq!(body.pointer("/generationConfig/maxOutputTokens"), Some(&json!(256)));
+        assert_eq!(body.pointer("/systemInstruction/parts/0/text"), Some(&json!(request.system)));
+    }
+
+    #[test]
+    fn gemini_reference_images_preserve_the_json_contract() {
+        let mut request = request();
+        request.images.push(ImageInput { mime_type: "image/png".into(), bytes: vec![1, 2, 3] });
+        let body = generation_body(&selection(ProviderKind::Gemini, None), &request).unwrap();
+        let prompt = body.pointer("/contents/0/parts/0/text").and_then(Value::as_str).unwrap();
+        assert!(prompt.contains("OUTPUT JSON CONTRACT:\n"));
+        assert_eq!(body.pointer("/contents/0/parts/1/inlineData/data"), Some(&json!("AQID")));
+    }
+
+    #[test]
     fn actual_provider_request_shapes() {
         let request = request();
         let openai = generation_body(&selection(ProviderKind::OpenAi, None), &request).unwrap();
@@ -110,7 +159,8 @@ mod native_tests {
         assert_eq!(openai.pointer("/text/format/strict"), Some(&json!(false)));
         assert_eq!(openai.get("store"), Some(&json!(false)));
         let gemini = generation_body(&selection(ProviderKind::Gemini, None), &request).unwrap();
-        assert_eq!(gemini.pointer("/generationConfig/responseJsonSchema"), Some(&request.json_schema));
+        assert!(gemini.pointer("/generationConfig/responseJsonSchema").is_none());
+        assert!(gemini.pointer("/contents/0/parts/0/text").and_then(Value::as_str).unwrap().contains("OUTPUT JSON CONTRACT:\n"));
         let ollama = generation_body(&selection(ProviderKind::Ollama, None), &request).unwrap();
         assert_eq!(ollama.get("format"), Some(&request.json_schema));
         assert_eq!(ollama.get("stream"), Some(&json!(false)));

@@ -1,0 +1,12 @@
+{
+  "skill_id": "lc-lesson-prep",
+  "source": {
+    "repo": "learning-commons-org/agent-skills",
+    "commit": "5894a3c9dcda8d4499bb73fad85b2b11a2b78344",
+    "path": "skills/k12-lesson-prep/SKILL.md",
+    "url": "https://github.com/learning-commons-org/agent-skills/blob/5894a3c9dcda8d4499bb73fad85b2b11a2b78344/skills/k12-lesson-prep/SKILL.md"
+  },
+  "license": "Apache-2.0",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "cfca47967fc70625f92756a7f1228ed1176050772a46e43e73e38112c85354a3"
+}

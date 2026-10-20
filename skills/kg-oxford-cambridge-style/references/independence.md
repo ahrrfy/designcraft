@@ -1,0 +1,1 @@
+Original editable layout examples. Publisher names are descriptive references only; no affiliation, endorsement, curriculum certification or measured similarity is claimed. No reference-book images, characters or fonts are distributed.

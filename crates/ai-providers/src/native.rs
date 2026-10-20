@@ -176,6 +176,19 @@ fn model_id(selection: &ModelSelection) -> Result<&str, String> {
     Ok(model)
 }
 
+fn gemini_json_prompt(request: &GenerationRequest) -> Result<String, String> {
+    // The native command schema contains open parameter objects and empty image arrays.
+    // Gemini can reject that schema before inference. JSON mode carries the same contract
+    // as prompt data; the worker still validates every command on its private document.
+    const PREFIX: &str = "\n\nOUTPUT JSON CONTRACT:\n";
+    let schema = encode_json(&request.json_schema)?;
+    if request.prompt.len().saturating_add(request.system.len()).saturating_add(PREFIX.len()).saturating_add(schema.len()) > MAX_JSON_BYTES / 2 {
+        return Err("AI prompt and JSON contract exceed size limit".into());
+    }
+    let schema = std::str::from_utf8(&schema).map_err(|_| "Cannot encode AI JSON contract")?;
+    Ok(format!("{}{PREFIX}{schema}", request.prompt))
+}
+
 pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRequest) -> Result<Value, String> {
     if request.prompt.len().saturating_add(request.system.len()) > MAX_JSON_BYTES / 2 || !request.json_schema.is_object() {
         return Err("AI prompt is too large or schema is not an object".into());
@@ -204,8 +217,8 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
         ProviderKind::OpenAi => json!({"model":model,"instructions":request.system,"input":request.prompt,"store":false,
             "max_output_tokens":request.max_output_tokens,"text":{"format":{"type":"json_schema","name":"designcraft_plan","schema":request.json_schema,"strict":false}}}),
         ProviderKind::Gemini => {
-            json!({"systemInstruction":{"parts":[{"text":request.system}]},"contents":[{"role":"user","parts":[{"text":request.prompt}]}],
-            "generationConfig":{"responseMimeType":"application/json","responseJsonSchema":request.json_schema,"maxOutputTokens":request.max_output_tokens}})
+            json!({"systemInstruction":{"parts":[{"text":request.system}]},"contents":[{"role":"user","parts":[{"text":gemini_json_prompt(request)?}]}],
+            "generationConfig":{"responseMimeType":"application/json","maxOutputTokens":request.max_output_tokens}})
         }
         ProviderKind::Ollama => {
             request.resources.validate()?;
@@ -234,7 +247,7 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
                 body["input"] = json!([{"role":"user","content":content}]);
             }
             ProviderKind::Gemini => {
-                let mut parts = vec![json!({"text":request.prompt})];
+                let mut parts = vec![json!({"text":gemini_json_prompt(request)?})];
                 for (input, encoded) in request.images.iter().zip(&encoded_images) {
                     parts.push(json!({"inlineData":{"mimeType":input.mime_type,"data":encoded}}));
                 }
@@ -478,8 +491,15 @@ pub(super) fn generate_images(
         return Err("Image size or quality option exceeds length limit".into());
     }
     let model = model_id(selection)?;
+    let body = image_generation_body(selection.provider, model, request)?;
+    let path = if selection.provider == ProviderKind::OpenAi { "images/generations".into() } else { format!("models/{model}:generateContent") };
     let transport = Transport::new(selection, key)?;
-    let (path, body) = if selection.provider == ProviderKind::OpenAi {
+    let value = transport.post(&path, &body, cancel, IMAGE_JSON_LIMIT)?;
+    parse_images(selection.provider, &value, cancel)
+}
+
+pub(super) fn image_generation_body(provider: ProviderKind, model: &str, request: &ImageRequest) -> Result<Value, String> {
+    if provider == ProviderKind::OpenAi {
         // GPT Image models return base64 by default. No URL download is followed.
         let mut body = json!({"model":model,"prompt":request.prompt,"n":1});
         if let Some(size) = &request.size {
@@ -488,15 +508,22 @@ pub(super) fn generate_images(
         if let Some(quality) = &request.quality {
             body["quality"] = json!(quality);
         }
-        ("images/generations".into(), body)
+        Ok(body)
     } else {
-        (
-            format!("models/{model}:generateContent"),
-            json!({"contents":[{"parts":[{"text":request.prompt}]}],"generationConfig":{"responseModalities":["TEXT","IMAGE"]}}),
-        )
-    };
-    let value = transport.post(&path, &body, cancel, IMAGE_JSON_LIMIT)?;
-    parse_images(selection.provider, &value, cancel)
+        let mut config = json!({"responseModalities":["TEXT","IMAGE"]});
+        // Gemini's native image config uses an aspect ratio, not an OpenAI pixel size.
+        // https://ai.google.dev/gemini-api/docs/image-generation
+        if let Some(ratio) = &request.size {
+            if !matches!(
+                ratio.as_str(),
+                "1:1" | "1:4" | "1:8" | "2:3" | "3:2" | "3:4" | "4:1" | "4:3" | "4:5" | "5:4" | "8:1" | "9:16" | "16:9" | "21:9"
+            ) {
+                return Err("Unsupported Gemini image aspect ratio".into());
+            }
+            config["imageConfig"] = json!({"aspectRatio":ratio});
+        }
+        Ok(json!({"contents":[{"parts":[{"text":request.prompt}]}],"generationConfig":config}))
+    }
 }
 
 /// Bind only explicit user-supplied placeholders; never infer graph node IDs.

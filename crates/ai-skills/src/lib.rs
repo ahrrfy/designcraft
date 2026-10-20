@@ -2,11 +2,13 @@
 //!
 //! Package content is data, never executable code. `SKILL.md` uses Agent Skills YAML
 //! frontmatter; `designcraft.json` adapts it to native DesignCraft commands. Importing,
-//! editing or generating a package always creates a draft. Only `approve` activates it.
+//! editing or generating a package creates a draft. Activation requires exact native sample
+//! evidence, either human review or automatic native validation recorded separately.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod builtin;
+mod educational_style;
 mod package;
 
 use designcraft_ai_types::EngineAction;
@@ -90,6 +92,8 @@ pub struct NativeManifest {
     pub external_tools: Vec<String>,
     #[serde(default)]
     pub compatibility_notes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_profile: Option<designcraft_ai_types::DesignProfile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,6 +112,8 @@ pub struct SkillRevision {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApprovalRecord {
+    #[serde(default)]
+    pub automatic: bool,
     pub reviewer: String,
     pub sample_sha256: String,
     pub sample_format: String,
@@ -145,6 +151,8 @@ pub struct SkillSnapshot {
     pub references: BTreeMap<String, String>,
     pub reference_hashes: BTreeMap<String, String>,
     pub templates: BTreeMap<String, Vec<EngineAction>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_profile: Option<designcraft_ai_types::DesignProfile>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -309,8 +317,19 @@ impl SkillRegistry {
     /// Explicit human approval after review. An existing approved revision is
     /// immutable; importing identical bytes is idempotent, never a review bypass.
     pub fn approve(&mut self, skill_id: &str, revision: &str, evidence: ApprovalEvidence) -> Result<()> {
+        self.activate(skill_id, revision, evidence, false)
+    }
+
+    /// Host-only local validation, never a claim that a human reviewed the sample.
+    pub fn activate_automatically(&mut self, skill_id: &str, revision: &str, mut evidence: ApprovalEvidence) -> Result<()> {
+        evidence.reviewer = "DesignCraft native validator".into();
+        evidence.notes = "Automatic native template execution, rendered sample and print preflight; no human approval claimed.".into();
+        self.activate(skill_id, revision, evidence, true)
+    }
+
+    fn activate(&mut self, skill_id: &str, revision: &str, evidence: ApprovalEvidence, automatic: bool) -> Result<()> {
         let record = self.revision(skill_id, revision)?.clone();
-        if record.status != RevisionStatus::Draft {
+        if record.status != RevisionStatus::Draft && (automatic || !record.approval.as_ref().is_some_and(|approval| approval.automatic)) {
             return Err(SkillError::Invalid("revision is already approved".into()));
         }
         if evidence.reviewer.trim().is_empty() || evidence.notes.trim().is_empty() {
@@ -350,7 +369,8 @@ impl SkillRegistry {
         let entry = next.entries.get_mut(skill_id).ok_or_else(|| SkillError::NotFound(skill_id.into()))?;
         let revised = entry.revisions.iter_mut().find(|r| r.revision == revision).ok_or_else(|| SkillError::NotFound(revision.into()))?;
         revised.status = RevisionStatus::Approved;
-        revised.approval = Some(ApprovalRecord { reviewer: evidence.reviewer, sample_sha256, sample_format: format.into(), notes: evidence.notes });
+        revised.approval =
+            Some(ApprovalRecord { automatic, reviewer: evidence.reviewer, sample_sha256, sample_format: format.into(), notes: evidence.notes });
         entry.active_revision = Some(revision.into());
         entry.name = revised.name.clone();
         entry.description = revised.description.clone();
@@ -391,6 +411,13 @@ impl SkillRegistry {
         if package_hash(&record.file_hashes) != record.revision {
             return Err(SkillError::Integrity("revision file list changed".into()));
         }
+        // Catalog metadata cannot inject a profile or change template permissions.
+        if record.file_hashes.contains_key("designcraft.json") {
+            let manifest: NativeManifest = serde_json::from_slice(&self.verified_file(record, "designcraft.json")?)?;
+            if serde_json::to_value(&manifest)? != serde_json::to_value(&record.manifest)? {
+                return Err(SkillError::Integrity("manifest metadata changed".into()));
+            }
+        }
         let skill_bytes = self.verified_file(record, "SKILL.md")?;
         let instructions = package::instructions(&skill_bytes)?;
         if instructions.len() > MAX_SNAPSHOT_TEXT_BYTES {
@@ -422,7 +449,15 @@ impl SkillRegistry {
         for name in &record.manifest.templates {
             templates.insert(name.clone(), package::parse_actions(&self.verified_file(record, name)?)?);
         }
-        Ok(SkillSnapshot { skill_id: skill_id.into(), revision: revision.clone(), instructions, references, reference_hashes, templates })
+        Ok(SkillSnapshot {
+            skill_id: skill_id.into(),
+            revision: revision.clone(),
+            instructions,
+            references,
+            reference_hashes,
+            templates,
+            design_profile: record.manifest.design_profile.clone(),
+        })
     }
 
     pub fn cache_analysis(&mut self, reference_sha256: &str, analyzer: &str, text: &str) -> Result<()> {
@@ -454,12 +489,17 @@ impl SkillRegistry {
         builtin::packages()?
             .into_iter()
             .map(|files| {
+                let license = match files.get("references/LICENSE.txt") {
+                    Some(bytes) if bytes.starts_with(b"MIT License") => "MIT",
+                    Some(_) => "Apache-2.0",
+                    None => "MIT OR Apache-2.0",
+                };
                 self.import_files(
                     files,
                     Provenance {
-                        source: "DesignCraft original builtin".into(),
+                        source: "DesignCraft native builtin; upstream attribution, where applicable, is in references/NOTICE.md".into(),
                         author: Some("DesignCraft contributors".into()),
-                        license: Some("MIT OR Apache-2.0".into()),
+                        license: Some(license.into()),
                         source_sha256: None,
                     },
                 )

@@ -13,6 +13,9 @@ pub(super) struct BatchJob {
     before: UsageSummary,
     snapshot: BatchSnapshot,
     prefs: Prefs,
+    // Keeps the original allocation alive: selection/view revisions alone are
+    // not document edits, and an address cannot be recycled while pinned here.
+    publication_base: Option<DocState>,
 }
 impl BatchJob {
     pub(super) fn snapshot_elapsed(&self) -> u64 {
@@ -47,6 +50,34 @@ pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRo
     Ok(Some(snapshot))
 }
 
+/// A continuation starts only from a deliberately selected current book. Never
+/// infer permission or a page offset from stale, editable checkpoint metadata.
+pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraft_ai_types::DesignProfile>) -> Result<(u32, u32), String> {
+    if let Some(profile) = profile {
+        profile.validate()?;
+    }
+    let page_mm = profile.map_or([210.0, 297.0], |p| p.page_mm);
+    let pages = u32::try_from(base.doc.spreads.len()).map_err(|_| "Invalid existing book page count")?;
+    if !(1..=1000).contains(&pages)
+        || base.doc.spreads.iter().any(|spread| {
+            spread.pages.len() != 1
+                || spread.pages.iter().any(|page| {
+                    !page.width.is_finite()
+                        || !page.height.is_finite()
+                        || (page.width - page_mm[0] * 72.0 / 25.4).abs() > 0.1
+                        || (page.height - page_mm[1] * 72.0 / 25.4).abs() > 0.1
+                })
+        })
+    {
+        return Err("Continue book requires 1–1000 single pages matching the selected profile (A4 by default)".into());
+    }
+    let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
+    if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
+        return Err("Continue book requires completed opening pages followed only by blank pages; existing content will not be overwritten".into());
+    }
+    Ok((pages, u32::try_from(start).map_err(|_| "Invalid continuation page")?))
+}
+
 impl ProductionRunner {
     pub(super) fn start_batches(
         &mut self,
@@ -56,7 +87,14 @@ impl ProductionRunner {
         mut base: DocState,
         context: Value,
     ) -> Result<(), String> {
-        let TaskTarget::NewA4 { pages } = task.target else { return Err("Batch production requires a new A4 book".into()) };
+        let (pages, completed, existing) = match task.target {
+            TaskTarget::NewA4 { pages } => (pages, 0, None),
+            TaskTarget::ContinueBook => {
+                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()))?;
+                (pages, completed, Some((base.uid, base.revision)))
+            }
+            TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
+        };
         let size = task.settings.pages_per_batch;
         if !(1..=32).contains(&size) || !(1..=1000).contains(&pages) {
             return Err("Invalid book or batch size".into());
@@ -72,7 +110,10 @@ impl ProductionRunner {
             total_pages: pages,
             pages_per_batch: size,
             current_batch: 1,
-            total_batches: pages.div_ceil(size),
+            total_batches: pages.saturating_sub(completed).div_ceil(size),
+            completed_pages: completed,
+            document_uid: existing.map(|(uid, _)| uid),
+            document_revision: existing.map(|(_, revision)| revision),
             status: "running".into(),
             ..Default::default()
         };
@@ -85,6 +126,7 @@ impl ProductionRunner {
             before: UsageSummary::default(),
             snapshot,
             prefs: session.prefs.clone(),
+            publication_base: existing.map(|_| base.clone()),
         };
         base.selection = Default::default();
         self.launch_batch(job, base, context)
@@ -273,6 +315,7 @@ impl ProductionRunner {
         job.snapshot.elapsed_ms = job.snapshot.elapsed_ms.saturating_add(elapsed);
         job.ledger = Some(ledger);
         let mut report = TaskReport {
+            design_style: self.style_use(&pending.skills, pending.task.as_ref().map(|task| &task.target)),
             id: pending.id,
             status: "failed".into(),
             title: job.task.prompt.chars().take(80).collect(),
@@ -372,11 +415,19 @@ impl ProductionRunner {
         let first = job.snapshot.document_uid.is_none();
         let previous = session.active_index();
         if first {
-            session.execute("file.new", &new_a4(job.snapshot.total_pages)).map_err(|e| e.to_string())?;
+            let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
+            session.execute("file.new", &crate::design::document_params(profile, job.snapshot.total_pages)).map_err(|e| e.to_string())?;
         }
         let result = (|| {
             let current = session.doc().map_err(|e| e.to_string())?;
-            if !first && (Some(current.uid) != job.snapshot.document_uid || Some(current.revision) != job.snapshot.document_revision) {
+            if !first
+                && (Some(current.uid) != job.snapshot.document_uid
+                    || !job.publication_base.as_ref().is_some_and(|original| {
+                        Arc::ptr_eq(&original.doc, &current.doc)
+                            && original.active_layer == current.active_layer
+                            && original.editing_parents == current.editing_parents
+                    }))
+            {
                 return Err("The book changed while its batch was generating; publication is refused".into());
             }
             let mut base = current.clone();
@@ -402,12 +453,13 @@ impl ProductionRunner {
             write_json(
                 &self.profile_access,
                 &trace,
-                &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plan":plan,"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
+                &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"designStyle":report.design_style,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plan":plan,"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
             )?;
             session.execute("production.apply",&json!({"commands":plan.commands,"outputMode":job.task.settings.output_mode,"label":format!("{} · batch {}",plan.title,job.snapshot.current_batch),"expectedDocumentUid":uid,"expectedRevision":revision,"requirePreflight":true,"minPpi":150})).map_err(|e|e.to_string())?;
             let state = session.doc().map_err(|e| e.to_string())?;
             job.snapshot.document_uid = Some(state.uid);
             job.snapshot.document_revision = Some(state.revision);
+            job.publication_base = Some(state.clone());
             report.title = plan.title.clone();
             batch_report.title = plan.title.clone();
             report.actions = plan.commands.len();
@@ -540,6 +592,38 @@ mod tests {
             export_directory: None,
         }
     }
+    #[test]
+    fn continuation_refuses_blank_books_filled_books_holes_and_non_a4_pages() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(4)).unwrap();
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert_eq!(continuation_progress(session.doc().unwrap(), None).unwrap(), (4, 1));
+        session.execute("frame.create", &json!({"spread":2,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        session.execute("frame.create", &json!({"spread":1,"rect":[50,50,100,100]})).unwrap();
+        session.execute("frame.create", &json!({"spread":3,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        session.execute("file.new", &json!({"width":400,"height":600,"pages":2,"facingPages":false})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn continuation_matches_selected_non_a4_geometry_without_weakening_the_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
+        profile.page_mm = [240.0, 320.0];
+        profile.margin_mm = 10.0;
+        let mut session = Session::new();
+        session.execute("file.new", &crate::design::document_params(Some(&profile), 3)).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile)).unwrap(), (3, 1));
+        profile.page_mm = [250.0, 350.0];
+        assert!(continuation_progress(session.doc().unwrap(), Some(&profile)).is_err());
+    }
     fn wait(runner: &mut ProductionRunner, session: &mut Session) -> AiSnapshot {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -595,12 +679,22 @@ mod tests {
             before: UsageSummary::default(),
             snapshot,
             prefs: session.prefs.clone(),
+            publication_base: session.active().cloned(),
         });
         ("fixture-book".into(), 1)
     }
 
     #[test]
     fn explicit_approval_is_the_only_path_between_real_http_batches() {
+        reviewed_http_batches(0);
+    }
+
+    #[test]
+    fn continuing_an_existing_book_preserves_its_prefix_and_human_http_checkpoints() {
+        reviewed_http_batches(2);
+    }
+
+    fn reviewed_http_batches(initial_completed: u32) {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -645,10 +739,11 @@ mod tests {
                         }
                     }
                 }
-                let page = server_calls.fetch_add(1, Ordering::Relaxed);
-                if page > 1 {
+                let request_index = server_calls.fetch_add(1, Ordering::Relaxed);
+                if request_index > 1 {
                     return Err("Unexpected unapproved provider request".into());
                 }
+                let page = initial_completed + request_index;
                 let plan = json!({"title":"Reviewed native book","commands":[{"command":"frame.create","params":{"spread":page,"rect":[50,60,200,180],"content":"unassigned"}},{"command":"object.label","params":{"ids":["$0.id"],"label":format!("page-{}",page+1)}}],"images":[]});
                 let reply =
                     json!({"done":true,"message":{"content":plan.to_string()},"prompt_eval_count":120,"eval_count":30,"prompt_eval_cached_count":10})
@@ -665,15 +760,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
-        let started = runner.handle(&mut session, AiRequest::Start(task(endpoint, 3)));
+        let mut request = task(endpoint, 3);
+        let mut prefix = vec![];
+        if initial_completed > 0 {
+            session.execute("file.new", &new_a4(initial_completed + 2)).unwrap();
+            for page in 0..initial_completed {
+                session.execute("frame.create", &json!({"spread":page,"rect":[50,50,100,100],"content":"unassigned"})).unwrap();
+            }
+            prefix = session.doc().unwrap().doc.spreads.iter().take(initial_completed as usize).cloned().collect();
+            request.target = TaskTarget::ContinueBook;
+        }
+        let prior_undo = session.doc().map(|state| state.history.undo.len()).unwrap_or(0);
+        let started = runner.handle(&mut session, AiRequest::Start(request));
         assert!(started.busy, "{}", started.message);
+        if initial_completed > 0 {
+            let original = session.doc().unwrap().clone();
+            session.execute("select.firstAbove", &json!({})).unwrap();
+            assert_ne!(session.doc().unwrap().revision, original.revision);
+            assert!(Arc::ptr_eq(&session.doc().unwrap().doc, &original.doc), "Selection changed without editing document content");
+        }
         let first = wait(&mut runner, &mut session);
         assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
         let checkpoint = first.batch.as_ref().unwrap();
-        assert_eq!(checkpoint.completed_pages, 1);
+        assert_eq!(checkpoint.completed_pages, initial_completed + 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(checkpoint.batches[0].proof_paths.len(), 3);
-        let approved_page = session.doc().unwrap().doc.spreads[0].clone();
+        let approved_page = session.doc().unwrap().doc.spreads[initial_completed as usize].clone();
+        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
         for _ in 0..8 {
             runner.handle(&mut session, AiRequest::Poll);
             std::thread::sleep(Duration::from_millis(5));
@@ -695,14 +808,15 @@ mod tests {
         let second = wait(&mut runner, &mut session);
         assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
         let final_checkpoint = second.batch.as_ref().unwrap();
-        assert_eq!(final_checkpoint.completed_pages, 2);
+        assert_eq!(final_checkpoint.completed_pages, initial_completed + 2);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(final_checkpoint.cumulative_usage.requests, 2);
         assert_eq!(final_checkpoint.cumulative_usage.input_tokens, 240);
         assert!(final_checkpoint.batches.iter().all(|batch| batch.usage.requests == 1));
-        assert_eq!(session.doc().unwrap().doc.spreads[0], approved_page);
-        assert_eq!(session.doc().unwrap().doc.spreads[1].items[0].label, "page-2");
-        assert_eq!(session.doc().unwrap().history.undo.len(), 2);
+        assert_eq!(session.doc().unwrap().doc.spreads[initial_completed as usize], approved_page);
+        assert_eq!(session.doc().unwrap().doc.spreads[(initial_completed + 1) as usize].items[0].label, format!("page-{}", initial_completed + 2));
+        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
+        assert_eq!(session.doc().unwrap().history.undo.len(), prior_undo + 2);
         let completed =
             runner.handle(&mut session, AiRequest::ApproveBatch { job_id: final_checkpoint.job_id.clone(), checkpoint: final_checkpoint.checkpoint });
         assert_eq!(completed.batch.as_ref().unwrap().status, "completed");
@@ -772,14 +886,42 @@ mod tests {
 
     #[test]
     fn smart_quote_preferences_changed_during_generation_cannot_publish_different_text() {
+        rejected_changed_publication("preferences");
+    }
+
+    #[test]
+    fn document_content_changed_during_generation_cannot_be_overwritten() {
+        rejected_changed_publication("document");
+    }
+
+    #[test]
+    fn active_layer_changed_without_content_edits_cannot_change_the_published_layer() {
+        rejected_changed_publication("active-layer");
+    }
+
+    fn rejected_changed_publication(change: &str) {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
         let mut job = runner.batch.take().unwrap();
+        if change == "active-layer" {
+            session.execute("layer.new", &json!({"name":"Other layer"})).unwrap();
+            job.publication_base = session.active().cloned();
+        }
         let before = session.doc().unwrap().clone();
-        session.prefs.typographers_quotes = !session.prefs.typographers_quotes;
-        assert_eq!(session.doc().unwrap().revision, before.revision, "Preferences are independent of document revisions");
+        if change == "preferences" {
+            session.prefs.typographers_quotes = !session.prefs.typographers_quotes;
+            assert_eq!(session.doc().unwrap().revision, before.revision, "Preferences are independent of document revisions");
+        } else if change == "active-layer" {
+            session.execute("layer.activate", &json!({"id":1})).unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+            assert_ne!(before.active_layer, session.doc().unwrap().active_layer);
+        } else {
+            session.execute("frame.create", &json!({"spread":0,"rect":[200,60,300,180],"content":"unassigned"})).unwrap();
+            assert!(!Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        }
+        let before = session.doc().unwrap().clone();
         let plan = ProductionPlan {
             title: "Smart quotes".into(),
             commands: vec![
@@ -789,6 +931,7 @@ mod tests {
             images: vec![],
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "preference-proof".into(),
             status: String::new(),
             title: String::new(),
@@ -811,7 +954,7 @@ mod tests {
         let error = runner
             .publish_batch(&mut session, &mut job, &plan, proofs, worker::BatchScope { start: 1, count: 1 }, &mut BatchReport::default(), &mut report)
             .unwrap_err();
-        assert!(error.contains("preferences changed"), "{error}");
+        assert!(error.contains(if change == "preferences" { "preferences changed" } else { "book changed" }), "{error}");
         assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
         assert!(report.artifacts.is_empty());
         assert!(!runner.root.join("runs").exists(), "A mismatched proof cannot be persisted or published");
@@ -850,6 +993,7 @@ mod tests {
             worker::ProofArtifact { name: "page-1.png".into(), bytes: vec![3] },
         ];
         let mut report = TaskReport {
+            design_style: None,
             id: "preview-publication".into(),
             status: String::new(),
             title: String::new(),

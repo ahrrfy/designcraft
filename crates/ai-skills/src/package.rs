@@ -175,11 +175,30 @@ pub(crate) fn parse(files: &PackageFiles) -> Result<ParsedPackage> {
             sample_template: None,
             external_tools: vec!["unadapted-agent-skill".into()],
             compatibility_notes: "Adapt to native DesignCraft commands and add a reviewable sample before approval.".into(),
+            design_profile: None,
         }
     };
     validate_id(&manifest.skill_id)?;
     if manifest.schema_version != 1 || manifest.skill_id != front.name {
         return Err(SkillError::Unsupported("manifest version or skill identity mismatch".into()));
+    }
+    if let Some(profile) = &manifest.design_profile {
+        profile.validate().map_err(SkillError::Invalid)?;
+        for family in &profile.page_families {
+            if !manifest.templates.contains(&family.template) {
+                return Err(SkillError::Invalid("design page family refers to an undeclared template".into()));
+            }
+            let actions = parse_actions(files.get(&family.template).ok_or_else(|| SkillError::Invalid("missing design page template".into()))?)?;
+            for slot in &family.text_slots {
+                if !actions.get(slot.command).is_some_and(|a| {
+                    a.command == "frame.create"
+                        && a.params.get("text").is_some_and(|v| v.is_string())
+                        && a.params.get("content").and_then(serde_json::Value::as_str) == Some("text")
+                }) {
+                    return Err(SkillError::Invalid("design text slot must name a native text-frame creation action".into()));
+                }
+            }
+        }
     }
     if !front.allowed_tools.is_null() {
         // Preserve upstream tool requirements as an approval blocker; importing a

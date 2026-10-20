@@ -1,0 +1,12 @@
+{
+  "skill_id": "linyaosky-svg-design",
+  "source": {
+    "repo": "linyaosky/svg-skill",
+    "commit": "2103b92cb47f588a97a6c38aa6c40571fadbd4f8",
+    "path": "SKILL.md",
+    "url": "https://github.com/linyaosky/svg-skill/blob/2103b92cb47f588a97a6c38aa6c40571fadbd4f8/SKILL.md"
+  },
+  "license": "MIT",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "9a3c1508abb8eaeaa603aed2f407a7ac1c43c769cf333e1644db5424a9697690"
+}

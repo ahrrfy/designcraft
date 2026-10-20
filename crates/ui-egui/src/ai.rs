@@ -91,6 +91,7 @@ pub struct AiUiState {
     key_for_images: bool,
     prompt: String,
     new_document: bool,
+    continue_book: bool,
     pages: u32,
     automatic_skills: bool,
     selected_skills: BTreeSet<String>,
@@ -98,6 +99,10 @@ pub struct AiUiState {
     import_path: String,
     export_path: String,
     skill_prompt: String,
+    build_design_style: bool,
+    correction_before: String,
+    correction_after: String,
+    correction_reason: String,
     references: String,
     review_key: Option<(String, String)>,
     skill_md: String,
@@ -117,6 +122,8 @@ pub struct AiUiState {
     proof_document_version: Option<(u64, u64)>,
     proof_document_matches: bool,
     review_input_is_human: bool,
+    review_pointer_press: Option<(BatchReviewKey, egui::Id)>,
+    batch_approval_gesture: Option<(BatchReviewKey, egui::Context, u64)>,
     proof_path: Option<String>,
     proof_loaded: Option<String>,
     proof_texture: Option<egui::TextureHandle>,
@@ -154,6 +161,7 @@ impl Default for AiUiState {
             key_for_images: false,
             prompt: String::new(),
             new_document: true,
+            continue_book: false,
             pages: 8,
             automatic_skills: true,
             selected_skills: BTreeSet::new(),
@@ -161,6 +169,10 @@ impl Default for AiUiState {
             import_path: String::new(),
             export_path: String::new(),
             skill_prompt: String::new(),
+            build_design_style: true,
+            correction_before: String::new(),
+            correction_after: String::new(),
+            correction_reason: String::new(),
             references: String::new(),
             review_key: None,
             skill_md: String::new(),
@@ -180,6 +192,8 @@ impl Default for AiUiState {
             proof_document_version: None,
             proof_document_matches: false,
             review_input_is_human: false,
+            review_pointer_press: None,
+            batch_approval_gesture: None,
             proof_path: None,
             proof_loaded: None,
             proof_texture: None,
@@ -201,6 +215,9 @@ impl AiUiState {
     fn accept(&mut self, snapshot: AiSnapshot) {
         if !self.initialized && snapshot.available {
             self.settings = snapshot.settings.clone();
+            // Reuse explicitly configured prices; restarting does not require the same setup again.
+            self.rates_confirmed =
+                self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
             self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
             if self.settings.text_model.provider == ProviderKind::Ollama {
                 self.local_ollama = self.settings.text_model.clone();
@@ -224,6 +241,8 @@ impl AiUiState {
         }
         let proof_key = snapshot.batch.as_ref().and_then(BatchReviewKey::from_batch);
         if self.proof_key != proof_key {
+            self.review_pointer_press = None;
+            self.batch_approval_gesture = None;
             self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
             self.reviewed_proofs.clear();
             self.proof_document_matches = false;
@@ -282,6 +301,51 @@ impl AiUiState {
             && self.proof_key.as_ref().is_some_and(|key| key.pages().all(|page| self.reviewed_proofs.contains(page)))
     }
 
+    /// A clicked response alone may come from accessibility or stale widget state.
+    /// Bind a primary press/release (or non-repeated focused key press) to this proof.
+    fn fresh_review_gesture(
+        human: bool,
+        key: Option<&BatchReviewKey>,
+        pointer_press: &mut Option<(BatchReviewKey, egui::Id)>,
+        response: &egui::Response,
+    ) -> bool {
+        if !human {
+            *pointer_press = None;
+            return false;
+        }
+        let Some(key) = key else { return false };
+        let pointer_down = response.is_pointer_button_down_on();
+        let pointer_clicked = response.clicked_by(egui::PointerButton::Primary);
+        let keyboard_clicked = response.clicked() && response.has_focus();
+        response.ctx.input(|input| {
+            let mut pointer = false;
+            for event in &input.events {
+                if let egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, .. } = event {
+                    if *pressed {
+                        // A coalesced press+release has no held-button state at frame end.
+                        // Require egui to attribute the interaction to this widget as well.
+                        if response.rect.contains(*pos) && (pointer_down || pointer_clicked) {
+                            *pointer_press = Some((key.clone(), response.id));
+                        } else if pointer_press.as_ref().is_some_and(|(_, id)| *id == response.id) {
+                            *pointer_press = None;
+                        }
+                    } else if pointer_press.as_ref().is_some_and(|(_, id)| *id == response.id) {
+                        pointer = pointer_clicked
+                            && response.rect.contains(*pos)
+                            && pointer_press.as_ref().is_some_and(|(pressed_key, _)| pressed_key == key);
+                        *pointer_press = None;
+                    }
+                }
+            }
+            let keyboard = keyboard_clicked
+                && input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Key { key: egui::Key::Enter | egui::Key::Space, pressed: true, repeat: false, .. }));
+            pointer || keyboard
+        })
+    }
+
     fn task_active(&self) -> bool {
         self.snapshot.busy || self.snapshot.batch.as_ref().is_some_and(|b| matches!(b.status.as_str(), "running" | "awaiting_human_proof"))
     }
@@ -304,6 +368,37 @@ impl AiUiState {
         self.settings.output_mode != OutputMode::NativeWithImages
             || self.settings.image_model.provider != ProviderKind::ComfyUi
             || (self.workflow_error.is_empty() && self.settings.comfy_workflow.is_some())
+    }
+
+    fn production_issue(&self, available: bool, document: bool, arabic: bool) -> Option<&'static str> {
+        let (en, ar) = if !available {
+            ("Native AI host is unavailable. Open the desktop application.", "خدمة الذكاء غير متاحة. افتح تطبيق سطح المكتب.")
+        } else if self.snapshot.busy {
+            ("A task is running. Wait for it to finish or cancel it.", "توجد مهمة قيد التشغيل. انتظر انتهاءها أو ألغها.")
+        } else if self.task_active() {
+            (
+                "Review and approve the current batch, or cancel the task before starting another.",
+                "راجع الدفعة الحالية واعتمدها، أو ألغ المهمة قبل بدء مهمة أخرى.",
+            )
+        } else if self.prompt.trim().is_empty() {
+            ("Enter production instructions.", "أدخل تعليمات الإنتاج.")
+        } else if self.settings.text_model.model.trim().is_empty() {
+            ("Choose a text model above.", "اختر نموذج النص من الحقل أعلاه.")
+        } else if !self.new_document && !document {
+            ("Open a document or choose New document.", "افتح مستنداً أو اختر مستنداً جديداً.")
+        } else if self.settings.output_mode == OutputMode::NativeWithImages
+            && self.settings.image_model.provider != ProviderKind::ComfyUi
+            && self.settings.image_model.model.trim().is_empty()
+        {
+            ("Choose an image model in Providers and keys.", "اختر نموذج الصور من تبويب المزودين والمفاتيح.")
+        } else if !self.workflow_ready() {
+            ("Complete a valid ComfyUI API workflow in Providers and keys.", "أكمل مخطط ComfyUI API صالحاً في تبويب المزودين والمفاتيح.")
+        } else if self.settings.budget.max_cost_usd.is_some() && !self.rates_confirmed {
+            ("Set and confirm provider prices in Advanced settings.", "أدخل أسعار المزود وأكّدها من الإعدادات المتقدمة.")
+        } else {
+            return None;
+        };
+        Some(text(arabic, en, ar))
     }
 }
 
@@ -329,9 +424,13 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
         return Err("This action requires a human gesture in the desktop panel; control-generated input is not approval.".into());
     }
     if let AiRequest::ApproveBatch { job_id, checkpoint } = &request {
+        let gesture = app.ui.ai.batch_approval_gesture.take();
         app.ui.ai.review_input_is_human = human_review_input(app);
         app.ui.ai.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
-        if !app.ui.ai.can_approve_batch() || !app.ui.ai.proof_key.as_ref().is_some_and(|key| key.job_id == *job_id && key.checkpoint == *checkpoint) {
+        if !gesture.is_some_and(|(key, ctx, frame)| app.ui.ai.proof_key.as_ref() == Some(&key) && ctx.cumulative_frame_nr() == frame)
+            || !app.ui.ai.can_approve_batch()
+            || !app.ui.ai.proof_key.as_ref().is_some_and(|key| key.job_id == *job_id && key.checkpoint == *checkpoint)
+        {
             return Err("Review and confirm every page of the current document proof before approving this checkpoint.".into());
         }
         app.ui.ai.reviewed_proofs.clear();
@@ -380,17 +479,26 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
         "list_models" => AiRequest::ListModels { selection: serde_json::from_value(decode("selection")?).map_err(|e| e.to_string())? },
         "import_skill" => AiRequest::ImportSkill { path: field("path")? },
         "inspect_skill" => AiRequest::InspectSkill { id: field("id")?, revision: field("revision")? },
+        "prepare_skills" => AiRequest::PrepareSkills { prompt: field("prompt")? },
         "save_skill_draft" => AiRequest::SaveSkillDraft { id: field("id")?, skill_md: field("skill_md")?, manifest_json: field("manifest_json")? },
+        "add_design_correction" => AiRequest::AddDesignCorrection {
+            id: field("id")?,
+            revision: field("revision")?,
+            correction: serde_json::from_value(decode("correction")?).map_err(|e| e.to_string())?,
+        },
         "generate_skill" => AiRequest::GenerateSkill {
+            design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
             prompt: field("prompt")?,
             reference_paths: serde_json::from_value(decode("reference_paths")?).map_err(|e| e.to_string())?,
             settings: serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?,
         },
         "generate_skill_from_document" => AiRequest::GenerateSkillFromDocument {
+            design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
             prompt: field("prompt")?,
             settings: serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?,
         },
         "run_skill_sample" => AiRequest::RunSkillSample { id: field("id")?, revision: field("revision")? },
+        "run_design_template" => AiRequest::RunDesignTemplate { id: field("id")?, revision: field("revision")?, template: field("template")? },
         "approve_skill" | "approve_batch" => {
             return Err("Approval requires the human review button in the desktop panel.".into());
         }
@@ -484,6 +592,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         return;
     }
     let mut state = std::mem::take(&mut app.ui.ai);
+    state.batch_approval_gesture = None;
     state.review_input_is_human = human_review_input(app);
     state.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
     let a = app.ui.language == "ar";
@@ -550,6 +659,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             });
         });
     state.open = open;
+    if ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary)) {
+        state.review_pointer_press = None;
+    }
     app.ui.ai = state;
     if std::mem::take(&mut app.ui.ai.pick_ollama)
         && let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ollama_executable"))
@@ -565,6 +677,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             app.ui.ai.error = e;
         }
     }
+    app.ui.ai.batch_approval_gesture = None;
     load_preview(app, ctx);
     load_proof_preview(app, ctx);
 }
@@ -815,78 +928,184 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
 }
 
 fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, document: bool, requests: &mut Vec<AiRequest>) {
-    batch_review(ui, s, a, requests);
     ui.add_enabled_ui(!s.task_active(), |ui| {
-        rtl::label(ui, format!("{} / {}", provider_name(s.settings.text_model.provider), s.settings.text_model.model));
-        if button(ui, a, "Configure providers and keys", "إعداد المزودين والمفاتيح") {
-            s.tab = 3;
+        ui.horizontal_wrapped(|ui| {
+            provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
+            label(ui, a, "Model or agent", "النموذج أو الوكيل");
+            ui.add(egui::TextEdit::singleline(&mut s.settings.text_model.model).desired_width(230.0));
+            if button(ui, a, "Discover", "اكتشاف") {
+                s.pending_models = Some(s.settings.text_model.clone());
+                requests.push(AiRequest::ListModels { selection: s.settings.text_model.clone() });
+            }
+            if button(ui, a, "Keys and providers", "المفاتيح والمزودون") {
+                s.tab = 3;
+            }
+        });
+        if !s.snapshot.models.is_empty() && s.pending_models.as_ref() == Some(&s.settings.text_model) {
+            egui::ComboBox::from_id_salt("production_discovered_models").selected_text(text(a, "Available models", "النماذج المتاحة")).show_ui(
+                ui,
+                |ui| {
+                    for name in &s.snapshot.models {
+                        ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
+                    }
+                },
+            );
         }
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Limits", "الحدود"))).show(ui, |ui| {
-            budgets(ui, s, a);
+        label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
+        ui.horizontal_wrapped(|ui| {
+            label(ui, a, "Design style", "نمط التصميم");
+            let selected = s
+                .settings
+                .design_style
+                .as_ref()
+                .and_then(|id| s.snapshot.skills.iter().rev().find(|card| &card.id == id))
+                .and_then(|card| card.design_profile.as_ref())
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| {
+                    s.settings.design_style.clone().unwrap_or_else(|| text(a, "Automatic from the request", "تلقائي حسب المطلوب").into())
+                });
+            egui::ComboBox::from_id_salt("production_design_style").selected_text(selected).width(260.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.settings.design_style, None, rtl::widget(ui, text(a, "Automatic from the request", "تلقائي حسب المطلوب")));
+                let mut seen = BTreeSet::new();
+                for card in s.snapshot.skills.iter().rev().filter(|card| card.enabled && card.compatible) {
+                    if let Some(profile) = &card.design_profile
+                        && seen.insert(&card.id)
+                    {
+                        ui.selectable_value(&mut s.settings.design_style, Some(card.id.clone()), rtl::widget(ui, &profile.name));
+                    }
+                }
+            });
+            if button(ui, a, "Style library", "مكتبة الأنماط") {
+                s.tab = 1;
+            }
         });
-        ui.separator();
-        label(ui, a, "Production instructions", "تعليمات الإنتاج");
-        ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(5).desired_width(f32::INFINITY));
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut s.new_document, false, rtl::widget(ui, text(a, "Current document", "المستند الحالي")));
-            ui.radio_value(&mut s.new_document, true, rtl::widget(ui, text(a, "New A4 document", "مستند A4 جديد")));
-            ui.add_enabled(s.new_document, egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
+        // Long pasted briefs scroll inside the composer instead of hiding the production button.
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(180.0).show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(text(
+                a,
+                "Describe your design, audience and desired result...",
+                "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
+            )));
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Current document", "المستند الحالي"))).clicked() {
+                s.new_document = false;
+                s.continue_book = false;
+            }
+            if ui
+                .radio(s.new_document, rtl::widget(ui, text(a, "New document (style size; A4 default)", "مستند جديد (مقاس النمط؛ الافتراضي A4)")))
+                .clicked()
+            {
+                s.new_document = true;
+                s.continue_book = false;
+            }
+            if ui.radio(s.continue_book, rtl::widget(ui, text(a, "Continue remaining book pages", "استكمال صفحات الكتاب المتبقية"))).clicked()
+            {
+                s.new_document = false;
+                s.continue_book = true;
+            }
+            if s.new_document {
+                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
+            }
             label(ui, a, "Pages per batch", "الصفحات في كل دفعة");
-            ui.add_enabled(s.new_document, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=32));
+            ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=32));
         });
+        if s.automatic_skills {
+            label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
+        }
+        if !s.snapshot.skill_warnings.is_empty() {
+            egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Skipped skill drafts — details", "مسودات مهارات مستبعدة — التفاصيل"))).show(
+                ui,
+                |ui| {
+                    for warning in &s.snapshot.skill_warnings {
+                        rtl::label(ui, warning);
+                    }
+                },
+            );
+        }
+        label(
+            ui,
+            a,
+            "Template styles use the model for content; native drawing and formatting commands are assembled locally.",
+            "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
+        );
+        if let Some(cost) = s.settings.budget.max_cost_usd {
+            rtl::label(ui, format!("{} ${cost:.2}", text(a, "Task cost ceiling (estimate):", "سقف كلفة المهمة (تقديري):")));
+        }
         label(
             ui,
             a,
             "Each batch stops for your visual approval before another provider request.",
             "تتوقف كل دفعة لمراجعتك البصرية قبل أي طلب جديد إلى المزود.",
         );
-        ui.checkbox(
-            &mut s.automatic_skills,
-            rtl::widget(ui, text(a, "Automatically select compatible approved skills", "اختيار المهارات المعتمدة والمتوافقة تلقائياً")),
-        );
-        if !s.automatic_skills {
-            for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
-                let mut selected = s.selected_skills.contains(&card.id);
-                if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
-                    if selected {
-                        s.selected_skills.insert(card.id.clone());
-                    } else {
-                        s.selected_skills.remove(&card.id);
-                    }
-                }
-            }
+        let issue = s.production_issue(available, document, a);
+        if let Some(reason) = issue {
+            rtl::label(ui, reason);
         }
-        field(ui, a, "Output/sample directory (optional for production)", "مجلد المخرجات والعينة (اختياري للإنتاج)", &mut s.directory);
-        let valid = available
-            && !s.prompt.trim().is_empty()
-            && !s.settings.text_model.model.trim().is_empty()
-            && (s.new_document || document)
-            && s.workflow_ready()
-            && (s.settings.budget.max_cost_usd.is_none() || s.rates_confirmed);
-        if ui.add_enabled(valid, egui::Button::new(rtl::widget(ui, text(a, "Start production", "بدء الإنتاج")))).clicked() {
+        if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked() {
             requests.push(AiRequest::Start(TaskRequest {
                 prompt: s.prompt.clone(),
                 settings: s.settings.clone(),
                 auto_select_skills: s.automatic_skills,
                 skill_ids: if s.automatic_skills { Vec::new() } else { s.selected_skills.iter().cloned().collect() },
-                target: if s.new_document { TaskTarget::NewA4 { pages: s.pages } } else { TaskTarget::CurrentDocument },
+                target: if s.new_document {
+                    TaskTarget::NewA4 { pages: s.pages }
+                } else if s.continue_book {
+                    TaskTarget::ContinueBook
+                } else {
+                    TaskTarget::CurrentDocument
+                },
                 export_directory: (!s.directory.trim().is_empty()).then(|| s.directory.clone()),
             }));
         }
-        if ui
-            .add_enabled(
-                available && !s.directory.trim().is_empty(),
-                egui::Button::new(rtl::widget(ui, text(a, "Create original 8-page science example", "إنشاء مثال علوم أصلي من ٨ صفحات"))),
-            )
-            .clicked()
-        {
-            requests.push(AiRequest::CreateScienceSample { directory: s.directory.clone() });
-        }
-        ui.separator();
-        export_print(ui, s, a, available && document, requests);
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).show(ui, |ui| {
+            budgets(ui, s, a);
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut s.settings.output_mode, OutputMode::NativeOnly, text(a, "Editable elements", "عناصر قابلة للتحرير"));
+                ui.selectable_value(
+                    &mut s.settings.output_mode,
+                    OutputMode::NativeWithImages,
+                    text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور"),
+                );
+            });
+            if s.settings.output_mode == OutputMode::NativeWithImages {
+                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, requests);
+            }
+            ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
+            if !s.automatic_skills {
+                for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
+                    let mut selected = s.selected_skills.contains(&card.id);
+                    if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
+                        if selected {
+                            s.selected_skills.insert(card.id.clone());
+                        } else {
+                            s.selected_skills.remove(&card.id);
+                        }
+                    }
+                }
+            }
+            field(ui, a, "Output/sample directory (optional for production)", "مجلد المخرجات والعينة (اختياري للإنتاج)", &mut s.directory);
+            if ui
+                .add_enabled(
+                    available && !s.directory.trim().is_empty(),
+                    egui::Button::new(rtl::widget(ui, text(a, "Create original 8-page science example", "إنشاء مثال علوم أصلي من ٨ صفحات"))),
+                )
+                .clicked()
+            {
+                requests.push(AiRequest::CreateScienceSample { directory: s.directory.clone() });
+            }
+        });
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save, export and print", "الحفظ والتصدير والطباعة"))).show(ui, |ui| {
+            export_print(ui, s, a, available && document, requests);
+        });
     });
+    ui.separator();
+    if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") || s.task_active() {
+        batch_review(ui, s, a, requests);
+    } else if s.snapshot.batch.is_some() {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Previous task", "المهمة السابقة"))).show(ui, |ui| batch_review(ui, s, a, requests));
+    }
 }
 
 fn elapsed(ms: u64) -> String {
@@ -939,6 +1158,32 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
     };
     ui.separator();
     label(ui, a, "Batch production and proof", "إنتاج الدفعات والمراجعة");
+    if let Some(style) = s
+        .snapshot
+        .reports
+        .iter()
+        .rev()
+        .find(|report| report.id.starts_with(&format!("{}-batch-", batch.job_id)))
+        .and_then(|report| report.design_style.as_ref())
+    {
+        rtl::label(
+            ui,
+            format!(
+                "{}: {} · {}",
+                text(a, "Pinned design style", "نمط التصميم المثبّت"),
+                style.name,
+                style.revision.chars().take(12).collect::<String>()
+            ),
+        );
+        if style.execution_mode == "native_templates" {
+            label(
+                ui,
+                a,
+                "Native template execution — one content plan; no automatic paid command repairs.",
+                "تنفيذ قوالب أصلية — تخطيط محتوى واحد، دون تصحيح أوامر مدفوع تلقائياً.",
+            );
+        }
+    }
     rtl::label(
         ui,
         format!(
@@ -1001,10 +1246,9 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                 "المستند النشط لا يطابق إصدار البروفة. ارجع إلى المستند نفسه أو أعد بدء المهمة بعد تعديلاته.",
             );
         }
-        if ui
-            .add_enabled(can_review, egui::Button::new(rtl::widget(ui, text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة"))))
-            .clicked()
-        {
+        let review_response =
+            ui.add_enabled(can_review, egui::Button::new(rtl::widget(ui, text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة"))));
+        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &review_response) {
             confirm_page = true;
         }
         let final_batch = batch.current_batch >= batch.total_batches;
@@ -1013,7 +1257,9 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
         } else {
             ("Approve proof and generate next batch", "اعتماد المراجعة وإنشاء الدفعة التالية")
         };
-        if ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar)))).clicked() {
+        let approve_response = ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar))));
+        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &approve_response) {
+            s.batch_approval_gesture = s.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
             requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
         }
     }
@@ -1051,19 +1297,24 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
 }
 
 fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
+    ui.checkbox(
+        &mut s.settings.allow_paid_repairs,
+        rtl::widget(ui, text(a, "Allow extra automatic planning requests (may be billed)", "السماح بطلبات تخطيط إضافية تلقائية قد تكون مدفوعة")),
+    );
+    let repairs = s.settings.allow_paid_repairs;
     let b = &mut s.settings.budget;
     egui::Grid::new("ai_limits").num_columns(2).show(ui, |ui| {
         label(ui, a, "Total tokens", "مجموع الرموز");
-        ui.add(egui::DragValue::new(&mut b.token_limit).range(1..=10_000_000));
+        ui.add(egui::DragValue::new(&mut b.token_limit).range(256..=4_000_000));
         ui.end_row();
         label(ui, a, "Output tokens per request", "رموز الإخراج لكل طلب");
-        ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=1_000_000));
+        ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=65_536));
         ui.end_row();
         label(ui, a, "Maximum requests", "أقصى عدد للطلبات");
-        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=100));
+        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=64));
         ui.end_row();
-        label(ui, a, "Repair attempts", "محاولات الإصلاح");
-        ui.add(egui::DragValue::new(&mut b.repair_attempts).range(0..=10));
+        label(ui, a, "Maximum extra planning requests", "أقصى طلبات تخطيط إضافية");
+        ui.add_enabled(repairs, egui::DragValue::new(&mut b.repair_attempts).range(0..=3));
         ui.end_row();
     });
     let mut cap = b.max_cost_usd.is_some();
@@ -1236,6 +1487,47 @@ fn export_print(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, enabled: bool, re
 
 fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, document: bool, requests: &mut Vec<AiRequest>) {
     ui.add_enabled_ui(available && !s.task_active(), |ui| {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Design style library", "مكتبة أنماط التصميم"))).default_open(true).show(ui, |ui| {
+            label(
+                ui,
+                a,
+                "Reusable rules, native page families and recorded corrections. Technical checks do not replace educator or visual review.",
+                "قواعد وقوالب أصلية وتصحيحات محفوظة. الفحص التقني لا يغني عن المراجعة التربوية والبصرية.",
+            );
+            let mut seen = BTreeSet::new();
+            for card in s.snapshot.skills.iter().rev() {
+                if let Some(profile) = &card.design_profile
+                    && seen.insert(&card.id)
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        rtl::label(ui, &profile.name);
+                        rtl::label(
+                            ui,
+                            format!(
+                                "{}–{} · {} × {} mm · {} mm · {} {}",
+                                profile.age_range[0],
+                                profile.age_range[1],
+                                profile.page_mm[0],
+                                profile.page_mm[1],
+                                profile.margin_mm,
+                                profile.page_families.len(),
+                                text(a, "page families", "قوالب صفحات")
+                            ),
+                        );
+                        if button(ui, a, "Inspect style", "فحص النمط") {
+                            requests.push(AiRequest::InspectSkill { id: card.id.clone(), revision: card.revision.clone() });
+                        }
+                        if ui
+                            .add_enabled(card.enabled && card.compatible, egui::Button::new(rtl::widget(ui, text(a, "Use style", "استخدام النمط"))))
+                            .clicked()
+                        {
+                            s.settings.design_style = Some(card.id.clone());
+                            s.tab = 0;
+                        }
+                    });
+                }
+            }
+        });
         field(ui, a, "Import skill folder or ZIP path", "مسار مجلد المهارة أو ملف ZIP", &mut s.import_path);
         if ui.add_enabled(!s.import_path.trim().is_empty(), egui::Button::new(rtl::widget(ui, text(a, "Import draft", "استيراد مسودة")))).clicked()
         {
@@ -1261,7 +1553,12 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                     ui.add_sized([name_width, 20.0], egui::Label::new(rtl::widget(ui, &c.name)).truncate()).on_hover_text(&c.name);
                     let revision: String = c.revision.chars().take(12).collect();
                     ui.add_sized([version_width, 20.0], egui::Label::new(revision).truncate()).on_hover_text(&c.revision);
-                    let mut status = text(a, if c.approved { "Approved" } else { "Draft" }, if c.approved { "معتمدة" } else { "مسودة" }).to_owned();
+                    let mut status = if c.automatically_validated {
+                        text(a, "Auto checked", "فُحصت تلقائياً")
+                    } else {
+                        text(a, if c.approved { "Approved" } else { "Draft" }, if c.approved { "معتمدة" } else { "مسودة" })
+                    }
+                    .to_owned();
                     if c.active {
                         status.push_str(text(a, " / Active", " / نشطة"));
                     }
@@ -1272,9 +1569,9 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                     if button(ui, a, "Inspect", "مراجعة") {
                         requests.push(AiRequest::InspectSkill { id: c.id.clone(), revision: c.revision.clone() });
                     }
-                    let mut enabled = c.enabled && c.approved && c.compatible;
+                    let mut enabled = c.enabled && c.compatible;
                     if ui
-                        .add_enabled(c.approved && c.compatible, egui::Checkbox::new(&mut enabled, rtl::widget(ui, text(a, "Enabled", "مفعلة"))))
+                        .add_enabled(c.compatible, egui::Checkbox::new(&mut enabled, rtl::widget(ui, text(a, "Use skill", "استخدام المهارة"))))
                         .changed()
                     {
                         requests.push(AiRequest::SetSkillEnabled { id: c.id.clone(), enabled });
@@ -1296,6 +1593,74 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         if let Some(r) = s.snapshot.review.clone() {
             ui.separator();
             rtl::label(ui, format!("{} / {}", r.id, r.revision));
+            if let Some(profile) =
+                s.snapshot.skills.iter().find(|card| card.id == r.id && card.revision == r.revision).and_then(|card| card.design_profile.as_ref())
+            {
+                egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Style rules and correction examples", "قواعد النمط وأمثلة التصحيح")))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (en, ar, rules) in [
+                            ("Typography", "الخطوط", &profile.typography),
+                            ("Layout", "التوزيع", &profile.layout),
+                            ("Pedagogy", "التدرج التعليمي", &profile.pedagogy),
+                            ("Illustrations", "الرسوم", &profile.illustration),
+                        ] {
+                            label(ui, a, en, ar);
+                            for rule in rules {
+                                ui.add(egui::Label::new(rtl::widget(ui, rule)).wrap());
+                            }
+                        }
+                        for family in &profile.page_families {
+                            ui.horizontal_wrapped(|ui| {
+                                rtl::label(ui, format!("{}: {}", family.id, family.purpose));
+                                if button(ui, a, "Preview page family", "معاينة قالب الصفحة") {
+                                    requests.push(AiRequest::RunDesignTemplate {
+                                        id: r.id.clone(),
+                                        revision: r.revision.clone(),
+                                        template: family.template.clone(),
+                                    });
+                                }
+                            });
+                        }
+                        for correction in &profile.corrections {
+                            ui.add(
+                                egui::Label::new(rtl::widget(ui, format!("{} → {} ({})", correction.before, correction.after, correction.reason)))
+                                    .wrap(),
+                            );
+                        }
+                    });
+                egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save a design correction", "حفظ تصحيح للنمط"))).show(ui, |ui| {
+                    field(ui, a, "Before", "قبل التصحيح", &mut s.correction_before);
+                    field(ui, a, "After", "المطلوب بعد التصحيح", &mut s.correction_after);
+                    field(ui, a, "Reason", "سبب التصحيح", &mut s.correction_reason);
+                    let ready = [&s.correction_before, &s.correction_after, &s.correction_reason]
+                        .iter()
+                        .all(|value| !value.trim().is_empty() && value.len() <= 512);
+                    if ui
+                        .add_enabled(
+                            ready,
+                            egui::Button::new(rtl::widget(ui, text(a, "Save correction as a new revision", "حفظ التصحيح بإصدار جديد"))),
+                        )
+                        .clicked()
+                    {
+                        requests.push(AiRequest::AddDesignCorrection {
+                            id: r.id.clone(),
+                            revision: r.revision.clone(),
+                            correction: designcraft_ai_types::DesignCorrection {
+                                before: s.correction_before.clone(),
+                                after: s.correction_after.clone(),
+                                reason: s.correction_reason.clone(),
+                            },
+                        });
+                    }
+                    label(
+                        ui,
+                        a,
+                        "Explicit reusable guidance; this does not train model weights or approve a page batch.",
+                        "توجيه محفوظ للاستعمال لاحقاً؛ لا يدرّب أوزان النموذج ولا يعتمد دفعة صفحات.",
+                    );
+                });
+            }
             label(ui, a, "SKILL.md — edits create a new draft", "SKILL.md — التعديل ينشئ مسودة جديدة");
             ui.add(egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY));
             label(ui, a, "Manifest JSON", "ملف الوصف JSON");
@@ -1354,6 +1719,10 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         }
         ui.separator();
         label(ui, a, "Generate a reviewable skill draft", "إنشاء مسودة مهارة للمراجعة");
+        ui.checkbox(
+            &mut s.build_design_style,
+            rtl::widget(ui, text(a, "Build a design style with multiple native page templates", "بناء نمط تصميم بقواعد وقوالب صفحات متعددة")),
+        );
         ui.add(egui::TextEdit::multiline(&mut s.skill_prompt).desired_rows(3).desired_width(f32::INFINITY));
         label(ui, a, "Reference paths (one per line)", "مسارات المراجع (مسار في كل سطر)");
         ui.add(egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY));
@@ -1364,6 +1733,7 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                 && (s.settings.budget.max_cost_usd.is_none() || s.rates_confirmed);
             if ui.add_enabled(ready, egui::Button::new(rtl::widget(ui, text(a, "Generate draft", "إنشاء المسودة")))).clicked() {
                 requests.push(AiRequest::GenerateSkill {
+                    design_style: s.build_design_style,
                     prompt: s.skill_prompt.clone(),
                     reference_paths: s.references.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned).collect(),
                     settings: s.settings.clone(),
@@ -1376,7 +1746,11 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                 )
                 .clicked()
             {
-                requests.push(AiRequest::GenerateSkillFromDocument { prompt: s.skill_prompt.clone(), settings: s.settings.clone() });
+                requests.push(AiRequest::GenerateSkillFromDocument {
+                    prompt: s.skill_prompt.clone(),
+                    settings: s.settings.clone(),
+                    design_style: s.build_design_style,
+                });
             }
         });
     });
@@ -1392,6 +1766,12 @@ fn usage(ui: &mut egui::Ui, s: &AiUiState, a: bool) {
     for r in s.snapshot.reports.iter().rev() {
         egui::CollapsingHeader::new(format!("{} · {} · {}", r.title, r.status, r.id)).default_open(true).show(ui, |ui| {
             rtl::label(ui, format!("{} / {} · {} ms · {} actions", provider_name(r.provider), r.model, r.elapsed_ms, r.actions));
+            if let Some(style) = &r.design_style {
+                rtl::label(
+                    ui,
+                    format!("{}: {} · {}", text(a, "Design style", "نمط التصميم"), style.name, style.revision.chars().take(12).collect::<String>()),
+                );
+            }
             let u = &r.usage;
             rtl::label(
                 ui,
@@ -1494,7 +1874,66 @@ mod tests {
     use super::*;
     use crate::Services;
     use designcraft_engine::Session;
+    use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::json;
+    #[test]
+    fn production_composer_exposes_model_prompt_and_action_without_advanced_settings() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.ui.ai.open = true;
+        app.ui.ai.snapshot.available = true;
+        app.ui.ai.initialized = true;
+        app.ui.ai.prompt = "A long request\n".repeat(200);
+        let mut harness = crate::test_window::open(app, egui::vec2(1200.0, 900.0));
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Model or agent").is_some());
+        assert!(harness.query_by_label("What would you like to create?").is_some());
+        assert!(harness.query_by_label("Produce").is_some());
+        assert!(harness.get_by_label("Produce").rect().max.y < 650.0, "long briefs must not push the action off screen");
+        assert!(harness.query_by_label("Input").is_none(), "pricing belongs in advanced settings");
+    }
+    #[test]
+    fn disabled_production_button_explains_the_missing_model() {
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() },
+        );
+        app.run("ai.production", json!({})).unwrap();
+        app.ui.ai.prompt = "Create an editable activity".into();
+        let mut harness = crate::test_window::open(app, egui::vec2(1500.0, 1100.0));
+        harness.run_steps(3);
+        assert!(harness.get_by_label("Produce").accesskit_node().is_disabled());
+        assert!(harness.query_by_label("Choose a text model above.").is_some(), "a disabled button must explain what to fix");
+        harness.state_mut().app.ui.ai.settings.text_model.model = "fixture-model".into();
+        harness.run_steps(3);
+        assert!(!harness.get_by_label("Produce").accesskit_node().is_disabled());
+        assert!(harness.query_by_label("Choose a text model above.").is_none());
+    }
+
+    #[test]
+    fn production_readiness_preserves_workflow_budget_and_human_review_guards() {
+        let mut state = AiUiState { prompt: "Native activity".into(), ..Default::default() };
+        state.settings.text_model.model = "text-model".into();
+        state.settings.output_mode = OutputMode::NativeWithImages;
+        state.settings.image_model.provider = ProviderKind::Gemini;
+        assert_eq!(state.production_issue(true, false, false), Some("Choose an image model in Providers and keys."));
+        state.settings.image_model.model = "image-model".into();
+        state.settings.budget.max_cost_usd = Some(1.8);
+        assert_eq!(state.production_issue(true, false, true), Some("أدخل أسعار المزود وأكّدها من الإعدادات المتقدمة."));
+        state.rates_confirmed = true;
+        assert_eq!(state.production_issue(true, false, false), None);
+        state.settings.image_model.provider = ProviderKind::ComfyUi;
+        state.settings.image_model.model.clear();
+        assert_eq!(state.production_issue(true, false, false), Some("Complete a valid ComfyUI API workflow in Providers and keys."));
+        state.workflow_json = r#"{"node":{"text":"{{prompt}}"}}"#.into();
+        state.edit_workflow();
+        assert_eq!(state.production_issue(true, false, false), None, "a workflow can specify its checkpoint without a model placeholder");
+        state.snapshot.batch = Some(BatchSnapshot { status: "awaiting_human_proof".into(), ..Default::default() });
+        assert_eq!(
+            state.production_issue(true, false, false),
+            Some("Review and approve the current batch, or cancel the task before starting another.")
+        );
+        assert!(!state.can_approve_batch());
+    }
     #[test]
     fn callback_dispatch_and_manual_settings_survive_poll() {
         let mut app = DesignApp::new(
@@ -1781,11 +2220,123 @@ mod tests {
         assert!(fixture.app.ui.ai.can_approve_batch());
         assert!(fixture.app.run("ai.request", json!({"method":"approve_batch", "job_id":"two-page-proof", "checkpoint":1})).is_err());
         assert_eq!(fixture.calls.get(), 0);
-        dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).unwrap();
+        assert!(
+            dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err(),
+            "absence of control input is not a human gesture"
+        );
+        let ctx = fixture.ctx.clone();
+        let mut focused = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = ui.button("Approve proof");
+            response.request_focus();
+            focused = response.has_focus();
+        });
+        output.textures_delta.clear();
+        assert!(focused);
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let response = ui.button("Approve proof");
+            assert!(AiUiState::fresh_review_gesture(
+                true,
+                fixture.app.ui.ai.proof_key.as_ref(),
+                &mut fixture.app.ui.ai.review_pointer_press,
+                &response
+            ));
+            fixture.app.ui.ai.batch_approval_gesture =
+                fixture.app.ui.ai.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
+            dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).unwrap();
+        });
+        output.textures_delta.clear();
         assert_eq!(fixture.calls.get(), 1);
         assert!(fixture.app.ui.ai.reviewed_proofs.is_empty(), "the human approval is consumed once");
         assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
         assert_eq!(fixture.calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_batch_review_frames_never_confirm_or_approve_and_expired_gesture_is_rejected() {
+        let mut fixture = ProofFixture::new();
+        fixture.view("page-1.png");
+        let ctx = fixture.ctx.clone();
+        for reviewed in [false, true] {
+            if reviewed {
+                fixture.confirm_all();
+            }
+            let before = fixture.app.ui.ai.reviewed_proofs.clone();
+            for _ in 0..4 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let mut requests = Vec::new();
+                    batch_review(ui, &mut fixture.app.ui.ai, false, &mut requests);
+                    assert!(requests.is_empty());
+                    assert!(fixture.app.ui.ai.batch_approval_gesture.is_none());
+                });
+                output.textures_delta.clear();
+                assert_eq!(fixture.app.ui.ai.reviewed_proofs, before);
+            }
+        }
+        fixture.app.ui.ai.batch_approval_gesture = fixture.app.ui.ai.proof_key.clone().map(|key| (key, ctx.clone(), ctx.cumulative_frame_nr()));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(dispatch(&mut fixture.app, AiRequest::ApproveBatch { job_id: "two-page-proof".into(), checkpoint: 1 }).is_err());
+        assert_eq!(fixture.calls.get(), 0);
+    }
+
+    #[test]
+    fn review_gesture_rejects_repeated_keys_and_pointer_press_from_previous_proof() {
+        fn frame(fixture: &mut ProofFixture, events: Vec<egui::Event>) -> (egui::Rect, bool) {
+            let ctx = fixture.ctx.clone();
+            let mut result = (egui::Rect::NOTHING, false);
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                let response = ui.button("Confirm proof");
+                response.request_focus();
+                result = (
+                    response.rect,
+                    AiUiState::fresh_review_gesture(
+                        true,
+                        fixture.app.ui.ai.proof_key.as_ref(),
+                        &mut fixture.app.ui.ai.review_pointer_press,
+                        &response,
+                    ),
+                );
+            });
+            output.textures_delta.clear();
+            result
+        }
+        let mut fixture = ProofFixture::new();
+        let (rect, activated) = frame(&mut fixture, vec![]);
+        assert!(!activated);
+        let key = |repeat| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat, modifiers: Default::default() };
+        assert!(frame(&mut fixture, vec![key(false)]).1);
+        assert!(!frame(&mut fixture, vec![key(true)]).1);
+        assert!(
+            !frame(
+                &mut fixture,
+                vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() }]
+            )
+            .1
+        );
+        assert!(frame(&mut fixture, vec![key(false)]).1);
+        let pointer =
+            |pressed| egui::Event::PointerButton { pos: rect.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        assert!(!frame(&mut fixture, vec![egui::Event::PointerMoved(rect.center()), pointer(true)]).1);
+        assert!(fixture.app.ui.ai.review_pointer_press.is_some());
+        let mut changed = fixture.checkpoint.clone();
+        changed.batch.as_mut().unwrap().checkpoint += 1;
+        fixture.app.ui.ai.accept(changed);
+        assert!(!frame(&mut fixture, vec![pointer(false)]).1, "release cannot approve a replacement proof");
+        assert!(!frame(&mut fixture, vec![pointer(true)]).1);
+        assert!(frame(&mut fixture, vec![pointer(false)]).1, "a fresh press and release on the current proof remains usable");
+        assert!(frame(&mut fixture, vec![pointer(true), pointer(false)]).1, "coalesced fresh pointer input remains usable");
+        let outside = egui::Event::PointerButton {
+            pos: rect.right_bottom() + egui::vec2(50.0, 50.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        assert!(!frame(&mut fixture, vec![outside, pointer(false)]).1, "a press originating outside the proof widget is not approval");
     }
 
     #[test]

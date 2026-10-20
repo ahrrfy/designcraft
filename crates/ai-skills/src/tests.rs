@@ -9,6 +9,55 @@ fn registry() -> (tempfile::TempDir, SkillRegistry) {
     (temporary, registry)
 }
 
+#[test]
+fn style_package_authenticates_profile_and_rejects_broken_family_links() {
+    let (temp, mut registry) = registry();
+    let mut files = crate::educational_style::package().unwrap();
+    let record = registry.import_files(files.clone(), Provenance::default()).unwrap();
+    assert_eq!(record.manifest.design_profile.as_ref().unwrap().page_families.len(), 4);
+    let path = temp.path().join("proof.png");
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.write_header().unwrap().write_image_data(&[255, 255, 255]).unwrap();
+    }
+    fs::write(&path, png_bytes).unwrap();
+    registry
+        .activate_automatically(
+            &record.skill_id,
+            &record.revision,
+            ApprovalEvidence {
+                reviewer: String::new(),
+                sample_artifact: path,
+                executed_actions: registry.sample_actions(&record.skill_id, &record.revision).unwrap(),
+                supported_commands: record.manifest.required_commands.iter().cloned().collect(),
+                notes: String::new(),
+            },
+        )
+        .unwrap();
+    let pinned = registry.snapshot(&record.skill_id, &[]).unwrap();
+    let profile = pinned.design_profile.clone().unwrap();
+    assert_eq!(profile.margin_mm, 15.0);
+    assert_eq!(pinned.templates.len(), 4);
+    let mut manifest: NativeManifest = serde_json::from_slice(files.get("designcraft.json").unwrap()).unwrap();
+    manifest.design_profile.as_mut().unwrap().page_families[0].template = "templates/missing.json".into();
+    files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+    assert!(registry.import_files(files, Provenance::default()).is_err());
+    registry.index.entries.get_mut(&record.skill_id).unwrap().revisions.last_mut().unwrap().manifest.design_profile.as_mut().unwrap().margin_mm = 1.0;
+    assert!(matches!(registry.snapshot(&record.skill_id, &[]), Err(SkillError::Integrity(_))));
+    assert_eq!(pinned.design_profile.unwrap().margin_mm, 15.0);
+}
+
+#[test]
+fn legacy_human_approval_is_not_relabelled_as_automatic() {
+    let record: ApprovalRecord = serde_json::from_value(serde_json::json!({
+        "reviewer":"Human reviewer","sample_sha256":"legacy","sample_format":"png","notes":"Reviewed"
+    }))
+    .unwrap();
+    assert!(!record.automatic);
+}
+
 fn approve(registry: &mut SkillRegistry, temp: &Path, record: &SkillRevision) {
     let sample = temp.join("sample.png");
     let mut bytes = Vec::new();
@@ -39,7 +88,7 @@ fn approve(registry: &mut SkillRegistry, temp: &Path, record: &SkillRevision) {
 fn drafts_require_review_and_preserve_active_revision_on_edit() {
     let (temp, mut registry) = registry();
     let records = registry.install_builtin_drafts().unwrap();
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 9);
     let first = records.first().unwrap();
     assert_eq!(first.status, RevisionStatus::Draft);
     assert!(registry.snapshot(&first.skill_id, &[]).is_err());
@@ -67,6 +116,25 @@ fn drafts_require_review_and_preserve_active_revision_on_edit() {
     assert!(!pinned.instructions.is_empty());
     let reopened = SkillRegistry::open(temp.path().join("catalog")).unwrap();
     assert!(!reopened.catalog(&first.skill_id).first().unwrap().enabled);
+}
+
+#[test]
+fn native_adaptations_preserve_licenses_without_loading_them_as_task_guidance() {
+    let (_temp, mut registry) = registry();
+    let records = registry.install_builtin_drafts().unwrap();
+    for (id, license, needle) in [("native-design-composition", "Apache-2.0", "Apache License"), ("native-design-quality", "MIT", "MIT License")] {
+        let record = records.iter().find(|record| record.skill_id == id).unwrap();
+        assert_eq!(record.status, RevisionStatus::Draft);
+        assert_eq!(record.provenance.license.as_deref(), Some(license));
+        assert!(record.manifest.external_tools.is_empty());
+        assert_eq!(record.manifest.references, ["references/layout-contract.md"]);
+        let files = registry.review_files(id, &record.revision).unwrap();
+        let license = std::str::from_utf8(files.get("references/LICENSE.txt").unwrap()).unwrap();
+        assert!(license.contains(needle));
+        let notice = std::str::from_utf8(files.get("references/NOTICE.md").unwrap()).unwrap();
+        assert!(notice.contains("Pinned commit:") && notice.contains("Source SHA-256:"));
+        assert!(registry.snapshot(id, &[]).is_err(), "import must not approve the adaptation");
+    }
 }
 
 #[test]
@@ -209,8 +277,7 @@ fn arabic_catalog_queries_find_the_respective_builtin_drafts() {
         ("A4", "school-print-preflight"),
     ] {
         let entries = registry.catalog(query);
-        assert_eq!(entries.len(), 1, "query: {query}");
-        let entry = entries.first().unwrap();
+        let entry = entries.iter().find(|entry| entry.skill_id == expected_id).unwrap_or_else(|| panic!("query: {query}"));
         assert_eq!(entry.skill_id, expected_id, "query: {query}");
         assert_eq!(entry.revisions.first().unwrap().status, RevisionStatus::Draft);
         assert!(entry.active_revision.is_none());

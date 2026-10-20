@@ -1,0 +1,4 @@
+# Preserve package hashes and pinned upstream bytes on every OS.
+/skills/** -text whitespace=cr-at-eol
+# Archived upstream Markdown retains its original hard line breaks and EOF.
+/skills/**/assets/*.md whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof

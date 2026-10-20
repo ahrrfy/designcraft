@@ -110,6 +110,14 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
         ),
         ("object.group", object(&[("ids", ids())], &["ids"]), json!({"ids":["$0.id","$1.id"]})),
         (
+            "object.fittingOptions",
+            object(
+                &[("ids", ids()), ("fitting", choice(&["fitProportionally", "fillProportionally"])), ("align", integer(0, 8)), ("crop", rect())],
+                &["ids", "fitting"],
+            ),
+            json!({"ids":["$0.id"],"fitting":"fillProportionally","align":4,"crop":[0,0,0,0]}),
+        ),
+        (
             "object.textFrameOptions",
             object(
                 &[
@@ -916,6 +924,33 @@ mod tests {
         let p = json!({"outputMode":"native_with_images","commands":[{"command":"file.place","params":{"name":"illustration.png","base64":png,"x":36,"y":36,"width":100}}]});
         assert!(s.execute("production.apply", &p).is_ok());
         assert_eq!(s.doc().unwrap().history.undo.len(), 1);
+    }
+    #[test]
+    fn restricted_graphic_fitting_preserves_frame_and_rejects_hostile_parameters() {
+        let mut s = session();
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let mut p = json!({"outputMode":"native_with_images","commands":[
+            {"command":"frame.create","params":{"rect":[54,54,154,154],"content":"graphic"}},
+            {"command":"file.place","params":{"frame":"$0.id","name":"illustration.png","base64":png}},
+            {"command":"object.fittingOptions","params":{"ids":["$0.id"],"fitting":"fillProportionally","align":4,"crop":[0,25,0,25]}}
+        ]});
+        s.execute("production.apply", &p).unwrap();
+        let item = &s.doc().unwrap().doc.spreads[0].items[0];
+        let designcraft_doc::Content::Graphic(g) = &item.content else { panic!("Expected graphic") };
+        assert_eq!(g.crop, [0.0, 25.0, 0.0, 25.0]);
+        assert_eq!(item.inner_bounds(), designcraft_geom::Rect::new(54.0, 54.0, 154.0, 154.0));
+        for params in [
+            json!({"ids":["$0.id"],"fitting":"fitFrameToContent"}),
+            json!({"ids":["$0.id"],"fitting":"fillProportionally","crop":[0,null,0,0]}),
+            json!({"ids":["$0.id"],"fitting":"fillProportionally","crop":[0,1e300,0,0]}),
+            json!({"ids":["$0.id"],"fitting":"fillProportionally","align":9}),
+            json!({"ids":["$0.id"],"fitting":"fillProportionally","path":"private.jpg"}),
+        ] {
+            p["commands"][2]["params"] = params;
+            let before = s.doc().unwrap().doc.clone();
+            assert!(s.execute("production.apply", &p).is_err());
+            assert!(Arc::ptr_eq(&before, &s.doc().unwrap().doc));
+        }
     }
     #[test]
     fn stale_documents_and_hostile_plan_bounds_are_rejected() {

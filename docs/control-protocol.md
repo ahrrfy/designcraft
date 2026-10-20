@@ -107,3 +107,5 @@ Table panel. `ui.set` with `closePanel` closes the last explicitly opened panel;
 `dockExpanded:false` hides the root dock while floating groups remain visible.
 The icon rail can reopen a collapsed dock through any root panel. Activating a
 floating panel also raises its group. These operations change only UI layout.
+
+Automatic skill preparation: `ui.menu.invoke` with `{command: ai.request, params: {method: prepare_skills, prompt: ...}}` runs the same local native-template checks used before automatic production. It makes no provider request. Machine validation is recorded separately from human approval. It cannot approve batch proofs, reveal credentials, or submit printing.

@@ -1,7 +1,7 @@
 use crate::vault::{SessionKey, Vault};
 use crate::{ledger::UsageLedger, science, worker};
 use designcraft_ai_providers::{SecretString, validate_endpoint};
-use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry};
+use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry, SkillSnapshot};
 use designcraft_ai_types::protocol::*;
 use designcraft_ai_types::{EngineAction, ProviderKind};
 use designcraft_engine::{Session, file_access};
@@ -213,6 +213,34 @@ impl ProductionRunner {
                 self.snapshot.message = "Skill imported as a draft; run and review its sample before approval".into();
             }
             AiRequest::InspectSkill { id, revision } => self.inspect_skill(&id, &revision)?,
+            AiRequest::AddDesignCorrection { id, revision, correction } => {
+                let latest = self
+                    .registry
+                    .catalog("")
+                    .into_iter()
+                    .find(|e| e.skill_id == id)
+                    .and_then(|entry| entry.revisions.last().map(|r| r.revision.clone()));
+                if latest.as_deref() != Some(revision.as_str()) {
+                    return Err("Inspect the latest style revision before adding a correction".into());
+                }
+                let mut files = self.registry.review_files(&id, &revision).map_err(|e| e.to_string())?;
+                let mut manifest = self.registry.revision(&id, &revision).map_err(|e| e.to_string())?.manifest.clone();
+                let profile = manifest.design_profile.as_mut().ok_or("This skill has no design profile")?;
+                profile.corrections.push(correction);
+                profile.validate()?;
+                files.insert("designcraft.json".into(), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?);
+                let draft = self
+                    .registry
+                    .import_files(files, Provenance { source: "Explicit local design correction".into(), ..Default::default() })
+                    .map_err(|e| e.to_string())?;
+                self.sample = None;
+                self.inspect_skill(&id, &draft.revision)?;
+                self.snapshot.message = "Correction saved in a new design-style draft; the active version and running task stay unchanged".into();
+            }
+            AiRequest::PrepareSkills { prompt } => {
+                let ids = self.prepare_automatic_skills(session, &prompt)?;
+                self.snapshot.message = format!("Automatically prepared {} compatible skills locally; no provider request", ids.len());
+            }
             AiRequest::SaveSkillDraft { id, skill_md, manifest_json } => {
                 let review = self.snapshot.review.as_ref().filter(|r| r.id == id).ok_or("Inspect the skill before editing")?;
                 let mut files = self.registry.review_files(&id, &review.revision).map_err(|e| e.to_string())?;
@@ -231,12 +259,15 @@ impl ProductionRunner {
                 self.inspect_skill(&revised.skill_id, &revised.revision)?;
                 self.snapshot.message = "Draft saved; the previous approved revision remains active".into();
             }
-            AiRequest::GenerateSkill { prompt, reference_paths, settings } => self.start_skill(prompt, reference_paths, None, settings)?,
-            AiRequest::GenerateSkillFromDocument { prompt, settings } => {
-                let context = compact_context(session)?;
-                self.start_skill(prompt, Vec::new(), Some(context), settings)?;
+            AiRequest::GenerateSkill { prompt, reference_paths, settings, design_style } => {
+                self.start_skill(prompt, reference_paths, None, settings, design_style)?
+            }
+            AiRequest::GenerateSkillFromDocument { prompt, settings, design_style } => {
+                let context = if design_style { corrected_design_context(session)? } else { compact_context(session)? };
+                self.start_skill(prompt, Vec::new(), Some(context), settings, design_style)?;
             }
             AiRequest::RunSkillSample { id, revision } => self.run_sample(session, &id, &revision)?,
+            AiRequest::RunDesignTemplate { id, revision, template } => self.run_design_template(session, &id, &revision, Some(&template))?,
             AiRequest::ApproveSkill { id, revision } => {
                 let evidence = self
                     .sample
@@ -322,9 +353,16 @@ impl ProductionRunner {
         }
         let expected = match task.target {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
+            TaskTarget::ContinueBook => {
+                let current = session.doc().map_err(|e| e.to_string())?;
+                if task.settings.pages_per_batch == 0 {
+                    return Err("Continuing a book requires reviewed batches".into());
+                }
+                Some((current.uid, current.revision))
+            }
             TaskTarget::NewA4 { pages } => {
                 if !(1..=1000).contains(&pages) {
-                    return Err("AI new documents support 1–1000 A4 pages".into());
+                    return Err("AI new documents support 1–1000 pages".into());
                 }
                 if task.settings.pages_per_batch == 0 && pages > 8 {
                     return Err("Books over eight pages require reviewed batches".into());
@@ -332,21 +370,22 @@ impl ProductionRunner {
                 None
             }
         };
-        let (base, context) = match task.target {
-            TaskTarget::CurrentDocument => (session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?),
-            TaskTarget::NewA4 { pages } => {
-                let mut scratch = Session::new();
-                scratch.execute("file.new", &new_a4(pages)).map_err(|e| e.to_string())?;
-                let context = compact_context(&scratch)?;
-                (scratch.doc().map_err(|e| e.to_string())?.clone(), context)
+        let ids = if task.auto_select_skills {
+            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+        } else {
+            let mut ids = task.skill_ids.clone();
+            if let Some(id) = task.settings.design_style.as_deref() {
+                self.prepare_style(session, id)?;
+                if !ids.iter().any(|selected| selected == id) {
+                    ids.push(id.into());
+                }
             }
+            ids
         };
-        let ids = if task.auto_select_skills { self.choose_skills(&task.prompt) } else { task.skill_ids.clone() };
         if ids.len() > 8 {
             return Err("Select at most eight skills per task".into());
         }
         let mut snapshots = Vec::new();
-        let mut skill_context_bytes = 2usize;
         let supported = supported_commands();
         for id in ids {
             let card = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown skill: {id}"))?;
@@ -357,18 +396,24 @@ impl ProductionRunner {
             }
             let refs = selected_skill_references(record);
             let snapshot = self.registry.snapshot(&id, &refs).map_err(|e| e.to_string())?;
-            let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?.len();
-            skill_context_bytes = skill_context_bytes.checked_add(bytes.saturating_add(1)).ok_or("Selected skill context size overflow")?;
-            if skill_context_bytes > 64 * 1024 {
-                return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
-            }
             snapshots.push(snapshot);
         }
+        let snapshots = bounded_task_skills(snapshots, &task.target)?;
         let pins = snapshots.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
+        if snapshots.iter().filter(|s| s.design_profile.is_some()).count() > 1 {
+            return Err("Choose one design style per task to avoid conflicting identities".into());
+        }
+        let profile = snapshots.iter().find_map(|s| s.design_profile.as_ref());
+        let (base, context) = task_document_context(session, &task.target, profile)?;
+        if let TaskTarget::ContinueBook = task.target {
+            batch::continuation_progress(&base, profile)?;
+        }
+        if let Some(profile) = profile {
+            crate::design::check_geometry(Some(&base), &base, profile)?;
+        }
         let settings = task.settings.clone();
-        if let TaskTarget::NewA4 { pages } = task.target
-            && settings.pages_per_batch > 0
-            && pages > settings.pages_per_batch
+        if matches!(task.target, TaskTarget::ContinueBook)
+            || matches!(task.target, TaskTarget::NewA4 { pages } if settings.pages_per_batch > 0 && pages > settings.pages_per_batch)
         {
             return self.start_batches(session, task, snapshots, base, context);
         }
@@ -383,7 +428,14 @@ impl ProductionRunner {
         self.launch(work, Some(task), expected, pins, settings)
     }
 
-    fn start_skill(&mut self, prompt: String, paths: Vec<String>, context: Option<Value>, settings: AiSettings) -> Result<(), String> {
+    fn start_skill(
+        &mut self,
+        prompt: String,
+        paths: Vec<String>,
+        context: Option<Value>,
+        settings: AiSettings,
+        design_style: bool,
+    ) -> Result<(), String> {
         for path in &paths {
             file_access::check_read(path)?;
         }
@@ -393,6 +445,7 @@ impl ProductionRunner {
             return Err("Enter a bounded description for the new skill".into());
         }
         let work = worker::Work::Skill {
+            design_style,
             prompt,
             reference_paths: paths,
             context,
@@ -554,6 +607,7 @@ impl ProductionRunner {
         let committed_export = matches!(&outcome.result, Ok(worker::Product::Indesign(_)));
         let cancelled = pending.worker.cancel.load(Ordering::Relaxed) && !committed_export;
         let mut report = TaskReport {
+            design_style: self.style_use(&pending.skills, pending.task.as_ref().map(|task| &task.target)),
             id: pending.id,
             status: "failed".into(),
             title: pending.task.as_ref().map(|t| t.prompt.chars().take(80).collect()).unwrap_or_else(|| "AI service operation".into()),
@@ -668,20 +722,24 @@ impl ProductionRunner {
                 self.profile_access.check(&runs, file_access::Access::Write)?;
                 std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
                 let trace = runs.join(format!("{}.json", report.id));
+                let page_params = match task.target {
+                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params(&report.skills, pages)?),
+                    _ => None,
+                };
                 let context = match task.target {
-                    TaskTarget::CurrentDocument => compact_context(session)?,
-                    TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages}),
+                    TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
+                    TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages,"documentParams":page_params}),
                 };
                 write_json(
                     &self.profile_access,
                     &trace,
-                    &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"base":context,"plan":plan}),
+                    &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"designStyle":report.design_style,"base":context,"plan":plan}),
                 )?;
                 report.artifacts.push(trace.to_string_lossy().into_owned());
                 let previous_active = session.active_index();
                 let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
-                if let TaskTarget::NewA4 { pages } = task.target {
-                    session.execute("file.new", &new_a4(pages)).map_err(|e| e.to_string())?;
+                if let Some(params) = page_params {
+                    session.execute("file.new", &params).map_err(|e| e.to_string())?;
                 }
                 let current = session.doc().map_err(|e| e.to_string())?;
                 let params = json!({"commands":plan.commands,"outputMode":task.settings.output_mode,"label":plan.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true});
@@ -718,6 +776,161 @@ impl ProductionRunner {
     fn choose_skills(&self, prompt: &str) -> Vec<String> {
         choose_compatible_skills(prompt, self.registry.catalog(""), &supported_commands())
     }
+
+    fn pinned_document_params(&self, pins: &[(String, String)], pages: u32) -> Result<Value, String> {
+        let mut profile = None;
+        for (id, revision) in pins {
+            let record = self.registry.revision(id, revision).map_err(|e| e.to_string())?;
+            if let Some(selected) = record.manifest.design_profile.as_ref() {
+                if profile.is_some() {
+                    return Err("New document has conflicting pinned design profiles".into());
+                }
+                selected.validate()?;
+                profile = Some(selected);
+            }
+        }
+        Ok(crate::design::document_params(profile, pages))
+    }
+
+    fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
+        self.prepare_skills_for_style(session, prompt, None)
+    }
+
+    fn prepare_skills_for_style(&mut self, session: &Session, prompt: &str, style_id: Option<&str>) -> Result<Vec<String>, String> {
+        if prompt.trim().is_empty() || prompt.len() > 32_768 {
+            return Err("Enter a prompt of at most 32768 UTF-8 bytes".into());
+        }
+        self.snapshot.skill_warnings.clear();
+        let supported = supported_commands();
+        let mut candidates = self
+            .registry
+            .catalog("")
+            .into_iter()
+            .filter_map(|entry| {
+                if !entry.enabled {
+                    return None;
+                }
+                let revision = entry.revisions.last()?;
+                if revision.manifest.design_profile.is_some() {
+                    return None;
+                }
+                if !skill_is_compatible(revision, &supported) {
+                    return None;
+                }
+                let score = skill_match_score(prompt, &entry);
+                (score > 0).then(|| (score, entry.skill_id.clone(), revision.revision.clone(), revision.status.clone()))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, id, revision, status) in candidates.into_iter().take(6) {
+            if status == RevisionStatus::Approved {
+                continue;
+            }
+            let validation =
+                validate_skill_templates(&self.registry, session, &id, &revision).and_then(|()| self.run_sample(session, &id, &revision));
+            if let Err(error) = validation {
+                self.snapshot.skill_warnings.push(format!(
+                    "Skipped invalid skill draft {id}: {}. A compatible active revision is retained when available.",
+                    error.chars().take(1024).collect::<String>()
+                ));
+                continue;
+            }
+            let evidence = self.sample.as_ref().ok_or("Automatic sample evidence is unavailable")?;
+            self.registry
+                .activate_automatically(
+                    &id,
+                    &revision,
+                    ApprovalEvidence {
+                        reviewer: String::new(),
+                        sample_artifact: evidence.path.clone(),
+                        executed_actions: evidence.actions.clone(),
+                        supported_commands: supported.clone(),
+                        notes: String::new(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        self.refresh_catalog();
+        let mut ids = self.choose_skills(prompt);
+        let style = match style_id {
+            Some(id) => Some(id.to_owned()),
+            None => self
+                .registry
+                .catalog("")
+                .into_iter()
+                .filter(|entry| entry.enabled)
+                .filter_map(|entry| {
+                    let revision = design_revision(&entry)
+                        .filter(|r| skill_is_compatible(r, &supported))
+                        .or_else(|| active_design_revision(&entry).filter(|r| skill_is_compatible(r, &supported)))?;
+                    let profile = revision.manifest.design_profile.as_ref()?;
+                    let lower = normalize_skill_search(prompt);
+                    let hits = profile.keywords.iter().filter(|word| lower.contains(&normalize_skill_search(word))).count();
+                    let bonus = usize::from(hits > 0 && entry.skill_id == "kg-oxford-cambridge-style") * 16;
+                    (hits > 0).then_some((hits.saturating_add(bonus), entry.skill_id))
+                })
+                .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                .map(|(_, id)| id),
+        };
+        if let Some(id) = style {
+            self.prepare_style(session, &id)?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    fn prepare_style(&mut self, session: &Session, id: &str) -> Result<(), String> {
+        let entry = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown design style: {id}"))?;
+        if !entry.enabled {
+            return Err(format!("Design style {id} is disabled"));
+        }
+        let revision = design_revision(&entry).ok_or("Design style has no revision")?;
+        let version = revision.revision.clone();
+        let result = (|| {
+            if revision.manifest.design_profile.is_none() || !skill_is_compatible(revision, &supported_commands()) {
+                return Err(format!("Design style {id} is incompatible or has no design profile"));
+            }
+            if revision.status == RevisionStatus::Approved {
+                return Ok(());
+            }
+            validate_skill_templates(&self.registry, session, id, &version)?;
+            self.run_sample(session, id, &version)?;
+            let sample = self.sample.as_ref().ok_or("Design style sample evidence is unavailable")?;
+            self.registry.activate_automatically(id, &version, ApprovalEvidence {
+                reviewer: String::new(), sample_artifact: sample.path.clone(), executed_actions: sample.actions.clone(),
+                supported_commands: supported_commands(), notes: "All page-family templates passed native preflight and print geometry checks. Educational and aesthetic review remains human.".into(),
+            }).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if active_design_revision(&entry).is_some_and(|active| active.revision != version && skill_is_compatible(active, &supported_commands())) {
+                self.snapshot.message = format!("New design-style draft failed validation; retained the active revision: {error}");
+            } else {
+                return Err(error);
+            }
+        }
+        self.refresh_catalog();
+        Ok(())
+    }
+
+    fn style_use(&self, pins: &[(String, String)], target: Option<&TaskTarget>) -> Option<designcraft_ai_types::DesignStyleUse> {
+        pins.iter().find_map(|(id, revision)| {
+            let record = self.registry.revision(id, revision).ok()?;
+            let profile = record.manifest.design_profile.as_ref()?;
+            Some(designcraft_ai_types::DesignStyleUse {
+                skill_id: id.clone(),
+                revision: revision.clone(),
+                name: profile.name.clone(),
+                execution_mode: if matches!(target, Some(TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook))
+                    && profile.page_families.iter().all(|family| !family.text_slots.is_empty())
+                {
+                    "native_templates".into()
+                } else {
+                    "command_planner".into()
+                },
+            })
+        })
+    }
     fn refresh_catalog(&mut self) {
         let supported = supported_commands();
         self.snapshot.skills = self
@@ -729,12 +942,14 @@ impl ProductionRunner {
                 entry.revisions.into_iter().map(move |revision| {
                     let compatible = skill_is_compatible(&revision, supported);
                     SkillCard {
+                        design_profile: revision.manifest.design_profile.clone(),
                         id: entry.skill_id.clone(),
                         name: revision.name,
                         description: revision.description,
                         active: entry.active_revision.as_ref() == Some(&revision.revision),
                         revision: revision.revision,
                         approved: revision.status == RevisionStatus::Approved,
+                        automatically_validated: revision.approval.as_ref().is_some_and(|approval| approval.automatic),
                         enabled: entry.enabled,
                         compatible,
                     }
@@ -760,15 +975,33 @@ impl ProductionRunner {
         Ok(())
     }
     fn run_sample(&mut self, session: &Session, id: &str, revision: &str) -> Result<(), String> {
+        self.run_design_template(session, id, revision, None)
+    }
+
+    fn run_design_template(&mut self, session: &Session, id: &str, revision: &str, template: Option<&str>) -> Result<(), String> {
         let dir = self.root.join("samples");
-        let path = dir.join(format!("{id}-{revision}.png"));
+        let manifest = self.registry.revision(id, revision).map_err(|e| e.to_string())?.manifest.clone();
+        let template_actions = if let Some(template) = template {
+            if !manifest.design_profile.as_ref().is_some_and(|profile| profile.page_families.iter().any(|family| family.template == template)) {
+                return Err("Template is not a declared design page family".into());
+            }
+            Some(self.registry.review_templates(id, revision).map_err(|e| e.to_string())?.remove(template).ok_or("Missing native page template")?)
+        } else {
+            None
+        };
+        let suffix = template.and_then(|path| Path::new(path).file_stem()).and_then(|name| name.to_str()).unwrap_or("sample");
+        let path = dir.join(format!("{id}-{revision}-{suffix}.png"));
         self.profile_access.check(&dir, file_access::Access::Write)?;
         self.profile_access.check(&path, file_access::Access::Write)?;
         self.sample = None;
-        let actions = self.registry.sample_actions(id, revision).map_err(|e| e.to_string())?;
+        let actions = match template_actions {
+            Some(actions) => actions,
+            None => self.registry.sample_actions(id, revision).map_err(|e| e.to_string())?,
+        };
         let mut scratch = Session::new();
         scratch.prefs = session.prefs.clone();
-        scratch.execute("file.new", &new_a4(1)).map_err(|e| e.to_string())?;
+        let profile = self.registry.revision(id, revision).map_err(|e| e.to_string())?.manifest.design_profile.clone();
+        scratch.execute("file.new", &crate::design::document_params(profile.as_ref(), 1)).map_err(|e| e.to_string())?;
         scratch
             .execute(
                 "production.apply",
@@ -776,6 +1009,9 @@ impl ProductionRunner {
             )
             .map_err(|e| e.to_string())?;
         ensure_preflight(&mut scratch)?;
+        if let Some(profile) = &profile {
+            crate::design::check_geometry(None, scratch.doc().map_err(|e| e.to_string())?, profile)?;
+        }
         let mut renderer = designcraft_render::Renderer::new();
         let doc = scratch.doc().map_err(|e| e.to_string())?;
         let raster = renderer
@@ -788,11 +1024,88 @@ impl ProductionRunner {
         self.profile_access.check(&dir, file_access::Access::Write)?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         write_profile(&self.profile_access, &path, &bytes)?;
-        self.sample = Some(SampleEvidence { id: id.into(), revision: revision.into(), actions, path });
+        let is_main = template.is_none() || template == manifest.sample_template.as_deref();
+        if is_main {
+            self.sample = Some(SampleEvidence { id: id.into(), revision: revision.into(), actions, path: path.clone() });
+        }
         self.inspect_skill(id, revision)?;
+        if let Some(review) = &mut self.snapshot.review {
+            review.sample_path = Some(path.to_string_lossy().into_owned());
+        }
         self.snapshot.message = "Sample executed with native tools and passed preflight; review its preview before approving".into();
         Ok(())
     }
+}
+
+/// Preserve immutable guidance and executable design profiles within the task
+/// budget. Command planners can omit optional sample templates, largest first;
+/// the content compiler never needs non-style command examples.
+fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> Result<Vec<SkillSnapshot>, String> {
+    if matches!(target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook) && skills.iter().any(crate::template_plan::eligible) {
+        for skill in &mut skills {
+            if skill.design_profile.is_none() {
+                skill.templates.clear();
+            }
+        }
+        // Compiler commands remain immutable local inputs. The model receives
+        // only deduplicated guidance and the serialized design-profile rules.
+        let mut bytes = worker::compact_skill_guidance(&skills)?.len();
+        for profile in skills.iter().filter_map(|skill| skill.design_profile.as_ref()) {
+            let rules = serde_json::to_vec(profile).map_err(|e| e.to_string())?.len();
+            if rules > 32 * 1024 {
+                return Err("Template style rules exceed the bounded context limit".into());
+            }
+            bytes = bytes.checked_add(rules).ok_or("Selected skill context size overflow")?;
+            if bytes > 64 * 1024 {
+                return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
+            }
+        }
+        return Ok(skills);
+    }
+    if task_skill_context_bytes(&skills)? <= 64 * 1024 {
+        return Ok(skills);
+    }
+    let mut optional_examples = Vec::new();
+    for (index, skill) in skills.iter().enumerate().filter(|(_, skill)| skill.design_profile.is_none()) {
+        for (path, actions) in &skill.templates {
+            let size = serde_json::to_vec(&(path, actions)).map_err(|e| e.to_string())?.len();
+            optional_examples.push((size, index, path.clone()));
+        }
+    }
+    optional_examples.sort_by_key(|example| std::cmp::Reverse(example.0));
+    for (_, index, path) in optional_examples {
+        if let Some(skill) = skills.get_mut(index) {
+            skill.templates.remove(&path);
+        }
+        if task_skill_context_bytes(&skills)? <= 64 * 1024 {
+            return Ok(skills);
+        }
+    }
+    Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into())
+}
+
+fn task_skill_context_bytes(skills: &[SkillSnapshot]) -> Result<usize, String> {
+    let mut bytes = 2usize;
+    for (index, skill) in skills.iter().enumerate() {
+        let size = serde_json::to_vec(skill).map_err(|e| e.to_string())?.len();
+        bytes = bytes.checked_add(size).and_then(|size| size.checked_add(usize::from(index > 0))).ok_or("Selected skill context size overflow")?;
+    }
+    Ok(bytes)
+}
+
+fn design_revision(entry: &designcraft_ai_skills::CatalogEntry) -> Option<&designcraft_ai_skills::SkillRevision> {
+    let latest = entry.revisions.last()?;
+    if latest.status == RevisionStatus::Draft {
+        Some(latest)
+    } else {
+        entry.active_revision.as_ref().and_then(|id| entry.revisions.iter().find(|r| &r.revision == id)).or(Some(latest))
+    }
+}
+
+fn active_design_revision(entry: &designcraft_ai_skills::CatalogEntry) -> Option<&designcraft_ai_skills::SkillRevision> {
+    entry.active_revision.as_ref().and_then(|id| {
+        entry.revisions.iter().find(|r| &r.revision == id && r.status == RevisionStatus::Approved && r.manifest.design_profile.is_some())
+    })
 }
 
 fn selected_models(settings: &AiSettings) -> Vec<designcraft_ai_types::ModelSelection> {
@@ -851,16 +1164,21 @@ fn validate_skill_templates(registry: &SkillRegistry, session: &Session, id: &st
         let pages = u32::try_from(pages).map_err(|_| "Skill template review page count overflow")?;
         let mut scratch = Session::new();
         scratch.prefs = session.prefs.clone();
-        scratch.execute("file.new", &new_a4(pages)).map_err(|e| format!("Skill template {name}: {e}"))?;
+        scratch
+            .execute("file.new", &crate::design::document_params(record.manifest.design_profile.as_ref(), pages))
+            .map_err(|e| format!("Skill template {name}: {e}"))?;
         scratch
             .execute(
-                "production.validate",
+                "production.apply",
                 &json!({
                     "commands":actions,"outputMode":"native_only","allowedCommands":allowed,
                     "label":"Skill template compatibility review","requirePreflight":true
                 }),
             )
             .map_err(|e| format!("Skill template {name} is incompatible with the native engine: {e}"))?;
+        if let Some(profile) = &record.manifest.design_profile {
+            crate::design::check_geometry(None, scratch.doc().map_err(|e| e.to_string())?, profile)?;
+        }
     }
     Ok(())
 }
@@ -913,31 +1231,319 @@ fn selected_skill_references(revision: &designcraft_ai_skills::SkillRevision) ->
 }
 
 fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::CatalogEntry>, supported: &BTreeSet<String>) -> Vec<String> {
-    let words = prompt
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 3 || word.eq_ignore_ascii_case("a4"))
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>();
     let mut ranked = entries
         .into_iter()
         .filter(|entry| {
             entry.enabled
                 && entry.active_revision.as_ref().is_some_and(|active| {
-                    entry
-                        .revisions
-                        .iter()
-                        .find(|revision| &revision.revision == active)
-                        .is_some_and(|revision| revision.status == RevisionStatus::Approved && skill_is_compatible(revision, supported))
+                    entry.revisions.iter().find(|revision| &revision.revision == active).is_some_and(|revision| {
+                        revision.status == RevisionStatus::Approved
+                            && revision.manifest.design_profile.is_none()
+                            && skill_is_compatible(revision, supported)
+                    })
                 })
         })
-        .map(|entry| {
-            let haystack = format!("{} {} {}", entry.skill_id, entry.name, entry.description).to_lowercase();
-            (words.iter().filter(|word| haystack.contains(word.as_str())).count(), entry.skill_id)
-        })
+        .map(|entry| (skill_match_score(prompt, &entry), entry.skill_id))
         .filter(|(score, _)| *score > 0)
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    ranked.into_iter().take(3).map(|(_, id)| id).collect()
+    ranked.into_iter().take(6).map(|(_, id)| id).collect()
+}
+
+fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) -> usize {
+    let prompt = normalize_skill_search(prompt);
+    let haystack = normalize_skill_search(&format!("{} {} {}", entry.skill_id, entry.name, entry.description));
+    let words = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 3 || *word == "a4")
+        .filter(|word| {
+            !matches!(
+                *word,
+                "the"
+                    | "and"
+                    | "with"
+                    | "for"
+                    | "from"
+                    | "that"
+                    | "this"
+                    | "into"
+                    | "without"
+                    | "are"
+                    | "you"
+                    | "your"
+                    | "not"
+                    | "all"
+                    | "use"
+                    | "على"
+                    | "الى"
+                    | "إلى"
+                    | "هذا"
+                    | "هذه"
+                    | "ذلك"
+                    | "التي"
+                    | "الذي"
+                    | "لكل"
+                    | "لكي"
+                    | "كما"
+                    | "بعد"
+                    | "قبل"
+                    | "بين"
+                    | "فقط"
+                    | "جدا"
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    // Repetition cannot multiply relevance, and a long brief cannot displace
+    // core native/typography/print guidance merely by matching more words.
+    let lexical = words.into_iter().filter(|word| haystack.contains(*word)).count().min(8);
+    let mentions = |terms: &[&str]| terms.iter().any(|term| prompt.contains(term));
+    let arabic = prompt.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c) && c.is_alphabetic());
+    let intl = mentions(&[
+        "دولي",
+        "دولية",
+        "عالمي",
+        "عالمية",
+        "أكسفورد",
+        "اكسفورد",
+        "كامبريدج",
+        "كامبردج",
+        "فاملي اند فريندز",
+        "فرست فريندز",
+        "كارنيت",
+        "جارنيت",
+        "international",
+        "oxford",
+        "cambridge",
+        "family and friends",
+        "first friends",
+        "garnet",
+    ]);
+    let computing = mentions(&[
+        "حاسوب",
+        "الحاسوب",
+        "كمبيوتر",
+        "برمجة",
+        "تقنية",
+        "رقمي",
+        "رقمية",
+        "ذكاء اصطناعي",
+        "خوارزميات",
+        "بيانات",
+        "شبكات",
+        "روبوت",
+        "computer",
+        "computing",
+        "ict",
+        "coding",
+        "programming",
+        "software",
+        "hardware",
+        "algorithm",
+        "digital",
+        "robotics",
+    ]);
+    let book = mentions(&[
+        "كتاب",
+        "كتيب",
+        "كراس",
+        "منهج",
+        "مناهج",
+        "مقرر",
+        "وحدة",
+        "درس",
+        "رياضيات",
+        "علوم",
+        "حاسوب",
+        "الحاسوب",
+        "كمبيوتر",
+        "برمجة",
+        "تقنية",
+        "curriculum",
+        "book",
+        "workbook",
+        "coursebook",
+        "textbook",
+        "math",
+        "science",
+        "computer",
+        "computing",
+        "ict",
+    ]);
+    let children = mentions(&[
+        "أطفال",
+        "اطفال",
+        "طفل",
+        "روضة",
+        "للصغار",
+        "ابتدائي",
+        "مدرسي",
+        "طلاب",
+        "تلاميذ",
+        "kindergarten",
+        "preschool",
+        "children",
+        "early years",
+        "early-years",
+        "primary",
+    ]);
+    let visual = (children || intl || computing) && book
+        || mentions(&[
+            "تصميم",
+            "صمم",
+            "توزيع",
+            "بصري",
+            "مصور",
+            "صور",
+            "رسوم",
+            "بطاقات",
+            "illustrat",
+            "visual",
+            "layout",
+            "design",
+            "picture",
+            "flashcard",
+        ]);
+    let print = book || mentions(&["طباعة", "للطباعة", "مطبعة", "مطبوع", "print", "a4"]);
+    let kg = (children || intl || computing) && (book || visual);
+    let architecture = mentions(&[
+        "تسلسل",
+        "وتسلسله",
+        "وتسلسة",
+        "وحدات",
+        "ووحداته",
+        "ووحداتة",
+        "فصول",
+        "وفصوله",
+        "وفصولة",
+        "ربط سلسلي",
+        "ربط ذهني",
+        "السلسلي الذهني",
+        "خريطة منهج",
+        "هيكلة المنهج",
+        "بناء المنهج",
+        "scope and sequence",
+        "syllabus",
+        "curriculum map",
+        "spiral curriculum",
+    ]);
+    let purpose = match entry.skill_id.as_str() {
+        "native-engine-workflow" => 64,
+        "arabic-english-typography" if arabic => 56,
+        "school-print-preflight" if print => 48,
+        "curriculum-print-design-studio" if book && print => 41,
+        "kg-garnet-ict-computing" if kg && computing => 46,
+        "kg-international-curriculum-architect" if (kg || book) && architecture => 45,
+        "kg-cambridge-thinking-cpa"
+            if kg
+                && (computing
+                    || intl
+                    || mentions(&[
+                        "رياضيات",
+                        "حساب",
+                        "العد",
+                        "كميات",
+                        "منطق",
+                        "محسوس",
+                        "قواعد",
+                        "math",
+                        "mathematics",
+                        "counting",
+                        "subitiz",
+                        "grammar",
+                        "cpa",
+                    ])) =>
+        {
+            44
+        }
+        "kg-international-curriculum-architect" if kg && (intl || book) => {
+            if intl {
+                43
+            } else {
+                39
+            }
+        }
+        "kg-oxford-phonics-handwriting"
+            if kg && mentions(&["حروف", "أصوات", "الأصوات", "صوتيات", "خط اليد", "تأسيس الكتابة", "phonics", "handwriting", "letter maze"]) =>
+        {
+            44
+        }
+        "kg-oxford-skills-time"
+            if kg && (intl || computing || mentions(&["قراءة", "استماع", "تحدث", "مهارات", "reading", "listening", "speaking", "skills time"])) =>
+        {
+            if mentions(&["قراءة", "استماع", "تحدث", "مهارات", "reading", "listening", "speaking", "skills time"]) {
+                44
+            } else {
+                38
+            }
+        }
+        "kg-oxford-fluency-time"
+            if kg && (intl || computing || mentions(&["محادثة", "حوار", "مشروع يدوي", "بمشروع يدوي", "craft", "fluency", "conversation"])) =>
+        {
+            if mentions(&["محادثة", "حوار", "مشروع يدوي", "بمشروع يدوي", "craft", "fluency", "conversation"]) {
+                44
+            } else {
+                36
+            }
+        }
+        "kg-sensory-illustration-vector"
+            if kg
+                && mentions(&[
+                    "ألوان",
+                    "الألوان",
+                    "للألوان",
+                    "الوان",
+                    "قوس",
+                    "فني",
+                    "الفن",
+                    "رسم",
+                    "colour",
+                    "color",
+                    "rainbow",
+                    "song",
+                    "sensory art",
+                ]) =>
+        {
+            44
+        }
+        "kg-school-print-prepress" if kg && mentions(&["كراس", "كلمات متقاطعة", "workbook", "crossword", "word bank"]) => 44,
+        "native-editorial-variety" if visual && mentions(&["تنويع", "متنوع", "توزيع", "variety", "varied", "different layouts"]) => 42,
+        "kg-cognitive-sensory-layout" if kg && visual => 40,
+        "native-design-composition" if visual => 32,
+        "kg-school-print-prepress" if kg && print => 24,
+        "early-years-booklet-planning" | "early-years-activity-layout" if book => 12,
+        _ => 0,
+    };
+    lexical.saturating_add(purpose)
+}
+
+/// Search-only normalization; task copy and pinned skill contents stay exact.
+fn normalize_skill_search(text: &str) -> String {
+    let stripped = text
+        .chars()
+        .filter(|c| !matches!(*c, '\u{0610}'..='\u{061a}' | '\u{0640}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}'))
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let mut normalized = String::with_capacity(stripped.len().saturating_add(8));
+    let mut prev_arabic = None;
+    for ch in stripped.chars() {
+        let is_arabic = ('\u{0600}'..='\u{06ff}').contains(&ch);
+        let is_latin_or_digit = ch.is_ascii_alphanumeric();
+        if let Some(was_arabic) = prev_arabic
+            && ((was_arabic && is_latin_or_digit) || (!was_arabic && is_arabic))
+            && !normalized.ends_with(' ')
+        {
+            normalized.push(' ');
+        }
+        normalized.push(ch);
+        prev_arabic = if is_arabic {
+            Some(true)
+        } else if is_latin_or_digit {
+            Some(false)
+        } else {
+            None
+        };
+    }
+    normalized
 }
 
 fn supported_commands() -> BTreeSet<String> {
@@ -977,6 +1583,25 @@ fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     }
     Ok(())
 }
+fn task_document_context(
+    session: &Session,
+    target: &TaskTarget,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+) -> Result<(designcraft_engine::DocState, Value), String> {
+    match target {
+        TaskTarget::CurrentDocument | TaskTarget::ContinueBook => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
+        TaskTarget::NewA4 { pages } => {
+            if let Some(profile) = profile {
+                profile.validate()?;
+            }
+            let mut scratch = Session::new();
+            scratch.execute("file.new", &crate::design::document_params(profile, *pages)).map_err(|e| e.to_string())?;
+            let context = compact_context(&scratch)?;
+            Ok((scratch.doc().map_err(|e| e.to_string())?.clone(), context))
+        }
+    }
+}
+#[cfg(test)]
 fn new_a4(pages: u32) -> Value {
     json!({"preset":"A4","pages":pages,"facingPages":false,"margins":15.0*72.0/25.4,"bleed":0})
 }
@@ -1005,6 +1630,26 @@ fn ensure_publication_idle(session: &Session) -> Result<(), String> {
 fn compact_context(session: &Session) -> Result<Value, String> {
     let state = session.doc().map_err(|e| e.to_string())?;
     let doc = &state.doc;
+    // A small, measured font inventory prevents planning from assuming installed glyphs.
+    let fonts = designcraft_fonts::FontDb::global().scoped(doc.font_scope);
+    let mut families: Vec<String> = ["Tahoma", "Arial", "Noto Sans", "Noto Naskh Arabic", "DejaVu Sans"]
+        .into_iter()
+        .filter(|family| fonts.has_family(family))
+        .take(3)
+        .map(str::to_owned)
+        .collect();
+    if families.is_empty() {
+        families.extend(fonts.families().into_iter().take(3));
+    }
+    let mut font_faces = Vec::new();
+    for family in families {
+        for style in fonts.styles(&family).into_iter().take(3) {
+            let face = fonts.face(&family, &style);
+            let missing: String =
+                "ABCabc0123456789أابتثجحخدذرزسشصضطظعغفقكلمنهويىة★☆●✓".chars().filter(|character| face.glyph_for(*character) == 0).collect();
+            font_faces.push(json!({"family":family,"style":style,"missingProbeCharacters":missing}));
+        }
+    }
     let mut objects = Vec::new();
     for (spread_index, spread) in doc.spreads.iter().enumerate() {
         for item in &spread.items {
@@ -1022,8 +1667,37 @@ fn compact_context(session: &Session) -> Result<Value, String> {
         }
     }
     Ok(
-        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
+        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
     )
+}
+
+fn corrected_design_context(session: &Session) -> Result<Value, String> {
+    let mut context = compact_context(session)?;
+    let doc = &session.doc().map_err(|e| e.to_string())?.doc;
+    let mut observations = Vec::new();
+    for (spread_index, spread) in doc.spreads.iter().enumerate() {
+        for item in &spread.items {
+            if observations.len() >= 48 {
+                break;
+            }
+            let typography=item.text_frame().and_then(|frame|doc.stories.get(&frame.story)).and_then(|story| {
+                let para=story.paras.first()?;
+                let (paragraph,base)=doc.styles.resolve_para(para);
+                let chars=doc.styles.resolve_char(&base,story.char_format_at(0));
+                Some(json!({"fontFamily":chars.font_family.chars().take(160).collect::<String>(),"fontStyle":chars.font_style.chars().take(80).collect::<String>(),"size":chars.size,"leading":chars.leading,"direction":paragraph.direction,"align":paragraph.align,"spaceBefore":paragraph.space_before,"spaceAfter":paragraph.space_after}))
+            });
+            let bounds = item.visible_bounds();
+            observations.push(json!({"spread":spread_index,"visibleBounds":[bounds.x0,bounds.y0,bounds.x1,bounds.y1],"fillSwatch":item.fill.swatch.chars().take(160).collect::<String>(),"fillTint":item.fill.tint,"strokeSwatch":item.stroke.swatch.chars().take(160).collect::<String>(),"strokeWeight":item.stroke.weight,"typography":typography}));
+        }
+        if observations.len() >= 48 {
+            break;
+        }
+    }
+    context["measuredDesignObservations"] = json!(observations);
+    context["designObservationScope"] = json!(
+        "At most 48 top-level items; first text paragraph/run only; values resolved from actual native styles. Not full-document coverage or inferred before-state."
+    );
+    Ok(context)
 }
 fn read_json(access: &std::sync::Arc<file_access::AutomationRoots>, path: &Path, max: u64) -> Result<Option<Value>, String> {
     access.check(path, file_access::Access::Read)?;
@@ -1046,6 +1720,373 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Context bounding is a pure transformation of a pinned snapshot. Load the
+    // verified draft data without activating/rendering a bilingual sample: font
+    // availability and system-font initialization order belong to sample tests.
+    fn native_style_context_fixture() -> SkillSnapshot {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let id = "early-years-clear-style";
+        let card = runner.snapshot.skills.iter().find(|card| card.id == id).unwrap();
+        let record = runner.registry.revision(id, &card.revision).unwrap();
+        let files = runner.registry.review_files(id, &card.revision).unwrap();
+        SkillSnapshot {
+            skill_id: id.into(),
+            revision: card.revision.clone(),
+            instructions: String::from_utf8(files.get("SKILL.md").unwrap().clone()).unwrap(),
+            references: Default::default(),
+            reference_hashes: Default::default(),
+            templates: runner.registry.review_templates(id, &card.revision).unwrap(),
+            design_profile: record.manifest.design_profile.clone(),
+        }
+    }
+
+    #[test]
+    fn new_document_context_and_publication_use_the_same_pinned_profile_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let card = runner.snapshot.skills.iter().find(|card| card.id == "early-years-clear-style").unwrap().clone();
+        let mut manifest = runner.registry.revision(&card.id, &card.revision).unwrap().manifest.clone();
+        let profile = manifest.design_profile.as_mut().unwrap();
+        profile.page_mm = [240.0, 320.0];
+        profile.margin_mm = 10.0;
+        let profile = profile.clone();
+        let mut files = runner.registry.review_files(&card.id, &card.revision).unwrap();
+        files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+        let pinned = runner.registry.import_files(files.clone(), Provenance::default()).unwrap();
+        // A later revision must never change the geometry of an in-flight task.
+        manifest.design_profile.as_mut().unwrap().page_mm = [250.0, 350.0];
+        files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+        runner.registry.import_files(files, Provenance::default()).unwrap();
+        let pins = vec![(pinned.skill_id.clone(), pinned.revision.clone())];
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let original = session.doc().unwrap().clone();
+        let target = TaskTarget::NewA4 { pages: 2 };
+        let (base, context) = task_document_context(&session, &target, Some(&profile)).unwrap();
+        assert!(!context.is_null());
+        let page = &base.doc.spreads[0].pages[0];
+        assert!((page.width - 240.0 * 72.0 / 25.4).abs() < 0.001);
+        assert!((page.height - 320.0 * 72.0 / 25.4).abs() < 0.001);
+        assert!((page.margins.top - 10.0 * 72.0 / 25.4).abs() < 0.001);
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.doc().unwrap().doc));
+        let task = TaskRequest {
+            prompt: "Create a native document in the selected print geometry".into(),
+            target,
+            settings: Default::default(),
+            skill_ids: vec![pinned.skill_id],
+            auto_select_skills: false,
+            export_directory: None,
+        };
+        let mut report = TaskReport {
+            design_style: None,
+            id: "pinned-print-geometry".into(),
+            status: String::new(),
+            title: String::new(),
+            provider: ProviderKind::Ollama,
+            model: "synthetic-local".into(),
+            settings: None,
+            skills: pins,
+            usage: Default::default(),
+            elapsed_ms: 0,
+            actions: 0,
+            issues: vec![],
+            artifacts: vec![],
+            message: String::new(),
+        };
+        let plan = ProductionPlan {
+            title: "Native print geometry".into(),
+            commands: vec![designcraft_ai_types::EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread":0,"rect":[50,50,100,100],"content":"unassigned"}),
+            }],
+            images: vec![],
+        };
+        runner.publish(&mut session, &Some(task), None, worker::Product::Plan(plan), &mut report).unwrap();
+        let published = session.doc().unwrap();
+        crate::design::check_geometry(None, published, &profile).unwrap();
+        let page = &published.doc.spreads[0].pages[0];
+        assert!((page.margins.top - 10.0 * 72.0 / 25.4).abs() < 0.001);
+        assert_eq!(session.documents().len(), 2);
+        session.execute("file.activate", &json!({"index":0})).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.doc().unwrap().doc));
+        assert!(runner.pinned_document_params(&[("missing".into(), "missing".into())], 1).is_err());
+    }
+
+    #[test]
+    fn template_tasks_keep_skill_guidance_without_loading_unused_command_examples() {
+        let style = native_style_context_fixture();
+        assert!(crate::template_plan::eligible(&style));
+        let mut guidance = style.clone();
+        guidance.skill_id = "large-native-guidance".into();
+        guidance.design_profile = None;
+        guidance.instructions = "Preserve actual educational guidance".into();
+        guidance.references.insert("references/rules.md".into(), "Use short independent activities".into());
+        guidance.templates = std::collections::BTreeMap::from([(
+            "templates/example.json".into(),
+            vec![designcraft_ai_types::EngineAction { command: "frame.create".into(), params: json!({"text":"x".repeat(65 * 1024)}) }],
+        )]);
+        let originals = vec![guidance.clone(), style.clone()];
+        let command_plan = bounded_task_skills(originals.clone(), &TaskTarget::CurrentDocument).unwrap();
+        assert!(command_plan[0].templates.is_empty(), "Oversized optional examples must not exclude actual guidance");
+        let command_plan = bounded_task_skills(vec![guidance.clone()], &TaskTarget::ContinueBook).unwrap();
+        assert!(command_plan[0].templates.is_empty());
+        for target in [TaskTarget::ContinueBook, TaskTarget::NewA4 { pages: 48 }] {
+            let bounded = bounded_task_skills(originals.clone(), &target).unwrap();
+            assert!(bounded[0].templates.is_empty());
+            assert_eq!(bounded[0].instructions, guidance.instructions);
+            assert_eq!(bounded[0].references, guidance.references);
+            assert_eq!(bounded[0].revision, guidance.revision);
+            assert_eq!(bounded[0].reference_hashes, guidance.reference_hashes);
+            assert_eq!(serde_json::to_value(&bounded[1]).unwrap(), serde_json::to_value(&style).unwrap());
+        }
+        guidance.instructions = "x".repeat(65 * 1024);
+        assert!(bounded_task_skills(vec![guidance, style], &TaskTarget::ContinueBook).is_err(), "The context guard still limits actual guidance");
+    }
+
+    #[test]
+    fn bounded_skill_context_keeps_guidance_pins_small_examples_and_executable_profiles() {
+        let mut guidance = SkillSnapshot {
+            skill_id: "kg-guidance".into(),
+            revision: "immutable-revision".into(),
+            instructions: "Keep Arabic copy exactly: تَصْمِيم صَفَحَات".into(),
+            references: std::collections::BTreeMap::from([("references/layout.md".into(), "Exact safe-area guidance".into())]),
+            reference_hashes: std::collections::BTreeMap::from([("references/layout.md".into(), "pinned-sha256".into())]),
+            templates: std::collections::BTreeMap::from([
+                (
+                    "templates/oversized.json".into(),
+                    vec![EngineAction { command: "frame.create".into(), params: json!({"text":"x".repeat(111_399)}) }],
+                ),
+                ("templates/small.json".into(), vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[54,54,100,100]}) }]),
+            ]),
+            design_profile: None,
+        };
+        let original = guidance.clone();
+        let bounded = bounded_task_skills(vec![guidance.clone()], &TaskTarget::CurrentDocument).unwrap();
+        assert!(!bounded[0].templates.contains_key("templates/oversized.json"));
+        assert_eq!(
+            serde_json::to_value(&bounded[0].templates["templates/small.json"]).unwrap(),
+            serde_json::to_value(&original.templates["templates/small.json"]).unwrap()
+        );
+        guidance.templates.remove("templates/oversized.json");
+        assert_eq!(serde_json::to_value(&bounded[0]).unwrap(), serde_json::to_value(&guidance).unwrap());
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= 64 * 1024);
+        assert_eq!(
+            serde_json::to_value(&bounded_task_skills(vec![guidance.clone()], &TaskTarget::CurrentDocument).unwrap()[0]).unwrap(),
+            serde_json::to_value(&guidance).unwrap()
+        );
+        guidance.references.insert("references/oversized.md".into(), "x".repeat(65 * 1024));
+        assert!(
+            bounded_task_skills(vec![guidance], &TaskTarget::CurrentDocument).is_err(),
+            "Actual reference guidance must never be silently truncated"
+        );
+
+        let mut executable = native_style_context_fixture();
+        executable.templates.insert("templates/required.json".into(), original.templates["templates/oversized.json"].clone());
+        assert!(
+            bounded_task_skills(vec![executable], &TaskTarget::CurrentDocument).is_err(),
+            "Command planners must retain executable profile templates"
+        );
+    }
+
+    #[test]
+    fn compiler_context_bounds_guidance_and_profile_rules_without_sending_native_templates() {
+        let mut executable = native_style_context_fixture();
+        let valid_actions = executable.templates.values().max_by_key(|actions| actions.len()).unwrap().clone();
+        for index in 0..12 {
+            executable.templates.insert(format!("templates/valid-copy-{index}.json"), valid_actions.clone());
+        }
+        assert!(task_skill_context_bytes(std::slice::from_ref(&executable)).unwrap() > 64 * 1024);
+        assert!(bounded_task_skills(vec![executable.clone()], &TaskTarget::CurrentDocument).is_err());
+        for target in [TaskTarget::ContinueBook, TaskTarget::NewA4 { pages: 48 }] {
+            let bounded = bounded_task_skills(vec![executable.clone()], &target).unwrap();
+            assert_eq!(
+                serde_json::to_value(&bounded[0]).unwrap(),
+                serde_json::to_value(&executable).unwrap(),
+                "Compiler templates remain immutable local inputs"
+            );
+        }
+        let mut oversized = executable.clone();
+        oversized.instructions = "x".repeat(33 * 1024);
+        assert!(bounded_task_skills(vec![oversized], &TaskTarget::NewA4 { pages: 1 }).is_err());
+        executable.design_profile.as_mut().unwrap().layout.push("x".repeat(33 * 1024));
+        assert!(bounded_task_skills(vec![executable], &TaskTarget::ContinueBook).is_err());
+    }
+
+    #[test]
+    fn corrected_design_context_uses_resolved_native_type_and_color_values() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        session.execute("frame.create", &json!({"rect":[60,60,400,120],"content":"text","text":"Native sample","caret":false})).unwrap();
+        session
+            .execute("type.char", &json!({"attrs":{"fontFamily":"Tahoma","fontStyle":"Regular","size":21,"leading":{"kind":"points","value":30}}}))
+            .unwrap();
+        session.execute("type.para", &json!({"attrs":{"align":"right","direction":"rightToLeft"}})).unwrap();
+        session.execute("object.fill", &json!({"swatch":"C=100 M=0 Y=0 K=0"})).unwrap();
+        let context = corrected_design_context(&session).unwrap();
+        let observed = &context["measuredDesignObservations"][0];
+        assert_eq!(observed["typography"]["fontFamily"], "Tahoma");
+        assert_eq!(observed["typography"]["size"].as_f64(), Some(21.0));
+        assert_eq!(observed["typography"]["align"], "right");
+        assert_eq!(observed["fillSwatch"], "C=100 M=0 Y=0 K=0");
+        assert!(context["swatchNames"].as_array().unwrap().iter().any(|v| v == "[Black]"));
+    }
+
+    #[test]
+    fn design_style_corrections_pin_revisions_preserve_rollback_and_reject_failed_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let original = runner.registry.catalog("").into_iter().flat_map(|e| e.revisions).find(|r| r.manifest.design_profile.is_some()).unwrap();
+        for entry in runner.registry.catalog("") {
+            runner.registry.set_enabled(&entry.skill_id, entry.skill_id == original.skill_id).unwrap();
+        }
+        let mut files = runner.registry.review_files(&original.skill_id, &original.revision).unwrap();
+        let mut manifest = original.manifest;
+        manifest.required_commands = vec!["frame.create".into()];
+        for family in &mut manifest.design_profile.as_mut().unwrap().page_families {
+            family.text_slots.clear();
+        }
+        files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+        for path in &manifest.templates {
+            files.insert(path.clone(), serde_json::to_vec(&json!([{"command":"frame.create","params":{"rect":[60,60,120,120]}}])).unwrap());
+        }
+        let record = runner.registry.import_files(files.clone(), Provenance::default()).unwrap();
+        let mut session = Session::new();
+        let selected = runner.prepare_skills_for_style(&session, "kindergarten", None).unwrap();
+        assert_eq!(selected.as_slice(), std::slice::from_ref(&record.skill_id));
+        let pinned = runner.registry.snapshot(&record.skill_id, &[]).unwrap();
+        runner
+            .dispatch(
+                &mut session,
+                AiRequest::AddDesignCorrection {
+                    id: record.skill_id.clone(),
+                    revision: record.revision.clone(),
+                    correction: designcraft_ai_types::DesignCorrection {
+                        before: "Crowded layout".into(),
+                        after: "Two aligned tasks with answer space".into(),
+                        reason: "Pencil room".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(runner.registry.snapshot(&record.skill_id, &[]).unwrap().revision, record.revision);
+        runner.prepare_style(&session, &record.skill_id).unwrap();
+        let revised = runner.registry.snapshot(&record.skill_id, &[]).unwrap();
+        assert_ne!(revised.revision, pinned.revision);
+        assert_eq!(revised.design_profile.unwrap().corrections.len(), pinned.design_profile.as_ref().unwrap().corrections.len() + 1);
+        assert_eq!(pinned.revision, record.revision);
+        runner.registry.rollback(&record.skill_id, &record.revision).unwrap();
+        runner.prepare_style(&session, &record.skill_id).unwrap();
+        assert_eq!(runner.registry.snapshot(&record.skill_id, &[]).unwrap().revision, record.revision);
+        // An invalid native template cannot replace the active style or break later tasks.
+        files.insert(manifest.templates[0].clone(), serde_json::to_vec(&json!([{"command":"frame.create","params":{"rect":[0,0,10,10]}}])).unwrap());
+        let broken = runner.registry.import_files(files, Provenance::default()).unwrap();
+        runner.prepare_style(&session, &record.skill_id).unwrap();
+        assert_eq!(runner.registry.snapshot(&record.skill_id, &[]).unwrap().revision, record.revision);
+        assert_eq!(runner.registry.revision(&record.skill_id, &broken.revision).unwrap().status, RevisionStatus::Draft);
+        assert!(runner.snapshot.reports.is_empty(), "Local style checks must not call a provider");
+        runner.registry.set_enabled(&record.skill_id, false).unwrap();
+        assert!(runner.prepare_style(&session, &record.skill_id).is_err());
+    }
+
+    #[test]
+    fn planning_context_reports_measured_font_glyph_coverage() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let context = compact_context(&session).unwrap();
+        let faces = context["fontFaces"].as_array().unwrap();
+        assert!(!faces.is_empty() && faces.len() <= 9);
+        let fonts = designcraft_fonts::FontDb::global().scoped(session.doc().unwrap().doc.font_scope);
+        for value in faces {
+            let face = fonts.face(value["family"].as_str().unwrap(), value["style"].as_str().unwrap());
+            assert_eq!(value["missingProbeCharacters"].as_str().unwrap().contains('★'), face.glyph_for('★') == 0);
+        }
+    }
+
+    #[test]
+    fn automatic_skills_validate_real_samples_without_human_approval_or_provider_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        for entry in runner.registry.catalog("") {
+            runner.registry.set_enabled(&entry.skill_id, false).unwrap();
+        }
+        let session = Session::new();
+        let manifest = json!({"schema_version":1,"skill_id":"automatic-fixture","required_commands":["frame.create"],
+            "templates":["templates/sample.json"],"sample_template":"templates/sample.json"});
+        let files = designcraft_ai_skills::PackageFiles::from([
+            (
+                "SKILL.md".into(),
+                b"---\nname: automatic-fixture\ndescription: fixture automatic layout\n---\nUse editable native elements.\n".to_vec(),
+            ),
+            ("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap()),
+            (
+                "templates/sample.json".into(),
+                serde_json::to_vec(&json!([
+                    {"command":"frame.create","params":{"rect":[54,54,120,120],"content":"unassigned"}}
+                ]))
+                .unwrap(),
+            ),
+        ]);
+        let revision = runner.registry.import_files(files.clone(), Provenance::default()).unwrap();
+        let reports = runner.snapshot.reports.len();
+        let ids = runner.prepare_automatic_skills(&session, "fixture layout").unwrap();
+        assert!(ids.contains(&revision.skill_id));
+        let pinned = runner.registry.snapshot(&revision.skill_id, &[]).unwrap();
+        let record = runner.registry.revision(&revision.skill_id, &revision.revision).unwrap();
+        assert!(record.approval.as_ref().unwrap().automatic);
+        runner.dispatch(&mut Session::new(), AiRequest::ApproveSkill { id: revision.skill_id.clone(), revision: revision.revision.clone() }).unwrap();
+        assert!(
+            !runner.registry.revision(&revision.skill_id, &revision.revision).unwrap().approval.as_ref().unwrap().automatic,
+            "a subsequent explicit human review must remain possible"
+        );
+        assert_eq!(runner.snapshot.reports.len(), reports, "local validation must not call a provider");
+        assert!(session.documents().is_empty(), "samples must not alter the user's document");
+        runner.registry.set_enabled(&revision.skill_id, false).unwrap();
+        assert!(!runner.prepare_automatic_skills(&session, "fixture layout").unwrap().contains(&revision.skill_id));
+        runner.registry.set_enabled(&revision.skill_id, true).unwrap();
+        let mut broken = files;
+        broken.insert(
+            "templates/sample.json".into(),
+            serde_json::to_vec(&json!([
+                {"command":"frame.create","params":{"rect":"bad rectangle"}}
+            ]))
+            .unwrap(),
+        );
+        let rejected = runner.registry.import_files(broken, Provenance::default()).unwrap();
+        assert!(runner.prepare_automatic_skills(&session, "fixture layout").unwrap().contains(&revision.skill_id));
+        assert_eq!(runner.snapshot.skill_warnings.len(), 1);
+        assert_eq!(runner.registry.snapshot(&revision.skill_id, &[]).unwrap().revision, pinned.revision);
+        assert_eq!(runner.registry.revision(&revision.skill_id, &rejected.revision).unwrap().status, RevisionStatus::Draft);
+        // A broken imported skill with no approved revision must not block the
+        // valid skill, acquire activation evidence, or alter the live document.
+        let bad_manifest = json!({"schema_version":1,"skill_id":"broken-fixture","required_commands":["frame.create"],
+            "templates":["templates/sample.json"],"sample_template":"templates/sample.json"});
+        let bad = runner
+            .registry
+            .import_files(
+                designcraft_ai_skills::PackageFiles::from([
+                    ("SKILL.md".into(), b"---\nname: broken-fixture\ndescription: fixture layout\n---\nNative sample.\n".to_vec()),
+                    ("designcraft.json".into(), serde_json::to_vec(&bad_manifest).unwrap()),
+                    (
+                        "templates/sample.json".into(),
+                        serde_json::to_vec(&json!([
+                            {"command":"frame.create","params":{"rect":"bad rectangle"}}
+                        ]))
+                        .unwrap(),
+                    ),
+                ]),
+                Provenance::default(),
+            )
+            .unwrap();
+        let selected = runner.prepare_automatic_skills(&session, "fixture layout").unwrap();
+        assert!(selected.contains(&revision.skill_id));
+        assert!(!selected.contains(&bad.skill_id));
+        assert_eq!(runner.snapshot.skill_warnings.len(), 2);
+        assert!(runner.registry.revision(&bad.skill_id, &bad.revision).unwrap().approval.is_none());
+        assert!(session.documents().is_empty());
+        assert_eq!(runner.snapshot.reports.len(), reports);
+    }
 
     #[test]
     fn new_document_publication_preserves_active_ime_before_any_side_effect() {
@@ -1075,6 +2116,7 @@ mod tests {
             images: vec![],
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "ime-publication".into(),
             status: String::new(),
             title: String::new(),
@@ -1166,6 +2208,7 @@ mod tests {
             images: vec![],
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "profile-escape".into(),
             status: String::new(),
             title: String::new(),
@@ -1218,7 +2261,12 @@ mod tests {
         let requests = [
             AiRequest::ImportSkill { path: outside_path.clone() },
             AiRequest::ExportSkill { id: "missing".into(), revision: "missing".into(), path: outside_path.clone() },
-            AiRequest::GenerateSkill { prompt: "Review reference".into(), reference_paths: vec![outside_path.clone()], settings: Default::default() },
+            AiRequest::GenerateSkill {
+                design_style: false,
+                prompt: "Review reference".into(),
+                reference_paths: vec![outside_path.clone()],
+                settings: Default::default(),
+            },
             AiRequest::CreateScienceSample { directory: outside_path.clone() },
             AiRequest::ExportDocument { path: outside_path.clone(), pdf: false },
             AiRequest::Start(TaskRequest {
@@ -1237,7 +2285,7 @@ mod tests {
             assert!(runner.pending.is_none());
             assert!(session.documents().is_empty());
             assert!(!Path::new(&outside_path).exists());
-            assert_eq!(snapshot.skills.len(), 4);
+            assert_eq!(snapshot.skills.len(), 9);
         }
     }
 
@@ -1262,6 +2310,7 @@ mod tests {
         // Exercise the launch boundary directly: completion must recheck paths even if
         // an upstream validation is missing or a destination changed while generating.
         let work = worker::Work::Skill {
+            design_style: false,
             prompt: String::new(),
             reference_paths: vec![],
             context: None,
@@ -1475,7 +2524,7 @@ mod tests {
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         let snapshot = runner.handle(&mut session, AiRequest::Poll);
-        assert_eq!(snapshot.skills.len(), 4);
+        assert_eq!(snapshot.skills.len(), 9);
         assert!(snapshot.skills.iter().all(|s| !s.approved));
         let skill = &snapshot.skills[0];
         let denied = runner.handle(&mut session, AiRequest::ApproveSkill { id: skill.id.clone(), revision: skill.revision.clone() });
@@ -1491,6 +2540,7 @@ mod tests {
                 templates.push("templates/alternative.json".into());
             }
             let manifest = designcraft_ai_skills::NativeManifest {
+                design_profile: None,
                 schema_version: 1,
                 skill_id: "approval-variants".into(),
                 required_commands: vec!["frame.create".into(), "object.label".into()],
@@ -1682,6 +2732,170 @@ mod tests {
     }
 
     #[test]
+    fn skill_relevance_counts_distinct_meaningful_terms_and_normalizes_only_search_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entry = runner.registry.catalog("school-print-preflight").remove(0);
+        entry.skill_id = "search-fixture".into();
+        entry.name = "fixture".into();
+        entry.description = "layout picture typography تصميم صفحات and the with".into();
+        assert_eq!(skill_match_score("layout picture", &entry), skill_match_score(&"layout picture ".repeat(100), &entry));
+        assert_eq!(skill_match_score("and the with", &entry), 0, "Common instruction words are not evidence of relevance");
+        assert_eq!(skill_match_score("تَصْمِيم صَفَحَات", &entry), skill_match_score("تصميم صفحات", &entry));
+        assert!(skill_match_score("تَصْمِيم صَفَحَات", &entry) > 0);
+        entry.description = "تَصْمِيم صَفَحَات".into();
+        assert!(skill_match_score("تصميم صفحات", &entry) > 0, "Search normalization must cover catalog text too");
+    }
+
+    #[test]
+    fn curriculum_studio_routes_to_books_without_claiming_unrelated_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entry = runner.registry.catalog("school-print-preflight").remove(0);
+        entry.skill_id = "curriculum-print-design-studio".into();
+        entry.name = "Curriculum studio".into();
+        entry.description = "Subject progression and page production".into();
+        entry.revisions[0].status = RevisionStatus::Approved;
+        entry.active_revision = Some(entry.revisions[0].revision.clone());
+        for prompt in ["كتيب علوم 48 صفحة للأطفال", "Create a 48 page science curriculum workbook"] {
+            assert_eq!(choose_compatible_skills(prompt, vec![entry.clone()], &supported_commands()), vec![entry.skill_id.clone()]);
+        }
+        assert!(choose_compatible_skills("Create a business invoice", vec![entry], &supported_commands()).is_empty());
+    }
+
+    #[test]
+    fn automatic_curriculum_routing_retains_native_arabic_print_and_visual_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entries =
+            runner.registry.catalog("").into_iter().filter(|entry| entry.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed = entries[0].clone();
+        for (id, description) in [
+            (
+                "kg-cognitive-sensory-layout",
+                "Unit opener, vocabulary flashcards and 4-panel story grid. تخطيط صفحات الوحدات والبطاقات المصورة والشبكة القصصية",
+            ),
+            ("kg-school-print-prepress", "Workbook architecture, word banks and school print preflight. هندسة كراس الأنشطة المدرسي"),
+        ] {
+            let mut entry = seed.clone();
+            entry.skill_id = id.into();
+            entry.name = id.into();
+            entry.description = description.into();
+            entries.push(entry);
+        }
+        for index in 0..8 {
+            let mut distractor = seed.clone();
+            distractor.skill_id = format!("distractor-{index}");
+            distractor.name = distractor.skill_id.clone();
+            distractor.description = "واقعي كامل مستقل توليدي متنوع دقيق واضح جذاب مناسب منظم متكامل أصلي".into();
+            entries.push(distractor);
+        }
+        for entry in &mut entries {
+            entry.enabled = true;
+            let record = entry.revisions.first_mut().unwrap();
+            record.status = RevisionStatus::Approved;
+            entry.active_revision = Some(record.revision.clone());
+        }
+        let brief = "صمم منهج علوم مصور للأطفال بعمر 5-6 سنوات مع صور ورسوم متنوعة للطباعة A4. ";
+        let repeated = "واقعي كامل مستقل توليدي متنوع دقيق واضح جذاب مناسب منظم متكامل أصلي ".repeat(60);
+        let selected = choose_compatible_skills(&format!("{brief}{repeated}"), entries.clone(), &supported_commands());
+        for id in [
+            "native-engine-workflow",
+            "arabic-english-typography",
+            "school-print-preflight",
+            "kg-cognitive-sensory-layout",
+            "native-design-composition",
+            "kg-school-print-prepress",
+        ] {
+            assert!(selected.iter().any(|selected| selected == id), "Missing {id} in {selected:?}");
+        }
+        assert_eq!(selected.len(), 6);
+        let unrelated = choose_compatible_skills("Create a business invoice", entries, &supported_commands());
+        assert!(!unrelated.iter().any(|id| id.starts_with("kg-")), "KG skills require a matching educational brief");
+    }
+
+    #[test]
+    fn automatic_kg_routing_follows_the_educational_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entries =
+            runner.registry.catalog("").into_iter().filter(|entry| entry.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed = entries[0].clone();
+        for (id, description) in [
+            ("kg-cognitive-sensory-layout", "Unit opener, vocabulary cards and story grids"),
+            ("kg-cambridge-thinking-cpa", "Grammar puzzle pieces and sensory mathematics"),
+            ("kg-oxford-phonics-handwriting", "Phonics letter maze and handwriting rows"),
+            ("kg-oxford-skills-time", "Integrated reading listening speaking writing"),
+            ("kg-oxford-fluency-time", "Everyday conversation and hands-on craft project"),
+            ("kg-sensory-illustration-vector", "Colour song, sensory art and rainbow illustration"),
+            ("kg-school-print-prepress", "Workbook picture crosswords and school print preflight"),
+            ("kg-garnet-ict-computing", "Garnet, Oxford and Cambridge international ICT and computing systems lab"),
+            (
+                "kg-international-curriculum-architect",
+                "International curriculum authoring, units, chapters, scope and sequence, and spiral mental chain",
+            ),
+        ] {
+            let mut entry = seed.clone();
+            entry.skill_id = id.into();
+            entry.name = id.into();
+            entry.description = description.into();
+            entries.push(entry);
+        }
+        for entry in &mut entries {
+            let record = entry.revisions.first_mut().unwrap();
+            record.status = RevisionStatus::Approved;
+            entry.active_revision = Some(record.revision.clone());
+        }
+        for (prompt, expected) in [
+            ("منهج رياضيات للأطفال لتعليم العد ومقارنة الكميات والتفكير المحسوس", "kg-cambridge-thinking-cpa"),
+            ("اريد منهج دولي لمادةmath", "kg-cambridge-thinking-cpa"),
+            ("منهج للأطفال عن الحروف والأصوات وتدريب خط اليد", "kg-oxford-phonics-handwriting"),
+            ("منهج أطفال لدمج القراءة والاستماع والتحدث والكتابة", "kg-oxford-skills-time"),
+            ("منهج للأطفال بمشروع يدوي ومحادثة يومية", "kg-oxford-fluency-time"),
+            ("منهج أطفال للألوان والفن والرسم وقوس قزح", "kg-sensory-illustration-vector"),
+            ("كراس أنشطة للأطفال مع شبكة كلمات متقاطعة وتجهيز المطبعة", "kg-school-print-prepress"),
+            ("صمم منهج علوم مصور للأطفال مع بطاقات وقصة مصورة", "kg-cognitive-sensory-layout"),
+            ("إنشاء منهج دولي متكامل في مادة الحاسوب بأسلوب أكسفورد وكامبريدج وكارنيت", "kg-garnet-ict-computing"),
+            ("خوارزمية ومهارة كتابة المنهج وإنشائه وتسلسله ووحداته وفصوله والربط السلسلي الذهني", "kg-international-curriculum-architect"),
+        ] {
+            let selected = choose_compatible_skills(prompt, entries.clone(), &supported_commands());
+            assert_eq!(selected.iter().find(|id| id.starts_with("kg-")).map(String::as_str), Some(expected), "{prompt}: {selected:?}");
+        }
+        let math_selected = choose_compatible_skills("اريد منهج دولي لمادةmath", entries, &supported_commands());
+        assert!(math_selected.iter().any(|id| id == "kg-international-curriculum-architect"), "{math_selected:?}");
+    }
+
+    #[test]
+    fn automatic_arabic_book_brief_selects_kg_layout_and_editorial_variety() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut entries =
+            runner.registry.catalog("").into_iter().filter(|entry| entry.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed = entries[0].clone();
+        for (id, description) in [
+            ("kg-cognitive-sensory-layout", "Unit opener, vocabulary cards and story grids"),
+            ("native-editorial-variety", "Choose different editable page compositions"),
+        ] {
+            let mut entry = seed.clone();
+            entry.skill_id = id.into();
+            entry.name = id.into();
+            entry.description = description.into();
+            entries.push(entry);
+        }
+        for entry in &mut entries {
+            let record = entry.revisions.first_mut().unwrap();
+            record.status = RevisionStatus::Approved;
+            entry.active_revision = Some(record.revision.clone());
+        }
+        let selected = choose_compatible_skills("كتيب علوم متنوع للأطفال48صفحةA4", entries.clone(), &supported_commands());
+        for expected in ["kg-cognitive-sensory-layout", "native-editorial-variety", "native-design-composition"] {
+            assert!(selected.iter().any(|id| id == expected), "Missing {expected}: {selected:?}");
+        }
+        let unrelated = choose_compatible_skills("Create a business invoice", entries, &supported_commands());
+        assert!(!unrelated.iter().any(|id| id == "native-editorial-variety" || id.starts_with("kg-")));
+    }
+
+    #[test]
     fn runtime_selects_every_supported_text_reference_including_third_and_fourth_files() {
         let dir = tempfile::tempdir().unwrap();
         let runner = ProductionRunner::open(dir.path()).unwrap();
@@ -1746,6 +2960,7 @@ mod tests {
             images: Vec::new(),
         };
         let mut report = TaskReport {
+            design_style: None,
             id: "test".into(),
             status: String::new(),
             title: String::new(),

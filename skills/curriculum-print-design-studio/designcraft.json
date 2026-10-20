@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "skill_id": "curriculum-print-design-studio",
+  "required_commands": [
+    "frame.create",
+    "line.create",
+    "object.fill",
+    "object.label",
+    "object.stroke",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/subject-blueprints.md",
+    "references/prepress-and-grid-specs.md",
+    "references/native-production-contract.md"
+  ],
+  "templates": [
+    "templates/sequence.json",
+    "templates/journal.json"
+  ],
+  "sample_template": "templates/sequence.json",
+  "external_tools": [],
+  "compatibility_notes": "Native adaptation of the user-supplied curriculum studio. Editable native samples, local automatic matching, selected profile authority and human batch proof. No external scripts, mockup-only pages or unverified print/curriculum certifications."
+}

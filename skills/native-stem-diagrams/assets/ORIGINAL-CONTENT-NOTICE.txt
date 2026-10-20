@@ -1,0 +1,6 @@
+Original local DesignCraft guidance and geometric sample.
+Related repository: https://github.com/liangdabiao/stem-illustration-skill
+Inspected commit: 80bc2bb1919db51f3afe67cd5921ccdfc850e733
+No clear license: no license file in the pinned tree; GitHub API license was null.
+The upstream skill is not installed or adopted. No upstream wording, code, README or templates are bundled.
+This notice records the packaging decision and makes no broader legal claim.

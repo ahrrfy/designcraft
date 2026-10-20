@@ -1,0 +1,1 @@
+Native adaptation of syi0808/svg-skills@c5937c2bed48aff98c12cda43ccba2ed6f2880f0/illustration-plan/SKILL.md. Upstream MIT notice retained. Original native sample, not copied artwork. Upstream scripts and dependencies are not executed or installed.

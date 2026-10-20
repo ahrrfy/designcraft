@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "skill_id": "kg-oxford-fluency-time",
+  "required_commands": [
+    "frame.create",
+    "line.create",
+    "object.fill",
+    "object.group",
+    "object.label",
+    "object.stroke",
+    "path.create",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/native-guide.md"
+  ],
+  "templates": [
+    "templates/sample.json"
+  ],
+  "sample_template": "templates/sample.json",
+  "external_tools": [],
+  "compatibility_notes": "Original native-only portable sample. For generated images use a validated design profile and host-owned image placements. Technical activation is separate from human batch proof."
+}

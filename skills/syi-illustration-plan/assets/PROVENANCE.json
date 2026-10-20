@@ -1,0 +1,12 @@
+{
+  "skill_id": "syi-illustration-plan",
+  "source": {
+    "repo": "syi0808/svg-skills",
+    "commit": "c5937c2bed48aff98c12cda43ccba2ed6f2880f0",
+    "path": "illustration-plan/SKILL.md",
+    "url": "https://github.com/syi0808/svg-skills/blob/c5937c2bed48aff98c12cda43ccba2ed6f2880f0/illustration-plan/SKILL.md"
+  },
+  "license": "MIT",
+  "adaptation": "Native DesignCraft instructions and original sample; external runtime steps replaced by engine commands.",
+  "upstream_sha256": "3272cbc509ebd0f24b55fc426e7b3e124df495fc5073ef10ca1b8ff6f0ce2251"
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "skill_id": "cell-image-native",
+  "required_commands": [
+    "frame.create",
+    "line.create",
+    "object.fill",
+    "object.label",
+    "object.stroke",
+    "path.create",
+    "swatch.create",
+    "type.char",
+    "type.para"
+  ],
+  "references": [
+    "references/native-guide.md"
+  ],
+  "templates": [
+    "templates/sample.json"
+  ],
+  "sample_template": "templates/sample.json",
+  "external_tools": [],
+  "compatibility_notes": "Data-only native adaptation. Original scratch A4 sample uses Tahoma, editable geometry and explicit direction. Upstream runtimes are not installed. Native sample/preflight must pass before automatic activation. Source and license are preserved as non-prompt assets; no human proof approval is implied."
+}

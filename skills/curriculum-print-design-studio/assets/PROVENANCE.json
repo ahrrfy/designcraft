@@ -1,0 +1,10 @@
+{
+  "source": "User-supplied curriculum-print-design-studio folder",
+  "adaptation": "Original native integration and rewritten guidance",
+  "source_sha256": {
+    "references/prepress-and-grid-specs.md": "2df03fe7fb60766fafb4093d63512f416e2d03da96a954561d83f305b2bf8b20",
+    "references/subject-blueprints.md": "6ebc7c8ee64a94f6546c7efadec99f25a9ad60ccce202fe8d2a1bee9ff98d3e6",
+    "scripts/generate_curriculum_script.py": "04c9537889e6fdb7e89fcb7573cc4ffff992f3b02af9f2aca4532fea7a3483bb",
+    "SKILL.md": "86b468eb747106b5090e1e4a72edf49dc988f0649b5d186240e1bf602fc70e3d"
+  }
+}

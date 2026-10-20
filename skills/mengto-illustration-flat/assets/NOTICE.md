@@ -1,0 +1,1 @@
+Native adaptation of MengTo/Skills@398cd41c86ba42fbb30e944ae507f463648f08b7/agent-skills/illustration/illustration-flat/SKILL.md. Upstream MIT notice retained. Original native sample, not copied artwork. Upstream scripts and dependencies are not executed or installed.
