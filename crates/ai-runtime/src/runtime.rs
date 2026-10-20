@@ -4,7 +4,7 @@ use designcraft_ai_providers::{SecretString, validate_endpoint};
 use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry, SkillSnapshot};
 use designcraft_ai_types::protocol::*;
 use designcraft_ai_types::{EngineAction, ProviderKind};
-use designcraft_engine::{Prefs, Session, file_access};
+use designcraft_engine::{DocState, Prefs, Session, file_access};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -462,30 +462,15 @@ impl ProductionRunner {
         }
         let profile = snapshots.iter().find_map(|s| s.design_profile.as_ref());
         let (base, mut context) = task_document_context(session, &task.target, profile, &task.prompt, &task.settings)?;
-        context["_production_cache_root"] = json!(self.root.join("production-cache-v1"));
-        if task.settings.facing_pages {
-            context["facing_editorial_direction"] = json!({
-                "enabled":true,"rightToLeft":book_binding(&task.settings,&task.prompt),
-                "instruction":"Plan occasional visually connected facing pairs, like an educational magazine: shared thematic scene, aligned sections, related activities and a continuous restrained identity. Use chapter openers and selected learning sequences, not one repeated spread everywhere. Preserve each page's supplied lesson and printable copy. Keep critical text/answer areas clear of the binding gutter; headers/folios follow left/right positions. Coordinate with the adjacent supplied PAGE block; both pages retain independently editable native elements. Cover page 1 stands alone; reader pairs are pages 2–3, 4–5 and so on."
-            });
-        }
+        enrich_production_context(&mut context, &self.root, &base, &task)?;
         let print_contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
         if print_contract.is_some() && self.print_contracts.len() >= 1024 {
             return Err("Too many document print contracts in this application session; save open work and restart before creating another".into());
         }
-        if let Some(contract) = &print_contract {
-            context["production_print_contract"] = serde_json::to_value(contract).map_err(|e| e.to_string())?;
-            if !matches!(task.target, TaskTarget::NewA4 { .. })
-                && let Err(message) = contract.validate_existing(&base)
-            {
-                context["existing_document_print_notice"] =
-                    json!(format!("Preserve the opened document's actual geometry; requested final print settings differ: {message}"));
-            }
-        }
         if let TaskTarget::ContinueBook = task.target {
-            batch::continuation_progress(&base, profile)?;
+            batch::continuation_progress(&base, profile, &task.prompt)?;
         }
-        if !matches!(task.target, TaskTarget::CurrentDocument)
+        if matches!(task.target, TaskTarget::NewA4 { .. })
             && print_contract.is_none()
             && let Some(profile) = profile
         {
@@ -1897,6 +1882,31 @@ fn ensure_publication_idle(session: &Session) -> Result<(), String> {
     }
     Ok(())
 }
+/// Task environment is rebuilt for every explicit start, retry and approved
+/// group. It is host data, never authority recovered from a model response.
+fn enrich_production_context(context: &mut Value, root: &Path, base: &DocState, task: &TaskRequest) -> Result<(), String> {
+    let context = context.as_object_mut().ok_or("Invalid native production context")?;
+    context.insert("_production_cache_root".into(), json!(root.join("production-cache-v1")));
+    if task.settings.facing_pages {
+        context.insert("facing_editorial_direction".into(), json!({
+            "enabled":true,"rightToLeft":book_binding(&task.settings,&task.prompt),
+            "instruction":"Plan occasional visually connected facing pairs, like an educational magazine: shared thematic scene, aligned sections, related activities and a continuous restrained identity. Use chapter openers and selected learning sequences, not one repeated spread everywhere. Preserve each page's supplied lesson and printable copy. Keep critical text/answer areas clear of the binding gutter; headers/folios follow left/right positions. Coordinate with the adjacent supplied PAGE block; both pages retain independently editable native elements. Cover page 1 stands alone; reader pairs are pages 2–3, 4–5 and so on."
+        }));
+    }
+    if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+        context.insert("production_print_contract".into(), serde_json::to_value(&contract).map_err(|e| e.to_string())?);
+        if !matches!(task.target, TaskTarget::NewA4 { .. })
+            && let Err(message) = contract.validate_existing(base)
+        {
+            context.insert(
+                "existing_document_print_notice".into(),
+                json!(format!("Preserve the opened document's actual geometry; requested final print settings differ: {message}")),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn compact_context(session: &Session) -> Result<Value, String> {
     let state = session.doc().map_err(|e| e.to_string())?;
     let doc = &state.doc;

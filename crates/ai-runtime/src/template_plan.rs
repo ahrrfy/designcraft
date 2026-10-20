@@ -23,6 +23,10 @@ pub(crate) fn eligible(skill: &SkillSnapshot) -> bool {
         .is_some_and(|profile| !profile.page_families.is_empty() && profile.page_families.iter().all(|family| !family.text_slots.is_empty()))
 }
 
+fn has_unbound_counting_frame(template: &[EngineAction]) -> bool {
+    template.iter().any(|action| action.command == "object.label" && action.params.get("label").and_then(Value::as_str) == Some("part.cpa.tf.outer"))
+}
+
 fn profile(skill: &SkillSnapshot) -> Result<&DesignProfile, String> {
     let profile = skill.design_profile.as_ref().ok_or("A design profile is required for template content")?;
     profile.validate()?;
@@ -570,31 +574,48 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
         ),
     };
 
-    let declared_families: Vec<&str> = profile.page_families.iter().map(|f| f.id.as_str()).collect();
+    // A suggested family must be accepted by the same strict compiler. Fixed
+    // counter artwork remains unavailable until its quantities are bound safely.
+    let declared_families: Vec<&str> = profile
+        .page_families
+        .iter()
+        .filter(|family| skill.templates.get(&family.template).is_some_and(|template| !has_unbound_counting_frame(template)))
+        .map(|family| family.id.as_str())
+        .collect();
+    if declared_families.is_empty() {
+        return Err("No compilable native page families remain; unbound fixed counting artwork requires structured adaptive activities".into());
+    }
     let has_family = |id: &str| declared_families.contains(&id);
     let cover_family = ["international-curriculum-cover", "cover"].into_iter().find(|id| has_family(id));
     let scope_family = ["international-scope-sequence", "curriculum-map"].into_iter().find(|id| has_family(id));
+    let opener_family = declared_families.iter().copied().find(|id| *id == "observe-growth-sequence");
 
-    let mut body_cycle: Vec<&str> = preferred_cycle.iter().copied().filter(|id| has_family(id)).collect();
+    let mut body_cycle: Vec<&str> = preferred_cycle.iter().copied().filter(|id| has_family(id) && Some(*id) != opener_family).collect();
     for fam in &declared_families {
-        if Some(*fam) != cover_family && Some(*fam) != scope_family && !body_cycle.contains(fam) {
+        if Some(*fam) != cover_family && Some(*fam) != scope_family && Some(*fam) != opener_family && !body_cycle.contains(fam) {
             body_cycle.push(fam);
         }
     }
     if body_cycle.is_empty() {
-        body_cycle.clone_from(&declared_families);
+        body_cycle.extend(declared_families.iter().copied().filter(|family| Some(*family) != opener_family));
     }
 
     let eff_total = total_pages.max(end).max(1);
     let use_cover = eff_total >= 2 && cover_family.is_some();
     let use_scope = eff_total >= 4 && scope_family.is_some();
-    let body_start_page = u32::from(use_cover).saturating_add(u32::from(use_scope));
+    let use_opener = !use_cover && opener_family.is_some();
+    let body_start_page = u32::from(use_cover).saturating_add(u32::from(use_scope)).saturating_add(u32::from(use_opener));
     let body_pages_total = eff_total.saturating_sub(body_start_page).max(1);
+    if body_cycle.is_empty() && eff_total > body_start_page {
+        return Err("The selected profile has no compilable body family after its page-one opener".into());
+    }
 
     let mut scoped_page_plan = Vec::with_capacity(usize::try_from(scope.count).unwrap_or(0));
     for page in scope.start..end {
         let recommended_family = if page == 0 && use_cover {
             cover_family.unwrap_or("cover")
+        } else if page == 0 && use_opener {
+            opener_family.ok_or("The native page-one opener disappeared")?
         } else if page == 1 && use_scope {
             scope_family.unwrap_or("curriculum-map")
         } else if !body_cycle.is_empty() {
@@ -888,12 +909,7 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
             return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
         }
         let template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
-        if verify_math
-            && template.iter().any(|action| {
-                action.command == "object.label"
-                    && action.params.get("label").and_then(Value::as_str).is_some_and(|label| label == "part.cpa.tf.outer")
-            })
-        {
+        if verify_math && has_unbound_counting_frame(template) {
             return Err(format!(
                 "Page {} ({}): fixed counting-frame geometry and tokens are not bound to lesson quantities; use a structured activity in adaptive native planning",
                 u64::from(page_number) + 1,
@@ -933,7 +949,7 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
         for slot in &family.text_slots {
             let text = page.text.get(&slot.id).ok_or("Missing validated text slot")?;
             let has_arabic = text.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c) && c.is_alphabetic());
-            let latin_only = text.chars().any(|c| c.is_ascii_alphabetic()) && !text.chars().any(|c| c.is_alphabetic() && !c.is_ascii());
+            let latin_only = text.chars().any(|c| c.is_ascii_alphanumeric()) && !text.chars().any(|c| c.is_alphabetic() && !c.is_ascii());
             let target = offset.checked_add(slot.command).ok_or("Text slot target overflow")?;
             let char_idx = target.checked_add(1);
             let para_idx = target.checked_add(2);
@@ -1134,6 +1150,57 @@ mod tests {
     }
 
     #[test]
+    fn ai20_blueprint_never_recommends_compiler_rejected_unbound_counting_families() {
+        let mut style = skill();
+        let mut blocked = style.design_profile.as_ref().unwrap().page_families[0].clone();
+        blocked.id = "cambridge-cpa-grammar".into();
+        blocked.template = "templates/unbound.json".into();
+        let mut actions = style.templates["templates/practice.json"].clone();
+        actions.push(EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":"part.cpa.tf.outer"}) });
+        style.templates.insert(blocked.template.clone(), actions);
+        style.design_profile.as_mut().unwrap().page_families.push(blocked.clone());
+        let mut rejected = content();
+        rejected["pages"][0]["family"] = json!(blocked.id);
+        assert!(compile_value(&rejected, &style).unwrap_err().contains("structured activity"), "The strict compiler guard remains authoritative");
+        for subject in ["Mathematics", "Science", "Computer Science", "English grammar", "Integrated curriculum"] {
+            let blueprint = curriculum_blueprint(subject, &style, BatchScope { start: 0, count: 8 }, 8).unwrap();
+            assert!(
+                blueprint["scoped_page_plan"].as_array().unwrap().iter().all(|page| page["recommended_family"] != blocked.id),
+                "{subject} recommended a family that the same compiler rejects"
+            );
+        }
+        style.design_profile.as_mut().unwrap().page_families = vec![blocked];
+        assert!(
+            curriculum_blueprint("Science", &style, BatchScope { start: 0, count: 1 }, 1).is_err(),
+            "No compilable family must fail locally instead of recommending rejected artwork"
+        );
+    }
+
+    #[test]
+    fn ai20_science_growth_sequence_is_an_absolute_page_one_opener_not_a_repeating_body_family() {
+        let mut style = skill();
+        let original = style.design_profile.as_ref().unwrap().page_families[0].clone();
+        style.design_profile.as_mut().unwrap().page_families =
+            ["observe-growth-sequence", "discover-test-needs", "explore-plant-parts", "observe-record-change"]
+                .into_iter()
+                .map(|id| {
+                    let mut family = original.clone();
+                    family.id = id.into();
+                    family
+                })
+                .collect();
+        let full = curriculum_blueprint("Science", &style, BatchScope { start: 0, count: 8 }, 8).unwrap();
+        let pages = full["scoped_page_plan"].as_array().unwrap();
+        assert_eq!(pages[0]["recommended_family"], "observe-growth-sequence");
+        assert!(pages.iter().skip(1).all(|page| page["recommended_family"] != "observe-growth-sequence"), "The opener must not cycle onto page 5");
+        for pair in pages.windows(2) {
+            assert_ne!(pair[0]["recommended_family"], pair[1]["recommended_family"]);
+        }
+        let later = curriculum_blueprint("Science", &style, BatchScope { start: 4, count: 2 }, 8).unwrap();
+        assert_eq!(later["scoped_page_plan"], json!([pages[4].clone(), pages[5].clone()]), "Internal chunks must retain absolute-page sequencing");
+    }
+
+    #[test]
     fn compiler_incompatibility_and_guaranteed_overflow_are_rejected_before_content_generation() {
         let mut skill = skill();
         preflight(&skill, scope(), OutputMode::NativeOnly).unwrap();
@@ -1257,6 +1324,42 @@ mod tests {
         let latin = stories.values().find(|story| story.text == "Let's count!").unwrap();
         let native = serde_json::to_value(latin).unwrap();
         assert_eq!(native["paras"][0]["para"]["direction"], "leftToRight");
+    }
+
+    #[test]
+    fn ai20_numeric_equations_are_ltr_and_keep_center_in_both_template_formatting_paths() {
+        for adjacent in [true, false] {
+            for align in ["center", "centerJustified"] {
+                for equation in ["2 + 1 = 3", "10 - 4 = 6", "5 > 3", "20"] {
+                    let mut style = skill();
+                    let mut actions = vec![EngineAction {
+                        command: "frame.create".into(),
+                        params: json!({"content":"text","text":"Original","rect":[60,60,300,150],"caret":false}),
+                    }];
+                    if !adjacent {
+                        actions.push(EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":"equation"}) });
+                    }
+                    actions.push(EngineAction {
+                        command: "type.char".into(),
+                        params: json!({"attrs":{"size":16,"leading":{"kind":"points","value":23},"language":"ar"}}),
+                    });
+                    actions.push(EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":"rightToLeft","align":align}}) });
+                    *style.templates.get_mut("templates/practice.json").unwrap() = actions;
+                    let content =
+                        json!({"title":"Numeric direction","pages":[{"page":0,"family":"practice","text":{"heading":equation},"illustrations":[]}]});
+                    let plan = compile(&content.to_string(), &style, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
+                    let mut session = designcraft_engine::Session::new();
+                    session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+                    session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only"})).unwrap();
+                    let story = session.doc().unwrap().doc.stories.values().find(|story| story.text == equation).unwrap();
+                    let native = serde_json::to_value(story).unwrap();
+                    assert_eq!(native["paras"][0]["para"]["direction"], "leftToRight", "adjacent={adjacent}, {equation}");
+                    assert_eq!(native["paras"][0]["para"]["align"], align, "Centering must survive both formatting paths");
+                    assert_eq!(native["chars"][0]["over"]["size"].as_f64(), Some(16.0));
+                    assert_eq!(native["chars"][0]["over"]["leading"]["value"].as_f64(), Some(23.0));
+                }
+            }
+        }
     }
     #[test]
     fn compiler_preserves_authored_typography_instead_of_heuristic_shrinking() {

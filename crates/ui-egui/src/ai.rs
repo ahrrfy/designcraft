@@ -19,6 +19,8 @@ struct OpenDocument {
     uid: u64,
     path: Option<String>,
     title: String,
+    facing_pages: bool,
+    right_to_left_binding: bool,
     pages: usize,
     remaining_pages: usize,
     continuable: bool,
@@ -32,6 +34,8 @@ impl OpenDocument {
             uid: document.uid,
             path: document.path.clone(),
             title: document.title(),
+            facing_pages: document.doc.settings.facing_pages,
+            right_to_left_binding: document.doc.settings.right_to_left_binding,
             pages,
             remaining_pages: first_blank.map_or(0, |first| pages.saturating_sub(first)),
             continuable: first_blank.is_some_and(|first| first > 0 && (first..pages).all(|page| !document.doc.page_has_items(page))),
@@ -41,6 +45,7 @@ impl OpenDocument {
 
 struct RequestEstimate {
     review_pages: u32,
+    scripted: bool,
     image_allowance: u32,
     vision_allowance: u32,
 }
@@ -254,6 +259,7 @@ pub struct AiUiState {
     directory: String,
     import_path: String,
     export_path: String,
+    skill_export_path: String,
     skill_prompt: String,
     build_design_style: bool,
     correction_before: String,
@@ -329,6 +335,7 @@ impl Default for AiUiState {
             directory: String::new(),
             import_path: String::new(),
             export_path: String::new(),
+            skill_export_path: "skill-package.zip".into(),
             skill_prompt: String::new(),
             build_design_style: true,
             correction_before: String::new(),
@@ -637,18 +644,19 @@ impl AiUiState {
     }
 
     fn request_estimate(&self, documents: &[OpenDocument], active: Option<usize>) -> Option<RequestEstimate> {
-        if (!self.new_document && !self.continue_book) || self.settings.pages_per_batch == 0 {
+        if (!self.new_document && !self.continue_book) || self.settings.pages_per_batch == 0 || self.prompt.trim().is_empty() {
             return None;
         }
-        let scripted_pages = explicit_script_pages(&self.prompt)?;
+        let scripted_pages = explicit_script_pages(&self.prompt);
         let remaining = if self.new_document {
-            if scripted_pages != self.pages {
+            if scripted_pages.is_some_and(|pages| pages != self.pages) {
                 return None;
             }
             self.pages
         } else {
             let document = documents.iter().find(|document| Some(document.index) == active)?;
-            if u32::try_from(document.pages).ok()? != scripted_pages || (self.continue_book && !document.continuable) {
+            if scripted_pages.is_some_and(|pages| u32::try_from(document.pages).ok() != Some(pages)) || (self.continue_book && !document.continuable)
+            {
                 return None;
             }
             u32::try_from(if self.continue_book { document.remaining_pages } else { document.pages }).ok()?
@@ -667,7 +675,7 @@ impl AiUiState {
         };
         let image_allowance = review_pages.saturating_mul(sources_per_page);
         let vision_allowance = if self.settings.verify_generated_images { image_allowance } else { 0 };
-        (review_pages > 0).then_some(RequestEstimate { review_pages, image_allowance, vision_allowance })
+        (review_pages > 0).then_some(RequestEstimate { review_pages, scripted: scripted_pages.is_some(), image_allowance, vision_allowance })
     }
 }
 
@@ -1313,6 +1321,51 @@ fn saved_book_document<'a>(draft: &ProductionDraft, documents: &'a [OpenDocument
     }
 }
 
+fn preserved_document_geometry<'a>(s: &AiUiState, documents: &'a [OpenDocument], selected: Option<usize>) -> Option<&'a OpenDocument> {
+    if s.new_document {
+        return None;
+    }
+    documents.iter().find(|document| Some(document.index) == selected && (!s.continue_book || document.facing_pages))
+}
+
+fn production_binding(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], selected: Option<usize>) {
+    if let Some(document) = preserved_document_geometry(s, documents, selected) {
+        if document.facing_pages {
+            let binding = text(
+                a,
+                if document.right_to_left_binding { "Right to left (RTL)" } else { "Left to right (LTR)" },
+                if document.right_to_left_binding {
+                    "من اليمين إلى اليسار (RTL)"
+                } else {
+                    "من اليسار إلى اليمين (LTR)"
+                },
+            );
+            rtl::label(ui, format!("{} {binding}", text(a, "Existing book binding:", "اتجاه تجليد الكتاب الحالي:")));
+        } else {
+            label(ui, a, "Existing document uses single pages.", "يستخدم المستند الحالي صفحات منفردة.");
+        }
+    } else if s.settings.facing_pages {
+        ui.horizontal_wrapped(|ui| {
+            label(ui, a, "Book binding", "اتجاه التجليد");
+            for (value, en, ar) in [
+                (None, "Automatic (content language)", "تلقائي حسب لغة المحتوى"),
+                (Some(true), "Right to left (RTL)", "من اليمين إلى اليسار (RTL)"),
+                (Some(false), "Left to right (LTR)", "من اليسار إلى اليمين (LTR)"),
+            ] {
+                ui.radio_value(&mut s.settings.right_to_left_binding, value, rtl::widget(ui, text(a, en, ar)));
+            }
+        });
+        if s.settings.right_to_left_binding.is_none() {
+            label(
+                ui,
+                a,
+                "Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.",
+                "اتجاه التجليد تلقائي: العربية من اليمين إلى اليسار والإنجليزية من اليسار إلى اليمين. يبقى الغلاف منفرداً.",
+            );
+        }
+    }
+}
+
 fn production_recovery(
     ui: &mut egui::Ui,
     s: &mut AiUiState,
@@ -1436,11 +1489,13 @@ fn production(
                 s.tab = 3;
             }
         });
-        if !s.snapshot.models.is_empty() && s.pending_models.as_ref() == Some(&s.settings.text_model) {
+        if let Some((_, models, _, _)) = s.local_probe.as_ref().filter(|(selection, models, _, success)| {
+            *success && !models.is_empty() && selection.provider == s.settings.text_model.provider && selection.endpoint == s.settings.text_model.endpoint
+        }) {
             egui::ComboBox::from_id_salt("production_discovered_models").selected_text(text(a, "Available models", "النماذج المتاحة")).show_ui(
                 ui,
                 |ui| {
-                    for name in &s.snapshot.models {
+                    for name in models {
                         ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
                     }
                 },
@@ -1531,16 +1586,14 @@ fn production(
             }
             label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
             ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000));
-            ui.checkbox(&mut s.settings.facing_pages, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة")));
+            if let Some(document) = preserved_document_geometry(s, documents, *activate_document) {
+                let mut actual = document.facing_pages;
+                ui.add_enabled(false, egui::Checkbox::new(&mut actual, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة"))));
+            } else {
+                ui.checkbox(&mut s.settings.facing_pages, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة")));
+            }
         });
-        if s.settings.facing_pages {
-            label(
-                ui,
-                a,
-                "Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.",
-                "اتجاه التجليد تلقائي: العربية من اليمين إلى اليسار والإنجليزية من اليسار إلى اليمين. يبقى الغلاف منفرداً.",
-            );
-        }
+        production_binding(ui, s, a, documents, *activate_document);
         if !s.new_document {
             ui.horizontal_wrapped(|ui| {
                 label(ui, a, "Target document", "المستند المستهدف");
@@ -1599,8 +1652,13 @@ fn production(
             rtl::label(
                 ui,
                 format!(
-                    "{}: {} {} + {} {}{} = {}",
-                    text(a, "Requests for this review (estimate)", "طلبات هذه المراجعة (تقدير)"),
+                    "{}: {}{} {} + {} {}{} = {}",
+                    if estimate.scripted {
+                        text(a, "Requests for this review (estimate)", "طلبات هذه المراجعة (تقدير)")
+                    } else {
+                        text(a, "Requests for this review (conservative estimate)", "طلبات هذه المراجعة (تقدير تحفظي)")
+                    },
+                    if estimate.scripted { "" } else { text(a, "up to ", "حتى ") },
                     estimate.review_pages,
                     text(a, "text", "للنص"),
                     estimate.image_allowance,
@@ -1616,8 +1674,16 @@ fn production(
             label(
                 ui,
                 a,
-                "One text request per PAGE; image allowance is provisional. Repairs and later reviews share the task limit. Token and cost limits still apply.",
-                "طلب نص لكل PAGE؛ حصة الصور تقديرية. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية.",
+                if estimate.scripted {
+                    "One text request per PAGE; image allowance is provisional. Repairs and later reviews share the task limit. Token and cost limits still apply."
+                } else {
+                    "Conservative planning allowance: up to one text request per page before repairs. Internal grouping and cache reuse can reduce actual requests; image counts are provisional. Repairs and later reviews share the task limit. Token and cost limits still apply."
+                },
+                if estimate.scripted {
+                    "طلب نص لكل PAGE؛ حصة الصور تقديرية. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية."
+                } else {
+                    "حصة تخطيط تحفظية: حتى طلب نص لكل صفحة قبل الإصلاحات. قد يقل العدد الفعلي بالتجميع الداخلي وإعادة استخدام المخزن؛ وعدد الصور تقديري. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية."
+                },
             );
             if estimate.vision_allowance > 0 {
                 label(
@@ -1634,7 +1700,11 @@ fn production(
                         "{} {} {} {}.",
                         text(a, "Configured request limit", "حد الطلبات المحدد"),
                         s.settings.budget.max_requests,
-                        text(a, "is below the minimum text requests for this review:", "أقل من الحد الأدنى لطلبات نص هذه المراجعة:"),
+                        if estimate.scripted {
+                            text(a, "is below the minimum text requests for this review:", "أقل من الحد الأدنى لطلبات نص هذه المراجعة:")
+                        } else {
+                            text(a, "is below the conservative planning allowance for this review:", "أقل من حصة التخطيط التحفظية لهذه المراجعة:")
+                        },
                         estimate.review_pages
                     ),
                 );
@@ -2481,12 +2551,12 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                     rtl::label(ui, f);
                 }
             });
-            field(ui, a, "Export skill ZIP path", "مسار تصدير المهارة ZIP", &mut s.export_path);
+            field(ui, a, "Export skill ZIP path", "مسار تصدير المهارة ZIP", &mut s.skill_export_path);
             if ui
-                .add_enabled(!s.export_path.trim().is_empty(), egui::Button::new(rtl::widget(ui, text(a, "Export skill", "تصدير المهارة"))))
+                .add_enabled(!s.skill_export_path.trim().is_empty(), egui::Button::new(rtl::widget(ui, text(a, "Export skill", "تصدير المهارة"))))
                 .clicked()
             {
-                requests.push(AiRequest::ExportSkill { id: r.id, revision: r.revision, path: s.export_path.clone() });
+                requests.push(AiRequest::ExportSkill { id: r.id, revision: r.revision, path: s.skill_export_path.clone() });
             }
         }
         ui.separator();
@@ -2671,6 +2741,185 @@ mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::json;
 
+    #[test]
+    fn ai20_ui_completed_discovery_stays_selectable_for_its_provider_and_endpoint() {
+        let mut state = AiUiState { initialized: true, ..Default::default() };
+        state.settings.text_model =
+            ModelSelection { provider: ProviderKind::Gemini, model: "original".into(), endpoint: Some("https://models.example".into()) };
+        let selection = state.settings.text_model.clone();
+        state.pending_models = Some(selection.clone());
+        state.accept(AiSnapshot { available: true, busy: true, stage: "discovering".into(), ..Default::default() });
+        state.accept(AiSnapshot { available: true, stage: "completed".into(), models: vec!["text-a".into(), "text-b".into()], ..Default::default() });
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 1200.0))
+            .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
+        panel.run_steps(3);
+        panel.get_by(|node| node.role() == egui::accesskit::Role::ComboBox && node.value().as_deref() == Some("Available models")).click();
+        panel.run_steps(2);
+        panel.get_by_label("text-a").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.text_model.model, "text-a");
+        panel.state_mut().accept(AiSnapshot { available: true, stage: "completed".into(), ..Default::default() });
+        panel.run_steps(3);
+        panel.get_by(|node| node.role() == egui::accesskit::Role::ComboBox && node.value().as_deref() == Some("Available models")).click();
+        panel.run_steps(2);
+        panel.get_by_label("text-b").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.text_model.model, "text-b");
+        panel.state_mut().settings.text_model.endpoint = Some("https://other.example".into());
+        panel.run_steps(3);
+        assert!(
+            panel.query_by(|node| node.role() == egui::accesskit::Role::ComboBox && node.value().as_deref() == Some("Available models")).is_none()
+        );
+        panel.state_mut().settings.text_model.endpoint = selection.endpoint;
+        panel.state_mut().settings.text_model.provider = ProviderKind::Ollama;
+        panel.run_steps(3);
+        assert!(
+            panel.query_by(|node| node.role() == egui::accesskit::Role::ComboBox && node.value().as_deref() == Some("Available models")).is_none()
+        );
+    }
+
+    #[test]
+    fn ai20_ui_natural_book_estimates_preserve_review_size_remaining_pages_and_explicit_budget() {
+        let mut state = AiUiState { prompt: "Create a clear science book for children.".into(), pages: 12, ..Default::default() };
+        state.settings.text_model.model = "fixture".into();
+        state.settings.pages_per_batch = 6;
+        let estimate = state.request_estimate(&[], None).expect("natural book briefs need a conservative planning allowance");
+        assert_eq!(estimate.review_pages, 6);
+        assert_eq!(estimate.allowance(), 6);
+        let original_tokens = state.settings.budget.token_limit;
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 1200.0))
+            .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 4);
+        assert!(panel.query_by_label("Configured request limit 4 is below the minimum text requests for this review: 6.").is_none());
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 6);
+        assert_eq!(panel.state().settings.pages_per_batch, 6);
+        assert_eq!(panel.state().pages, 12);
+        assert_eq!(panel.state().settings.budget.token_limit, original_tokens);
+
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":48,"facingPages":false})).unwrap();
+        for spread in 0..12 {
+            session.execute("frame.create", &json!({"spread":spread,"rect":[20,20,100,80]})).unwrap();
+        }
+        let document = OpenDocument::from_document(3, session.active().unwrap());
+        let mut continuing =
+            AiUiState { prompt: "Finish the remaining science lessons.".into(), new_document: false, continue_book: true, ..Default::default() };
+        continuing.settings.pages_per_batch = 40;
+        continuing.settings.output_mode = OutputMode::NativeWithImages;
+        continuing.settings.verify_generated_images = true;
+        let estimate = continuing.request_estimate(&[document], Some(3)).unwrap();
+        assert_eq!(estimate.review_pages, 36);
+        assert_eq!(estimate.image_allowance, 36);
+        assert_eq!(estimate.vision_allowance, 36);
+        assert_eq!(estimate.allowance(), 108);
+        assert_eq!(continuing.settings.pages_per_batch, 40);
+        assert_eq!(continuing.settings.budget.max_requests, 4);
+        continuing.continue_book = false;
+        assert!(continuing.request_estimate(&[], None).is_none(), "ordinary edits do not use book planning estimates");
+    }
+
+    #[test]
+    fn ai20_ui_binding_choices_are_visible_and_existing_book_binding_is_authoritative() {
+        let mut state = AiUiState { prompt: "Create a bilingual facing-page book.".into(), ..Default::default() };
+        state.settings.text_model.model = "fixture".into();
+        state.settings.facing_pages = true;
+        state.settings.right_to_left_binding = Some(false);
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1300.0, 1400.0))
+            .build_ui_state(|ui, (state, requests)| production(ui, state, false, true, &[], &mut None, requests), (state, Vec::new()));
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Left to right (LTR)").is_some());
+        assert!(
+            panel.query_by_label("Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.").is_none()
+        );
+        for (label, expected) in [("Automatic (content language)", None), ("Right to left (RTL)", Some(true)), ("Left to right (LTR)", Some(false))] {
+            panel.get_by_label(label).click();
+            panel.run_steps(3);
+            assert_eq!(panel.state().0.settings.right_to_left_binding, expected);
+            panel.get_by_label("Produce").click();
+            panel.run_steps(3);
+            assert!(
+                matches!(panel.state().1.last(), Some(AiRequest::Start(request)) if request.settings.right_to_left_binding == expected && request.settings.facing_pages)
+            );
+        }
+
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":4,"facingPages":true})).unwrap();
+        session.execute("layout.documentSetup", &json!({"binding":"rightToLeft"})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[20,20,100,80]})).unwrap();
+        let documents = vec![OpenDocument::from_document(0, session.active().unwrap())];
+        let mut state = AiUiState { prompt: "Continue this existing book.".into(), new_document: false, continue_book: true, ..Default::default() };
+        state.settings.right_to_left_binding = Some(false);
+        let mut existing = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1300.0, 1400.0))
+            .build_ui_state(move |ui, state| production(ui, state, false, true, &documents, &mut Some(0), &mut Vec::new()), state);
+        existing.run_steps(3);
+        assert!(existing.query_by_label("Existing book binding: Right to left (RTL)").is_some());
+        assert_eq!(existing.get_by_label("Facing pages").accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+        assert!(existing.get_by_label("Facing pages").accesskit_node().is_disabled());
+        assert!(existing.query_by_label("Automatic (content language)").is_none());
+        assert_eq!(
+            existing.state().settings.right_to_left_binding,
+            Some(false),
+            "viewing the existing binding does not rewrite new-book preferences"
+        );
+        assert!(!existing.state().settings.facing_pages, "displaying preserved geometry does not rewrite new-book preferences");
+        existing.state_mut().continue_book = false;
+        existing.run_steps(3);
+        assert_eq!(existing.get_by_label("Facing pages").accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+        assert!(existing.get_by_label("Facing pages").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn ai20_ui_document_and_skill_export_destinations_are_independent_and_session_only() {
+        let mut state = AiUiState { export_path: "book.pdf".into(), ..Default::default() };
+        state.snapshot.review = Some(designcraft_ai_types::protocol::SkillReview {
+            id: "fixture-skill".into(),
+            revision: "revision-one".into(),
+            skill_md: String::new(),
+            manifest_json: String::new(),
+            sample_path: None,
+            sample_valid: false,
+            files: Vec::new(),
+        });
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1800.0)).build_ui_state(
+            |ui, (state, requests, skill_tab)| {
+                if *skill_tab {
+                    skills(ui, state, false, true, false, requests);
+                } else {
+                    export_print(ui, state, false, true, requests);
+                }
+            },
+            (state, Vec::new(), true),
+        );
+        panel.run_steps(3);
+        panel.get_by(|node| node.role() == egui::accesskit::Role::TextInput && node.value().as_deref() == Some("skill-package.zip")).focus();
+        panel.run_steps(1);
+        panel.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        panel.event(egui::Event::Text("portable.zip".into()));
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.export_path, "book.pdf");
+        panel.get_by_label("Export skill").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::ExportSkill { path, .. }) if path == "portable.zip"));
+        panel.state_mut().2 = false;
+        panel.run_steps(3);
+        panel.get_by_label("Export IDML").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::ExportIdml { path }) if path == "book.idml"));
+        panel.state_mut().2 = true;
+        panel.run_steps(3);
+        assert!(panel.query_by(|node| node.role() == egui::accesskit::Role::TextInput && node.value().as_deref() == Some("portable.zip")).is_some());
+        let ui = crate::UiState { ai: panel.state().0.clone(), ..Default::default() };
+        let saved = serde_json::to_string(&ui).unwrap();
+        assert!(!saved.contains("portable.zip") && !saved.contains("book.idml"));
+    }
+
     fn continuation_request(target: TaskTarget) -> TaskRequest {
         let mut settings = AiSettings::default();
         settings.text_model.model = "continuation-fixture".into();
@@ -2741,7 +2990,17 @@ mod tests {
         let mut state = AiUiState { new_document: false, ..Default::default() };
         state.prompt = "Edit the selected document".into();
         state.settings.text_model.model = "fixture".into();
-        let documents = vec![OpenDocument { index: 0, uid: 1, path: None, title: "Book".into(), pages: 4, remaining_pages: 3, continuable: true }];
+        let documents = vec![OpenDocument {
+            index: 0,
+            uid: 1,
+            path: None,
+            title: "Book".into(),
+            facing_pages: false,
+            right_to_left_binding: false,
+            pages: 4,
+            remaining_pages: 3,
+            continuable: true,
+        }];
         let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
             move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
             (state, Vec::new(), Some(0)),
@@ -3138,7 +3397,17 @@ mod tests {
         let mut state = AiUiState { prompt, new_document: false, continue_book: true, ..Default::default() };
         state.settings.pages_per_batch = 6;
         state.settings.output_mode = OutputMode::NativeWithImages;
-        let document = OpenDocument { index: 3, uid: 1, path: None, title: "Book".into(), pages: 8, remaining_pages: 2, continuable: true };
+        let document = OpenDocument {
+            index: 3,
+            uid: 1,
+            path: None,
+            title: "Book".into(),
+            facing_pages: false,
+            right_to_left_binding: false,
+            pages: 8,
+            remaining_pages: 2,
+            continuable: true,
+        };
         let estimate = state.request_estimate(&[document], Some(3)).unwrap();
         assert_eq!(estimate.review_pages, 2);
         assert_eq!(estimate.image_allowance, 2);

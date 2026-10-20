@@ -82,7 +82,7 @@ impl Default for AiSettings {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskTarget {
     CurrentDocument,
-    /// Explicit new authority to fill the contiguous blank suffix of an existing A4 book.
+    /// Explicit new authority to fill the contiguous blank suffix of the selected book.
     /// Persisted checkpoints never grant this authority.
     ContinueBook,
     NewA4 {

@@ -62,11 +62,17 @@ pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRo
 
 /// A continuation starts only from a deliberately selected current book. Never
 /// infer permission or a page offset from stale, editable checkpoint metadata.
-pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraft_ai_types::DesignProfile>) -> Result<(u32, u32), String> {
+pub(super) fn continuation_progress(
+    base: &DocState,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    brief: &str,
+) -> Result<(u32, u32), String> {
     if let Some(profile) = profile {
         profile.validate()?;
     }
-    let page_mm = profile.map_or([210.0, 297.0], |p| p.page_mm);
+    // A style supplies an identity, not permission to resize the opened book.
+    // Only an explicit trim in the user's brief can require another size.
+    let requested_trim = crate::print_contract::PrintContract::from_prompt(brief)?.and_then(|contract| contract.page_mm);
     let pages = u32::try_from(base.doc.spreads.len()).map_err(|_| "Invalid existing book page count")?;
     if !(1..=1000).contains(&pages)
         || base.doc.spreads.iter().any(|spread| {
@@ -74,12 +80,19 @@ pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraf
                 || spread.pages.iter().any(|page| {
                     !page.width.is_finite()
                         || !page.height.is_finite()
-                        || (page.width - page_mm[0] * 72.0 / 25.4).abs() > 0.1
-                        || (page.height - page_mm[1] * 72.0 / 25.4).abs() > 0.1
+                        || page.width <= 0.0
+                        || page.height <= 0.0
+                        || page.width > 15552.0
+                        || page.height > 15552.0
+                        || requested_trim
+                            .is_some_and(|[w, h]| (page.width - w * 72.0 / 25.4).abs() > 0.1 || (page.height - h * 72.0 / 25.4).abs() > 0.1)
                 })
         })
     {
-        return Err("Continue book requires 1–1000 single pages matching the selected profile (A4 by default)".into());
+        return Err(
+            "Continue book requires 1–1000 valid pages matching any explicit Trim Size in your brief; select another book or correct that size"
+                .into(),
+        );
     }
     let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
     if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
@@ -124,12 +137,12 @@ impl ProductionRunner {
         task: TaskRequest,
         skills: Vec<SkillSnapshot>,
         mut base: DocState,
-        context: Value,
+        mut context: Value,
     ) -> Result<(), String> {
         let (pages, completed, existing) = match task.target {
             TaskTarget::NewA4 { pages } => (pages, 0, None),
             TaskTarget::ContinueBook => {
-                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()))?;
+                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()), &task.prompt)?;
                 (pages, completed, Some((base.uid, base.revision)))
             }
             TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
@@ -169,6 +182,12 @@ impl ProductionRunner {
             publication_base: if existing.is_some() { Some(session.doc().map_err(|e| e.to_string())?.clone()) } else { None },
             retry_sequence: 0,
         };
+        if completed > 0 {
+            let mut projected = Session::new();
+            projected.prefs = session.prefs.clone();
+            projected.add_document(base.clone());
+            context = batch_context(&projected, &job, &self.root)?;
+        }
         if let Some(mut draft) = self.snapshot.production_draft.clone() {
             draft.id = job.snapshot.job_id.clone();
             self.persist_production_draft(&draft)?;
@@ -285,7 +304,7 @@ impl ProductionRunner {
                 return Err("Select this failed task's book before Retry; another open document will not be modified".into());
             }
             let (base, context) = task_document_context(session, &TaskTarget::ContinueBook, profile, &job.task.prompt, &job.task.settings)?;
-            let (total, completed) = continuation_progress(&base, profile)?;
+            let (total, completed) = continuation_progress(&base, profile, &job.task.prompt)?;
             if total != job.snapshot.total_pages || completed != job.snapshot.completed_pages {
                 return Err("The target pages or book page count changed; prepare a fresh continuation instead of overwriting content".into());
             }
@@ -296,7 +315,14 @@ impl ProductionRunner {
             }
             task_document_context(session, &job.task.target, profile, &job.task.prompt, &job.task.settings)?
         };
-        context["_production_cache_root"] = json!(self.root.join("production-cache-v1"));
+        if job.snapshot.completed_pages > 0 {
+            let mut projected = Session::new();
+            projected.prefs = session.prefs.clone();
+            projected.add_document(base.clone());
+            context = batch_context(&projected, job, &self.root)?;
+        } else {
+            enrich_production_context(&mut context, &self.root, &base, &job.task)?;
+        }
         let mut job = self.batch.take().ok_or("The failed task disappeared")?;
         job.retry_sequence = job.retry_sequence.checked_add(1).ok_or("Too many retries for this task")?;
         if job.snapshot.document_uid.is_some() {
@@ -400,7 +426,7 @@ impl ProductionRunner {
         let mut projected = Session::new();
         projected.prefs = session.prefs.clone();
         projected.add_document(base.clone());
-        let context = batch_context(&projected, &job)?;
+        let context = batch_context(&projected, &job, &self.root)?;
         job.snapshot.current_batch = job.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
         // Consumes this exact approval before any next request is launched.
         job.snapshot.status = "running".into();
@@ -763,13 +789,22 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 /// Keep book-wide page coverage and recent approved content; never repeatedly resend page one.
-fn batch_context(session: &Session, job: &BatchJob) -> Result<Value, String> {
+fn batch_context(session: &Session, job: &BatchJob, root: &Path) -> Result<Value, String> {
     let state = session.doc().map_err(|e| e.to_string())?;
     let completed = usize::try_from(job.snapshot.completed_pages).map_err(|_| "Invalid approved page count")?;
-    let last = job.snapshot.batches.last().ok_or("Approved batch context is unavailable")?;
-    let start = usize::try_from(last.page_start).map_err(|_| "Invalid preceding batch page")?;
-    let count = usize::try_from(last.page_count).map_err(|_| "Invalid preceding batch size")?;
-    let end = start.checked_add(count).ok_or("Preceding batch range overflow")?;
+    let preceding = job.snapshot.batches.iter().rev().find(|batch| {
+        batch.status == "approved"
+            && batch.page_count > 0
+            && batch.page_start.checked_add(batch.page_count).is_some_and(|end| end <= job.snapshot.completed_pages)
+    });
+    let end = completed;
+    let start = if let Some(batch) = preceding {
+        usize::try_from(batch.page_start).map_err(|_| "Invalid preceding batch page")?
+    } else {
+        // A fresh continuation observes the existing prefix without inventing
+        // historical human approvals or reading a failed unpublished suffix.
+        completed.saturating_sub(usize::try_from(job.snapshot.pages_per_batch.clamp(1, 32)).map_err(|_| "Invalid review size")?)
+    };
     let per_page = (12_000 / completed.max(1)).clamp(8, 160);
     let mut briefs = Vec::new();
     for page in 0..completed.min(1000) {
@@ -802,17 +837,28 @@ fn batch_context(session: &Session, job: &BatchJob) -> Result<Value, String> {
             break;
         }
     }
-    let ranges: Vec<_> = job
+    let mut ranges: Vec<_> = job
         .snapshot
         .batches
         .iter()
+        .filter(|batch| {
+            batch.status == "approved"
+                && batch.page_count > 0
+                && batch.page_start.checked_add(batch.page_count).is_some_and(|end| end <= job.snapshot.completed_pages)
+        })
         .rev()
         .take(64)
-        .rev()
         .map(|batch| json!([batch.batch, batch.page_start, batch.page_count, limited_text(&batch.title, 80)]))
         .collect();
+    ranges.reverse();
     let title = limited_text(&job.task.prompt, 256);
-    let context = json!({"documentUid":state.uid,"revision":state.revision,"pageCount":state.doc.page_count(),"pageWidth":state.doc.settings.page_width,"pageHeight":state.doc.settings.page_height,"units":"points; each native spread is one A4 page","approvedPageCount":job.snapshot.completed_pages,"approvedPageBriefs":briefs,"recentApprovedBatchRanges":ranges,"earlierBatchRangesOmitted":job.snapshot.batches.len()>64,"recentApprovedObjects":objects,"recentObjectsTruncated":truncated,"bookRequestSummary":title,"continuityInstruction":"Continue the original book after the approved pages. Page briefs are bounded observations of existing editable content, not a new curriculum or a claim of educational certification. Do not repeat the beginning or regenerate approved pages."});
+    let mut context = compact_context(session)?;
+    let object = context.as_object_mut().ok_or("Invalid native book context")?;
+    object.remove("objects");
+    object.remove("objectsTruncated");
+    let continuity = json!({"units":"points; each canonical native spread is one actual document page","approvedPageCount":job.snapshot.completed_pages,"approvedPageBriefs":briefs,"recentApprovedBatchRanges":ranges,"earlierBatchRangesOmitted":job.snapshot.batches.len()>64,"recentApprovedObjects":objects,"recentObjectsTruncated":truncated,"bookRequestSummary":title,"continuityInstruction":"Continue the selected original book after its existing completed prefix. Page briefs are bounded observations of editable content, not invented historical approval or educational certification. Do not repeat the beginning or regenerate earlier pages."});
+    object.extend(continuity.as_object().ok_or("Invalid book continuity data")?.clone());
+    enrich_production_context(&mut context, root, state, &job.task)?;
     if serde_json::to_vec(&context).map_err(|e| e.to_string())?.len() > 48 * 1024 {
         return Err("Approved book continuity context exceeds its bounded size".into());
     }
@@ -855,24 +901,25 @@ mod tests {
         }
     }
     #[test]
-    fn continuation_refuses_blank_books_filled_books_holes_and_non_a4_pages() {
+    fn continuation_refuses_blank_books_filled_books_and_holes_but_preserves_custom_trim() {
         let mut session = Session::new();
         session.execute("file.new", &new_a4(4)).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None, "").is_err());
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert_eq!(continuation_progress(session.doc().unwrap(), None).unwrap(), (4, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), None, "").unwrap(), (4, 1));
         session.execute("frame.create", &json!({"spread":2,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None, "").is_err());
         session.execute("frame.create", &json!({"spread":1,"rect":[50,50,100,100]})).unwrap();
         session.execute("frame.create", &json!({"spread":3,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None, "").is_err());
         session.execute("file.new", &json!({"width":400,"height":600,"pages":2,"facingPages":false})).unwrap();
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert_eq!(continuation_progress(session.doc().unwrap(), None, "").unwrap(), (2, 1));
+        assert!(continuation_progress(session.doc().unwrap(), None, "Trim Size: A4").is_err());
     }
 
     #[test]
-    fn continuation_matches_selected_non_a4_geometry_without_weakening_the_default() {
+    fn continuation_preserves_actual_trim_when_style_or_default_sizes_differ() {
         let directory = tempfile::tempdir().unwrap();
         let runner = ProductionRunner::open(directory.path()).unwrap();
         let mut profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
@@ -881,10 +928,47 @@ mod tests {
         let mut session = Session::new();
         session.execute("file.new", &crate::design::document_params(Some(&profile), 3)).unwrap();
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
-        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile)).unwrap(), (3, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), None, "").unwrap(), (3, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
         profile.page_mm = [250.0, 350.0];
-        assert!(continuation_progress(session.doc().unwrap(), Some(&profile)).is_err());
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
+        assert!(continuation_progress(session.doc().unwrap(), Some(&profile), "Trim Size: 250 x 350 mm").is_err());
+    }
+
+    #[test]
+    fn ai20_continuation_preserves_opened_custom_trim_instead_of_forcing_a_style_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(directory.path()).unwrap();
+        let profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":195.0*72.0/25.4,"height":265.0*72.0/25.4,"pages":3,"facingPages":false})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn ai20_continuation_accepts_matching_explicit_trim_and_rejects_a_conflicting_brief_before_http() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        for (trim, allowed) in [("195 x 265 mm", true), ("210 x 297 mm", false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(directory.path()).unwrap();
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"width":195.0*72.0/25.4,"height":265.0*72.0/25.4,"pages":3,"facingPages":false})).unwrap();
+            session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+            let before = session.doc().unwrap().doc.clone();
+            let mut request = task("http://127.0.0.1:9/".into(), 1);
+            request.target = TaskTarget::ContinueBook;
+            request.prompt = format!("Trim Size: {trim}\nContinue the remaining blank pages with editable native artwork.");
+            let started = runner.handle(&mut session, AiRequest::Start(request));
+            assert_eq!(started.busy, allowed, "{}", started.message);
+            if allowed {
+                wait(&mut runner, &mut session);
+            } else {
+                assert!(runner.pending.is_none());
+            }
+            assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+        }
     }
     fn wait(runner: &mut ProductionRunner, session: &mut Session) -> AiSnapshot {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1936,7 +2020,7 @@ mod tests {
             status: "approved".into(),
             ..Default::default()
         });
-        let context = batch_context(&session, &job).unwrap();
+        let context = batch_context(&session, &job, dir.path()).unwrap();
         assert_eq!(context["approvedPageCount"], 2);
         assert_eq!(context["approvedPageBriefs"].as_array().unwrap().len(), 2);
         let recent = context["recentApprovedObjects"].to_string();
@@ -1945,5 +2029,46 @@ mod tests {
         assert!(context["recentApprovedBatchRanges"].to_string().contains("Plants"));
         assert!(serde_json::to_vec(&context).unwrap().len() < 48 * 1024);
         assert!(limited_text("حروف عربية", 7).len() <= 7);
+    }
+
+    #[test]
+    fn ai20_later_and_retry_context_keeps_environment_and_only_completed_native_observations() {
+        for prior_report in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(directory.path()).unwrap();
+            let mut session = Session::new();
+            waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            session
+                .execute(
+                    "frame.create",
+                    &json!({"spread":0,"rect":[200,60,400,120],"content":"text","text":"Existing approved roots and leaves","caret":false}),
+                )
+                .unwrap();
+            let mut job = runner.batch.take().unwrap();
+            job.task.settings.facing_pages = true;
+            job.task.prompt = "Trim Size: A4\nMargins: 15 mm\nContinue the bilingual book".into();
+            if prior_report {
+                job.snapshot.batches[0].status = "approved".into();
+            } else {
+                job.snapshot.batches.clear();
+            }
+            job.snapshot.batches.push(BatchReport {
+                batch: 2,
+                page_start: 1,
+                page_count: 1,
+                status: "failed".into(),
+                title: "UNPUBLISHED".into(),
+                ..Default::default()
+            });
+            let context = batch_context(&session, &job, directory.path()).unwrap();
+            assert!(context["fontFaces"].is_array());
+            assert!(context["swatchNames"].as_array().unwrap().iter().any(|name| name == "[Black]"));
+            assert!(context.get("_production_cache_root").is_some());
+            assert_eq!(context["facing_editorial_direction"]["enabled"], true);
+            assert!(context["production_print_contract"].is_object());
+            assert!(context["recentApprovedObjects"].to_string().contains("roots and leaves"));
+            assert!(!context["recentApprovedBatchRanges"].to_string().contains("UNPUBLISHED"));
+            assert!(serde_json::to_vec(&context).unwrap().len() < 48 * 1024);
+        }
     }
 }

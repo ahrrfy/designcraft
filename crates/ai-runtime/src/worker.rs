@@ -508,9 +508,12 @@ impl Runner<'_> {
             )?;
         }
         let explicit_script = crate::script_contract::parse(&request.prompt)?.is_some();
-        let adaptive_layout = explicit_script || self.print.is_some() || unbound_math_request(&request.prompt, &skills);
+        let adaptive_layout = explicit_script
+            || self.print.is_some()
+            || unbound_math_request(&request.prompt, &skills)
+            || continuation_style_geometry_differs(&request, &base, &skills);
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
-        if current_document {
+        if current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook) {
             opened_document_geometry(&mut context, &base)?;
         }
         let profiles = skills.iter().filter_map(|s| s.design_profile.as_ref()).collect::<Vec<_>>();
@@ -520,7 +523,7 @@ impl Runner<'_> {
         let profile = profiles.first().copied();
         if let Some(profile) = profile {
             profile.validate()?;
-            if !current_document {
+            if !current_document && !adaptive_layout {
                 preflight_profile_image_ratios(profile, &request.settings)?;
             }
         }
@@ -582,11 +585,15 @@ impl Runner<'_> {
         scope: Option<BatchScope>,
     ) -> Result<ProductionPlan, String> {
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
+        let opened_document = current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook);
         let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
         let explicit_script = crate::script_contract::parse(&request.prompt)?.is_some();
-        let adaptive_layout = explicit_script || self.print.is_some() || unbound_math_request(&request.prompt, skills);
-        let geometry_profile = if current_document || adaptive_layout { None } else { profile };
-        let geometry_check = if current_document || adaptive_layout {
+        let adaptive_layout = explicit_script
+            || self.print.is_some()
+            || unbound_math_request(&request.prompt, skills)
+            || continuation_style_geometry_differs(request, base, skills);
+        let geometry_profile = if opened_document || adaptive_layout { None } else { profile };
+        let geometry_check = if opened_document || adaptive_layout {
             GeometryCheck::OpenedDocument
         } else {
             profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
@@ -601,9 +608,9 @@ impl Runner<'_> {
             }
         }
         let mut system =
-            production_system(catalog, &planner_skills, request.settings.output_mode, current_document || adaptive_layout, adaptive_layout)?;
+            production_system(catalog, &planner_skills, request.settings.output_mode, opened_document || adaptive_layout, adaptive_layout)?;
         if adaptive_layout {
-            system.push_str("\nADAPTIVE SCRIPT/PRINT LAYOUT: the explicit page script and actual document geometry override profile page_mm, margin_mm and fixed example compositions. Keep the pinned profile's visual identity and complete guidance while constructing the required native page content. Executable template examples remain local host inputs and are not required for this adaptive command planner.");
+            system.push_str("\nADAPTIVE SCRIPT/PRINT LAYOUT: actual document geometry and any explicit page script override profile page_mm, margin_mm and fixed example compositions. Keep the pinned profile's visual identity and complete guidance while constructing the required native page content. Executable template examples remain local host inputs and are not required for this adaptive command planner.");
         }
         if let Some(scope) = scope {
             system.push_str(&format!("\nBATCH SCOPE IS MANDATORY: create only spreads {}..{} (exclusive end); every object needs explicit spread; every object/story reference must name an earlier result created in this batch. No page/global/style/swatches operations. Render every requested page natively before the human proof checkpoint.",scope.start,scope.start.saturating_add(scope.count)));
@@ -617,7 +624,7 @@ impl Runner<'_> {
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
         let mut document_context = context.clone();
-        if current_document || adaptive_layout {
+        if opened_document || adaptive_layout {
             opened_document_geometry(&mut document_context, base)?;
         }
         if explicit_script && let Some(scope) = scope {
@@ -1405,6 +1412,23 @@ fn review_end(scope: BatchScope) -> Result<u32, String> {
         .checked_add(scope.count)
         .filter(|end| scope.count > 0 && scope.count <= MAX_REVIEW_PAGES && *end <= MAX_REVIEW_PAGES)
         .ok_or_else(|| "Review must contain 1 to 1000 native pages within the document".into())
+}
+
+/// Existing-book trim and margins outrank fixed template coordinates. Matching
+/// books retain the local compiler; different geometry uses native adaptive
+/// commands with the same immutable visual guidance.
+fn continuation_style_geometry_differs(request: &TaskRequest, base: &DocState, skills: &[SkillSnapshot]) -> bool {
+    matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook)
+        && skills.iter().filter_map(|skill| skill.design_profile.as_ref()).any(|profile| {
+            let factor = 72.0 / 25.4;
+            base.doc.spreads.iter().flat_map(|spread| &spread.pages).any(|page| {
+                (page.width - profile.page_mm[0] * factor).abs() > 0.1
+                    || (page.height - profile.page_mm[1] * factor).abs() > 0.1
+                    || [page.margins.top, page.margins.bottom, page.margins.inside, page.margins.outside]
+                        .iter()
+                        .any(|margin| *margin > profile.margin_mm * factor + 0.1)
+            })
+        })
 }
 
 fn unbound_math_request(brief: &str, skills: &[SkillSnapshot]) -> bool {
@@ -5746,5 +5770,71 @@ mod tests {
         assert!(error.contains("Adaptive context reached"), "{error}");
         assert_eq!(provider.0.get(), 1);
         assert_eq!(serde_json::to_value(&skills).unwrap(), original, "Host snapshots must remain immutable");
+    }
+
+    #[test]
+    fn ai20_opened_custom_book_continuation_adapts_style_commands_to_actual_geometry() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct InspectOpened;
+        impl Provider for InspectOpened {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                assert!(request.system.contains("CURRENT DOCUMENT GEOMETRY"));
+                assert!(!request.system.contains("Preserve page_mm and margin_mm"));
+                let input: Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["document"]["pageWidth"].as_f64(), Some(720.0));
+                assert_eq!(input["document"]["pageGeometry"][1]["margins"]["inside"].as_f64(), Some(51.0));
+                Err("Opened continuation reached the selected provider".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No image generation".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt: "Continue the remaining editable pages of this book with a different activity.".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::ContinueBook,
+            export_directory: None,
+        };
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":720,"height":960,"pages":2,"facingPages":false,"margins":51})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[60,60,180,120]})).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &InspectOpened,
+        };
+        let error = runner
+            .production(
+                request,
+                json!({"batch_scope":{"start":1,"count":1}}),
+                catalog(),
+                vec![text_fit_style()],
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("Opened continuation reached"), "{error}");
     }
 }
