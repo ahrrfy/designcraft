@@ -1131,13 +1131,59 @@ mod tests {
         rejected_changed_publication("font-cache-first");
     }
 
+    #[test]
+    fn real_font_reload_during_generation_refuses_stale_batch_publication() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        rejected_changed_publication("font-reload");
+    }
+
+    #[test]
+    fn real_font_reload_before_first_book_publication_cannot_create_a_document() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        rejected_changed_publication("font-reload-first");
+    }
+
+    fn reload_fonts_without_document_edits(session: &mut Session) {
+        let before = session.doc().unwrap().clone();
+        let cache = session.cache.clone();
+        let prefs = serde_json::to_value(&session.prefs).unwrap();
+        session.execute("font.reload", &json!({})).unwrap();
+        let after = session.doc().unwrap();
+        assert!(!Arc::ptr_eq(&cache, &session.cache));
+        assert!(Arc::ptr_eq(&before.doc, &after.doc));
+        assert_eq!(before.is_dirty(), after.is_dirty());
+        assert!(after.revision > before.revision);
+        assert_eq!(serde_json::to_value(&session.prefs).unwrap(), prefs);
+    }
+
+    #[test]
+    fn real_font_reload_invalidates_human_proof_approval_without_document_edits() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        reload_fonts_without_document_edits(&mut session);
+        let before = session.doc().unwrap().clone();
+        let rejected = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+        assert!(rejected.message.contains("Font cache changed"), "{}", rejected.message);
+        assert!(!rejected.busy);
+        assert!(runner.pending.is_none());
+        assert!(runner.batch.is_none());
+        assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        assert_eq!(before.is_dirty(), session.doc().unwrap().is_dirty());
+        assert_eq!(before.revision, session.doc().unwrap().revision);
+        assert_eq!(rejected.batch.as_ref().unwrap().cumulative_usage.requests, 1);
+        assert!(!runner.root.join("runs").exists());
+    }
+
     fn rejected_changed_publication(change: &str) {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
         let mut job = runner.batch.take().unwrap();
-        let first = change == "font-cache-first";
+        let first = matches!(change, "font-cache-first" | "font-reload-first");
         let target_page = if first { 0 } else { 1 };
         if first {
             job.snapshot.document_uid = None;
@@ -1163,6 +1209,8 @@ mod tests {
             session.doc_mut().unwrap().revision = before.revision.checked_add(1).unwrap();
             assert!(!Arc::ptr_eq(&cache, &session.cache));
             assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc), "Font reload preserves document content");
+        } else if matches!(change, "font-reload" | "font-reload-first") {
+            reload_fonts_without_document_edits(&mut session);
         } else {
             session.execute("frame.create", &json!({"spread":0,"rect":[200,60,300,180],"content":"unassigned"})).unwrap();
             assert!(!Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
@@ -1211,7 +1259,7 @@ mod tests {
             .unwrap_err();
         let expected = if change == "preferences" {
             "preferences changed"
-        } else if matches!(change, "font-cache" | "font-cache-first") {
+        } else if matches!(change, "font-cache" | "font-cache-first" | "font-reload" | "font-reload-first") {
             "Font cache changed"
         } else {
             "book changed"

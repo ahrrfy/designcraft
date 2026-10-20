@@ -258,6 +258,27 @@ pub fn specs() -> Vec<CommandSpec> {
             })
         }),
         cmd!(
+            "layout.parents.delete",
+            "Delete Parent",
+            [],
+            None,
+            "{id: parent spread id} — unapply the parent and keep local overrides as ordinary items",
+            has_doc,
+            |s, p| {
+                let id = p.get("id").and_then(Value::as_u64).map(SpreadId).ok_or_else(|| bad("layout.parents.delete", "missing parent id"))?;
+                s.edit(|d, sel| {
+                    d.delete_parent(id)?;
+                    *sel = Default::default();
+                    ok()
+                })?;
+                let st = s.doc_mut()?;
+                if st.doc.parents.is_empty() {
+                    st.editing_parents = false;
+                }
+                ok()
+            }
+        ),
+        cmd!(
             noundo "layout.parents.edit",
             "Edit Parents",
             [],
@@ -2030,3 +2051,7 @@ mod parent_base_tests {
         assert_eq!(d.parents[1].parent.as_ref().unwrap().based_on, Some(a));
     }
 }
+
+#[cfg(test)]
+#[path = "parent_delete_tests.rs"]
+mod parent_delete_tests;

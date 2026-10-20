@@ -1864,6 +1864,12 @@ pub fn stroke_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
         super::cell_stroke::panel(app, ui);
         return;
     }
+    if super::colors_affect_text(app)
+        && let Some(a) = text_attrs(app)
+    {
+        text_stroke_panel(app, ui, &a["chars"]);
+        return;
+    }
     let Some(i) = sel_info(app) else {
         crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Select an object."));
         return;
@@ -1983,6 +1989,27 @@ pub fn stroke_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
         });
         ui.end_row();
     });
+}
+
+/// Stroke panel while text is selected: the text's outline colour, weight and whether it sits behind the fill.
+fn text_stroke_panel(app: &mut DesignApp, ui: &mut egui::Ui, c: &Value) {
+    let swatch = c["stroke"].as_str().unwrap_or(designcraft_color::swatch::NONE).to_string();
+    egui::Grid::new("text_stroke_panel").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+        caption(ui, crate::i18n::tr(&app.ui.language, "Weight:"));
+        if let Some(v) = number(ui, "tsw_panel", c["strokeWeight"].as_f64(), " pt", 60.0, 3) {
+            let _ = app.run("type.char", json!({"attrs": {"strokeWeight": v}}));
+        }
+        ui.end_row();
+        caption(ui, crate::i18n::tr(&app.ui.language, "Color:"));
+        super::swatch_picker(app, ui, "tspick", Some(swatch), |app, n| {
+            let _ = super::apply_swatch(app, true, &n, None);
+        });
+        ui.end_row();
+    });
+    let mut behind = c["strokeBehindFill"].as_bool().unwrap_or(false);
+    if ui.checkbox(&mut behind, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Stroke Behind Fill"))).changed() {
+        let _ = app.run("type.char", json!({"attrs": {"strokeBehindFill": behind}}));
+    }
 }
 
 /// A short line ending in arrowhead `a` (pointing left for Start, right for End).
@@ -2913,6 +2940,30 @@ mod tests {
         h.input_mut().max_texture_side = Some(8192);
         h.run_steps(3);
         h
+    }
+
+    /// With the caret in text, the Stroke panel offers the text's stroke options, not an empty panel.
+    #[test]
+    fn stroke_panel_shows_the_text_stroke_options_while_text_is_selected() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        app.run("frame.create", json!({"rect": [72, 72, 400, 400], "content": "text", "caret": true})).unwrap();
+        let mut ready = false;
+        let mut h = Harness::builder().with_size(vec2(320.0, 400.0)).build_ui_state(
+            move |ui, app: &mut DesignApp| {
+                if !ready {
+                    crate::theme::install_fonts(ui.ctx(), "");
+                    crate::theme::apply(ui.ctx(), &Tokens::for_brightness(Default::default()));
+                    ready = true;
+                    return;
+                }
+                stroke_panel(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        assert!(h.query_by_label("Select an object.").is_none());
+        h.get_by_label("Stroke Behind Fill");
     }
 
     /// As InDesign's: Edit Page takes the Page tool to the page in view, and Properties sets that
