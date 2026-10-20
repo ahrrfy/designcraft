@@ -8,6 +8,8 @@ use designcraft_ai_types::protocol::{AiRequest, AiSettings, AiSnapshot, BatchSna
 use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind};
 use serde_json::Value;
 
+const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
+
 /// Never persisted, and never included in a debug dump.
 #[derive(Clone, Default)]
 struct Secret(String);
@@ -16,7 +18,138 @@ struct OpenDocument {
     index: usize,
     title: String,
     pages: usize,
+    remaining_pages: usize,
     continuable: bool,
+}
+impl OpenDocument {
+    fn from_document(index: usize, document: &designcraft_engine::DocState) -> Self {
+        let pages = document.doc.page_count();
+        let first_blank = (0..pages).find(|page| !document.doc.page_has_items(*page));
+        Self {
+            index,
+            title: document.title(),
+            pages,
+            remaining_pages: first_blank.map_or(0, |first| pages.saturating_sub(first)),
+            continuable: first_blank.is_some_and(|first| first > 0 && (first..pages).all(|page| !document.doc.page_has_items(page))),
+        }
+    }
+}
+
+struct RequestEstimate {
+    review_pages: u32,
+    image_allowance: u32,
+    vision_allowance: u32,
+}
+
+#[derive(Clone)]
+struct CompanionProof {
+    path: String,
+    texture: Option<egui::TextureHandle>,
+    error: String,
+}
+
+/// Global zero-based pages: the cover stands alone, followed by 2–3, 4–5, … .
+fn facing_proof_pair(page: u32, right_to_left: bool) -> Option<[u32; 2]> {
+    if page == 0 {
+        return None;
+    }
+    let first = if page.is_multiple_of(2) { page.checked_sub(1)? } else { page };
+    let second = first.checked_add(1)?;
+    Some(if right_to_left { [second, first] } else { [first, second] })
+}
+
+fn automatic_proof_binding(brief: &str, fallback: bool) -> bool {
+    let arabic = |character: char| {
+        character.is_alphabetic()
+            && matches!(u32::from(character), 0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff | 0xfb50..=0xfdff | 0xfe70..=0xfeff)
+    };
+    let mut content = None;
+    for line in brief.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("binding") || lower.contains("اتجاه التجليد") || lower.contains("اتجاه الكتاب") {
+            if ["righttoleft", "right-to-left", "rtl", "من اليمين"].iter().any(|word| lower.contains(*word)) {
+                return true;
+            }
+            if ["lefttoright", "left-to-right", "ltr", "من اليسار"].iter().any(|word| lower.contains(*word)) {
+                return false;
+            }
+        }
+        if ["content copy language", "content language", "لغة المحتوى", "لغة الكتاب"].iter().any(|word| lower.contains(*word)) {
+            let value = lower.split_once(':').map_or(lower.as_str(), |(_, value)| value);
+            if ["arabic", "العربي", "بالعربي", "عربية"].iter().any(|word| value.contains(*word)) {
+                content = Some(true);
+            } else if ["english", "إنجليزي", "انجليزي", "إنكليزي", "انكليزي"].iter().any(|word| value.contains(*word)) {
+                content = Some(false);
+            } else if value.chars().any(arabic) {
+                content = Some(true);
+            }
+        }
+    }
+    content.unwrap_or_else(|| {
+        let lower = brief.to_lowercase();
+        if ["باللغة الإنجليزية", "باللغة الانجليزية", "باللغة الإنكليزية", "باللغة الانكليزية", "english-only", "english only"]
+            .iter()
+            .any(|phrase| lower.contains(*phrase))
+        {
+            false
+        } else if brief.chars().any(arabic) {
+            true
+        } else if brief.chars().any(|character| character.is_ascii_alphabetic()) {
+            false
+        } else {
+            fallback
+        }
+    })
+}
+impl RequestEstimate {
+    fn allowance(&self) -> u32 {
+        self.review_pages.saturating_add(self.image_allowance).saturating_add(self.vision_allowance)
+    }
+}
+
+/// A display estimate only: runtime still validates all authored PAGE blocks and fields.
+fn explicit_script_pages(brief: &str) -> Option<u32> {
+    if brief.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES || brief.contains('\0') {
+        return None;
+    }
+    let mut pages = 0u32;
+    let mut fenced = false;
+    for line in brief.lines() {
+        let line = line.trim();
+        if line.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || !line.starts_with('#') {
+            continue;
+        }
+        let heading = line.trim_start_matches('#').trim_start();
+        if heading.get(..4).is_none_or(|prefix| !prefix.eq_ignore_ascii_case("page")) {
+            continue;
+        }
+        let rest = heading.get(4..)?;
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let boundary = rest.find(|character: char| !character.is_ascii_digit()).unwrap_or(rest.len());
+        let number = rest.get(..boundary)?.parse::<u32>().ok()?;
+        if number != pages.checked_add(1)? || number > 1000 {
+            return None;
+        }
+        let suffix = rest.get(boundary..)?.trim_start();
+        let title = suffix
+            .strip_prefix('—')
+            .or_else(|| suffix.strip_prefix('–'))
+            .or_else(|| suffix.strip_prefix('-'))
+            .or_else(|| suffix.strip_prefix(':'))?
+            .trim();
+        if title.is_empty() || title.chars().count() > 512 {
+            return None;
+        }
+        pages = number;
+    }
+    (pages > 0).then_some(pages)
 }
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -133,12 +266,15 @@ pub struct AiUiState {
     reviewed_proofs: BTreeSet<(String, String)>,
     proof_document_version: Option<(u64, u64)>,
     proof_document_matches: bool,
+    proof_binding: Option<bool>,
+    proof_pair_view: bool,
     review_input_is_human: bool,
     review_pointer_press: Option<(BatchReviewKey, egui::Id)>,
     batch_approval_gesture: Option<(BatchReviewKey, egui::Context, u64)>,
     proof_path: Option<String>,
     proof_loaded: Option<String>,
     proof_texture: Option<egui::TextureHandle>,
+    companion_proof: Option<CompanionProof>,
     proof_error: String,
     local_ollama: ModelSelection,
     local_comfy: ModelSelection,
@@ -203,12 +339,15 @@ impl Default for AiUiState {
             reviewed_proofs: BTreeSet::new(),
             proof_document_version: None,
             proof_document_matches: false,
+            proof_binding: None,
+            proof_pair_view: true,
             review_input_is_human: false,
             review_pointer_press: None,
             batch_approval_gesture: None,
             proof_path: None,
             proof_loaded: None,
             proof_texture: None,
+            companion_proof: None,
             proof_error: String::new(),
             local_ollama: ModelSelection { provider: ProviderKind::Ollama, model: String::new(), endpoint: Some("http://127.0.0.1:11434".into()) },
             local_comfy: ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: Some("http://127.0.0.1:8188".into()) },
@@ -258,8 +397,10 @@ impl AiUiState {
             self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
             self.reviewed_proofs.clear();
             self.proof_document_matches = false;
+            self.proof_binding = None;
             self.proof_loaded = None;
             self.proof_texture = None;
+            self.companion_proof = None;
             self.proof_error.clear();
             self.proof_key = proof_key;
         }
@@ -303,6 +444,32 @@ impl AiUiState {
         if let Some(page) = self.proof_key.as_ref().and_then(|key| key.pages().find(|(path, _)| self.proof_path.as_deref() == Some(path.as_str()))) {
             self.reviewed_proofs.insert(page.clone());
         }
+    }
+
+    /// Navigation never carries a loaded texture or a held review gesture to another page.
+    fn select_proof(&mut self, path: &str) -> bool {
+        if self.proof_path.as_deref() == Some(path) || !self.proof_key.as_ref().is_some_and(|key| key.pages().any(|(page, _)| page == path)) {
+            return false;
+        }
+        self.proof_path = Some(path.into());
+        self.proof_loaded = None;
+        self.proof_texture = None;
+        self.proof_error.clear();
+        self.review_pointer_press = None;
+        true
+    }
+
+    fn companion_proof_path(&self) -> Option<&str> {
+        if !self.settings.facing_pages || !self.proof_pair_view {
+            return None;
+        }
+        let key = self.proof_key.as_ref()?;
+        let selected = key.pages().position(|(path, _)| self.proof_path.as_deref() == Some(path.as_str()))?;
+        let page = key.page_range.0.checked_add(u32::try_from(selected).ok()?)?;
+        let pair = facing_proof_pair(page, false)?;
+        let companion = pair.into_iter().find(|candidate| *candidate != page)?;
+        let index = companion.checked_sub(key.page_range.0)?;
+        key.pages().nth(usize::try_from(index).ok()?).map(|(path, _)| path.as_str())
     }
 
     fn can_approve_batch(&self) -> bool {
@@ -416,6 +583,40 @@ impl AiUiState {
             return None;
         };
         Some(text(arabic, en, ar))
+    }
+
+    fn request_estimate(&self, documents: &[OpenDocument], active: Option<usize>) -> Option<RequestEstimate> {
+        if (!self.new_document && !self.continue_book) || self.settings.pages_per_batch == 0 {
+            return None;
+        }
+        let scripted_pages = explicit_script_pages(&self.prompt)?;
+        let remaining = if self.new_document {
+            if scripted_pages != self.pages {
+                return None;
+            }
+            self.pages
+        } else {
+            let document = documents.iter().find(|document| Some(document.index) == active)?;
+            if u32::try_from(document.pages).ok()? != scripted_pages || (self.continue_book && !document.continuable) {
+                return None;
+            }
+            u32::try_from(if self.continue_book { document.remaining_pages } else { document.pages }).ok()?
+        };
+        let review_pages = remaining.min(self.settings.pages_per_batch);
+        let sources_per_page = if self.settings.output_mode == OutputMode::NativeOnly {
+            0
+        } else {
+            self.settings
+                .design_style
+                .as_ref()
+                .and_then(|id| self.snapshot.skills.iter().rev().find(|card| &card.id == id))
+                .and_then(|card| card.design_profile.as_ref())
+                .map(|profile| profile.page_families.iter().map(|family| family.image_slots.len()).max().unwrap_or(0))
+                .map_or(1, |sources| u32::try_from(sources.min(8)).unwrap_or(8))
+        };
+        let image_allowance = review_pages.saturating_mul(sources_per_page);
+        let vision_allowance = if self.settings.verify_generated_images { image_allowance } else { 0 };
+        (review_pages > 0).then_some(RequestEstimate { review_pages, image_allowance, vision_allowance })
     }
 }
 
@@ -612,26 +813,17 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     state.batch_approval_gesture = None;
     state.review_input_is_human = human_review_input(app);
     state.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
+    state.proof_binding = app
+        .session
+        .active()
+        .filter(|document| state.proof_document_matches && document.doc.settings.facing_pages)
+        .map(|document| document.doc.settings.right_to_left_binding);
     let a = app.ui.language == "ar";
     let mut open = state.open;
     let mut requests = Vec::new();
     let available = app.services.ai.is_some() && state.snapshot.available;
-    let documents: Vec<_> = app
-        .session
-        .documents()
-        .iter()
-        .enumerate()
-        .map(|(index, document)| {
-            let first_blank = document.doc.spreads.iter().position(|spread| spread.items.is_empty());
-            OpenDocument {
-                index,
-                title: document.title(),
-                pages: document.doc.page_count(),
-                continuable: document.doc.spreads.iter().all(|spread| spread.pages.len() == 1)
-                    && first_blank.is_some_and(|first| first > 0 && document.doc.spreads.iter().skip(first).all(|spread| spread.items.is_empty())),
-            }
-        })
-        .collect();
+    let documents: Vec<_> =
+        app.session.documents().iter().enumerate().map(|(index, document)| OpenDocument::from_document(index, document)).collect();
     let mut activate_document = app.session.active_index();
     let original_document = activate_document;
     egui::Window::new(text(a, "AI Production and Skills", "الذكاء"))
@@ -668,30 +860,86 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             }
             if state.task_active() {
                 ui.add(egui::ProgressBar::new(state.snapshot.progress.clamp(0.0, 1.0)).text(&state.snapshot.stage));
+                let usage = &state.snapshot.current_usage;
+                rtl::label(
+                    ui,
+                    format!(
+                        "{}: {} / {} · {} {} · {} {}{}{}",
+                        text(a, "Live requests", "الطلبات المباشرة"),
+                        usage.requests,
+                        state.settings.budget.max_requests,
+                        text(a, "Input", "الإدخال"),
+                        usage.input_tokens,
+                        text(a, "Output", "الإخراج"),
+                        usage.output_tokens,
+                        usage.estimated_cost_usd.map_or_else(String::new, |cost| format!(" · {} ${cost:.6}", text(a, "Estimated", "التقدير"))),
+                        if usage.has_unreported_usage {
+                            text(a, " · Some usage unreported", " · بعض الاستخدام غير مبلغ")
+                        } else {
+                            ""
+                        }
+                    ),
+                );
                 if button(ui, a, "Cancel task — keep produced pages", "إلغاء المهمة مع الاحتفاظ بالصفحات المنتجة")
                 {
                     requests.push(AiRequest::Cancel);
                 }
             }
-            if !state.snapshot.message.is_empty() {
-                let summary: String = state.snapshot.message.lines().next().unwrap_or("").chars().take(140).collect();
+            let status_message = if state.error.is_empty() { &state.snapshot.message } else { &state.error };
+            if !status_message.is_empty() {
+                let summary: String = status_message.lines().next().unwrap_or("").chars().take(140).collect();
                 rtl::label(ui, summary);
             }
-            egui::ScrollArea::vertical().max_height(650.0).show(ui, |ui| {
-                match state.tab {
+            let reviewing = state.tab == 0 && state.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof");
+            if reviewing {
+                // The proof and its actions share a bounded, non-scrolling workspace.
+                production(ui, &mut state, a, available, &documents, &mut activate_document, &mut requests);
+            } else {
+                egui::ScrollArea::vertical().id_salt("ai_panel_body").max_height(650.0).show(ui, |ui| match state.tab {
                     1 => skills(ui, &mut state, a, available, app.session.active().is_some(), &mut requests),
                     2 => usage(ui, &state, a),
                     3 => providers(ui, &mut state, a, available, &mut requests),
                     4 => local_ai(ui, &mut state, a, available, app.services.pick_open.is_some(), &mut requests),
                     _ => production(ui, &mut state, a, available, &documents, &mut activate_document, &mut requests),
-                }
-                if !state.error.is_empty() || !state.snapshot.message.is_empty() {
-                    egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Details", "التفاصيل"))).show(ui, |ui| {
+                });
+            }
+            if !state.error.is_empty()
+                || !state.snapshot.message.is_empty()
+                || !state.snapshot.current_issues.is_empty()
+                || state.snapshot.current_usage.requests > 0
+            {
+                egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Details", "التفاصيل"))).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("ai_status_details").max_height(140.0).show(ui, |ui| {
                         rtl::label(ui, &state.snapshot.message);
                         rtl::label(ui, &state.error);
+                        let usage = &state.snapshot.current_usage;
+                        rtl::label(
+                            ui,
+                            format!(
+                                "{} {} · {} {} · {} {} · {} {} · {} {} · {} {}",
+                                text(a, "Requests", "الطلبات"),
+                                usage.requests,
+                                text(a, "Input", "الإدخال"),
+                                usage.input_tokens,
+                                text(a, "Output", "الإخراج"),
+                                usage.output_tokens,
+                                text(a, "Cached", "المخزن"),
+                                usage.cached_input_tokens,
+                                text(a, "Reasoning", "التفكير"),
+                                usage.reasoning_tokens,
+                                text(a, "Estimated tokens", "الرموز المقدرة"),
+                                usage.estimated_tokens
+                            ),
+                        );
+                        if usage.has_unreported_usage {
+                            label(ui, a, "Some provider usage is unreported.", "بعض بيانات الاستخدام لم يبلغها المزود.");
+                        }
+                        for issue in &state.snapshot.current_issues {
+                            rtl::label(ui, serde_json::to_string_pretty(issue).unwrap_or_else(|_| issue.to_string()));
+                        }
                     });
-                }
-            });
+                });
+            }
         });
     state.open = open;
     if ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary)) {
@@ -724,6 +972,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     app.ui.ai.batch_approval_gesture = None;
     load_preview(app, ctx);
     load_proof_preview(app, ctx);
+    load_companion_proof(app, ctx);
 }
 
 fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, requests: &mut Vec<AiRequest>) {
@@ -979,6 +1228,15 @@ fn production(
     activate_document: &mut Option<usize>,
     requests: &mut Vec<AiRequest>,
 ) {
+    if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
+        batch_review(ui, s, a, requests);
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Production request", "تعليمات الإنتاج"))).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("ai_review_request").max_height(140.0).show(ui, |ui| {
+                rtl::label(ui, &s.prompt);
+            });
+        });
+        return;
+    }
     ui.add_enabled_ui(!s.task_active(), |ui| {
         ui.horizontal_wrapped(|ui| {
             provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
@@ -1084,7 +1342,16 @@ fn production(
             }
             label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
             ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000));
+            ui.checkbox(&mut s.settings.facing_pages, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة")));
         });
+        if s.settings.facing_pages {
+            label(
+                ui,
+                a,
+                "Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.",
+                "اتجاه التجليد تلقائي: العربية من اليمين إلى اليسار والإنجليزية من اليسار إلى اليمين. يبقى الغلاف منفرداً.",
+            );
+        }
         if !s.new_document {
             ui.horizontal_wrapped(|ui| {
                 label(ui, a, "Target document", "المستند المستهدف");
@@ -1137,6 +1404,65 @@ fn production(
             "Your review page count stays unchanged. Internal requests build this group, then stop for your approval before the next review group.",
             "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
         );
+        if let Some(estimate) = s.request_estimate(documents, *activate_document) {
+            rtl::label(
+                ui,
+                format!(
+                    "{}: {} {} + {} {}{} = {}",
+                    text(a, "Requests for this review (estimate)", "طلبات هذه المراجعة (تقدير)"),
+                    estimate.review_pages,
+                    text(a, "text", "للنص"),
+                    estimate.image_allowance,
+                    text(a, "images", "للصور"),
+                    if estimate.vision_allowance > 0 {
+                        format!(" + {} {}", estimate.vision_allowance, text(a, "vision checks", "لفحص الصور"))
+                    } else {
+                        String::new()
+                    },
+                    estimate.allowance()
+                ),
+            );
+            label(
+                ui,
+                a,
+                "One text request per PAGE; image allowance is provisional. Repairs and later reviews share the task limit. Token and cost limits still apply.",
+                "طلب نص لكل PAGE؛ حصة الصور تقديرية. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية.",
+            );
+            if estimate.vision_allowance > 0 {
+                label(
+                    ui,
+                    a,
+                    "Image inspection adds one billed text request per uncached generated source; this estimate assumes no cached reuse.",
+                    "يضيف فحص الصور طلب نص مدفوعاً لكل مصدر مولد غير مخزن؛ يفترض هذا التقدير عدم إعادة استخدام صور مخزنة.",
+                );
+            }
+            if s.settings.budget.max_requests < estimate.review_pages {
+                rtl::label(
+                    ui,
+                    format!(
+                        "{} {} {} {}.",
+                        text(a, "Configured request limit", "حد الطلبات المحدد"),
+                        s.settings.budget.max_requests,
+                        text(a, "is below the minimum text requests for this review:", "أقل من الحد الأدنى لطلبات نص هذه المراجعة:"),
+                        estimate.review_pages
+                    ),
+                );
+            }
+            if s.settings.budget.max_requests < estimate.allowance() {
+                if ui
+                    .add_enabled(
+                        estimate.allowance() <= MAX_REQUEST_ALLOWANCE,
+                        egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for this review", "ضبط حصة الطلبات لهذه المراجعة"))),
+                    )
+                    .clicked()
+                {
+                    s.settings.budget.max_requests = estimate.allowance();
+                }
+                if estimate.allowance() > MAX_REQUEST_ALLOWANCE {
+                    label(ui, a, "This provisional estimate exceeds the 10,000-request task ceiling.", "يتجاوز هذا التقدير الأولي سقف المهمة البالغ ١٠٬٠٠٠ طلب.");
+                }
+            }
+        }
         let continuation_issue = (s.continue_book
             && !documents.iter().any(|document| Some(document.index) == *activate_document && document.continuable))
         .then_some(text(
@@ -1177,6 +1503,7 @@ fn production(
             });
             if s.settings.output_mode == OutputMode::NativeWithImages {
                 model(ui, a, "production_image_provider", &mut s.settings.image_model, true, requests);
+                image_inspection_setting(ui, s, a);
             }
             ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
             if !s.automatic_skills {
@@ -1254,47 +1581,47 @@ fn usage_line(ui: &mut egui::Ui, a: bool, usage: &designcraft_ai_types::protocol
     }
 }
 
+fn proof_image(
+    ui: &mut egui::Ui,
+    a: bool,
+    texture: Option<&egui::TextureHandle>,
+    error: &str,
+    title: &str,
+    size: egui::Vec2,
+) -> Option<egui::Response> {
+    if let Some(texture) = texture {
+        Some(ui.add(egui::Image::new(texture).fit_to_exact_size(size).alt_text(title).sense(egui::Sense::click())))
+    } else {
+        label(ui, a, "Page preview unavailable", "معاينة الصفحة غير متاحة");
+        if !error.is_empty() {
+            egui::ScrollArea::vertical().id_salt("ai_proof_error").max_height((size.y - 30.0).max(40.0)).show(ui, |ui| {
+                rtl::label(ui, error);
+            });
+        }
+        None
+    }
+}
+
 fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
     let can_review = s.can_review_selected_proof();
     let can_approve = s.can_approve_batch();
-    let page_count = s.proof_key.as_ref().map_or(0, |key| key.pages().count());
+    let pages: Vec<_> = s.proof_key.as_ref().map_or_else(Vec::new, |key| key.pages().collect());
+    let page_count = pages.len();
+    let reviewed_count = pages.iter().filter(|page| s.reviewed_proofs.contains(**page)).count();
+    let selected = pages.iter().position(|(path, _)| s.proof_path.as_deref() == Some(path.as_str()));
+    let selected_reviewed = selected.and_then(|index| pages.get(index)).is_some_and(|page| s.reviewed_proofs.contains(*page));
+    let mut select_page = None;
     let mut confirm_page = false;
     let Some(batch) = &s.snapshot.batch else {
         return;
     };
     ui.separator();
-    label(ui, a, "Batch production and proof", "إنتاج الدفعات والمراجعة");
-    if let Some(style) = s
-        .snapshot
-        .reports
-        .iter()
-        .rev()
-        .find(|report| report.id.starts_with(&format!("{}-batch-", batch.job_id)))
-        .and_then(|report| report.design_style.as_ref())
-    {
-        rtl::label(
-            ui,
-            format!(
-                "{}: {} · {}",
-                text(a, "Pinned design style", "نمط التصميم المثبّت"),
-                style.name,
-                style.revision.chars().take(12).collect::<String>()
-            ),
-        );
-        if style.execution_mode == "native_templates" {
-            label(
-                ui,
-                a,
-                "Native template execution — bounded internal plans; one complete human review group.",
-                "تنفيذ قوالب أصلية — أجزاء داخلية محدودة، ومجموعة مراجعة بشرية كاملة.",
-            );
-        }
-    }
+    label(ui, a, "Page proof review", "مراجعة معاينات الصفحات");
     rtl::label(
         ui,
         format!(
             "{} {} / {} · {} {} / {} · {}",
-            text(a, "Batch", "الدفعة"),
+            text(a, "Review group", "مجموعة المراجعة"),
             batch.current_batch,
             batch.total_batches,
             text(a, "Pages", "الصفحات"),
@@ -1303,102 +1630,250 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             batch.status
         ),
     );
-    label(ui, a, "Cumulative task usage", "الاستخدام التراكمي للمهمة");
-    usage_line(ui, a, &batch.cumulative_usage, batch.elapsed_ms);
     if let Some(current) = batch.batches.iter().find(|report| report.batch == batch.current_batch) {
-        label(ui, a, "Current batch", "الدفعة الحالية");
-        usage_line(ui, a, &current.usage, current.elapsed_ms);
-        for path in &current.proof_paths {
-            ui.horizontal(|ui| {
-                let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-                ui.add(egui::Label::new(name).truncate()).on_hover_text(path);
-                if path.to_ascii_lowercase().ends_with(".png") && button(ui, a, "Open proof preview", "فتح معاينة المراجعة") {
-                    s.proof_path = Some(path.clone());
-                    s.proof_loaded = None;
-                    s.proof_texture = None;
-                }
-                if s.reviewed_proofs.iter().any(|(page, _)| page == path) {
-                    label(ui, a, "Reviewed", "تمت المراجعة");
+        let pair = selected
+            .and_then(|index| current.page_start.checked_add(u32::try_from(index).ok()?))
+            .filter(|_| s.settings.facing_pages && s.proof_pair_view)
+            .and_then(|page| {
+                facing_proof_pair(page, s.proof_binding.or(s.settings.right_to_left_binding).unwrap_or_else(|| automatic_proof_binding(&s.prompt, a)))
+            });
+        let height = (ui.available_height() - 88.0).clamp(300.0, 480.0);
+        let action_width = (ui.available_width() * 0.36).clamp(190.0, 255.0);
+        let image_width = (ui.available_width() - action_width - ui.spacing().item_spacing.x).max(100.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(image_width, height), egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.set_width(image_width);
+                ui.set_min_height(height);
+                if let Some(pair) = pair {
+                    let page_width = ((image_width - ui.spacing().item_spacing.x) * 0.5).max(40.0);
+                    ui.allocate_ui_with_layout(egui::vec2(image_width, height), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        for page in pair {
+                            ui.push_id(("facing_proof_page", page), |ui| {
+                                ui.allocate_ui_with_layout(egui::vec2(page_width, height), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                    ui.set_width(page_width);
+                                    let page_number = page.saturating_add(1);
+                                    let proof = page
+                                        .checked_sub(current.page_start)
+                                        .and_then(|index| usize::try_from(index).ok())
+                                        .and_then(|index| pages.get(index));
+                                    if let Some(proof) = proof {
+                                        let (path, _) = proof;
+                                        let is_selected = s.proof_path.as_deref() == Some(path.as_str());
+                                        let title = format!(
+                                            "{} {}{}{}",
+                                            text(a, "Page", "الصفحة"),
+                                            page_number,
+                                            if is_selected { text(a, " · Selected", " · محددة") } else { "" },
+                                            if s.reviewed_proofs.contains(*proof) {
+                                                text(a, " · Reviewed", " · تمت المراجعة")
+                                            } else {
+                                                ""
+                                            }
+                                        );
+                                        if ui.selectable_label(is_selected, rtl::widget(ui, title)).clicked() {
+                                            select_page = Some(path.clone());
+                                        }
+                                        let (texture, error) = if is_selected {
+                                            (s.proof_texture.as_ref(), s.proof_error.as_str())
+                                        } else if let Some(companion) = &s.companion_proof
+                                            && companion.path.as_str() == path.as_str()
+                                        {
+                                            (companion.texture.as_ref(), companion.error.as_str())
+                                        } else {
+                                            (None, "")
+                                        };
+                                        let alt = format!("{} {} {}", text(a, "Page", "الصفحة"), page_number, text(a, "proof", "للمراجعة"));
+                                        if proof_image(ui, a, texture, error, &alt, egui::vec2(page_width, height - 48.0))
+                                            .is_some_and(|response| response.clicked())
+                                        {
+                                            select_page = Some(path.clone());
+                                        }
+                                    } else if page < batch.total_pages {
+                                        rtl::label(ui, format!("{} {}", text(a, "Page", "الصفحة"), page_number));
+                                        label(ui, a, "Outside this review group", "خارج مجموعة المراجعة الحالية");
+                                    } else {
+                                        label(ui, a, "End of book", "نهاية الكتاب");
+                                    }
+                                });
+                            });
+                        }
+                    });
+                } else {
+                    let _ = proof_image(
+                        ui,
+                        a,
+                        s.proof_texture.as_ref(),
+                        &s.proof_error,
+                        text(a, "Selected page proof", "معاينة الصفحة المحددة"),
+                        egui::vec2(image_width, height),
+                    );
                 }
             });
-        }
-        if let Some(texture) = &s.proof_texture {
-            ui.add(egui::Image::new(texture).max_size(egui::vec2(620.0, 440.0)));
-        }
-        if !s.proof_error.is_empty() {
-            rtl::label(ui, &s.proof_error);
-        }
-        if let Some(path) = &s.proof_path {
-            ui.add(egui::Label::new(path).wrap());
-        }
+            ui.allocate_ui_with_layout(egui::vec2(action_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(action_width);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                rtl::label(ui, format!("{} {} / {}", text(a, "Pages reviewed:", "الصفحات المراجعة:"), reviewed_count, page_count));
+                if s.settings.facing_pages {
+                    ui.checkbox(&mut s.proof_pair_view, rtl::widget(ui, text(a, "Show facing pair", "عرض الصفحتين المتقابلتين")));
+                }
+                if let Some(index) = selected {
+                    rtl::label(
+                        ui,
+                        format!(
+                            "{} {} / {} · {} {}",
+                            text(a, "Preview", "المعاينة"),
+                            index.saturating_add(1),
+                            page_count,
+                            text(a, "Document page", "صفحة المستند"),
+                            current.page_start.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)).saturating_add(1)
+                        ),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(index > 0, egui::Button::new(rtl::widget(ui, text(a, "Previous", "السابقة")))).clicked() {
+                            select_page = index.checked_sub(1).and_then(|previous| pages.get(previous)).map(|(path, _)| path.clone());
+                        }
+                        if ui
+                            .add_enabled(index.saturating_add(1) < page_count, egui::Button::new(rtl::widget(ui, text(a, "Next", "التالية"))))
+                            .clicked()
+                        {
+                            select_page = pages.get(index.saturating_add(1)).map(|(path, _)| path.clone());
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("ai_proof_page")
+                        .selected_text(format!("{} {}", text(a, "Page", "الصفحة"), index.saturating_add(1)))
+                        .show_ui(ui, |ui| {
+                            for (page_index, page) in pages.iter().enumerate() {
+                                let (path, _) = page;
+                                let reviewed = s.reviewed_proofs.contains(*page);
+                                let title = format!(
+                                    "{} {}{}",
+                                    text(a, "Page", "الصفحة"),
+                                    page_index.saturating_add(1),
+                                    if reviewed { text(a, " · Reviewed", " · تمت المراجعة") } else { "" }
+                                );
+                                if ui.selectable_label(page_index == index, rtl::widget(ui, title)).clicked() {
+                                    select_page = Some(path.clone());
+                                }
+                            }
+                        });
+                }
+                if batch.status == "awaiting_human_proof" {
+                    let review_label = if selected_reviewed {
+                        text(a, "Reviewed", "تمت المراجعة")
+                    } else {
+                        text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة")
+                    };
+                    // A held press on one page must never confirm a different preview.
+                    ui.push_id(("ai_review_page", s.proof_path.as_deref()), |ui| {
+                        let response = ui.add_enabled(can_review && !selected_reviewed, egui::Button::new(rtl::widget(ui, review_label)).wrap());
+                        confirm_page =
+                            AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &response);
+                    });
+                    ui.separator();
+                    let (en, ar) = if batch.current_batch >= batch.total_batches {
+                        ("Approve final proof and finish", "اعتماد المراجعة النهائية وإنهاء المهمة")
+                    } else {
+                        ("Approve and generate next review group", "اعتماد وإنشاء مجموعة المراجعة التالية")
+                    };
+                    let response = ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar))).wrap());
+                    if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &response) {
+                        s.batch_approval_gesture = s.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
+                        requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
+                    }
+                    if page_count == 0 {
+                        label(ui, a, "Verified previews for every group page are required.", "يلزم توفر صور موثقة لجميع صفحات المجموعة.");
+                    } else if !s.proof_document_matches {
+                        label(
+                            ui,
+                            a,
+                            "Return to the proof's document revision. Changes require a new proof.",
+                            "ارجع إلى إصدار المستند المطابق للبروفة. التعديلات تتطلب بروفة جديدة.",
+                        );
+                    } else if reviewed_count < page_count {
+                        label(ui, a, "Confirm each displayed page to enable approval.", "أكد مراجعة كل صفحة معروضة لتفعيل الاعتماد.");
+                    }
+                }
+            });
+        });
     } else {
-        label(ui, a, "Current batch usage and proof have not yet been reported.", "لم تُبلغ بيانات استخدام الدفعة الحالية ومعاينتها بعد.");
-    }
-    if batch.status == "awaiting_human_proof" {
-        label(
-            ui,
-            a,
-            "Review every proof page. The next batch uses the same cumulative task limits.",
-            "افتح كل صورة وأكد مراجعتها. تخضع الدفعة التالية لحدود المهمة التراكمية نفسها.",
-        );
-        rtl::label(ui, format!("{} {} / {}", text(a, "Pages confirmed:", "الصفحات المؤكد مراجعتها:"), s.reviewed_proofs.len(), page_count));
-        if page_count == 0 {
-            label(ui, a, "Verified previews for every batch page are required.", "يلزم توفر صور موثقة لجميع صفحات الدفعة.");
-        } else if !s.proof_document_matches {
-            label(
-                ui,
-                a,
-                "The active document does not match this proof revision. Return to that document or restart the task after changes.",
-                "المستند النشط لا يطابق إصدار البروفة. ارجع إلى المستند نفسه أو أعد بدء المهمة بعد تعديلاته.",
-            );
-        }
-        let review_response =
-            ui.add_enabled(can_review, egui::Button::new(rtl::widget(ui, text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة"))));
-        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &review_response) {
-            confirm_page = true;
-        }
-        let final_batch = batch.current_batch >= batch.total_batches;
-        let (en, ar) = if final_batch {
-            ("Approve final proof and finish", "اعتماد المراجعة النهائية وإنهاء المهمة")
-        } else {
-            ("Approve proof and generate next batch", "اعتماد المراجعة وإنشاء الدفعة التالية")
-        };
-        let approve_response = ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar))));
-        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &approve_response) {
-            s.batch_approval_gesture = s.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
-            requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
-        }
+        label(ui, a, "Current group usage and proof have not yet been reported.", "لم تُبلغ بيانات استخدام المجموعة الحالية ومعاينتها بعد.");
     }
     egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Batch details", "تفاصيل الدفعات"))).show(ui, |ui| {
-        rtl::label(
-            ui,
-            format!(
-                "{} / checkpoint {} / document {:?} / revision {:?}",
-                batch.job_id, batch.checkpoint, batch.document_uid, batch.document_revision
-            ),
-        );
-        for report in &batch.batches {
+        egui::ScrollArea::vertical().id_salt("ai_batch_details").max_height(160.0).show(ui, |ui| {
             rtl::label(
                 ui,
                 format!(
-                    "{} {} · {} {}–{} · {}",
-                    text(a, "Batch", "الدفعة"),
-                    report.batch,
-                    text(a, "Pages", "الصفحات"),
-                    report.page_start.saturating_add(1),
-                    report.page_start.saturating_add(report.page_count),
-                    report.status
+                    "{} / checkpoint {} / document {:?} / revision {:?}",
+                    batch.job_id, batch.checkpoint, batch.document_uid, batch.document_revision
                 ),
             );
-            usage_line(ui, a, &report.usage, report.elapsed_ms);
-            for path in &report.proof_paths {
-                ui.add(egui::Label::new(path).wrap());
+            if let Some(style) = s
+                .snapshot
+                .reports
+                .iter()
+                .rev()
+                .find(|report| report.id.starts_with(&format!("{}-batch-", batch.job_id)))
+                .and_then(|report| report.design_style.as_ref())
+            {
+                rtl::label(ui, format!("{}: {} · {}", text(a, "Pinned design style", "نمط التصميم المثبّت"), style.name, style.revision));
             }
-        }
+            label(ui, a, "Cumulative task usage", "الاستخدام التراكمي للمهمة");
+            usage_line(ui, a, &batch.cumulative_usage, batch.elapsed_ms);
+            for report in &batch.batches {
+                rtl::label(
+                    ui,
+                    format!(
+                        "{} {} · {} {}–{} · {}",
+                        text(a, "Batch", "الدفعة"),
+                        report.batch,
+                        text(a, "Pages", "الصفحات"),
+                        report.page_start.saturating_add(1),
+                        report.page_start.saturating_add(report.page_count),
+                        report.status
+                    ),
+                );
+                usage_line(ui, a, &report.usage, report.elapsed_ms);
+                for path in &report.proof_paths {
+                    ui.add(egui::Label::new(path).wrap());
+                }
+            }
+        });
     });
     if confirm_page {
         s.review_selected_proof();
         ui.ctx().request_repaint();
+    }
+    if let Some(path) = select_page
+        && s.select_proof(&path)
+    {
+        ui.ctx().request_repaint();
+    }
+}
+
+fn image_inspection_setting(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
+    let supported_provider = s.settings.text_model.provider == ProviderKind::Gemini;
+    ui.add_enabled(
+        supported_provider,
+        egui::Checkbox::new(
+            &mut s.settings.verify_generated_images,
+            rtl::widget(
+                ui,
+                text(
+                    a,
+                    "Inspect generated images with Gemini (extra billed vision requests)",
+                    "فحص الصور المولدة مع Gemini (طلبات رؤية إضافية مدفوعة)",
+                ),
+            ),
+        ),
+    );
+    label(
+        ui,
+        a,
+        "Optional advisory inspection; human proof review is still required. Requires a supported Gemini text model, validated before use.",
+        "فحص استشاري اختياري؛ تبقى مراجعة البروفة البشرية مطلوبة. يتطلب نموذج نص Gemini مدعوماً، ويُتحقق من دعمه قبل الاستخدام.",
+    );
+    if !supported_provider && s.settings.verify_generated_images && button(ui, a, "Turn off image inspection", "إيقاف فحص الصور") {
+        s.settings.verify_generated_images = false;
     }
 }
 
@@ -1417,7 +1892,7 @@ fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
         ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=65_536));
         ui.end_row();
         label(ui, a, "Maximum requests", "أقصى عدد للطلبات");
-        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=64));
+        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=MAX_REQUEST_ALLOWANCE));
         ui.end_row();
         label(ui, a, "Maximum extra planning requests", "أقصى طلبات تخطيط إضافية");
         ui.add_enabled(repairs, egui::DragValue::new(&mut b.repair_attempts).range(0..=3));
@@ -1975,6 +2450,28 @@ fn load_proof_preview(app: &mut DesignApp, ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
+fn load_companion_proof(app: &mut DesignApp, ctx: &egui::Context) {
+    let path = app.ui.ai.companion_proof_path().map(str::to_owned);
+    if app.ui.ai.companion_proof.as_ref().map(|proof| &proof.path) == path.as_ref() {
+        return;
+    }
+    app.ui.ai.companion_proof = None;
+    let Some(path) = path else { return };
+    let loaded = match &app.services.read {
+        Some(read) => preview_texture(read, &path, ctx, "ai_companion_proof"),
+        None => Err("Proof reader unavailable.".into()),
+    };
+    let (texture, error) = match loaded {
+        Ok(texture) => (Some(texture), String::new()),
+        Err(error) => {
+            app.ui.ai.reviewed_proofs.retain(|(page, _)| page != &path);
+            (None, error)
+        }
+    };
+    app.ui.ai.companion_proof = Some(CompanionProof { path, texture, error });
+    ctx.request_repaint();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2040,6 +2537,137 @@ mod tests {
         );
         assert!(!state.can_approve_batch());
     }
+
+    #[test]
+    fn explicit_page_review_estimate_changes_request_allowance_only_after_the_button() {
+        let mut state = AiUiState { prompt: (1..=8).map(|page| format!("### PAGE {page:02} — Lesson {page}\n")).collect(), ..Default::default() };
+        state.pages = 8;
+        state.settings.pages_per_batch = 6;
+        state.settings.text_model.model = "fixture-model".into();
+        let token_limit = state.settings.budget.token_limit;
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 1100.0))
+            .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Requests for this review (estimate): 6 text + 0 images = 6").is_some());
+        assert!(panel.query_by_label("Configured request limit 4 is below the minimum text requests for this review: 6.").is_some());
+        assert_eq!(panel.state().settings.budget.max_requests, 4, "an estimate never raises the spending allowance itself");
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 6);
+        assert_eq!(panel.state().settings.pages_per_batch, 6);
+        assert_eq!(panel.state().pages, 8);
+        assert_eq!(panel.state().settings.budget.token_limit, token_limit);
+
+        panel.state_mut().settings.output_mode = OutputMode::NativeWithImages;
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Requests for this review (estimate): 6 text + 6 images = 12").is_some());
+        assert_eq!(panel.state().settings.budget.max_requests, 6, "provisional image allowance requires another explicit choice");
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 12);
+        assert_eq!(panel.state().settings.pages_per_batch, 6);
+        panel.state_mut().settings.text_model.provider = ProviderKind::Gemini;
+        panel.state_mut().settings.verify_generated_images = true;
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Requests for this review (estimate): 6 text + 6 images + 6 vision checks = 18").is_some());
+        assert_eq!(panel.state().settings.budget.max_requests, 12, "opting into inspection still does not raise request allowance implicitly");
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 18);
+        assert_eq!(panel.state().settings.pages_per_batch, 6);
+        assert_eq!(panel.state().settings.budget.token_limit, token_limit);
+    }
+
+    #[test]
+    fn image_inspection_requires_explicit_gemini_choice_and_can_be_disabled_after_provider_change() {
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 400.0))
+            .build_ui_state(|ui, state| image_inspection_setting(ui, state, false), AiUiState::default());
+        let label = "Inspect generated images with Gemini (extra billed vision requests)";
+        panel.run_steps(3);
+        assert!(panel.get_by_label(label).accesskit_node().is_disabled());
+        assert!(!panel.state().settings.verify_generated_images);
+        panel.state_mut().settings.text_model.provider = ProviderKind::Gemini;
+        panel.run_steps(3);
+        assert!(!panel.get_by_label(label).accesskit_node().is_disabled());
+        panel.get_by_label(label).click();
+        panel.run_steps(3);
+        assert!(panel.state().settings.verify_generated_images);
+        assert_eq!(panel.state().settings.budget.max_requests, 4);
+        assert_eq!(panel.state().settings.pages_per_batch, 2);
+        panel.state_mut().settings.text_model.provider = ProviderKind::Ollama;
+        panel.run_steps(3);
+        assert!(panel.get_by_label(label).accesskit_node().is_disabled());
+        assert!(panel.state().settings.verify_generated_images, "provider changes do not silently change an explicit inspection choice");
+        panel.get_by_label("Turn off image inspection").click();
+        panel.run_steps(3);
+        assert!(!panel.state().settings.verify_generated_images);
+        assert_eq!(panel.state().settings.budget.max_requests, 4);
+        assert_eq!(panel.state().settings.pages_per_batch, 2);
+    }
+
+    #[test]
+    fn continuation_request_estimate_counts_only_remaining_pages_and_ignores_fenced_examples() {
+        let prompt = format!(
+            "```markdown\n### PAGE 99 — Example only\n```\n{}",
+            (1..=8).map(|page| format!("### PAGE {page:02} — Lesson {page}\n")).collect::<String>()
+        );
+        let mut state = AiUiState { prompt, new_document: false, continue_book: true, ..Default::default() };
+        state.settings.pages_per_batch = 6;
+        state.settings.output_mode = OutputMode::NativeWithImages;
+        let document = OpenDocument { index: 3, title: "Book".into(), pages: 8, remaining_pages: 2, continuable: true };
+        let estimate = state.request_estimate(&[document], Some(3)).unwrap();
+        assert_eq!(estimate.review_pages, 2);
+        assert_eq!(estimate.image_allowance, 2);
+        assert_eq!(state.settings.budget.max_requests, 4);
+    }
+
+    #[test]
+    fn facing_page_choice_preserves_automatic_binding_without_another_direction_prompt() {
+        let state = AiUiState::default();
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1000.0, 1100.0))
+            .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
+        panel.run_steps(3);
+        assert!(!panel.state().settings.facing_pages);
+        panel.get_by_label("Facing pages").click();
+        panel.run_steps(3);
+        assert!(panel.state().settings.facing_pages);
+        assert_eq!(panel.state().settings.right_to_left_binding, None);
+        assert!(
+            panel.query_by_label("Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.").is_some()
+        );
+    }
+    #[test]
+    fn facing_book_continuation_counts_blank_pages_inside_a_partly_filled_pair() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":360,"height":480,"pages":5,"facingPages":true})).unwrap();
+        let add_page_item = |session: &mut Session, absolute| {
+            let document = session.doc().unwrap();
+            let (spread, page) = document.doc.page_loc(absolute).unwrap();
+            let x = document.doc.spreads[spread].pages[page].x;
+            session.execute("frame.create", &json!({"spread":spread,"rect":[x+20.0,20.0,x+100.0,80.0]})).unwrap();
+        };
+        add_page_item(&mut session, 0);
+        add_page_item(&mut session, 1);
+        assert!(session.doc().unwrap().doc.spreads.iter().any(|spread| spread.pages.len() == 2));
+        let book = OpenDocument::from_document(0, session.doc().unwrap());
+        assert!(book.continuable);
+        assert_eq!(book.pages, 5);
+        assert_eq!(book.remaining_pages, 3, "the blank right page of the first pair is part of the suffix");
+        add_page_item(&mut session, 3);
+        assert!(!OpenDocument::from_document(0, session.doc().unwrap()).continuable, "a later filled page cannot bypass a blank gap");
+    }
+
+    #[test]
+    fn automatic_proof_binding_uses_print_content_metadata_before_instruction_language() {
+        assert!(!automatic_proof_binding("صمّم كتاباً للأطفال\nContent Copy Language: English", true));
+        assert!(automatic_proof_binding("Script Language: English\nContent Copy Language: English LTR + Vocalized Arabic RTL", false));
+        assert!(!automatic_proof_binding("تعليمات عربية: محتوى الكتاب باللغة الإنجليزية", true));
+        assert!(automatic_proof_binding("Binding: RTL\nContent Copy Language: English", false));
+    }
+
     #[test]
     fn long_bilingual_composer_keeps_the_full_brief_and_uses_the_shared_limit() {
         let mut state = AiUiState { prompt: "تعليمات المنهج Mathematics\n".repeat(4000), ..Default::default() };
@@ -2236,7 +2864,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            app.run("file.new", json!({})).unwrap();
+            app.run("file.new", json!({"facingPages":false})).unwrap();
             let document = app.session.active().map(|d| (d.uid, d.revision)).unwrap();
             let checkpoint = AiSnapshot {
                 available: true,
@@ -2281,6 +2909,216 @@ mod tests {
                 self.app.ui.ai.review_selected_proof();
             }
         }
+
+        fn panel(mut self) -> egui_kittest::Harness<'static, DesignApp> {
+            self.app.ui.ai.open = true;
+            self.app.ui.ai.prompt = "A long production request\n".repeat(1000);
+            egui_kittest::Harness::builder().with_size(egui::vec2(1024.0, 768.0)).build_ui_state(|ui, app| show(app, ui.ctx()), self.app)
+        }
+    }
+
+    #[test]
+    fn production_review_keeps_actions_beside_the_proof_and_tracks_each_displayed_page() {
+        let fixture = ProofFixture::new();
+        let calls = fixture.calls.clone();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        let image = panel.get_by_label("Selected page proof").rect();
+        let review = panel.get_by_label("I reviewed the displayed page").rect();
+        let approval = panel.get_by_label("Approve and generate next review group").rect();
+        assert!(review.min.x >= image.max.x, "page confirmation belongs beside its displayed preview");
+        assert!(approval.min.x >= image.max.x, "group approval belongs beside the preview");
+        assert!(image.contains(egui::pos2(image.center().x, review.center().y)));
+        assert!(image.contains(egui::pos2(image.center().x, approval.center().y)));
+        assert!(image.max.y < 768.0 && approval.max.y < 768.0, "long requests and file lists must not require scrolling to approve");
+        assert!(panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled());
+        assert!(panel.get_by_label("Previous").accesskit_node().is_disabled());
+        assert!(panel.query_by_label("Pages reviewed: 0 / 2").is_some());
+
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Reviewed").is_some());
+        assert_eq!(panel.state().ui.ai.reviewed_proofs, BTreeSet::from([("page-1.png".into(), "2".repeat(64))]));
+        assert!(panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled());
+
+        panel.get_by_label("Next").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.proof_path.as_deref(), Some("page-2.png"));
+        assert_eq!(panel.state().ui.ai.proof_loaded.as_deref(), Some("page-2.png"));
+        assert!(panel.query_by_label("Pages reviewed: 1 / 2").is_some());
+        assert!(panel.get_by_label("Next").accesskit_node().is_disabled());
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 1, "navigation and loading never review the next page");
+
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2);
+        assert!(!panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled());
+        assert_eq!(calls.get(), 0, "per-page review never submits group approval");
+    }
+
+    #[test]
+    fn busy_production_shows_live_usage_and_keeps_full_diagnostics_in_details() {
+        let mut fixture = ProofFixture::new();
+        fixture.app.ui.ai.snapshot.busy = true;
+        fixture.app.ui.ai.snapshot.current_usage = designcraft_ai_types::protocol::UsageSummary {
+            requests: 3,
+            input_tokens: 1042,
+            output_tokens: 91,
+            estimated_cost_usd: Some(0.0123),
+            ..Default::default()
+        };
+        let issue = json!({"page":7,"field":"body","reason":"Native text exceeds frame","solution":"Increase frame height"});
+        fixture.app.ui.ai.snapshot.current_issues = vec![issue.clone()];
+        fixture.app.ui.ai.error = "Native text exceeds frame\nPage 7 body needs another line.".into();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Live requests: 3 / 4 · Input 1042 · Output 91 · Estimated $0.012300").is_some());
+        assert!(panel.query_by_label("Native text exceeds frame").is_some());
+        assert!(panel.query_by_label("Native text exceeds frame\nPage 7 body needs another line.").is_none());
+        let diagnostic = serde_json::to_string_pretty(&issue).unwrap();
+        assert!(panel.query_by_label(&diagnostic).is_none());
+        panel.get_by_label("Details").click();
+        panel.run_steps(3);
+        assert!(panel.query_by_label(&diagnostic).is_some());
+        assert!(panel.query_by_label("Native text exceeds frame\nPage 7 body needs another line.").is_some());
+        assert!(panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled());
+        assert!(panel.get_by_label("Approve and generate next review group").rect().max.y < 768.0);
+    }
+
+    #[test]
+    fn facing_proofs_keep_cover_single_order_pairs_and_review_each_selected_page_separately() {
+        let mut fixture = ProofFixture::new();
+        let batch = fixture.checkpoint.batch.as_mut().unwrap();
+        batch.total_pages = 6;
+        batch.pages_per_batch = 3;
+        batch.completed_pages = 3;
+        let report = &mut batch.batches[0];
+        report.page_count = 3;
+        report.proof_paths.push("page-3.png".into());
+        report.proof_sha256.push("4".repeat(64));
+        fixture.app.ui.ai.accept(fixture.checkpoint.clone());
+        fixture.app.ui.ai.settings.facing_pages = true;
+        fixture.app.ui.ai.settings.right_to_left_binding = Some(false);
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Selected page proof").is_some(), "the first cover remains a single page");
+        assert!(panel.query_by_label("Page 2 proof").is_none());
+        panel.get_by_label("Next").click();
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Page 2 proof").rect().center().x < panel.get_by_label("Page 3 proof").rect().center().x);
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty(), "showing a pair reviews neither page");
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs, BTreeSet::from([("page-2.png".into(), "3".repeat(64))]));
+        panel.get_by_label("Page 3").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.proof_path.as_deref(), Some("page-3.png"));
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 1);
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2);
+        assert!(
+            panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled(),
+            "the cover still requires its own review"
+        );
+        panel.state_mut().ui.ai.settings.right_to_left_binding = Some(true);
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Page 3 proof").rect().center().x < panel.get_by_label("Page 2 proof").rect().center().x);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2, "changing physical reading order cannot add a review");
+        panel.get_by_label("Show facing pair").click();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Selected page proof").is_some());
+        assert!(panel.state().ui.ai.companion_proof.is_none());
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2);
+        panel.get_by_label("Show facing pair").click();
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Page 3 proof").rect().center().x < panel.get_by_label("Page 2 proof").rect().center().x);
+        panel.get_by_label("Previous").click();
+        panel.run_steps(3);
+        assert!(panel.get_by_label("Reviewed").accesskit_node().is_disabled());
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2);
+    }
+
+    #[test]
+    fn facing_partner_outside_review_group_is_a_placeholder_without_implied_review() {
+        let mut fixture = ProofFixture::new();
+        fixture.app.ui.ai.settings.facing_pages = true;
+        fixture.app.ui.ai.settings.right_to_left_binding = Some(false);
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        panel.get_by_label("Next").click();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Page 2 proof").is_some());
+        assert!(panel.query_by_label("Page 3 proof").is_none());
+        assert!(panel.query_by_label("Outside this review group").is_some());
+        assert!(panel.state().ui.ai.companion_proof.is_none());
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 1);
+        panel.get_by_label("Previous").click();
+        panel.run_steps(3);
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2);
+        assert!(
+            !panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled(),
+            "only actual pages in the current group are required"
+        );
+    }
+
+    #[test]
+    fn facing_proof_prefers_matching_document_binding_and_drops_it_after_revision_change() {
+        let mut fixture = ProofFixture::new();
+        fixture.app.run("layout.documentSetup", json!({"facingPages":true,"binding":"rightToLeft"})).unwrap();
+        let document = fixture.app.session.active().unwrap();
+        let batch = fixture.checkpoint.batch.as_mut().unwrap();
+        batch.document_uid = Some(document.uid);
+        batch.document_revision = Some(document.revision);
+        batch.total_pages = 6;
+        batch.pages_per_batch = 3;
+        batch.completed_pages = 3;
+        let report = &mut batch.batches[0];
+        report.page_count = 3;
+        report.proof_paths.push("page-3.png".into());
+        report.proof_sha256.push("4".repeat(64));
+        fixture.app.ui.ai.accept(fixture.checkpoint.clone());
+        fixture.app.ui.ai.settings.facing_pages = true;
+        fixture.app.ui.ai.settings.right_to_left_binding = Some(false);
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        panel.get_by_label("Next").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.proof_binding, Some(true));
+        assert!(panel.get_by_label("Page 3 proof").rect().center().x < panel.get_by_label("Page 2 proof").rect().center().x);
+        panel.state_mut().run("layout.documentSetup", json!({"binding":"leftToRight"})).unwrap();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.proof_binding, None);
+        assert!(!panel.state().ui.ai.can_review_selected_proof());
+        assert!(!panel.state().ui.ai.can_approve_batch());
+    }
+
+    #[test]
+    fn proof_navigation_rejects_foreign_pages_and_discards_a_press_on_the_previous_page() {
+        let mut panel = ProofFixture::new().panel();
+        panel.run_steps(3);
+        assert!(!panel.state_mut().ui.ai.select_proof("foreign.png"));
+        assert_eq!(panel.state().ui.ai.proof_loaded.as_deref(), Some("page-1.png"));
+        let pos = panel.get_by_label("I reviewed the displayed page").rect().center();
+        panel.event(egui::Event::PointerMoved(pos));
+        panel.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        panel.run_steps(1);
+        assert!(panel.state().ui.ai.review_pointer_press.is_some());
+        assert!(panel.state_mut().ui.ai.select_proof("page-2.png"));
+        assert!(panel.state().ui.ai.proof_texture.is_none());
+        assert!(panel.state().ui.ai.review_pointer_press.is_none());
+        panel.run_steps(2);
+        panel.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        panel.run_steps(3);
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty(), "releasing a press from another page cannot confirm the new preview");
+        panel.get_by_label("I reviewed the displayed page").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs, BTreeSet::from([("page-2.png".into(), "3".repeat(64))]));
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub(super) struct BatchJob {
     roots: Option<Arc<file_access::AutomationRoots>>,
     ledger: Option<UsageLedger>,
     before: UsageSummary,
-    snapshot: BatchSnapshot,
+    pub(super) snapshot: BatchSnapshot,
     prefs: Prefs,
     // Font reload replaces the composition cache without changing the document
     // allocation. Proof authority therefore pins it independently of doc edits.
@@ -134,7 +134,7 @@ impl ProductionRunner {
             snapshot,
             prefs: session.prefs.clone(),
             publication_cache: session.cache.clone(),
-            publication_base: existing.map(|_| base.clone()),
+            publication_base: if existing.is_some() { Some(session.doc().map_err(|e| e.to_string())?.clone()) } else { None },
         };
         base.selection = Default::default();
         self.launch_batch(job, base, context)
@@ -173,10 +173,21 @@ impl ProductionRunner {
         let worker = worker::spawn_with_ledger(work, keys, job.roots.clone(), ledger)?;
         let id = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
         let expected = job.snapshot.document_uid.zip(job.snapshot.document_revision);
-        self.pending =
-            Some(Pending { roots: job.roots.clone(), worker, id, started: Instant::now(), task: Some(task), expected, skills: pins, settings });
+        self.pending = Some(Pending {
+            roots: job.roots.clone(),
+            worker,
+            id,
+            started: Instant::now(),
+            task: Some(task),
+            expected,
+            expected_prefs: None,
+            skills: pins,
+            settings,
+        });
         job.snapshot.status = "running".into();
         self.snapshot.busy = true;
+        self.snapshot.current_usage = job.before.clone();
+        self.snapshot.current_issues.clear();
         self.snapshot.stage = "generating_batch".into();
         self.snapshot.progress = job.snapshot.completed_pages as f32 / job.snapshot.total_pages as f32;
         self.snapshot.message =
@@ -268,9 +279,12 @@ impl ProductionRunner {
             }
             return exported.map(|_| ());
         }
-        let mut base = session.doc().map_err(|e| e.to_string())?.clone();
+        let mut base = crate::facing_pages::canonicalize(session.doc().map_err(|e| e.to_string())?, &session.prefs)?;
         base.selection = Default::default();
-        let context = batch_context(session, &job)?;
+        let mut projected = Session::new();
+        projected.prefs = session.prefs.clone();
+        projected.add_document(base.clone());
+        let context = batch_context(&projected, &job)?;
         job.snapshot.current_batch = job.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
         // Consumes this exact approval before any next request is launched.
         job.snapshot.status = "running".into();
@@ -338,7 +352,7 @@ impl ProductionRunner {
             usage: usage.clone(),
             elapsed_ms: elapsed,
             actions: 0,
-            issues: vec![],
+            issues: self.snapshot.current_issues.clone(),
             artifacts: vec![],
             message: String::new(),
         };
@@ -410,7 +424,7 @@ impl ProductionRunner {
     }
 
     fn publish_batch(
-        &self,
+        &mut self,
         session: &mut Session,
         job: &mut BatchJob,
         plans: &[ProductionPlan],
@@ -482,7 +496,16 @@ impl ProductionRunner {
         let previous = session.active_index();
         if first {
             let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
-            session.execute("file.new", &crate::design::document_params(profile, job.snapshot.total_pages)).map_err(|e| e.to_string())?;
+            session
+                .execute("file.new", &production_document_params(profile, job.snapshot.total_pages, &job.task.prompt)?)
+                .map_err(|e| e.to_string())?;
+            initialize_print_document(session, &job.task.prompt)?;
+            // Print preferences define the new document's creation baseline. Facing setup
+            // and reviewed artwork are published together by applyGroup below, so undoing
+            // this batch restores its complete pre-publication state in one step.
+            let created = session.doc_mut().map_err(|e| e.to_string())?;
+            created.history.undo.clear();
+            created.history.redo.clear();
         }
         let result = (|| {
             let current = session.doc().map_err(|e| e.to_string())?;
@@ -498,7 +521,29 @@ impl ProductionRunner {
             }
             let mut base = current.clone();
             base.selection = Default::default();
-            worker::simulate_group_scoped(plans, &base, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), scope)?;
+            let change_layout = job.task.settings.facing_pages && !base.doc.settings.facing_pages;
+            let facing = if change_layout {
+                Some(crate::facing_pages::formatted_proof_state(&base, &job.prefs, book_binding(&job.task.settings, &job.task.prompt))?)
+            } else {
+                None
+            };
+            let projected_base = facing.as_ref().unwrap_or(&base);
+            let canonical = crate::facing_pages::canonicalize(projected_base, &job.prefs)?;
+            worker::simulate_group_scoped(plans, &canonical, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), scope)?;
+            let mapped: Vec<_> = plans.iter().map(|plan| crate::facing_pages::map_plan(plan, projected_base)).collect::<Result<_, _>>()?;
+            let min_ppi =
+                crate::print_contract::PrintContract::from_prompt(&job.task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+            let chunks = mapped.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect::<Vec<_>>();
+            let mut projected = Session::new();
+            projected.prefs = job.prefs.clone();
+            projected.add_document(base.clone());
+            let mut group_params = json!({"chunks":chunks,"outputMode":job.task.settings.output_mode,"requirePreflight":true,"minPpi":min_ppi});
+            if change_layout {
+                group_params["documentSetup"] =
+                    json!({"facingPages":true,"binding":if book_binding(&job.task.settings,&job.task.prompt){"rightToLeft"}else{"leftToRight"}});
+            }
+            projected.execute("production.applyGroup", &group_params).map_err(|e| e.to_string())?;
+            crate::facing_pages::validate_mapped_result(projected_base, projected.doc().map_err(|e| e.to_string())?, scope)?;
             let uid = current.uid;
             let revision = current.revision;
             let directory = self.root.join("runs").join(&job.snapshot.job_id).join(format!("batch-{}", job.snapshot.current_batch));
@@ -516,13 +561,20 @@ impl ProductionRunner {
                 &trace,
                 &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"designStyle":report.design_style,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plans":plans,"plan":(plans.len()==1).then_some(first_plan),"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
             )?;
-            let chunks = plans.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect::<Vec<_>>();
             let label = format!("{} · batch {}", limited_text(&first_plan.title, 200), job.snapshot.current_batch);
-            session.execute("production.applyGroup",&json!({"chunks":chunks,"outputMode":job.task.settings.output_mode,"label":label,"expectedDocumentUid":uid,"expectedRevision":revision,"requirePreflight":true,"minPpi":150})).map_err(|e|e.to_string())?;
+            group_params["label"] = json!(label);
+            group_params["expectedDocumentUid"] = json!(uid);
+            group_params["expectedRevision"] = json!(revision);
+            session.execute("production.applyGroup", &group_params).map_err(|e| e.to_string())?;
             let state = session.doc().map_err(|e| e.to_string())?;
             job.snapshot.document_uid = Some(state.uid);
             job.snapshot.document_revision = Some(state.revision);
             job.publication_base = Some(state.clone());
+            if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&job.task.prompt)? {
+                self.print_contracts.insert(state.uid, contract);
+            }
+            let preflight = session.execute("preflight.run", &json!({"minPpi":min_ppi})).map_err(|e| e.to_string())?;
+            report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
             report.title = first_plan.title.clone();
             batch_report.title = first_plan.title.clone();
             report.actions = actions;
@@ -548,7 +600,12 @@ impl ProductionRunner {
         let source = Path::new(directory).join(format!("reviewed-{job_id}.designcraft"));
         let pdf = Path::new(directory).join(format!("reviewed-{job_id}.pdf"));
         session.execute("file.saveAs", &json!({"path":source})).map_err(|e| e.to_string())?;
-        session.execute("file.exportPdf", &json!({"path":pdf,"spreads":false,"bleed":false,"marks":false})).map_err(|e| e.to_string())?;
+        let contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
+        let params = match &contract {
+            Some(contract) => contract.pdf_export_params(Some(pdf.to_str().ok_or("PDF export path is not valid Unicode")?))?,
+            None => json!({"path":pdf,"spreads":false,"bleed":false,"marks":false}),
+        };
+        session.execute("file.exportPdf", &params).map_err(|e| e.to_string())?;
         Ok(vec![source.to_string_lossy().into_owned(), pdf.to_string_lossy().into_owned()])
     }
 }
@@ -746,6 +803,206 @@ mod tests {
             publication_base: session.active().cloned(),
         });
         ("fixture-book".into(), 1)
+    }
+
+    #[test]
+    fn public_poll_publishes_new_rtl_facing_book_with_one_undo_and_human_proofs() {
+        synthetic_facing_publication(false, false);
+    }
+
+    #[test]
+    fn public_poll_continues_single_page_book_as_rtl_facing_without_changing_prefix() {
+        synthetic_facing_publication(true, false);
+    }
+
+    #[test]
+    fn public_poll_keeps_new_print_baseline_in_creation_not_a_second_undo() {
+        synthetic_facing_publication(false, true);
+    }
+
+    fn synthetic_facing_publication(continuing: bool, baseline: bool) {
+        use base64::Engine as _;
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(if continuing { 6 } else { 1 })).unwrap();
+        let prefix = if continuing { 2 } else { 1 };
+        for page in 0..prefix {
+            let created = session.execute("frame.create", &json!({"spread":page,"rect":[60,60,160,160]})).unwrap();
+            session.execute("object.label", &json!({"ids":[created["id"]],"label":format!("Preserved prefix {}",page+1)})).unwrap();
+        }
+        let before = session.doc().unwrap().clone();
+        let previous_index = session.active_index().unwrap();
+        let document_count = session.documents().len();
+        let mut request = task("http://127.0.0.1:9/".into(), 1);
+        request.prompt = "Content Copy Language: Arabic\nSix-page editable book with independently reviewed native pages.".into();
+        if baseline {
+            request.prompt.push_str("\nGrid System: 8 mm baseline grid.");
+        }
+        request.settings.facing_pages = true;
+        request.settings.right_to_left_binding = Some(true);
+        request.settings.pages_per_batch = if continuing { 2 } else { 3 };
+        request.target = if continuing { TaskTarget::ContinueBook } else { TaskTarget::NewA4 { pages: 6 } };
+        let start = if continuing { 2 } else { 0 };
+        let count = request.settings.pages_per_batch;
+        let (canonical, _) = task_document_context(&session, &request.target, None, &request.prompt, &request.settings).unwrap();
+        assert_eq!(canonical.doc.spreads.len(), 6);
+        assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc), "Private planning cannot reformat the live book");
+        let plans: Vec<_> = (start..start + count)
+            .map(|page| ProductionPlan {
+                title: format!("Absolute page {}", page + 1),
+                commands: vec![
+                    EngineAction { command: "frame.create".into(), params: json!({"spread":page,"rect":[60,180,160,280]}) },
+                    EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":format!("Reviewed page {}",page+1)}) },
+                ],
+                images: vec![],
+            })
+            .collect();
+        let mut proof_session = Session::new();
+        proof_session.prefs = session.prefs.clone();
+        proof_session.add_document(canonical);
+        let chunks: Vec<_> = plans.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect();
+        proof_session.execute("production.applyGroup", &json!({"chunks":chunks,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        let formatted = crate::facing_pages::formatted_proof_state(proof_session.doc().unwrap(), &proof_session.prefs, true).unwrap();
+        proof_session.add_document(formatted);
+        let mut proofs = vec![worker::ProofArtifact {
+            name: "document.designcraft".into(),
+            bytes: designcraft_format::save(&proof_session.doc().unwrap().doc).unwrap(),
+        }];
+        let pdf = proof_session
+            .execute("file.exportPdf", &json!({"pages":(start+1..=start+count).collect::<Vec<_>>(),"spreads":false,"bleed":false,"marks":false}))
+            .unwrap();
+        proofs.push(worker::ProofArtifact {
+            name: "proof.pdf".into(),
+            bytes: base64::engine::general_purpose::STANDARD.decode(pdf["base64"].as_str().unwrap()).unwrap(),
+        });
+        let mut renderer = designcraft_render::Renderer::new();
+        for page in start..start + count {
+            let image = renderer
+                .render_page(&proof_session.doc().unwrap().doc, &proof_session.cache, page as usize, 0.25, false, &Default::default())
+                .unwrap();
+            proofs.push(worker::ProofArtifact { name: format!("page-{}.png", page + 1), bytes: image.to_png() });
+        }
+        let ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
+        let snapshot = BatchSnapshot {
+            job_id: if continuing { "synthetic-facing-continue" } else { "synthetic-facing-new" }.into(),
+            total_pages: 6,
+            pages_per_batch: count,
+            current_batch: 1,
+            total_batches: (6 - start).div_ceil(count),
+            completed_pages: start,
+            status: "running".into(),
+            document_uid: continuing.then_some(before.uid),
+            document_revision: continuing.then_some(before.revision),
+            ..Default::default()
+        };
+        runner.batch = Some(BatchJob {
+            task: request.clone(),
+            skills: vec![],
+            roots: None,
+            ledger: None,
+            before: Default::default(),
+            snapshot: snapshot.clone(),
+            prefs: session.prefs.clone(),
+            publication_cache: session.cache.clone(),
+            publication_base: continuing.then_some(before.clone()),
+        });
+        runner.snapshot.batch = Some(snapshot.clone());
+        runner.snapshot.busy = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(worker::Message::FinishedWithLedger(
+                worker::Outcome { result: Ok(worker::Product::BatchGroup { plans, proofs }), usage: Default::default() },
+                ledger,
+            ))
+            .unwrap();
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: Arc::new(AtomicBool::new(false)) },
+            id: format!("{}-batch-1", snapshot.job_id),
+            started: Instant::now(),
+            task: Some(request.clone()),
+            expected: continuing.then_some((before.uid, before.revision)),
+            expected_prefs: None,
+            skills: vec![],
+            settings: request.settings,
+        });
+        let completed = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(completed.stage, "awaiting_human_proof", "{}", completed.message);
+        assert!(!completed.busy);
+        assert!(runner.pending.is_none());
+        assert!(runner.batch.is_some(), "Human proof authority must remain unconsumed");
+        let checkpoint = completed.batch.as_ref().unwrap();
+        assert_eq!((checkpoint.completed_pages, checkpoint.checkpoint), (start + count, 1));
+        assert_eq!(checkpoint.cumulative_usage.requests, 0, "Synthetic completion must not call any provider");
+        let published = session.doc().unwrap().clone();
+        assert!(published.doc.settings.facing_pages && published.doc.settings.right_to_left_binding);
+        if baseline {
+            assert!((published.doc.settings.baseline_grid.increment - 8.0 * 72.0 / 25.4).abs() < 0.001);
+        }
+        assert_eq!((published.doc.page_count(), published.doc.spreads.len()), (6, 4));
+        let local = crate::facing_pages::canonicalize(&published, &session.prefs).unwrap();
+        for page in 0..6 {
+            let spread = &local.doc.spreads[page];
+            if (start..start + count).contains(&(page as u32)) {
+                assert_eq!(spread.items.len(), 1);
+                assert_eq!(spread.items[0].label, format!("Reviewed page {}", page + 1));
+                assert_eq!(spread.items[0].bounds().x0, 60.0);
+                assert_eq!(spread.items[0].bounds().y0, 180.0);
+            } else if continuing && page < prefix {
+                assert_eq!(spread.items, before.doc.spreads[page].items, "Prefix artwork must remain exactly editable and unchanged");
+                assert_eq!(spread.pages[0].id, before.doc.spreads[page].pages[0].id);
+            } else {
+                assert!(spread.items.is_empty(), "Future absolute pages must stay blank");
+            }
+        }
+        assert_eq!(
+            published.history.undo.len(),
+            if continuing { before.history.undo.len() + 1 } else { 1 },
+            "One reviewed batch must produce one undo entry"
+        );
+        if !continuing {
+            assert_eq!(session.documents().len(), document_count + 1);
+            assert!(Arc::ptr_eq(&session.documents()[previous_index].doc, &before.doc), "Creating a book must preserve the former document");
+        }
+        let evidence = &checkpoint.batches[0];
+        assert_eq!(evidence.status, "awaiting_human_proof");
+        assert_eq!(evidence.proof_paths.len(), (count + 2) as usize);
+        for path in &evidence.proof_paths {
+            let bytes = std::fs::read(path).unwrap();
+            match Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap() {
+                "designcraft" => {
+                    let proof = designcraft_format::load(&bytes).unwrap();
+                    assert!(proof.settings.facing_pages && proof.settings.right_to_left_binding);
+                    assert_eq!((proof.page_count(), proof.spreads.len()), (6, 4));
+                }
+                "pdf" => assert!(bytes.starts_with(b"%PDF-")),
+                "png" => {
+                    let image = image::load_from_memory(&bytes).unwrap();
+                    assert!(image.width() < image.height(), "Each PNG must show one absolute portrait page, not a facing spread");
+                }
+                other => panic!("Unexpected proof format {other}"),
+            }
+        }
+        let mut undo = Session::new();
+        undo.add_document(published);
+        undo.execute("edit.undo", &json!({})).unwrap();
+        if continuing {
+            assert!(Arc::ptr_eq(&undo.doc().unwrap().doc, &before.doc));
+            assert!(!undo.doc().unwrap().doc.settings.facing_pages, "One undo must restore single-page topology as well as artwork");
+        } else {
+            assert!(undo.doc().unwrap().doc.spreads.iter().all(|spread| spread.items.is_empty()));
+            if baseline {
+                assert!((undo.doc().unwrap().doc.settings.baseline_grid.increment - 8.0 * 72.0 / 25.4).abs() < 0.001);
+            }
+        }
+        for _ in 0..3 {
+            let unchanged = runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(unchanged.stage, "awaiting_human_proof");
+            assert_eq!(unchanged.batch.unwrap().checkpoint, 1);
+            assert!(runner.pending.is_none(), "Polling cannot send another request before human approval");
+        }
     }
 
     #[test]

@@ -68,6 +68,32 @@ mod native_tests {
         assert!(crate::native::image_generation_body(ProviderKind::Gemini, "test-model", &invalid).unwrap_err().contains("aspect ratio"));
     }
 
+    #[test]
+    fn gemini_print_resolution_uses_smallest_supported_native_tier() {
+        assert_eq!(gemini_print_size("gemini-3.1-flash-image", "1:1", [1600, 1000]).unwrap(), "1:1@2K");
+        assert_eq!(gemini_print_size("gemini-3.1-flash-image", "4:1", [2800, 700]).unwrap(), "4:1@2K");
+        assert_eq!(gemini_print_size("gemini-3.1-flash-image", "1:1", [2050, 2050]).unwrap(), "1:1@4K");
+        assert!(gemini_print_size("gemini-3.1-flash-image", "1:1", [4097, 100]).unwrap_err().contains("4K"));
+        assert!(gemini_print_size("gemini-2.5-flash-image", "1:1", [1600, 1000]).unwrap_err().contains("model"));
+        assert!(gemini_print_size("gemini-3.1-flash-lite-image", "1:1", [1600, 1000]).is_err());
+        assert!(gemini_print_size("gemini-3.1-flash-image", "1:0", [1, 1]).is_err());
+        assert!(gemini_print_size("gemini-3.1-flash-image", "1:1", [0, 1]).is_err());
+        let request = ImageRequest {
+            prompt: "Original synthetic illustration".into(),
+            size: Some("4:1@2K".into()),
+            quality: None,
+            comfy: None,
+            resources: Default::default(),
+        };
+        let body = crate::native::image_generation_body(ProviderKind::Gemini, "gemini-3.1-flash-image", &request).unwrap();
+        assert_eq!(body["generationConfig"]["imageConfig"], json!({"aspectRatio":"4:1","imageSize":"2K"}));
+        for size in ["1:1@2k", "1:1@8K", "1:1@2K@4K"] {
+            let invalid = ImageRequest { size: Some(size.into()), ..request.clone() };
+            assert!(crate::native::image_generation_body(ProviderKind::Gemini, "gemini-3.1-flash-image", &invalid).is_err());
+        }
+        assert!(crate::native::image_generation_body(ProviderKind::Gemini, "gemini-2.5-flash-image", &request).is_err());
+    }
+
     /// Minimal synthetic server captures complete request and returns fixed data.
     fn mock(responses: Vec<(u16, String)>) -> (String, JoinHandle<Vec<String>>) {
         mock_cancellable(responses, None)

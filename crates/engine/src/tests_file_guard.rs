@@ -48,6 +48,10 @@ const ALLOWED: &[(&str, &str)] = &[
         "Selected reference paths are checked against the originating automation read roots before metadata probes and each bounded open; worker execution retains those roots. Reference decoding does not open linked resources.",
     ),
     (
+        "ai-runtime/src/production_cache.rs",
+        "The native host supplies a fixed private-profile cache directory, never a provider-selected path. Captured automation roots are checked before directory probes, scans and creation; ancestor metadata rejects links/reparse points without reading ancestor contents. Entry names are fixed SHA-256 hex digests and kinds, reads use capped engine I/O, and atomic writes use the engine gateway. Quotas, corruption and link tests bound reuse; cached data grants no execution or approval authority.",
+    ),
+    (
         "ai-runtime/src/science.rs",
         "The requested output directory is checked against automation write roots before creation; every generated file is written through engine::io or an engine export command.",
     ),

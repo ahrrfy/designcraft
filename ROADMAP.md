@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI18 (2026-10-20): Harden script-driven production with numbered-page copy contracts, deterministic five/ten-frame activities, bounded native overset recovery, requested print geometry/font binding and resolution-aware Gemini images. Reuse validated local plans/artwork, expose live usage and full diagnostics, and keep proof navigation/review actions beside images. Facing-page books use automatic language binding, occasional paired editorial context and atomic native publication; optional billed illustration inspection remains advisory. See `docs/production-hardening-ai18.ar.md` for acceptance evidence and remaining print limits.
+
 - AI17 (2026-10-20): Validate template text with native composition instead of a copy-length estimate, retain authored typography and complete wording, and report exact invalid slots. Validate all text parts and project the complete image budget before purchasing artwork for a review group; preserve atomic publication and human checkpoints. Operational and design-quality follow-ups are documented in `docs/production-reliability-review.ar.md`.
 
 - AI16 (2026-10-20): Keep the requested review group independent of bounded native/provider execution chunks, publish each group atomically with one undo, and require proof of every page before continuing. Full UTF-8 briefs up to 1 MiB share one admission limit; current-document work uses the selected open file's geometry and exposes its target in the production panel.

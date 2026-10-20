@@ -1,0 +1,736 @@
+//! Bounded user-authored page scripts and deterministic native math activities.
+use crate::worker::BatchScope;
+use designcraft_ai_types::EngineAction;
+use designcraft_ai_types::protocol::{ImagePlacement, MAX_BRIEF_BYTES, ProductionPlan};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+
+const MAX_PAGES: u32 = 1000;
+const MAX_ACTIONS: usize = 512;
+const MAX_IMAGE_PROMPT: usize = 8192;
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ScriptPage {
+    pub page: u32,
+    pub title: String,
+    pub english_print_copy: Option<String>,
+    pub arabic_print_copy: Option<String>,
+    pub illustration_prompt: Option<String>,
+    pub full_script: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptContract {
+    pub global_instructions: String,
+    pub pages: Vec<ScriptPage>,
+}
+
+fn end(scope: BatchScope) -> Result<u32, String> {
+    scope.start.checked_add(scope.count).filter(|end| scope.count > 0 && *end <= MAX_PAGES).ok_or_else(|| "Invalid explicit-script page scope".into())
+}
+
+fn page_heading(line: &str) -> Result<Option<(u32, String)>, String> {
+    let line = line.trim();
+    if !line.starts_with('#') {
+        return Ok(None);
+    }
+    let heading = line.trim_start_matches('#').trim_start();
+    if heading.get(..4).is_none_or(|prefix| !prefix.eq_ignore_ascii_case("page")) {
+        return Ok(None);
+    }
+    let rest = heading.get(4..).ok_or("Invalid page heading boundary")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return Ok(None);
+    }
+    let rest = rest.trim_start();
+    let boundary = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let number = rest
+        .get(..boundary)
+        .ok_or("Invalid page number boundary")?
+        .parse::<u32>()
+        .map_err(|_| "Explicit PAGE headings require a number from 1 to 1000")?;
+    if !(1..=MAX_PAGES).contains(&number) {
+        return Err("Explicit PAGE headings require a number from 1 to 1000".into());
+    }
+    let suffix = rest.get(boundary..).ok_or("Invalid page title boundary")?.trim_start();
+    let title = suffix
+        .strip_prefix('—')
+        .or_else(|| suffix.strip_prefix('–'))
+        .or_else(|| suffix.strip_prefix('-'))
+        .or_else(|| suffix.strip_prefix(':'))
+        .ok_or("Explicit PAGE headings require a dash or colon before the title")?
+        .trim();
+    if title.is_empty() || title.chars().count() > 512 {
+        return Err("Explicit page title is empty or exceeds 512 characters".into());
+    }
+    Ok(Some((number - 1, title.to_owned())))
+}
+
+fn field_heading(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    let rest = line.strip_prefix("* **").or_else(|| line.strip_prefix("- **"))?;
+    let (label, value) = rest.split_once("**")?;
+    Some((label.trim_end_matches(':').trim(), value.trim_start_matches(':').trim()))
+}
+
+fn page_fields(body: &str) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+    let mut fields: [Option<String>; 3] = [None, None, None];
+    let mut active = None;
+    for line in body.lines() {
+        let value = if let Some((label, value)) = field_heading(line) {
+            active = if label.starts_with("English Print Copy") {
+                Some(0)
+            } else if label.starts_with("Arabic Print Copy") {
+                Some(1)
+            } else if label.contains("Illustration Prompt") {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(index) = active {
+                let field = fields.get_mut(index).ok_or("Invalid script field")?;
+                if field.is_some() {
+                    return Err("Explicit page repeats a print-copy or illustration field".into());
+                }
+                *field = Some(String::new());
+            }
+            value
+        } else {
+            line.trim().strip_prefix('>').map(str::trim_start).unwrap_or(line.trim())
+        };
+        if let Some(index) = active {
+            let field = fields.get_mut(index).and_then(Option::as_mut).ok_or("Missing script field")?;
+            if !field.is_empty() && !value.is_empty() {
+                field.push('\n');
+            }
+            field.push_str(value);
+        }
+    }
+    for field in fields.iter_mut().flatten() {
+        *field = field.trim().to_owned();
+        if field.is_empty() {
+            return Err("Explicit page has an empty designated print-copy or illustration field".into());
+        }
+    }
+    let [english, arabic, illustration] = fields;
+    Ok((english, arabic, illustration))
+}
+
+/// Parse only explicit Markdown PAGE blocks. A generic brief keeps its existing path.
+pub(crate) fn parse(brief: &str) -> Result<Option<ScriptContract>, String> {
+    if brief.len() > MAX_BRIEF_BYTES || brief.contains('\0') {
+        return Err("Page script exceeds the shared brief limit or contains a null character".into());
+    }
+    let mut headers = Vec::new();
+    let mut offset = 0usize;
+    let mut fenced = false;
+    for line in brief.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced && let Some((page, title)) = page_heading(line)? {
+            let expected = u32::try_from(headers.len()).map_err(|_| "Too many explicit page headings")?;
+            if page != expected {
+                return Err(format!("Explicit page script must contain each page once in order; expected PAGE {:02}", u64::from(expected) + 1));
+            }
+            if headers.len() >= usize::try_from(MAX_PAGES).map_err(|_| "Invalid page limit")? {
+                return Err("Explicit page script exceeds 1000 pages".into());
+            }
+            headers.push((offset, offset.checked_add(line.len()).ok_or("Script offset overflow")?, page, title));
+        }
+        offset = offset.checked_add(line.len()).ok_or("Script offset overflow")?;
+    }
+    let Some((first, _, _, _)) = headers.first() else {
+        return Ok(None);
+    };
+    let global_instructions = brief.get(..*first).ok_or("Invalid global script boundary")?.trim().to_owned();
+    let mut pages = Vec::with_capacity(headers.len());
+    for (index, (start, body_start, page, title)) in headers.iter().enumerate() {
+        let stop = headers.get(index.saturating_add(1)).map(|header| header.0).unwrap_or(brief.len());
+        let body = brief.get(*body_start..stop).ok_or("Invalid explicit page script boundary")?;
+        let (english_print_copy, arabic_print_copy, illustration_prompt) = page_fields(body)?;
+        pages.push(ScriptPage {
+            page: *page,
+            title: title.clone(),
+            english_print_copy,
+            arabic_print_copy,
+            illustration_prompt,
+            full_script: brief.get(*start..stop).ok_or("Invalid explicit page block")?.trim().to_owned(),
+        });
+    }
+    Ok(Some(ScriptContract { global_instructions, pages }))
+}
+
+impl ScriptContract {
+    fn scoped_pages(&self, scope: BatchScope) -> Result<&[ScriptPage], String> {
+        let end = end(scope)?;
+        let range = usize::try_from(scope.start).map_err(|_| "Invalid explicit page start")?
+            ..usize::try_from(end).map_err(|_| "Invalid explicit page end")?;
+        self.pages.get(range).ok_or_else(|| "Requested pages are missing from the explicit user page script".into())
+    }
+
+    pub(crate) fn context(&self, scope: BatchScope, total_pages: u32) -> Result<Value, String> {
+        if u64::try_from(self.pages.len()).map_err(|_| "Too many explicit pages")? != u64::from(total_pages) {
+            return Err("Explicit page-script count must match the requested document page count".into());
+        }
+        Ok(json!({"outline_status":"explicit_user_page_script","page_numbering":"page is zero-based; PAGE headings are one-based",
+            "global_production_specifications":self.global_instructions,"scoped_page_plan":self.scoped_pages(scope)?,
+            "precedence_rule":"Follow these exact authored page topics, sequence, layout requirements and designated printable copy. Do not insert a fallback contents page, cycle families, change lessons, remove diacritics, or replace supplied copy. Split copy across native text frames as needed. Icon/name-line markers describe native objects; retain numeral practice arrays. Native math activities must bind their stated quantities; raster semantic correctness still requires human visual review."}))
+    }
+}
+
+/// Keep shared prepress/style directions while avoiding repeated unrelated page blocks.
+pub(crate) fn scoped_prompt(brief: &str, scope: BatchScope) -> Result<String, String> {
+    let Some(contract) = parse(brief)? else {
+        return Ok(brief.to_owned());
+    };
+    let mut output = contract.global_instructions.clone();
+    for page in contract.scoped_pages(scope)? {
+        output.push_str("\n\n");
+        output.push_str(&page.full_script);
+    }
+    Ok(output)
+}
+
+fn facing_link_hint(pages: &[&ScriptPage]) -> (bool, &'static str) {
+    let (Some(first), Some(second)) = (pages.first(), pages.get(1)) else {
+        return (false, "standalone_page");
+    };
+    if pages.iter().any(|page| {
+        let source = page.full_script.to_lowercase();
+        ["two-page spread", "double-page spread", "across both pages", "صفحتين متقابلتين", "صفحتان متقابلتان"]
+            .iter()
+            .any(|phrase| source.contains(phrase))
+    }) {
+        return (true, "authored_facing_page_direction");
+    }
+    let first_title = crate::template_plan::normalize_curriculum_query(&first.title);
+    let second_title = crate::template_plan::normalize_curriculum_query(&second.title);
+    if [&first_title, &second_title].iter().any(|title| {
+        (title.contains("unit") && title.contains("opener")) || title.contains("افتتاح") || (title.contains("الوحدة") && title.contains("مقدمة"))
+    }) {
+        return (true, "unit_opener");
+    }
+    let meaningful = |word: &str| {
+        word.chars().count() >= 4
+            && !matches!(
+                word,
+                "page"
+                    | "unit"
+                    | "lesson"
+                    | "independent"
+                    | "practice"
+                    | "activity"
+                    | "activities"
+                    | "number"
+                    | "numbers"
+                    | "count"
+                    | "counting"
+                    | "math"
+                    | "mathematics"
+                    | "with"
+                    | "from"
+                    | "this"
+                    | "that"
+                    | "book"
+                    | "trace"
+                    | "write"
+                    | "review"
+                    | "صفحة"
+                    | "الوحدة"
+                    | "الدرس"
+                    | "تدريب"
+                    | "تدريبات"
+                    | "النشاط"
+                    | "التمرين"
+                    | "تمارين"
+                    | "الكتاب"
+                    | "الرياضيات"
+                    | "الاعداد"
+                    | "العدد"
+            )
+    };
+    let first_topics: BTreeSet<_> = first_title.split(|c: char| !c.is_alphanumeric()).filter(|word| meaningful(word)).collect();
+    if second_title.split(|c: char| !c.is_alphanumeric()).any(|word| meaningful(word) && first_topics.contains(word)) {
+        (true, "shared_authored_title_topic")
+    } else {
+        (false, "independent_lessons")
+    }
+}
+
+/// Facing context never widens the production/review scope. Future companion
+/// scripts are public design input, not permission to generate or approve them.
+/// Pair IDs use absolute human page numbers, independent of chunk boundaries.
+pub(crate) fn facing_context(brief: &str, scope: BatchScope) -> Result<Value, String> {
+    let end = end(scope)?;
+    let produce_only_pages: Vec<_> = (scope.start..end).collect();
+    let mut context = json!({"status":"no_explicit_page_script","scope":scope,"produce_only_pages":produce_only_pages,"pairs":[],
+        "page_numbering":"page and produce_only_pages are zero-based; human_pages are one-based",
+        "physical_pairing":"Cover page 1 stands alone, followed by absolute facing pairs 2–3, 4–5, 6–7 and so on. The document binding determines physical left/right placement.",
+        "text_direction":{"arabic":"rightToLeft","english":"leftToRight"},
+        "coordination_policy":"Retain the book's common header, palette, recurring characters and illustration identity. Occasionally connect a facing pair when the authored unit opener or related activity benefits from it; linked_candidate is an advisory cue, never a requirement to link every pair. Keep each page's designated copy and individual lesson complete.",
+        "scope_policy":"Produce commands and image placements only for produce_only_pages. Companion members marked context_only may guide shared motifs, headers, palettes and related activities; do not generate, replace, approve or advance their pages. Context grants no provider or human approval.",
+        "art_policy":"Use original supplied or permitted artwork; do not copy publisher art. Matching scene directions do not guarantee identical generated pixels; human visual proof remains required."});
+    let Some(contract) = parse(brief)? else {
+        return Ok(context);
+    };
+    contract.scoped_pages(scope)?;
+    let starts: BTreeSet<_> = (scope.start..end).map(|page| if page == 0 || page % 2 == 1 { page } else { page.saturating_sub(1) }).collect();
+    let mut pairs = Vec::with_capacity(starts.len());
+    for first in starts {
+        let nominal_last = if first == 0 { 0 } else { first.checked_add(1).ok_or("Facing companion page overflow")? };
+        let mut sources = Vec::with_capacity(2);
+        for page in first..=nominal_last {
+            if let Some(source) = contract.pages.get(usize::try_from(page).map_err(|_| "Invalid facing companion index")?) {
+                sources.push(source);
+            }
+        }
+        let human_first = first.checked_add(1).ok_or("Facing page number overflow")?;
+        let human_last = nominal_last.checked_add(1).ok_or("Facing companion number overflow")?;
+        let pair_id = if first == 0 { "cover-0001".to_owned() } else { format!("pages-{human_first:04}-{human_last:04}") };
+        let (linked_candidate, link_reason) = if first == 0 { (false, "standalone_cover") } else { facing_link_hint(&sources) };
+        let members: Vec<_> = sources
+            .iter()
+            .map(|page| {
+                json!({"page":page.page,"human_page":u64::from(page.page) + 1,
+            "role":if (scope.start..end).contains(&page.page) {"produce"} else {"context_only"},
+            "title":page.title,"illustration_prompt":page.illustration_prompt,"full_script":page.full_script})
+            })
+            .collect();
+        let human_pages: Vec<_> = sources.iter().map(|page| u64::from(page.page) + 1).collect();
+        pairs.push(json!({"pair_id":pair_id,"human_pages":human_pages,"members":members,
+            "linked_candidate":linked_candidate,"link_reason":link_reason,"link_status":"advisory_source_context_only"}));
+    }
+    context["status"] = json!("explicit_script_facing_context");
+    context["pairs"] = json!(pairs);
+    Ok(context)
+}
+
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn contains_copy(actual: &str, expected: &str) -> bool {
+    let word = |c: char| {
+        c.is_alphanumeric()
+            || c == '_'
+            || matches!(c, '\u{0300}'..='\u{036f}' | '\u{0610}'..='\u{061a}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}')
+    };
+    let starts_word = expected.chars().next().is_some_and(word);
+    let ends_word = expected.chars().next_back().is_some_and(word);
+    actual.match_indices(expected).any(|(offset, _)| {
+        let before = actual.get(..offset).and_then(|text| text.chars().next_back());
+        let after = offset.checked_add(expected.len()).and_then(|end| actual.get(end..)).and_then(|text| text.chars().next());
+        (!starts_word || before.is_none_or(|c| !word(c))) && (!ends_word || after.is_none_or(|c| !word(c)))
+    })
+}
+
+fn printable_segment(segment: &str) -> String {
+    let mut remaining = segment;
+    let mut result = String::with_capacity(segment.len());
+    while let Some((before, after)) = remaining.split_once('[') {
+        result.push_str(before);
+        let Some((marker, tail)) = after.split_once(']') else {
+            result.push('[');
+            result.push_str(after);
+            return normalized(&result);
+        };
+        if !(marker.starts_with("ICON:") || marker.starts_with("أيقونة:") || matches!(marker, "Name Line" | "Line" | "سطر الاسم" | "سطر"))
+        {
+            result.push('[');
+            result.push_str(marker);
+            result.push(']');
+        }
+        remaining = tail;
+    }
+    result.push_str(remaining);
+    normalized(&result)
+}
+
+fn reference_index(value: Option<&Value>) -> Result<usize, String> {
+    let reference = value.and_then(Value::as_str).ok_or("Script-copy validation needs a native story reference")?;
+    let body = reference
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| reference.strip_prefix('$'))
+        .ok_or("Invalid script-copy story reference")?;
+    let (index, path) = body.split_once('.').ok_or("Invalid script-copy story reference")?;
+    if path != "story" {
+        return Err("Script-copy mutation must target a native frame story".into());
+    }
+    index.parse().map_err(|_| "Invalid script-copy story index".into())
+}
+
+fn native_copy(plan: &ProductionPlan) -> Result<BTreeMap<u32, String>, String> {
+    let mut stories: BTreeMap<usize, (u32, String)> = BTreeMap::new();
+    for (index, action) in plan.commands.iter().enumerate() {
+        if action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text") {
+            let page = action
+                .params
+                .get("spread")
+                .and_then(Value::as_u64)
+                .and_then(|page| u32::try_from(page).ok())
+                .ok_or("Explicit-script text frame needs a page")?;
+            let text = action.params.get("text").and_then(Value::as_str).unwrap_or("");
+            stories.insert(index, (page, text.replace("$$", "$")));
+        } else if action.command == "story.setText" {
+            let source = reference_index(action.params.get("story"))?;
+            let story = stories.get_mut(&source).ok_or("Script-copy mutation targets an unknown story")?;
+            story.1 = action.params.get("text").and_then(Value::as_str).ok_or("Script-copy mutation needs text")?.replace("$$", "$");
+        } else if matches!(action.command.as_str(), "text.insert" | "table.insert" | "table.setCell") {
+            return Err(
+                "Explicit-script copy must use final native frame text or story.setText so every supplied word can be verified before images".into(),
+            );
+        }
+    }
+    let mut pages: BTreeMap<u32, String> = BTreeMap::new();
+    for (page, text) in stories.into_values() {
+        let copy = pages.entry(page).or_default();
+        if copy.len().saturating_add(text.len()).saturating_add(1) > MAX_BRIEF_BYTES {
+            return Err("Native page copy exceeds its bounded verification limit".into());
+        }
+        copy.push(' ');
+        copy.push_str(&text);
+    }
+    Ok(pages.into_iter().map(|(page, text)| (page, normalized(&text))).collect())
+}
+
+/// This proves literal native copy coverage, not raster objects or reading order.
+pub(crate) fn validate_plan(brief: &str, scope: BatchScope, plan: &ProductionPlan) -> Result<(), String> {
+    let Some(contract) = parse(brief)? else {
+        return Ok(());
+    };
+    let copy = native_copy(plan)?;
+    for page in contract.scoped_pages(scope)? {
+        let actual = copy
+            .get(&page.page)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| format!("Page {} has no verifiable native printable copy", u64::from(page.page) + 1))?;
+        let mut designated = false;
+        for (language, expected) in [("English", &page.english_print_copy), ("Arabic", &page.arabic_print_copy)] {
+            if let Some(expected) = expected {
+                designated = true;
+                for segment in expected.split('|').map(printable_segment).filter(|segment| !segment.is_empty()) {
+                    if !contains_copy(actual, &segment) {
+                        let preview: String = segment.chars().take(100).collect();
+                        return Err(format!("Page {} is missing or changes supplied {language} print copy: {preview}", u64::from(page.page) + 1));
+                    }
+                }
+            }
+        }
+        if !designated && !contains_copy(actual, &normalized(&page.title)) {
+            return Err(format!("Page {} does not preserve its explicit authored title", u64::from(page.page) + 1));
+        }
+    }
+    Ok(())
+}
+
+/// Ground each purchased image in its own authored lesson. Native preflight does
+/// not establish whether a raster contains the right animals or exact counts.
+pub(crate) fn anchor_images(brief: &str, scope: BatchScope, plan: &mut ProductionPlan) -> Result<(), String> {
+    let Some(contract) = parse(brief)? else {
+        return Ok(());
+    };
+    let pages = contract.scoped_pages(scope)?;
+    let mut prompts = Vec::with_capacity(plan.images.len());
+    for image in &plan.images {
+        let page = pages
+            .iter()
+            .find(|page| u64::from(page.page) == u64::try_from(image.page).unwrap_or(u64::MAX))
+            .ok_or("Illustration is outside its explicit page contract")?;
+        let art = page.illustration_prompt.as_deref().unwrap_or("");
+        let prompt = format!(
+            "USER PAGE {} — {}\nSUPPLIED SCENE AND SUBJECT REQUIREMENTS:\n{art}\nSELECTED ILLUSTRATION DETAIL:\n{}\nRender only the requested illustrative scene, objects and characters for this page. Preserve the supplied entities and requested quantities. All words, numerals, diagrams, number frames, tracing lines, labels and page layout in the source directions are handled as editable native objects: include none of them in raster artwork. No text, captions, letters, numerals or speech bubbles. This prompt does not certify the generated pixels; human visual proof remains required.",
+            u64::from(page.page) + 1,
+            page.title,
+            image.prompt
+        );
+        if prompt.len() > MAX_IMAGE_PROMPT {
+            return Err("Page-anchored illustration prompt exceeds 8192 bytes; split the illustration into focused scene slots".into());
+        }
+        prompts.push(prompt);
+    }
+    for (image, prompt) in plan.images.iter_mut().zip(prompts) {
+        image.prompt = prompt;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CountFrame {
+    Five,
+    Ten,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeActivity {
+    pub page: u32,
+    pub rect: [f64; 4],
+    pub frame: CountFrame,
+    pub quantity: u8,
+    pub filled: bool,
+}
+
+pub(crate) fn activity_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["page","rect","frame","quantity","filled"],"properties":{
+        "page":{"type":"integer","minimum":0,"maximum":999},
+        "rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":0,"maximum":100000}},
+        "frame":{"type":"string","enum":["five","ten"]},"quantity":{"type":"integer","minimum":0,"maximum":10},
+        "filled":{"type":"boolean","description":"true for filled counters; false for outlined circles to color"}
+    }})
+}
+
+fn activity_shape(
+    commands: &mut Vec<EngineAction>,
+    base: usize,
+    page: u32,
+    rect: [f64; 4],
+    shape: &str,
+    filled: bool,
+    label: String,
+) -> Result<(), String> {
+    let index = base.checked_add(commands.len()).ok_or("Native activity reference overflow")?;
+    if index.checked_add(4).is_none_or(|end| end > MAX_ACTIONS) {
+        return Err("Native count-frame activities exceed the 512-command plan limit; split the internal page chunk".into());
+    }
+    commands.push(EngineAction { command: "frame.create".into(), params: json!({"spread":page,"rect":rect,"content":"unassigned","shape":shape}) });
+    commands.push(EngineAction {
+        command: "object.fill".into(),
+        params: json!({"ids":[format!("${index}.id")],"swatch":if filled {"[Black]"} else {"[None]"}}),
+    });
+    commands.push(EngineAction { command: "object.stroke".into(), params: json!({"ids":[format!("${index}.id")],"swatch":"[Black]","weight":0.8}) });
+    commands.push(EngineAction { command: "object.label".into(), params: json!({"ids":[format!("${index}.id")],"label":label}) });
+    Ok(())
+}
+
+/// Build mathematical counters locally; a five-frame has 1×5 cells and a
+/// ten-frame has 2×5, filled left-to-right across the top row first.
+/// The caller still validates page geometry and human-reviewed pedagogy.
+pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, activities: &[NativeActivity]) -> Result<(), String> {
+    let end = end(scope)?;
+    if activities.len() > 16 {
+        return Err("At most 16 bounded native activities are allowed per internal plan".into());
+    }
+    let mut commands = Vec::new();
+    for (activity_index, activity) in activities.iter().enumerate() {
+        let rows = match activity.frame {
+            CountFrame::Five => 1u8,
+            CountFrame::Ten => 2u8,
+        };
+        let capacity = rows.saturating_mul(5);
+        let [left, top, right, bottom] = activity.rect;
+        if activity.page < scope.start
+            || activity.page >= end
+            || activity.quantity > capacity
+            || activity.rect.iter().any(|value| !value.is_finite() || !(0.0..=100_000.0).contains(value))
+            || right - left < 25.0
+            || bottom - top < f64::from(rows) * 5.0
+        {
+            return Err("Native count frame has an invalid page, rectangle or quantity for its five/ten cells".into());
+        }
+        for earlier in activities.get(..activity_index).ok_or("Invalid native activity range")? {
+            let [a, b, c, d] = earlier.rect;
+            if earlier.page == activity.page && left < c && right > a && top < d && bottom > b {
+                return Err("Native count-frame activity rectangles overlap".into());
+            }
+        }
+        let width = (right - left) / 5.0;
+        let height = (bottom - top) / f64::from(rows);
+        let frame = match activity.frame {
+            CountFrame::Five => "five",
+            CountFrame::Ten => "ten",
+        };
+        for cell in 0..capacity {
+            let x = left + f64::from(cell % 5) * width;
+            let y = top + f64::from(cell / 5) * height;
+            activity_shape(
+                &mut commands,
+                plan.commands.len(),
+                activity.page,
+                [x, y, x + width, y + height],
+                "rectangle",
+                false,
+                format!("activity.count_frame.{activity_index}.{frame}.cell.{cell}"),
+            )?;
+            if cell < activity.quantity {
+                let radius = width.min(height) * 0.24;
+                let center_x = x + width / 2.0;
+                let center_y = y + height / 2.0;
+                activity_shape(
+                    &mut commands,
+                    plan.commands.len(),
+                    activity.page,
+                    [center_x - radius, center_y - radius, center_x + radius, center_y + radius],
+                    "ellipse",
+                    activity.filled,
+                    format!("activity.count_frame.{activity_index}.{frame}.token.{cell}"),
+                )?;
+            }
+        }
+    }
+    plan.commands.extend(commands);
+    Ok(())
+}
+
+/// Backward-compatible plan envelope. Activities become engine commands before
+/// any image purchase; they never enter an immutable style manifest.
+pub(crate) fn compile_native_plan(text: &str, scope: BatchScope) -> Result<ProductionPlan, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Content {
+        title: String,
+        commands: Vec<EngineAction>,
+        #[serde(default)]
+        images: Vec<ImagePlacement>,
+        #[serde(default)]
+        activities: Vec<NativeActivity>,
+    }
+    if text.len() > MAX_BRIEF_BYTES {
+        return Err("Native content plan exceeds 1 MiB".into());
+    }
+    let content: Content = serde_json::from_str(text).map_err(|error| format!("Invalid native content plan: {error}"))?;
+    if content.commands.len() > MAX_ACTIONS {
+        return Err("Native content plan exceeds 512 commands".into());
+    }
+    let mut plan = ProductionPlan { title: content.title, commands: content.commands, images: content.images };
+    append_activities(&mut plan, scope, &content.activities)?;
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const SCRIPT: &str = "# Global print specs\nA4; bleed 3 mm; vocalized Arabic.\n### PAGE 01 — Cover\n* **English Print Copy (LTR):**\n  > MY MATH BOOK\n* **Arabic Print Copy (RTL - Vocalized):**\n  > كِتَابُ الرِّيَاضِيَّاتِ\n* **Visual & Illustration Prompt (Art Direction):** Noor and Leo with a lion.\n### PAGE 02 — Ownership & Number Chart\n* **English Print Copy (LTR):**\n  > THIS BOOK BELONGS TO: [Name Line] | MY NUMBER CHART 1–20\n* **Visual & Illustration Prompt (Art Direction):** Twenty number cards.\n";
+
+    fn plan(page: u32, en: &str, ar: &str) -> ProductionPlan {
+        ProductionPlan {
+            title: "Native proof".into(),
+            commands: vec![
+                EngineAction { command: "frame.create".into(), params: json!({"spread":page,"content":"text","rect":[45,45,550,200],"text":en}) },
+                EngineAction { command: "frame.create".into(), params: json!({"spread":page,"content":"text","rect":[45,210,550,400],"text":ar}) },
+            ],
+            images: vec![],
+        }
+    }
+
+    #[test]
+    fn facing_context_page_twelve_keeps_thirteen_as_context_across_review_boundary() {
+        let brief: String = (1..=14).map(|page| {
+            let title = match page { 12 => "Unit 2 Opener: Ocean Counting", 13 => "Ocean Counting Practice", _ => "Independent Lesson" };
+            format!("### PAGE {page:02} — {title}\n* **English Print Copy (LTR):**\n  > Lesson {page}\n* **Visual & Illustration Prompt (Art Direction):** Ocean coral scene {page} — رِيَاضِيَّات\n")
+        }).collect();
+        let scope = BatchScope { start: 11, count: 1 };
+        let context = facing_context(&brief, scope).unwrap();
+        assert_eq!(context["scope"], json!({"start":11,"count":1}));
+        assert_eq!(context["produce_only_pages"], json!([11]));
+        assert_eq!(context["pairs"].as_array().unwrap().len(), 1);
+        let pair = &context["pairs"][0];
+        assert_eq!(pair["pair_id"], "pages-0012-0013");
+        assert_eq!(pair["human_pages"], json!([12, 13]));
+        assert_eq!(pair["members"][0]["page"], 11);
+        assert_eq!(pair["members"][0]["role"], "produce");
+        assert_eq!(pair["members"][1]["page"], 12);
+        assert_eq!(pair["members"][1]["role"], "context_only");
+        assert!(pair["members"][1]["full_script"].as_str().unwrap().contains("رِيَاضِيَّات"));
+        assert_eq!(pair["linked_candidate"], true);
+        let reverse = facing_context(&brief, BatchScope { start: 12, count: 1 }).unwrap();
+        assert_eq!(reverse["pairs"][0]["pair_id"], pair["pair_id"]);
+        assert_eq!(reverse["produce_only_pages"], json!([12]));
+        let review = facing_context(&brief, BatchScope { start: 0, count: 12 }).unwrap();
+        assert_eq!(review["produce_only_pages"].as_array().unwrap().len(), 12);
+        assert_eq!(review["pairs"][6]["members"][1]["role"], "context_only");
+    }
+
+    #[test]
+    fn facing_context_keeps_cover_standalone_and_has_no_invented_fallback_pages() {
+        let cover = facing_context(SCRIPT, BatchScope { start: 0, count: 1 }).unwrap();
+        assert_eq!(cover["pairs"][0]["pair_id"], "cover-0001");
+        assert_eq!(cover["pairs"][0]["members"].as_array().unwrap().len(), 1);
+        assert_eq!(cover["pairs"][0]["linked_candidate"], false);
+        let generic = facing_context("Design an English/Arabic educational magazine", BatchScope { start: 11, count: 1 }).unwrap();
+        assert_eq!(generic["status"], "no_explicit_page_script");
+        assert!(generic["pairs"].as_array().unwrap().is_empty());
+        assert!(facing_context(SCRIPT, BatchScope { start: u32::MAX, count: 1 }).is_err());
+    }
+
+    #[test]
+    fn facing_context_does_not_force_linking_unrelated_lessons() {
+        let brief = "### PAGE 01 — Cover\n### PAGE 02 — Measuring Length\n### PAGE 03 — Shapes Everywhere\n";
+        let context = facing_context(brief, BatchScope { start: 1, count: 1 }).unwrap();
+        assert_eq!(context["pairs"][0]["linked_candidate"], false);
+        assert_eq!(context["pairs"][0]["link_reason"], "independent_lessons");
+        assert_eq!(context["pairs"][0]["members"][1]["role"], "context_only");
+    }
+
+    #[test]
+    fn scoped_prompt_retains_global_specs_and_only_requested_page() {
+        let scoped = scoped_prompt(SCRIPT, BatchScope { start: 1, count: 1 }).unwrap();
+        assert!(scoped.contains("A4; bleed 3 mm"));
+        assert!(scoped.contains("### PAGE 02 — Ownership"));
+        assert!(!scoped.contains("### PAGE 01"));
+        assert!(!scoped.contains("Noor and Leo with a lion"));
+        let contract = parse(SCRIPT).unwrap().unwrap();
+        assert_eq!(contract.pages.len(), 2);
+        assert_eq!(contract.pages[0].arabic_print_copy.as_deref(), Some("كِتَابُ الرِّيَاضِيَّاتِ"));
+    }
+
+    #[test]
+    fn explicit_copy_rejects_changed_page_missing_arabic_and_removed_diacritics() {
+        let scope = BatchScope { start: 0, count: 1 };
+        validate_plan(SCRIPT, scope, &plan(0, "MY MATH BOOK", "كِتَابُ الرِّيَاضِيَّاتِ")).unwrap();
+        assert!(validate_plan(SCRIPT, scope, &plan(0, "MY SCIENCE BOOK", "كِتَابُ الرِّيَاضِيَّاتِ")).is_err());
+        assert!(validate_plan(SCRIPT, scope, &plan(0, "MY MATH BOOK", "كتاب الرياضيات")).is_err());
+        assert!(validate_plan(SCRIPT, scope, &plan(1, "MY MATH BOOK", "كِتَابُ الرِّيَاضِيَّاتِ")).is_err());
+        validate_plan(SCRIPT, BatchScope { start: 1, count: 1 }, &plan(1, "THIS BOOK BELONGS TO:\n_______", "MY NUMBER CHART 1–20")).unwrap();
+    }
+
+    #[test]
+    fn exact_copy_does_not_match_a_different_quantity_or_overwritten_story() {
+        let brief = "### PAGE 01 — Counting\n* **English Print Copy (LTR):**\n  > 5 Monkeys\n";
+        let scope = BatchScope { start: 0, count: 1 };
+        assert!(validate_plan(brief, scope, &plan(0, "15 Monkeys", "")).is_err());
+        let mut changed = plan(0, "5 Monkeys", "");
+        changed.commands.push(EngineAction { command: "story.setText".into(), params: json!({"story":"$0.story","text":"5 Lions"}) });
+        assert!(validate_plan(brief, scope, &changed).is_err());
+    }
+
+    #[test]
+    fn explicit_script_parser_rejects_duplicate_gap_zero_and_hostile_unicode_headings() {
+        for brief in [
+            "### PAGE 00 — Zero",
+            "### PAGE 01 — A\n### PAGE 01 — B",
+            "### PAGE 01 — A\n### PAGE 03 — Gap",
+            "### PAGE 999999999999999999999999999999 — Huge",
+            "### PAGE 1ع — Broken",
+        ] {
+            assert!(parse(brief).is_err(), "{brief}");
+        }
+        assert!(parse("Generic Arabic brief رِيَاضِيَّات").unwrap().is_none());
+        assert!(scoped_prompt(SCRIPT, BatchScope { start: u32::MAX, count: 1 }).is_err());
+    }
+
+    #[test]
+    fn deterministic_count_frames_have_exact_cell_and_token_counts_and_atomic_failure() {
+        let mut native = ProductionPlan { title: "Count".into(), commands: vec![], images: vec![] };
+        let activity: NativeActivity =
+            serde_json::from_value(json!({"page":0,"rect":[50,100,300,200],"frame":"ten","quantity":7,"filled":true})).unwrap();
+        append_activities(&mut native, BatchScope { start: 0, count: 1 }, &[activity]).unwrap();
+        assert_eq!(
+            native.commands.iter().filter(|a| a.params.get("label").and_then(Value::as_str).is_some_and(|label| label.contains(".cell."))).count(),
+            10
+        );
+        assert_eq!(
+            native.commands.iter().filter(|a| a.params.get("label").and_then(Value::as_str).is_some_and(|label| label.contains(".token."))).count(),
+            7
+        );
+        let before = serde_json::to_value(&native).unwrap();
+        let invalid: NativeActivity =
+            serde_json::from_value(json!({"page":0,"rect":[50,100,300,200],"frame":"five","quantity":6,"filled":true})).unwrap();
+        assert!(append_activities(&mut native, BatchScope { start: 0, count: 1 }, &[invalid]).is_err());
+        assert_eq!(serde_json::to_value(&native).unwrap(), before);
+    }
+}

@@ -38,8 +38,14 @@ pub struct TokenRates {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
+    /// Real book spreads; existing documents always keep their current binding.
+    pub facing_pages: bool,
+    /// None infers direction from content language; explicit preferences remain available.
+    pub right_to_left_binding: Option<bool>,
     /// Additional planning requests may be billed; opt in explicitly, including legacy settings.
     pub allow_paid_repairs: bool,
+    /// Optional billed visual inspection using the selected supported vision text model.
+    pub verify_generated_images: bool,
     /// None selects a relevant style locally; Some pins this skill's design profile at task start.
     pub design_style: Option<String>,
     pub text_model: ModelSelection,
@@ -55,7 +61,10 @@ pub struct AiSettings {
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
+            facing_pages: false,
+            right_to_left_binding: None,
             allow_paid_repairs: false,
+            verify_generated_images: false,
             design_style: None,
             text_model: ModelSelection { provider: ProviderKind::Ollama, model: String::new(), endpoint: None },
             image_model: ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: None },
@@ -365,6 +374,12 @@ pub struct AiSnapshot {
     pub busy: bool,
     pub stage: String,
     pub progress: f32,
+    /// Current task's measured cumulative ledger, refreshed after each provider call.
+    #[serde(default)]
+    pub current_usage: UsageSummary,
+    /// Local fitting decisions and production checks; never provider credentials.
+    #[serde(default)]
+    pub current_issues: Vec<Value>,
     pub message: String,
     pub settings: AiSettings,
     pub skills: Vec<SkillCard>,

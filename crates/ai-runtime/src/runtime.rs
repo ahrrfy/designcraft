@@ -4,9 +4,9 @@ use designcraft_ai_providers::{SecretString, validate_endpoint};
 use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry, SkillSnapshot};
 use designcraft_ai_types::protocol::*;
 use designcraft_ai_types::{EngineAction, ProviderKind};
-use designcraft_engine::{Session, file_access};
+use designcraft_engine::{Prefs, Session, file_access};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, mpsc::TryRecvError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +24,7 @@ struct Pending {
     started: Instant,
     task: Option<TaskRequest>,
     expected: Option<(u64, u64)>,
+    expected_prefs: Option<Prefs>,
     skills: Vec<(String, String)>,
     settings: AiSettings,
 }
@@ -47,6 +48,7 @@ pub struct ProductionRunner {
     sample: Option<SampleEvidence>,
     sequence: u64,
     print_attempts: BTreeSet<String>,
+    print_contracts: BTreeMap<u64, crate::print_contract::PrintContract>,
     local_server: crate::localserver::LocalOllama,
 }
 
@@ -97,6 +99,7 @@ impl ProductionRunner {
             sample: None,
             sequence: 0,
             print_attempts,
+            print_contracts: BTreeMap::new(),
             local_server: Default::default(),
         };
         host.refresh_catalog();
@@ -309,12 +312,26 @@ impl ProductionRunner {
             }
             AiRequest::ExportDocument { path, pdf } => {
                 file_access::check_write(&path)?;
+                let contract = self.print_contracts.get(&session.doc().map_err(|e| e.to_string())?.uid).cloned();
                 if pdf {
-                    ensure_preflight(session)?;
+                    ensure_preflight_at(session, contract.as_ref().and_then(|c| c.min_image_ppi()).unwrap_or(150.0))?;
                 }
-                let params = if pdf { json!({"path":path,"spreads":false,"bleed":false,"marks":false}) } else { json!({"path":path}) };
+                let params = if pdf {
+                    match &contract {
+                        Some(contract) => contract.pdf_export_params(Some(&path))?,
+                        None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
+                    }
+                } else {
+                    json!({"path":path})
+                };
                 session.execute(if pdf { "file.exportPdf" } else { "file.saveAs" }, &params).map_err(|e| e.to_string())?;
                 self.snapshot.message = format!("Exported {path}");
+                if pdf
+                    && let Some(contract) = contract
+                    && let Err(warning) = contract.validate_final_export()
+                {
+                    self.snapshot.message.push_str(&format!(". Review PDF saved; {warning}"));
+                }
             }
             AiRequest::ExportIdml { path } => {
                 file_access::check_write(&path)?;
@@ -342,7 +359,14 @@ impl ProductionRunner {
         Ok(())
     }
 
-    fn start(&mut self, session: &mut Session, task: TaskRequest) -> Result<(), String> {
+    fn start(&mut self, session: &mut Session, mut task: TaskRequest) -> Result<(), String> {
+        if matches!(task.target, TaskTarget::ContinueBook) {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            task.settings.facing_pages |= current.doc.settings.facing_pages;
+            if current.doc.settings.facing_pages {
+                task.settings.right_to_left_binding = Some(current.doc.settings.right_to_left_binding);
+            }
+        }
         if let Some(directory) = &task.export_directory {
             file_access::check_write(directory)?;
         }
@@ -404,11 +428,32 @@ impl ProductionRunner {
             return Err("Choose one design style per task to avoid conflicting identities".into());
         }
         let profile = snapshots.iter().find_map(|s| s.design_profile.as_ref());
-        let (base, context) = task_document_context(session, &task.target, profile)?;
+        let (base, mut context) = task_document_context(session, &task.target, profile, &task.prompt, &task.settings)?;
+        context["_production_cache_root"] = json!(self.root.join("production-cache-v1"));
+        if task.settings.facing_pages {
+            context["facing_editorial_direction"] = json!({
+                "enabled":true,"rightToLeft":book_binding(&task.settings,&task.prompt),
+                "instruction":"Plan occasional visually connected facing pairs, like an educational magazine: shared thematic scene, aligned sections, related activities and a continuous restrained identity. Use chapter openers and selected learning sequences, not one repeated spread everywhere. Preserve each page's supplied lesson and printable copy. Keep critical text/answer areas clear of the binding gutter; headers/folios follow left/right positions. Coordinate with the adjacent supplied PAGE block; both pages retain independently editable native elements. Cover page 1 stands alone; reader pairs are pages 2–3, 4–5 and so on."
+            });
+        }
+        let print_contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
+        if print_contract.is_some() && self.print_contracts.len() >= 1024 {
+            return Err("Too many document print contracts in this application session; save open work and restart before creating another".into());
+        }
+        if let Some(contract) = &print_contract {
+            context["production_print_contract"] = serde_json::to_value(contract).map_err(|e| e.to_string())?;
+            if !matches!(task.target, TaskTarget::NewA4 { .. })
+                && let Err(message) = contract.validate_existing(&base)
+            {
+                context["existing_document_print_notice"] =
+                    json!(format!("Preserve the opened document's actual geometry; requested final print settings differ: {message}"));
+            }
+        }
         if let TaskTarget::ContinueBook = task.target {
             batch::continuation_progress(&base, profile)?;
         }
         if !matches!(task.target, TaskTarget::CurrentDocument)
+            && print_contract.is_none()
             && let Some(profile) = profile
         {
             crate::design::check_geometry(Some(&base), &base, profile)?;
@@ -486,9 +531,15 @@ impl ProductionRunner {
         self.prepare_credentials(&selections)?;
         let keys = self.worker_keys();
         let roots = file_access::current();
+        let expected_prefs = match &work {
+            worker::Work::Production { prefs, .. } => Some(prefs.clone()),
+            _ => None,
+        };
         let worker = worker::spawn(work, keys, roots.clone())?;
-        self.pending = Some(Pending { roots, worker, id, started: Instant::now(), task, expected, skills, settings });
+        self.pending = Some(Pending { roots, worker, id, started: Instant::now(), task, expected, expected_prefs, skills, settings });
         self.snapshot.busy = true;
+        self.snapshot.current_usage = Default::default();
+        self.snapshot.current_issues.clear();
         self.snapshot.progress = 0.0;
         self.snapshot.stage = "generating".into();
         self.snapshot.message = "AI task started".into();
@@ -569,6 +620,20 @@ impl ProductionRunner {
                     self.snapshot.stage = stage;
                     self.snapshot.progress = fraction.clamp(0.0, 1.0);
                 }
+                Ok(worker::Message::Usage(usage)) => {
+                    self.snapshot.current_usage = usage.clone();
+                    if let Some(job) = self.batch.as_mut() {
+                        job.snapshot.cumulative_usage = usage.clone();
+                    }
+                    if let Some(batch) = self.snapshot.batch.as_mut() {
+                        batch.cumulative_usage = usage;
+                    }
+                }
+                Ok(worker::Message::Diagnostic(issue)) => {
+                    if self.snapshot.current_issues.len() < 1024 {
+                        self.snapshot.current_issues.push(issue);
+                    }
+                }
                 Ok(worker::Message::Finished(outcome)) => {
                     completed = Some(outcome);
                     break;
@@ -618,7 +683,7 @@ impl ProductionRunner {
             usage: outcome.usage,
             elapsed_ms: pending.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             actions: 0,
-            issues: Vec::new(),
+            issues: self.snapshot.current_issues.clone(),
             artifacts: Vec::new(),
             message: String::new(),
         };
@@ -626,7 +691,17 @@ impl ProductionRunner {
             Err("AI task cancelled; document changes were not published".into())
         } else {
             file_access::confine(pending.roots.as_ref(), || {
-                outcome.result.and_then(|product| self.publish(session, &pending.task, pending.expected, product, &mut report))
+                let product = outcome.result?;
+                if let Some(expected) = &pending.expected_prefs
+                    && serde_json::to_value(expected).map_err(|e| e.to_string())?
+                        != serde_json::to_value(&session.prefs).map_err(|e| e.to_string())?
+                {
+                    return Err(
+                        "Application preferences changed during generation; result was not published. Run the task again with current preferences"
+                            .into(),
+                    );
+                }
+                self.publish(session, &pending.task, pending.expected, product, &mut report)
             })
         };
         match result {
@@ -725,7 +800,7 @@ impl ProductionRunner {
                 std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
                 let trace = runs.join(format!("{}.json", report.id));
                 let page_params = match task.target {
-                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params(&report.skills, pages)?),
+                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params_for_brief(&report.skills, pages, &task.prompt)?),
                     _ => None,
                 };
                 let context = match task.target {
@@ -740,31 +815,62 @@ impl ProductionRunner {
                 report.artifacts.push(trace.to_string_lossy().into_owned());
                 let previous_active = session.active_index();
                 let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
-                if let Some(params) = page_params {
-                    session.execute("file.new", &params).map_err(|e| e.to_string())?;
-                }
-                let current = session.doc().map_err(|e| e.to_string())?;
-                let params = json!({"commands":plan.commands,"outputMode":task.settings.output_mode,"label":plan.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true});
-                if let Err(error) = session.execute("production.apply", &params) {
-                    if new_document {
-                        session.execute("file.close", &json!({})).map_err(|e| format!("{error}; could not close the failed new document: {e}"))?;
-                        if let Some(index) = previous_active {
-                            session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
-                        }
+                let min_ppi =
+                    crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+                let mut created = false;
+                let published = (|| {
+                    if let Some(params) = page_params {
+                        session.execute("file.new", &params).map_err(|e| e.to_string())?;
+                        created = true;
+                        initialize_print_document(session, &task.prompt)?;
+                        initialize_facing_document(session, &task.settings, &task.prompt)?;
+                        // Creation settings form the empty document's baseline.
+                        // Only the production edit belongs in the user's undo history.
+                        let baseline = session.doc_mut().map_err(|e| e.to_string())?;
+                        baseline.history.undo.clear();
+                        baseline.history.redo.clear();
                     }
-                    return Err(error.to_string());
+                    let current = session.doc().map_err(|e| e.to_string())?;
+                    let mapped = if new_document && task.settings.facing_pages { Some(crate::facing_pages::map_plan(&plan, current)?) } else { None };
+                    let applied = mapped.as_ref().unwrap_or(&plan);
+                    let params = json!({"commands":applied.commands,"outputMode":task.settings.output_mode,"label":applied.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true,"minPpi":min_ppi});
+                    session.execute("production.apply", &params).map_err(|e| e.to_string())?;
+                    Ok::<_, String>((applied.commands.len(), applied.title.clone()))
+                })();
+                let (actions, title) = match published {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if created {
+                            session
+                                .execute("file.close", &json!({}))
+                                .map_err(|e| format!("{error}; could not close the failed new document: {e}"))?;
+                            if let Some(index) = previous_active {
+                                session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
+                report.actions = actions;
+                report.title = title;
+                if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+                    self.print_contracts.insert(session.doc().map_err(|e| e.to_string())?.uid, contract);
                 }
-                report.actions = plan.commands.len();
-                report.title = plan.title;
-                let preflight = ensure_preflight(session)?;
-                report.issues = preflight.get("issues").and_then(Value::as_array).cloned().unwrap_or_default();
+                let preflight = ensure_preflight_at(session, min_ppi)?;
+                report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
                 if let Some(directory) = &task.export_directory {
                     file_access::check_write(directory)?;
                     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
                     for (extension, command) in [("designcraft", "file.saveAs"), ("pdf", "file.exportPdf")] {
                         let path = Path::new(directory).join(format!("production-{}.{}", report.id, extension));
-                        let args =
-                            if extension == "pdf" { json!({"path":path,"spreads":false,"bleed":false,"marks":false}) } else { json!({"path":path}) };
+                        let args = if extension == "pdf" {
+                            match crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+                                Some(contract) => contract.pdf_export_params(Some(path.to_str().ok_or("PDF export path is not valid Unicode")?))?,
+                                None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
+                            }
+                        } else {
+                            json!({"path":path})
+                        };
                         session.execute(command, &args).map_err(|e| e.to_string())?;
                         report.artifacts.push(path.to_string_lossy().into_owned());
                     }
@@ -779,7 +885,11 @@ impl ProductionRunner {
         choose_compatible_skills(prompt, self.registry.catalog(""), &supported_commands())
     }
 
+    #[cfg(test)]
     fn pinned_document_params(&self, pins: &[(String, String)], pages: u32) -> Result<Value, String> {
+        self.pinned_document_params_for_brief(pins, pages, "")
+    }
+    fn pinned_document_params_for_brief(&self, pins: &[(String, String)], pages: u32, brief: &str) -> Result<Value, String> {
         let mut profile = None;
         for (id, revision) in pins {
             let record = self.registry.revision(id, revision).map_err(|e| e.to_string())?;
@@ -791,7 +901,7 @@ impl ProductionRunner {
                 profile = Some(selected);
             }
         }
-        Ok(crate::design::document_params(profile, pages))
+        production_document_params(profile, pages, brief)
     }
 
     fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
@@ -1599,19 +1709,65 @@ fn task_document_context(
     session: &Session,
     target: &TaskTarget,
     profile: Option<&designcraft_ai_types::DesignProfile>,
+    brief: &str,
+    settings: &AiSettings,
 ) -> Result<(designcraft_engine::DocState, Value), String> {
     match target {
-        TaskTarget::CurrentDocument | TaskTarget::ContinueBook => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
+        TaskTarget::CurrentDocument => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
+        TaskTarget::ContinueBook => {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            let facing = if settings.facing_pages && !current.doc.settings.facing_pages {
+                Some(crate::facing_pages::formatted_proof_state(current, &session.prefs, book_binding(settings, brief))?)
+            } else {
+                None
+            };
+            let state = crate::facing_pages::canonicalize(facing.as_ref().unwrap_or(current), &session.prefs)?;
+            let mut scratch = Session::new();
+            scratch.prefs = session.prefs.clone();
+            scratch.add_document(state.clone());
+            Ok((state, compact_context(&scratch)?))
+        }
         TaskTarget::NewA4 { pages } => {
             if let Some(profile) = profile {
                 profile.validate()?;
             }
             let mut scratch = Session::new();
-            scratch.execute("file.new", &crate::design::document_params(profile, *pages)).map_err(|e| e.to_string())?;
+            scratch.execute("file.new", &production_document_params(profile, *pages, brief)?).map_err(|e| e.to_string())?;
+            initialize_print_document(&mut scratch, brief)?;
+            if settings.facing_pages {
+                initialize_facing_document(&mut scratch, settings, brief)?;
+                let state = crate::facing_pages::canonicalize(scratch.doc().map_err(|e| e.to_string())?, &scratch.prefs)?;
+                scratch.add_document(state);
+            }
             let context = compact_context(&scratch)?;
             Ok((scratch.doc().map_err(|e| e.to_string())?.clone(), context))
         }
     }
+}
+fn production_document_params(profile: Option<&designcraft_ai_types::DesignProfile>, pages: u32, brief: &str) -> Result<Value, String> {
+    match crate::print_contract::PrintContract::from_prompt(brief)? {
+        Some(contract) => contract.document_params(profile, pages),
+        None => Ok(crate::design::document_params(profile, pages)),
+    }
+}
+fn initialize_print_document(session: &mut Session, brief: &str) -> Result<(), String> {
+    if let Some(contract) = crate::print_contract::PrintContract::from_prompt(brief)? {
+        for action in contract.initial_actions() {
+            session.execute(&action.command, &action.params).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+pub(crate) fn book_binding(settings: &AiSettings, brief: &str) -> bool {
+    settings.right_to_left_binding.unwrap_or_else(|| crate::facing_pages::auto_direction(brief) == "rightToLeft")
+}
+fn initialize_facing_document(session: &mut Session, settings: &AiSettings, brief: &str) -> Result<(), String> {
+    if settings.facing_pages {
+        session
+            .execute("layout.documentSetup", &json!({"facingPages":true,"binding":if book_binding(settings,brief){"rightToLeft"}else{"leftToRight"}}))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 #[cfg(test)]
 fn new_a4(pages: u32) -> Value {
@@ -1625,7 +1781,10 @@ fn print_params(printer: Option<String>, grayscale: bool, duplex: String) -> Val
     params
 }
 fn ensure_preflight(session: &mut Session) -> Result<Value, String> {
-    let report = session.execute("preflight.run", &json!({"minPpi":150})).map_err(|e| e.to_string())?;
+    ensure_preflight_at(session, 150.0)
+}
+fn ensure_preflight_at(session: &mut Session, min_ppi: f64) -> Result<Value, String> {
+    let report = session.execute("preflight.run", &json!({"minPpi":min_ppi})).map_err(|e| e.to_string())?;
     if report.get("errors").and_then(Value::as_u64).is_none_or(|n| n > 0) {
         return Err(format!("Preflight errors require correction before output: {report}"));
     }
@@ -1962,7 +2121,7 @@ mod tests {
         session.execute("file.new", &new_a4(1)).unwrap();
         let original = session.doc().unwrap().clone();
         let target = TaskTarget::NewA4 { pages: 2 };
-        let (base, context) = task_document_context(&session, &target, Some(&profile)).unwrap();
+        let (base, context) = task_document_context(&session, &target, Some(&profile), "", &AiSettings::default()).unwrap();
         assert!(!context.is_null());
         let page = &base.doc.spreads[0].pages[0];
         assert!((page.width - 240.0 * 72.0 / 25.4).abs() < 0.001);
@@ -3143,6 +3302,105 @@ mod tests {
         assert!(session.documents().is_empty(), "review samples must not alter open documents");
     }
     #[test]
+    fn running_usage_and_full_diagnostics_are_visible_before_worker_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            id: "live-progress".into(),
+            started: Instant::now(),
+            expected: None,
+            expected_prefs: None,
+            task: None,
+            skills: vec![],
+            settings: Default::default(),
+        });
+        runner.snapshot.busy = true;
+        sender
+            .send(worker::Message::Usage(UsageSummary {
+                requests: 2,
+                input_tokens: 123,
+                output_tokens: 45,
+                estimated_cost_usd: Some(0.01),
+                ..Default::default()
+            }))
+            .unwrap();
+        sender.send(worker::Message::Diagnostic(json!({"kind":"printRequirement","message":"full detailed cause\npossible remedy"}))).unwrap();
+        let snapshot = runner.handle(&mut session, AiRequest::Poll);
+        assert!(snapshot.busy);
+        assert_eq!(snapshot.current_usage.requests, 2);
+        assert_eq!(snapshot.current_usage.input_tokens, 123);
+        assert_eq!(snapshot.current_issues[0]["message"], "full detailed cause\npossible remedy");
+        assert!(snapshot.reports.is_empty());
+        assert!(session.documents().is_empty());
+        assert!(runner.pending.is_some());
+    }
+
+    #[test]
+    fn facing_nonbatch_mapping_failure_restores_original_active_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        session.execute("frame.create", &json!({"rect":[40,40,100,100]})).unwrap();
+        let original = session.doc().unwrap().clone();
+        let task = TaskRequest {
+            prompt: "Create a facing-page booklet".into(),
+            settings: AiSettings { facing_pages: true, pages_per_batch: 0, ..Default::default() },
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 2 },
+            export_directory: None,
+        };
+        // A missing absolute spread is valid in ordinary nonbatch engine actions,
+        // but cannot be mapped safely into a facing-page book.
+        let plan = ProductionPlan {
+            title: "Invalid mapping".into(),
+            commands: vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[50,50,100,100]}) }],
+            images: vec![],
+        };
+        let mut report = TaskReport {
+            id: "facing-rollback".into(),
+            status: String::new(),
+            title: String::new(),
+            provider: ProviderKind::Ollama,
+            model: String::new(),
+            settings: None,
+            skills: vec![],
+            usage: Default::default(),
+            elapsed_ms: 0,
+            actions: 0,
+            issues: vec![],
+            artifacts: vec![],
+            message: String::new(),
+            design_style: None,
+        };
+        let error = runner.publish(&mut session, &Some(task.clone()), None, worker::Product::Plan(plan), &mut report).unwrap_err();
+        assert!(error.contains("spread"), "{error}");
+        assert_eq!(session.documents().len(), 1);
+        assert_eq!(session.active_index(), Some(0));
+        assert_eq!(session.doc().unwrap().uid, original.uid);
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.doc().unwrap().doc));
+        assert_eq!(session.doc().unwrap().history.undo.len(), original.history.undo.len());
+        let valid = ProductionPlan {
+            title: "Valid facing publication".into(),
+            commands: vec![EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[50,50,100,100]}) }],
+            images: vec![],
+        };
+        runner.publish(&mut session, &Some(task), None, worker::Product::Plan(valid), &mut report).unwrap();
+        assert_eq!(session.documents().len(), 2);
+        assert!(session.doc().unwrap().doc.settings.facing_pages);
+        assert_eq!(session.doc().unwrap().history.undo.len(), 1);
+        session.execute("edit.undo", &json!({})).unwrap();
+        assert!(session.doc().unwrap().doc.spreads.iter().all(|spread| spread.items.is_empty()));
+        assert!(session.doc().unwrap().doc.settings.facing_pages);
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.documents()[0].doc));
+    }
+
+    #[test]
     fn stale_result_cannot_touch_another_document() {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -3184,6 +3442,65 @@ mod tests {
         assert_eq!(session.doc().unwrap().doc.spreads[0].items.len(), 1);
     }
     #[test]
+    fn nonbatch_production_rejects_changed_preferences_before_any_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.prefs.typographers_quotes = false;
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let before = session.doc().unwrap().clone();
+        let original_prefs = session.prefs.clone();
+        let supplied = "\"Preserve this exact copy\"";
+        let plan = ProductionPlan {
+            title: "Pinned nonbatch preferences".into(),
+            commands: vec![
+                EngineAction { command: "frame.create".into(), params: json!({"rect":[50,50,300,180],"content":"text"}) },
+                EngineAction { command: "text.insert".into(), params: json!({"text":supplied}) },
+            ],
+            images: vec![],
+        };
+        let mut private = Session::new();
+        private.prefs = original_prefs.clone();
+        private.add_document(before.clone());
+        private.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        assert!(private.doc().unwrap().doc.stories.values().any(|story| story.text == supplied));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let settings = AiSettings { pages_per_batch: 0, ..Default::default() };
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            id: "nonbatch-prefs".into(),
+            started: Instant::now(),
+            task: Some(TaskRequest {
+                prompt: supplied.into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: TaskTarget::CurrentDocument,
+                export_directory: None,
+            }),
+            expected: Some((before.uid, before.revision)),
+            expected_prefs: Some(original_prefs),
+            skills: vec![],
+            settings,
+        });
+        runner.snapshot.busy = true;
+        session.prefs.typographers_quotes = true;
+        assert_eq!(session.doc().unwrap().revision, before.revision, "Preference changes do not invalidate the document revision pin");
+        sender.send(worker::Message::Finished(worker::Outcome { result: Ok(worker::Product::Plan(plan)), usage: Default::default() })).unwrap();
+        let rejected = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(rejected.stage, "failed");
+        assert!(rejected.message.contains("preferences changed"), "{}", rejected.message);
+        assert!(runner.pending.is_none());
+        assert!(std::sync::Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        assert_eq!(before.history.undo.len(), session.doc().unwrap().history.undo.len());
+        assert_eq!(before.is_dirty(), session.doc().unwrap().is_dirty());
+        assert_eq!(before.revision, session.doc().unwrap().revision);
+        assert!(rejected.reports.last().unwrap().artifacts.is_empty());
+        assert!(!runner.root.join("runs").exists(), "Preference drift must be refused before any trace or live publication");
+    }
+
+    #[test]
     fn cancel_wins_over_already_queued_completion() {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -3210,6 +3527,7 @@ mod tests {
             id: "cancel-test".into(),
             started: Instant::now(),
             expected: Some((session.doc().unwrap().uid, session.doc().unwrap().revision)),
+            expected_prefs: Some(session.prefs.clone()),
             task: Some(task),
             skills: Vec::new(),
             settings: Default::default(),

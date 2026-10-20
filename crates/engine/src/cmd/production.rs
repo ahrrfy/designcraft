@@ -808,7 +808,9 @@ fn publish_draft(s: &mut Session, mut finished: crate::DocState, label: &str) ->
 pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<Value> {
     let params = p.as_object().ok_or_else(|| bad(GROUP_ID, "parameters must be an object"))?;
     for key in params.keys() {
-        if !["chunks", "outputMode", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi"].contains(&key.as_str()) {
+        if !["chunks", "outputMode", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi", "documentSetup"]
+            .contains(&key.as_str())
+        {
             return Err(bad(GROUP_ID, format!("unknown parameter `{key}`")));
         }
     }
@@ -824,6 +826,24 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
     {
         return Err(bad(GROUP_ID, "label must contain 1 to 256 bytes"));
     }
+    // This host envelope is deliberately absent from the provider command schemas. A review
+    // group may change pagination/binding atomically, but cannot smuggle size/page-count or
+    // unrelated Document Setup changes through the host.
+    let document_setup = if let Some(value) = p.get("documentSetup") {
+        let setup = value.as_object().ok_or_else(|| bad(GROUP_ID, "documentSetup must be an object"))?;
+        for (key, value) in setup {
+            match key.as_str() {
+                "facingPages" if value.as_bool().is_some() => {}
+                "binding" if matches!(value.as_str(), Some("leftToRight" | "rightToLeft")) => {}
+                "facingPages" => return Err(bad(GROUP_ID, "documentSetup.facingPages must be a boolean")),
+                "binding" => return Err(bad(GROUP_ID, "documentSetup.binding must be leftToRight or rightToLeft")),
+                _ => return Err(bad(GROUP_ID, format!("documentSetup: unknown parameter `{key}`"))),
+            }
+        }
+        Some(value)
+    } else {
+        None
+    };
     let original = s.doc()?;
     if original.interaction.is_some() || original.preview_stash.is_some() || s.tool.composing() {
         return Err(bad(GROUP_ID, "finish the current interaction or preview first"));
@@ -835,12 +855,22 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
             return Err(bad(GROUP_ID, format!("{key}: document changed while generation was pending")));
         }
     }
+    let original_page_count = original.doc.page_count();
     let mut work = Session::new();
     work.cache = s.cache.clone();
     work.prefs = s.prefs.clone();
     work.docs.push(original.clone());
     work.active = Some(0);
     work.in_undo_step = true;
+    if let Some(setup) = document_setup {
+        if cancelled() {
+            return Err(bad(GROUP_ID, "production cancelled"));
+        }
+        work.execute("layout.documentSetup", setup)?;
+        if work.doc()?.doc.page_count() != original_page_count {
+            return Err(bad(GROUP_ID, "documentSetup cannot add or remove existing document pages"));
+        }
+    }
     let mut results = Vec::with_capacity(chunks.len());
     let mut steps = 0usize;
     for (index, chunk) in chunks.iter().enumerate() {
@@ -879,7 +909,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "production.catalog","AI Production Commands",[],None,"{} → vetted commands with paramsSchema and examples",always,|_,_| Ok(catalog())),
         cmd!(query "production.validate","Validate AI Production",[],None,"{commands: [{command, params}], outputMode, allowedCommands?, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool (default false; refuse error-level issues before publication), minPpi?: 150 (1 to 2400)} → {valid, steps, results}",has_doc,|s,p| validate_actions(s,p)),
         cmd!(noundo "production.apply","Apply AI Production",[],None,"{commands: [{command, params}], outputMode, allowedCommands?, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool (default false; refuse error-level issues before publication), minPpi?: 150 (1 to 2400)} → {applied, steps, results}",has_doc,|s,p| apply_actions(s,p,|| false)),
-        cmd!(noundo "production.applyGroup","Apply AI Production Group",[],None,"{chunks: [{commands: [{command, params}], label?}] (1 to 1000 chunks, at most 512 commands each; references reset per chunk), outputMode, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool, minPpi?: 150 (1 to 2400)} → {applied, groups, steps, results: [chunk results], label, documentUid, revision}",has_doc,|s,p| apply_action_groups(s,p,|| false)),
+        cmd!(noundo "production.applyGroup","Apply AI Production Group",[],None,"{chunks: [{commands: [{command, params}], label?}] (1 to 1000 chunks, at most 512 commands each; references reset per chunk), outputMode, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool, minPpi?: 150 (1 to 2400), documentSetup?: {facingPages?: bool, binding?: leftToRight|rightToLeft} (host only; applied privately before chunks without changing page count)} → {applied, groups, steps, results: [chunk results], label, documentUid, revision}",has_doc,|s,p| apply_action_groups(s,p,|| false)),
     ]
 }
 
@@ -957,6 +987,113 @@ mod tests {
         assert_eq!(after.history.undo.len(), before.history.undo.len());
         assert_eq!(after.history.redo.len(), before.history.redo.len());
         assert_eq!(format!("{:?}", after.selection), format!("{:?}", before.selection));
+        assert_eq!(s.journal.len(), journal);
+    }
+
+    fn grouped_facing_setup() -> Value {
+        json!({"outputMode":"native_only","documentSetup":{"facingPages":true,"binding":"rightToLeft"},"label":"Facing review group","chunks":[
+            {"commands":[
+                {"command":"frame.create","params":{"spread":1,"rect":[420,30,520,130]}},
+                {"command":"object.label","params":{"ids":["$0.id"],"label":"Absolute page two"}}
+            ]},
+            {"commands":[
+                {"command":"frame.create","params":{"spread":1,"rect":[20,30,120,130]}},
+                {"command":"object.label","params":{"ids":["$0.id"],"label":"Absolute page three"}}
+            ]}
+        ]})
+    }
+
+    #[test]
+    fn grouped_document_setup_and_mapped_chunks_publish_atomically_with_one_undo() {
+        let mut s = session();
+        s.execute("file.new", &json!({"width":400,"height":600,"pages":6,"facingPages":false})).unwrap();
+        let cover = s.execute("frame.create", &json!({"spread":0,"rect":[20,30,120,130]})).unwrap();
+        s.execute("object.label", &json!({"ids":[cover["id"]],"label":"Existing cover"})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let page_ids: Vec<_> = before.doc.pages().map(|(_, _, page)| page.id).collect();
+        let mut parameters = grouped_facing_setup();
+        // The host can validate identical mapped chunks against a private formatted state
+        // before any setup or new artwork reaches the live document.
+        let mut preview = Session::new();
+        preview.add_document(before.clone());
+        preview.execute("layout.documentSetup", &parameters["documentSetup"]).unwrap();
+        let mut preview_parameters = parameters.clone();
+        preview_parameters.as_object_mut().unwrap().remove("documentSetup");
+        preview.execute("production.applyGroup", &preview_parameters).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        parameters["expectedDocumentUid"] = json!(before.uid);
+        parameters["expectedRevision"] = json!(before.revision);
+        let result = s.execute("production.applyGroup", &parameters).unwrap();
+        assert_eq!((result["groups"].as_u64(), result["steps"].as_u64()), (Some(2), Some(4)));
+        let after = s.doc().unwrap();
+        assert!(after.doc.settings.facing_pages && after.doc.settings.right_to_left_binding);
+        assert_eq!((after.doc.page_count(), after.doc.spreads.len()), (6, 4));
+        assert_eq!(after.doc.pages().map(|(_, _, page)| page.id).collect::<Vec<_>>(), page_ids);
+        assert_eq!(
+            after.doc.item(crate::doc::ItemId(cover["id"].as_u64().unwrap())),
+            before.doc.item(crate::doc::ItemId(cover["id"].as_u64().unwrap()))
+        );
+        assert_eq!(after.doc.spreads, preview.doc().unwrap().doc.spreads);
+        assert_eq!(after.history.undo.len(), before.history.undo.len() + 1);
+        assert_eq!(after.history.undo.last().unwrap().label, "Facing review group");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        assert!(!s.doc().unwrap().doc.settings.facing_pages);
+        assert_eq!(s.doc().unwrap().doc.spreads.len(), 6);
+        assert_eq!(s.doc().unwrap().doc.spreads.iter().map(|spread| spread.items.len()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn grouped_document_setup_rejects_other_fields_or_types_without_live_changes() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        for setup in [
+            json!(null),
+            json!([]),
+            json!(true),
+            json!({"pages":2}),
+            json!({"width":400}),
+            json!({"facingPages":"true"}),
+            json!({"facingPages":null}),
+            json!({"binding":"vertical"}),
+            json!({"binding":true}),
+            json!({"binding":f64::NAN}),
+        ] {
+            let mut parameters = grouped_facing_setup();
+            parameters["documentSetup"] = setup;
+            let error = s.execute("production.applyGroup", &parameters).unwrap_err();
+            assert!(error.to_string().contains("documentSetup"), "{error}");
+            let after = s.doc().unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &after.doc));
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.history.undo.len(), after.history.undo.len());
+            assert_eq!(s.journal.len(), journal);
+        }
+    }
+
+    #[test]
+    fn grouped_document_setup_later_failure_and_stale_pins_leave_original_state_untouched() {
+        let mut s = session();
+        s.execute("file.new", &json!({"width":400,"height":600,"pages":6,"facingPages":false})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        let mut parameters = grouped_facing_setup();
+        parameters["chunks"][1]["commands"][1]["params"]["ids"] = json!(["$0.missing"]);
+        let error = s.execute("production.applyGroup", &parameters).unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        for key in ["expectedDocumentUid", "expectedRevision"] {
+            let mut parameters = grouped_facing_setup();
+            parameters[key] = json!(if key == "expectedDocumentUid" { before.uid + 1 } else { before.revision + 1 });
+            assert!(s.execute("production.applyGroup", &parameters).unwrap_err().to_string().contains(key));
+            let after = s.doc().unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &after.doc));
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.history.undo.len(), after.history.undo.len());
+            assert_eq!(before.history.redo.len(), after.history.redo.len());
+            assert_eq!(before.selection, after.selection);
+        }
         assert_eq!(s.journal.len(), journal);
     }
 

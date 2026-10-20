@@ -26,7 +26,7 @@ impl UsageLedger {
             || budget.max_output_tokens == 0
             || budget.max_output_tokens > 65_536
             || budget.max_requests == 0
-            || budget.max_requests > 64
+            || budget.max_requests > 10_000
             || budget.repair_attempts > 3
         {
             return Err("Invalid token, request or repair limits".into());

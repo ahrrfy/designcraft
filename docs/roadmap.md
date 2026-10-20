@@ -1,6 +1,6 @@
 # DesignCraft roadmap (detail)
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-18 · **Change:** minor (native AI production and reviewed skills; .indd and .indt open through indd-utils; text threads by hand; the gate waits on the Primary Text Frame page fixes) · **Target:** Adobe InDesign 2026 (21.6)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-20 · **Change:** native AI18 production hardening and facing-page proof review; the parity gate still waits on the Primary Text Frame page fixes · **Target:** Adobe InDesign 2026 (21.6)
 
 Forward-looking plan. The one-page summary is [ROADMAP.md](../ROADMAP.md); numbers are in
 [target-app-parity.md](target-app-parity.md); the work list is [gaps.md](gaps.md). Hours are
@@ -52,7 +52,7 @@ In order. Each closes a beta blocker from [gaps.md](gaps.md).
 
 ### Native AI production — implementation, 2026-10-18
 
-The independent Smart Design fork adds five desktop AI panels, independent text/image models, endpoint-scoped Windows credentials, reviewed immutable skills and bounded reference analysis. Books use human proof checkpoints (default four pages, at most 32 per batch and 1,000 total), one cumulative budget and pinned skill revisions; interrupted work never resumes API calls automatically. Client resource admission and the owned Ollama process are not OS/GPU isolation. Printing submits the exact frozen PDF/font/color/printer proof after a durable human decision. Four builtin skills remain drafts with no active revisions; approval validates all template variants.
+The independent Smart Design fork adds five desktop AI panels, independent text/image models, endpoint-scoped Windows credentials, reviewed immutable skills and bounded reference analysis. Books use user-selected human proof groups (1–1,000 pages), bounded internal execution parts, one cumulative budget and pinned skill revisions; interrupted work never resumes API calls automatically. AI18 adds numbered-page copy contracts, native text fitting and math activities, validated local reuse, requested print geometry/fonts/resolution, live usage and facing-page reviews with occasional magazine-style paired context. Optional extra-billed illustration inspection remains advisory. See [AI18 acceptance and limits](production-hardening-ai18.ar.md). Client resource admission and the owned Ollama process are not OS/GPU isolation. Printing submits the exact frozen PDF/font/color/printer proof after a durable human decision. Builtin skills begin as drafts; approval validates all template variants.
 
 The original deterministic eight-page A4 fixture was reopened through installed InDesign 21.2: 52 editable stories/text frames, matching content and 99 object bounds, no missing fonts/overset; Script labels are lost. This does not measure AI quality or savings. Manual upstream integration and CI/unsigned Windows preview workflows preserve the fork review path; current-head CI/release and physical paper proof remain pending. See the [Arabic operating and evaluation guide](ai-production.ar.md). The pre-alpha gate and parity estimates are unchanged.
 

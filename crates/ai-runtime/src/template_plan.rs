@@ -303,6 +303,9 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
     if end > 1000 || total_pages == 0 || total_pages > 1000 || total_pages < end {
         return Err("Curriculum page scope exceeds the 1–1000 page document limit".into());
     }
+    if let Some(contract) = crate::script_contract::parse(prompt)? {
+        return contract.context(scope, total_pages);
+    }
 
     let norm = normalize_curriculum_query(prompt);
     let subject = detect_curriculum_subject(prompt);
@@ -712,7 +715,9 @@ pub(crate) fn capacity(skill: &SkillSnapshot, mode: OutputMode) -> Result<u32, S
     for family in &profile.page_families {
         let text = family.text_slots.iter().map(|slot| (slot.id.clone(), "X".to_owned())).collect::<BTreeMap<_, _>>();
         let sample = json!({"title":"Local template validation","pages":[{"page":0,"family":family.id,"text":text,"illustrations":[]}]});
-        let plan = compile(&sample.to_string(), skill, BatchScope { start: 0, count: 1 }, mode)?;
+        // Capacity verifies command topology using placeholder copy, without
+        // treating a sample's fixed mathematical artwork as bound lesson data.
+        let plan = compile_inner(&sample.to_string(), skill, BatchScope { start: 0, count: 1 }, mode, false)?;
         largest = largest.max(plan.commands.len());
         let placements = family
             .image_slots
@@ -820,6 +825,23 @@ fn authored_center_alignment(template: &[EngineAction], target: usize) -> Option
 }
 
 pub(crate) fn compile(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode) -> Result<ProductionPlan, String> {
+    compile_inner(text, skill, scope, mode, true)
+}
+
+pub(crate) fn compile_for_brief(
+    text: &str,
+    skill: &SkillSnapshot,
+    scope: BatchScope,
+    mode: OutputMode,
+    brief: &str,
+) -> Result<ProductionPlan, String> {
+    let mut plan = compile(text, skill, scope, mode)?;
+    crate::script_contract::validate_plan(brief, scope, &plan)?;
+    crate::script_contract::anchor_images(brief, scope, &mut plan)?;
+    Ok(plan)
+}
+
+fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, verify_math: bool) -> Result<ProductionPlan, String> {
     if text.len() > MAX_JSON {
         return Err("Template content exceeds 1 MiB".into());
     }
@@ -866,6 +888,18 @@ pub(crate) fn compile(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode
             return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
         }
         let template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
+        if verify_math
+            && template.iter().any(|action| {
+                action.command == "object.label"
+                    && action.params.get("label").and_then(Value::as_str).is_some_and(|label| label == "part.cpa.tf.outer")
+            })
+        {
+            return Err(format!(
+                "Page {} ({}): fixed counting-frame geometry and tokens are not bound to lesson quantities; use a structured activity in adaptive native planning",
+                u64::from(page_number) + 1,
+                family.id
+            ));
+        }
         let offset = plan.commands.len();
         if offset.checked_add(template.len()).is_none_or(|count| count > MAX_ACTIONS) {
             return Err("Compiled template exceeds 512 commands".into());
@@ -1068,6 +1102,37 @@ mod tests {
     fn compile_value(content: &Value, skill: &SkillSnapshot) -> Result<ProductionPlan, String> {
         compile(&content.to_string(), skill, scope(), OutputMode::NativeWithImages)
     }
+    #[test]
+    fn explicit_script_page_two_keeps_ownership_chart_instead_of_fallback_scope_sequence() {
+        let brief = "Mathematics KG2\n### PAGE 01 — Cover\n* **English Print Copy (LTR):**\n  > My Math Book\n### PAGE 02 — This Book Belongs To & My 1–20 Bilingual Number Chart\n* **English Print Copy (LTR):**\n  > THIS MATH BOOK BELONGS TO: [Name Line] | MY NUMBER CHART 1–20\n### PAGE 03 — Teacher & Parent Guide\n* **English Print Copy (LTR):**\n  > WELCOME TO KG2 INTERNATIONAL MATH!\n### PAGE 04 — Our Math Journey\n* **English Print Copy (LTR):**\n  > Meet Noor and Leo!\n";
+        let blueprint = curriculum_blueprint(brief, &skill(), BatchScope { start: 1, count: 1 }, 4).unwrap();
+        assert_eq!(blueprint["outline_status"], "explicit_user_page_script");
+        assert_eq!(blueprint["scoped_page_plan"][0]["title"], "This Book Belongs To & My 1–20 Bilingual Number Chart");
+        assert_eq!(blueprint["scoped_page_plan"][0]["english_print_copy"], "THIS MATH BOOK BELONGS TO: [Name Line] | MY NUMBER CHART 1–20");
+        assert!(blueprint.get("units_and_chapters").is_none());
+        assert!(blueprint["scoped_page_plan"][0].get("recommended_family").is_none());
+    }
+
+    #[test]
+    fn compiler_rejects_fixed_six_cell_diagram_mislabelled_as_ten_frame() {
+        let mut style = skill();
+        let actions = style.templates.get_mut("templates/practice.json").unwrap();
+        actions.extend(
+            serde_json::from_value::<Vec<EngineAction>>(json!([
+                {"command":"frame.create","params":{"content":"unassigned","shape":"rectangle","rect":[232,480,364,612]}},
+                {"command":"object.label","params":{"ids":["$3.id"],"label":"part.cpa.tf.outer"}},
+                {"command":"line.create","params":{"a":[232,546],"b":[364,546]}},
+                {"command":"line.create","params":{"a":[276,480],"b":[276,612]}},
+                {"command":"line.create","params":{"a":[320,480],"b":[320,612]}}
+            ]))
+            .unwrap(),
+        );
+        let mut value = content();
+        value["pages"][0]["text"]["heading"] = json!("TenFrame: 5");
+        let error = compile_value(&value, &style).unwrap_err();
+        assert!(error.contains("structured activity"), "{error}");
+    }
+
     #[test]
     fn compiler_incompatibility_and_guaranteed_overflow_are_rejected_before_content_generation() {
         let mut skill = skill();

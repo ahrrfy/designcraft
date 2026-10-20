@@ -4,11 +4,34 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde_json::json;
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(90);
 const IMAGE_JSON_LIMIT: usize = 24 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Clones share reqwest's connection pool. Credentials are attached only to requests, never to
+/// this process-wide client; idle connections are capped per host and expire after a minute.
+fn shared_client() -> Result<Client, String> {
+    static CLIENT: OnceLock<Result<Client, &'static str>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(NETWORK_TIMEOUT)
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+                // Even a protocol-level automatic retry is inappropriate for a generation POST.
+                .retry(reqwest::retry::never())
+                .build()
+                .map_err(|_| "Cannot initialize AI HTTP transport")
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|message| (*message).into())
+}
 
 struct LimitedJson(Vec<u8>);
 
@@ -72,12 +95,7 @@ impl<'a> Transport<'a> {
         if key.is_some_and(|key| key.len() > 8192 || key.chars().any(char::is_control)) {
             return Err("Invalid API key".into());
         }
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(NETWORK_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| "Cannot initialize AI HTTP transport")?;
+        let client = shared_client()?;
         Ok(Self { client, base, provider: selection.provider, key })
     }
 
@@ -125,7 +143,17 @@ fn send(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String
     check_cancel(cancel)?;
     let response = request.send().map_err(|error| {
         // Do not expose reqwest errors: they can contain full URLs and credentials.
-        if error.is_timeout() { "AI provider request timed out" } else { "AI provider connection failed" }
+        if error.is_connect() {
+            if error.is_timeout() {
+                "AI provider connection timed out; no automatic retry was sent"
+            } else {
+                "AI provider connection failed; no automatic retry was sent"
+            }
+        } else if error.is_timeout() {
+            "AI provider response timed out; request outcome is unknown; no automatic retry was sent"
+        } else {
+            "AI provider request failed before a complete response; request outcome is unknown; no automatic retry was sent"
+        }
     })?;
     check_cancel(cancel)?;
     let status = response.status();
@@ -151,7 +179,7 @@ fn read_bounded(mut response: Response, cancel: &AtomicBool, limit: usize) -> Re
     let mut chunk = [0u8; 8192];
     loop {
         check_cancel(cancel)?;
-        let count = response.read(&mut chunk).map_err(|_| "AI response read failed or timed out")?;
+        let count = response.read(&mut chunk).map_err(|error| response_read_error(&error))?;
         if count == 0 {
             break;
         }
@@ -163,6 +191,25 @@ fn read_bounded(mut response: Response, cancel: &AtomicBool, limit: usize) -> Re
     }
     check_cancel(cancel)?;
     Ok(bytes)
+}
+
+fn response_read_error(error: &std::io::Error) -> &'static str {
+    let is_timeout = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock);
+    let mut timed_out = is_timeout(error);
+    // Blocking reqwest wraps its timeout in an io::Error of kind Other. Inspect types only:
+    // formatting either error could expose URLs, authentication or confidential request data.
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = error.get_ref().map(|cause| cause as _);
+    for _ in 0..16 {
+        let Some(current) = cause else { break };
+        timed_out |= current.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)
+            || current.downcast_ref::<std::io::Error>().is_some_and(is_timeout);
+        cause = current.source();
+    }
+    if timed_out {
+        "AI provider response body timed out; response may be incomplete; no automatic retry was sent"
+    } else {
+        "AI provider response body read failed; response may be incomplete; no automatic retry was sent"
+    }
 }
 
 fn model_id(selection: &ModelSelection) -> Result<&str, String> {
@@ -513,14 +560,19 @@ pub(super) fn image_generation_body(provider: ProviderKind, model: &str, request
         let mut config = json!({"responseModalities":["TEXT","IMAGE"]});
         // Gemini's native image config uses an aspect ratio, not an OpenAI pixel size.
         // https://ai.google.dev/gemini-api/docs/image-generation
-        if let Some(ratio) = &request.size {
-            if !matches!(
-                ratio.as_str(),
-                "1:1" | "1:4" | "1:8" | "2:3" | "3:2" | "3:4" | "4:1" | "4:3" | "4:5" | "5:4" | "8:1" | "9:16" | "16:9" | "21:9"
-            ) {
+        if let Some(size) = &request.size {
+            let (ratio, tier) = size.split_once('@').map_or((size.as_str(), None), |(ratio, tier)| (ratio, Some(tier)));
+            if super::gemini_base_pixels(ratio).is_none() {
                 return Err("Unsupported Gemini image aspect ratio".into());
             }
             config["imageConfig"] = json!({"aspectRatio":ratio});
+            if let Some(tier) = tier {
+                if !super::gemini_has_print_tiers(model) || !super::gemini_print_ratio_supported(model, ratio) || !matches!(tier, "1K" | "2K" | "4K")
+                {
+                    return Err("Unsupported Gemini model or native image resolution tier (1K, 2K, 4K)".into());
+                }
+                config["imageConfig"]["imageSize"] = json!(tier);
+            }
         }
         Ok(json!({"contents":[{"parts":[{"text":request.prompt}]}],"generationConfig":config}))
     }
@@ -752,6 +804,168 @@ fn poll_comfy(
             let sleep = remaining.min(50);
             std::thread::sleep(Duration::from_millis(sleep));
             remaining = remaining.saturating_sub(sleep);
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_http_tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+
+    fn selection(endpoint: &str) -> ModelSelection {
+        ModelSelection { provider: ProviderKind::Ollama, model: "synthetic-transport".into(), endpoint: Some(endpoint.into()) }
+    }
+
+    fn request_text(socket: &mut TcpStream) -> std::io::Result<String> {
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while bytes.len() < 65536 {
+            let n = socket.read(&mut buffer)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+            let text = String::from_utf8_lossy(&bytes);
+            if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|n| n.trim().parse::<usize>().ok()))
+                    .unwrap_or(0);
+                if body.len() >= length {
+                    return Ok(text.into_owned());
+                }
+            }
+        }
+        Err(std::io::Error::other("synthetic request exceeds its fixture limit"))
+    }
+
+    fn assert_redacted(error: &str) {
+        for private in ["synthetic-private-key", "synthetic-private-query", "synthetic-private-prompt", "127.0.0.1", "http:", "https:"] {
+            assert!(!error.contains(private), "transport diagnostic contains private request data");
+        }
+    }
+
+    #[test]
+    fn transport_http_reuses_one_connection_without_retaining_request_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut captured = Vec::new();
+            for _ in 0..3 {
+                let Ok(request) = request_text(&mut socket) else { break };
+                captured.push(request);
+                if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}").is_err() {
+                    break;
+                }
+                socket.flush().unwrap();
+            }
+            captured
+        });
+        let selection = selection(&endpoint);
+        let mut results = Vec::new();
+        for key in [Some("synthetic-private-key"), Some("different-synthetic-key"), None] {
+            let transport = Transport::new(&selection, key).unwrap();
+            let request = transport.request(reqwest::Method::POST, transport.url("synthetic").unwrap()).unwrap().timeout(Duration::from_secs(1));
+            let result = send(request.json(&json!({"prompt":"synthetic-private-prompt"})), &AtomicBool::new(false))
+                .and_then(|response| read_bounded(response, &AtomicBool::new(false), 1024));
+            results.push(result);
+        }
+        let captured = server.join().unwrap();
+        assert!(results.iter().all(Result::is_ok), "independent transports must reuse the same live connection");
+        assert_eq!(captured.len(), 3, "all three requests use one accepted socket");
+        assert!(captured[0].contains("Bearer synthetic-private-key"));
+        assert!(captured[1].contains("Bearer different-synthetic-key") && !captured[1].contains("synthetic-private-key"));
+        assert!(!captured[2].to_ascii_lowercase().contains("authorization:"));
+        let transport = Transport::new(&selection, Some("synthetic-private-key")).unwrap();
+        let request = transport.request(reqwest::Method::GET, transport.url("synthetic").unwrap()).unwrap().build().unwrap();
+        assert!(request.headers().get(AUTHORIZATION).unwrap().is_sensitive());
+    }
+
+    #[test]
+    fn transport_http_response_timeout_is_redacted_and_does_not_repeat_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let first = request_text(&mut socket).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            drop(socket);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(150);
+            let mut posts = usize::from(first.starts_with("POST "));
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        if request_text(&mut socket).is_ok_and(|request| request.starts_with("POST ")) {
+                            posts += 1;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("synthetic server accept failed: {error}"),
+                }
+            }
+            posts
+        });
+        let transport = Transport::new(&selection(&endpoint), Some("synthetic-private-key")).unwrap();
+        let request = transport
+            .request(reqwest::Method::POST, transport.url("slow?trace=synthetic-private-query").unwrap())
+            .unwrap()
+            .timeout(Duration::from_millis(100))
+            .json(&json!({"prompt":"synthetic-private-prompt"}));
+        let error = send(request, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(server.join().unwrap(), 1, "an ambiguous billable POST must never be repeated automatically");
+        assert!(error.contains("response timed out") && error.contains("unknown"), "{error}");
+        assert_redacted(&error);
+    }
+
+    #[test]
+    fn transport_http_connect_timeout_is_distinct_and_redacted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("https://{}/synthetic-private-query", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut hello = [0u8; 4096];
+            let _ = socket.read(&mut hello);
+            // TCP connects, but this synthetic peer never completes the TLS handshake.
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let client = Client::builder().connect_timeout(Duration::from_millis(100)).timeout(Duration::from_secs(1)).build().unwrap();
+        let error = send(client.post(endpoint), &AtomicBool::new(false)).unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("connection timed out"), "{error}");
+        assert_redacted(&error);
+    }
+
+    #[test]
+    fn transport_http_body_timeout_and_truncation_have_distinct_redacted_diagnostics() {
+        for stalled in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                request_text(&mut socket).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{").unwrap();
+                socket.flush().unwrap();
+                if stalled {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            });
+            let transport = Transport::new(&selection(&endpoint), Some("synthetic-private-key")).unwrap();
+            let request = transport
+                .request(reqwest::Method::POST, transport.url("body?trace=synthetic-private-query").unwrap())
+                .unwrap()
+                .timeout(Duration::from_millis(100))
+                .json(&json!({"prompt":"synthetic-private-prompt"}));
+            let response = send(request, &AtomicBool::new(false)).unwrap();
+            let error = read_bounded(response, &AtomicBool::new(false), 1024).unwrap_err();
+            server.join().unwrap();
+            assert!(error.contains(if stalled { "response body timed out" } else { "response body read failed" }), "{error}");
+            assert_redacted(&error);
         }
     }
 }
