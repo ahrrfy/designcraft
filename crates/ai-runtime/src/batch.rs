@@ -5,6 +5,10 @@ use designcraft_engine::{DocState, Prefs};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, atomic::AtomicBool};
 
+const MAX_PROOF_FILE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PAGE_PROOF_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROOF_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+
 pub(super) struct BatchJob {
     task: TaskRequest,
     skills: Vec<SkillSnapshot>,
@@ -13,6 +17,9 @@ pub(super) struct BatchJob {
     before: UsageSummary,
     snapshot: BatchSnapshot,
     prefs: Prefs,
+    // Font reload replaces the composition cache without changing the document
+    // allocation. Proof authority therefore pins it independently of doc edits.
+    publication_cache: Arc<designcraft_engine::compose::Cache>,
     // Keeps the original allocation alive: selection/view revisions alone are
     // not document edits, and an address cannot be recycled while pinned here.
     publication_base: Option<DocState>,
@@ -96,7 +103,7 @@ impl ProductionRunner {
             TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
         };
         let size = task.settings.pages_per_batch;
-        if !(1..=32).contains(&size) || !(1..=1000).contains(&pages) {
+        if !(1..=1000).contains(&size) || !(1..=1000).contains(&pages) {
             return Err("Invalid book or batch size".into());
         }
         if self.batch.is_some() || self.pending.is_some() {
@@ -126,6 +133,7 @@ impl ProductionRunner {
             before: UsageSummary::default(),
             snapshot,
             prefs: session.prefs.clone(),
+            publication_cache: session.cache.clone(),
             publication_base: existing.map(|_| base.clone()),
         };
         base.selection = Default::default();
@@ -189,6 +197,9 @@ impl ProductionRunner {
         }
         let mut job = self.batch.take().ok_or("Batch checkpoint disappeared")?;
         let validation = (|| {
+            if !Arc::ptr_eq(&job.publication_cache, &session.cache) {
+                return Err("Font cache changed after proof generation; approval is invalid".to_string());
+            }
             if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? {
                 return Err("Application preferences changed after proof generation; approval is invalid".to_string());
             }
@@ -205,12 +216,13 @@ impl ProductionRunner {
             for (path, expected) in proof.proof_paths.iter().zip(&proof.proof_sha256) {
                 self.profile_access.check(Path::new(path), file_access::Access::Read)?;
                 let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-                if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+                if !metadata.is_file() || metadata.len() > MAX_PROOF_FILE_BYTES as u64 {
                     return Err("Batch proof file changed type or exceeds its limit".into());
                 }
-                let bytes = file_access::confine(Some(&self.profile_access), || designcraft_engine::io::read_capped(path, 64 * 1024 * 1024))
-                    .map_err(|e| e.to_string())?;
-                if bytes.len() > 64 * 1024 * 1024 {
+                let bytes =
+                    file_access::confine(Some(&self.profile_access), || designcraft_engine::io::read_capped(path, MAX_PROOF_FILE_BYTES as u64))
+                        .map_err(|e| e.to_string())?;
+                if bytes.len() > MAX_PROOF_FILE_BYTES {
                     return Err("Batch proof grew beyond its byte limit".into());
                 }
                 if hash(&bytes) != *expected {
@@ -348,10 +360,12 @@ impl ProductionRunner {
             scope.and_then(|scope| {
                 file_access::confine(roots.as_ref(), || {
                     let product = outcome.result?;
-                    let worker::Product::BatchPlan { plan, proofs } = product else {
-                        return Err("Batch worker did not return native proof evidence".into());
+                    let (plans, proofs) = match product {
+                        worker::Product::BatchGroup { plans, proofs } => (plans, proofs),
+                        worker::Product::BatchPlan { plan, proofs } => (vec![plan], proofs),
+                        _ => return Err("Batch worker did not return native proof evidence".into()),
                     };
-                    self.publish_batch(session, &mut job, &plan, proofs, scope, &mut batch_report, &mut report)
+                    self.publish_batch(session, &mut job, &plans, proofs, scope, &mut batch_report, &mut report)
                 })
             })
         };
@@ -399,18 +413,70 @@ impl ProductionRunner {
         &self,
         session: &mut Session,
         job: &mut BatchJob,
-        plan: &ProductionPlan,
+        plans: &[ProductionPlan],
         proofs: Vec<worker::ProofArtifact>,
         scope: worker::BatchScope,
         batch_report: &mut BatchReport,
         report: &mut TaskReport,
     ) -> Result<(), String> {
         ensure_publication_idle(session)?;
+        if !Arc::ptr_eq(&job.publication_cache, &session.cache) {
+            return Err("Font cache changed during generation; proof no longer matches publication".into());
+        }
         if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? {
             return Err("Application preferences changed during generation; proof no longer matches publication".into());
         }
-        if proofs.len() < 3 || proofs.len() > 34 || proofs.iter().map(|p| p.bytes.len()).sum::<usize>() > 64 * 1024 * 1024 {
+        let first_plan = plans.first().ok_or("A review group must contain native plans")?;
+        let actions = plans.iter().try_fold(0usize, |total, plan| total.checked_add(plan.commands.len())).ok_or("Review action count overflow")?;
+        let scope_end = scope
+            .start
+            .checked_add(scope.count)
+            .filter(|end| (1..=1000).contains(&scope.count) && *end <= 1000)
+            .ok_or("Invalid review proof page range")?;
+        let maximum_proofs = scope
+            .count
+            .checked_add(scope.count.div_ceil(32))
+            .and_then(|count| count.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or("Batch proof count overflow")?;
+        if proofs.len() != maximum_proofs {
             return Err("Batch proof count or byte limit exceeded".into());
+        }
+        let mut total_bytes = 0usize;
+        let mut names = std::collections::BTreeSet::new();
+        for proof in &proofs {
+            let extension = Path::new(&proof.name).extension().and_then(|x| x.to_str());
+            if proof.name.contains(['/', '\\', ':'])
+                || !matches!(extension, Some("png" | "pdf" | "designcraft"))
+                || !names.insert(proof.name.as_str())
+            {
+                return Err("Invalid or duplicate batch proof artifact name".into());
+            }
+            let cap = if extension == Some("png") { MAX_PAGE_PROOF_BYTES } else { MAX_PROOF_FILE_BYTES };
+            if proof.bytes.len() > cap {
+                return Err("Batch proof file exceeds its byte limit".into());
+            }
+            total_bytes = total_bytes
+                .checked_add(proof.bytes.len())
+                .filter(|total| *total <= MAX_PROOF_TOTAL_BYTES)
+                .ok_or("Batch proofs exceed their aggregate byte limit")?;
+        }
+        let mut expected_names = std::collections::BTreeSet::from(["document.designcraft".to_owned()]);
+        for page in scope.start..scope_end {
+            expected_names.insert(format!("page-{}.png", page.saturating_add(1)));
+        }
+        let mut pdf_start = scope.start;
+        while pdf_start < scope_end {
+            let pdf_end = pdf_start.checked_add(32).ok_or("Review PDF page range overflow")?.min(scope_end);
+            expected_names.insert(if scope.count <= 32 {
+                "proof.pdf".into()
+            } else {
+                format!("proof-pages-{}-{pdf_end}.pdf", pdf_start.saturating_add(1))
+            });
+            pdf_start = pdf_end;
+        }
+        if names.len() != expected_names.len() || names.iter().any(|name| !expected_names.contains(*name)) {
+            return Err("Batch proofs must cover exactly every review page with one native document and complete PDF ranges".into());
         }
         let first = job.snapshot.document_uid.is_none();
         let previous = session.active_index();
@@ -432,18 +498,13 @@ impl ProductionRunner {
             }
             let mut base = current.clone();
             base.selection = Default::default();
-            worker::simulate_scoped(plan, &base, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), Some(scope))?;
+            worker::simulate_group_scoped(plans, &base, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), scope)?;
             let uid = current.uid;
             let revision = current.revision;
             let directory = self.root.join("runs").join(&job.snapshot.job_id).join(format!("batch-{}", job.snapshot.current_batch));
             self.profile_access.check(&directory, file_access::Access::Write)?;
             std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
             for proof in proofs {
-                if proof.name.contains(['/', '\\', ':'])
-                    || !matches!(Path::new(&proof.name).extension().and_then(|x| x.to_str()), Some("png" | "pdf" | "designcraft"))
-                {
-                    return Err("Invalid batch proof artifact name".into());
-                }
                 let path = directory.join(proof.name);
                 write_profile(&self.profile_access, &path, &proof.bytes)?;
                 batch_report.proof_sha256.push(hash(&proof.bytes));
@@ -453,16 +514,18 @@ impl ProductionRunner {
             write_json(
                 &self.profile_access,
                 &trace,
-                &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"designStyle":report.design_style,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plan":plan,"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
+                &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"designStyle":report.design_style,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plans":plans,"plan":(plans.len()==1).then_some(first_plan),"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
             )?;
-            session.execute("production.apply",&json!({"commands":plan.commands,"outputMode":job.task.settings.output_mode,"label":format!("{} · batch {}",plan.title,job.snapshot.current_batch),"expectedDocumentUid":uid,"expectedRevision":revision,"requirePreflight":true,"minPpi":150})).map_err(|e|e.to_string())?;
+            let chunks = plans.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect::<Vec<_>>();
+            let label = format!("{} · batch {}", limited_text(&first_plan.title, 200), job.snapshot.current_batch);
+            session.execute("production.applyGroup",&json!({"chunks":chunks,"outputMode":job.task.settings.output_mode,"label":label,"expectedDocumentUid":uid,"expectedRevision":revision,"requirePreflight":true,"minPpi":150})).map_err(|e|e.to_string())?;
             let state = session.doc().map_err(|e| e.to_string())?;
             job.snapshot.document_uid = Some(state.uid);
             job.snapshot.document_revision = Some(state.revision);
             job.publication_base = Some(state.clone());
-            report.title = plan.title.clone();
-            batch_report.title = plan.title.clone();
-            report.actions = plan.commands.len();
+            report.title = first_plan.title.clone();
+            batch_report.title = first_plan.title.clone();
+            report.actions = actions;
             report.artifacts = batch_report.proof_paths.clone();
             report.artifacts.push(trace.to_string_lossy().into_owned());
             Ok(())
@@ -679,6 +742,7 @@ mod tests {
             before: UsageSummary::default(),
             snapshot,
             prefs: session.prefs.clone(),
+            publication_cache: session.cache.clone(),
             publication_base: session.active().cloned(),
         });
         ("fixture-book".into(), 1)
@@ -692,6 +756,164 @@ mod tests {
     #[test]
     fn continuing_an_existing_book_preserves_its_prefix_and_human_http_checkpoints() {
         reviewed_http_batches(2);
+    }
+
+    #[test]
+    fn four_page_review_uses_two_internal_parts_one_checkpoint_and_one_undo() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicU32::new(0));
+        let server_calls = calls.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                socket.set_nonblocking(false).map_err(|e| e.to_string())?;
+                socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+                socket.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let request = loop {
+                    if bytes.len() > 1024 * 1024 || Instant::now() >= deadline {
+                        return Err("Mock content request exceeded bounds".into());
+                    }
+                    let count = socket.read(&mut chunk).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        return Err("Mock content request ended early".into());
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n").map(|(h, b)| (h.to_owned(), b.to_owned()))
+                    else {
+                        continue;
+                    };
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .ok_or("Missing mock Content-Length")?;
+                    if let Some(body) = body.as_bytes().get(..length) {
+                        break serde_json::from_slice::<Value>(body).map_err(|e| e.to_string())?;
+                    }
+                };
+                let index = server_calls.fetch_add(1, Ordering::Relaxed);
+                if index > 2 {
+                    return Err("Unexpected request beyond the approved five-page fixture".into());
+                }
+                let content = request.pointer("/messages/1/content").and_then(Value::as_str).ok_or("Missing content-planning request")?;
+                let input: Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
+                let scope: worker::BatchScope = serde_json::from_value(input["scope"].clone()).map_err(|e| e.to_string())?;
+                let expected = if index < 2 { (index * 2, 2) } else { (4, 1) };
+                if (scope.start, scope.count) != expected {
+                    return Err(format!("Unexpected internal scope: {} + {}", scope.start, scope.count));
+                }
+                let pages = (scope.start..scope.start + scope.count)
+                    .map(|page| {
+                        json!({
+                            "page":page,"family":"review-test","text":{"body":format!("Page {}", page + 1)},"illustrations":[]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let reply = json!({"done":true,"message":{"content":json!({"title":"Full review group","pages":pages}).to_string()},
+                    "prompt_eval_count":120,"eval_count":30})
+                .to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
+        profile.page_families.truncate(1);
+        let family = &mut profile.page_families[0];
+        family.id = "review-test".into();
+        family.template = "templates/review-test.json".into();
+        family.text_slots =
+            vec![designcraft_ai_types::design::DesignTextSlot { id: "body".into(), purpose: "Page text".into(), command: 0, max_chars: 32 }];
+        family.image_slots.clear();
+        let fonts = designcraft_fonts::FontDb::global();
+        let font = fonts
+            .families()
+            .into_iter()
+            .find(|family| {
+                fonts.styles(family).iter().any(|style| style == "Regular")
+                    && "Page 12345".chars().all(|c| fonts.face(family, "Regular").glyph_for(c) != 0)
+            })
+            .unwrap();
+        let mut actions = vec![
+            EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,300,120],"content":"text","text":"Example"}) },
+            EngineAction { command: "type.char".into(), params: json!({"attrs":{"fontFamily":font,"fontStyle":"Regular","size":18}}) },
+            EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":"leftToRight","align":"left"}}) },
+        ];
+        actions.resize(200, EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":"Editable page"}) });
+        let style = SkillSnapshot {
+            skill_id: "review-test".into(),
+            revision: "fixture".into(),
+            instructions: "One editable heading per page".into(),
+            references: Default::default(),
+            reference_hashes: Default::default(),
+            templates: std::collections::BTreeMap::from([("templates/review-test.json".into(), actions)]),
+            design_profile: Some(profile),
+        };
+        assert_eq!(crate::template_plan::capacity(&style, designcraft_ai_types::OutputMode::NativeOnly).unwrap(), 2);
+        let mut request = task(endpoint, 4);
+        request.target = TaskTarget::NewA4 { pages: 5 };
+        request.settings.pages_per_batch = 4;
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(5)).unwrap();
+        let base = session.doc().unwrap().clone();
+        runner.start_batches(&mut session, request, vec![style], base, json!({})).unwrap();
+        let first = wait(&mut runner, &mut session);
+        assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
+        let checkpoint = first.batch.as_ref().unwrap();
+        assert_eq!((checkpoint.pages_per_batch, checkpoint.completed_pages, checkpoint.checkpoint), (4, 4, 1));
+        assert_eq!(checkpoint.batches.len(), 1);
+        assert_eq!(checkpoint.batches[0].page_count, 4);
+        assert_eq!(checkpoint.batches[0].proof_paths.len(), 6, "Four PNG pages plus complete PDF and native evidence");
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "Internal capacity changes provider parts, never the human review size");
+        let state = session.doc().unwrap();
+        assert!(state.doc.spreads.iter().take(4).all(|page| !page.items.is_empty()));
+        assert!(state.doc.spreads[4].items.is_empty());
+        assert_eq!(state.history.undo.len(), 1, "The complete four-page group is one native undo step");
+        let report = first.reports.last().unwrap();
+        assert_eq!(report.actions, 800);
+        let trace: Value = serde_json::from_slice(&std::fs::read(report.artifacts.last().unwrap()).unwrap()).unwrap();
+        assert_eq!(trace["plans"].as_array().unwrap().len(), 2);
+        let mut undo_probe = Session::new();
+        undo_probe.add_document(state.clone());
+        undo_probe.execute("edit.undo", &json!({})).unwrap();
+        assert!(undo_probe.doc().unwrap().doc.spreads.iter().all(|page| page.items.is_empty()));
+        for _ in 0..8 {
+            runner.handle(&mut session, AiRequest::Poll);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "Page five must not reach HTTP before human approval");
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
+        assert!(approved.busy, "{}", approved.message);
+        let second = wait(&mut runner, &mut session);
+        assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
+        assert_eq!(second.batch.as_ref().unwrap().completed_pages, 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(session.doc().unwrap().history.undo.len(), 2);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
     }
 
     fn reviewed_http_batches(initial_completed: u32) {
@@ -899,12 +1121,30 @@ mod tests {
         rejected_changed_publication("active-layer");
     }
 
+    #[test]
+    fn font_cache_changed_during_generation_cannot_publish_stale_proofs() {
+        rejected_changed_publication("font-cache");
+    }
+
+    #[test]
+    fn font_cache_changed_before_first_book_publication_cannot_create_a_document() {
+        rejected_changed_publication("font-cache-first");
+    }
+
     fn rejected_changed_publication(change: &str) {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
         waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
         let mut job = runner.batch.take().unwrap();
+        let first = change == "font-cache-first";
+        let target_page = if first { 0 } else { 1 };
+        if first {
+            job.snapshot.document_uid = None;
+            job.snapshot.document_revision = None;
+            job.snapshot.completed_pages = 0;
+            job.publication_base = None;
+        }
         if change == "active-layer" {
             session.execute("layer.new", &json!({"name":"Other layer"})).unwrap();
             job.publication_base = session.active().cloned();
@@ -917,15 +1157,22 @@ mod tests {
             session.execute("layer.activate", &json!({"id":1})).unwrap();
             assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
             assert_ne!(before.active_layer, session.doc().unwrap().active_layer);
+        } else if matches!(change, "font-cache" | "font-cache-first") {
+            let cache = session.cache.clone();
+            session.cache = Arc::new(Default::default());
+            session.doc_mut().unwrap().revision = before.revision.checked_add(1).unwrap();
+            assert!(!Arc::ptr_eq(&cache, &session.cache));
+            assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc), "Font reload preserves document content");
         } else {
             session.execute("frame.create", &json!({"spread":0,"rect":[200,60,300,180],"content":"unassigned"})).unwrap();
             assert!(!Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
         }
         let before = session.doc().unwrap().clone();
+        let documents = session.documents().len();
         let plan = ProductionPlan {
             title: "Smart quotes".into(),
             commands: vec![
-                EngineAction { command: "frame.create".into(), params: json!({"spread":1,"rect":[50,50,300,180],"content":"text"}) },
+                EngineAction { command: "frame.create".into(), params: json!({"spread":target_page,"rect":[50,50,300,180],"content":"text"}) },
                 EngineAction { command: "text.insert".into(), params: json!({"text":"\"Proof text\""}) },
             ],
             images: vec![],
@@ -949,15 +1196,91 @@ mod tests {
         let proofs = vec![
             worker::ProofArtifact { name: "document.designcraft".into(), bytes: vec![1] },
             worker::ProofArtifact { name: "proof.pdf".into(), bytes: vec![2] },
-            worker::ProofArtifact { name: "page-2.png".into(), bytes: vec![3] },
+            worker::ProofArtifact { name: format!("page-{}.png", target_page + 1), bytes: vec![3] },
         ];
         let error = runner
-            .publish_batch(&mut session, &mut job, &plan, proofs, worker::BatchScope { start: 1, count: 1 }, &mut BatchReport::default(), &mut report)
+            .publish_batch(
+                &mut session,
+                &mut job,
+                &[plan],
+                proofs,
+                worker::BatchScope { start: target_page, count: 1 },
+                &mut BatchReport::default(),
+                &mut report,
+            )
             .unwrap_err();
-        assert!(error.contains(if change == "preferences" { "preferences changed" } else { "book changed" }), "{error}");
+        let expected = if change == "preferences" {
+            "preferences changed"
+        } else if matches!(change, "font-cache" | "font-cache-first") {
+            "Font cache changed"
+        } else {
+            "book changed"
+        };
+        assert!(error.contains(expected), "{error}");
         assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        assert_eq!(session.documents().len(), documents, "Refusal must precede creating a new book");
         assert!(report.artifacts.is_empty());
         assert!(!runner.root.join("runs").exists(), "A mismatched proof cannot be persisted or published");
+    }
+
+    #[test]
+    fn incomplete_or_misnamed_review_proofs_cannot_publish_native_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let mut job = runner.batch.take().unwrap();
+        let before = session.doc().unwrap().clone();
+        let plan = ProductionPlan {
+            title: "Review".into(),
+            commands: vec![EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread":1,"rect":[60,60,160,160],"content":"unassigned"}),
+            }],
+            images: vec![],
+        };
+        let mut report = TaskReport {
+            design_style: None,
+            id: "proof-set".into(),
+            status: String::new(),
+            title: String::new(),
+            provider: ProviderKind::Ollama,
+            model: "mock".into(),
+            settings: None,
+            skills: vec![],
+            usage: Default::default(),
+            elapsed_ms: 0,
+            actions: 0,
+            issues: vec![],
+            artifacts: vec![],
+            message: String::new(),
+        };
+        for names in [
+            ["document.designcraft", "proof.pdf", "page-3.png"],
+            ["document.designcraft", "proof.pdf", "other.pdf"],
+            ["document.designcraft", "proof-pages-2-2.pdf", "page-2.png"],
+            ["other.designcraft", "proof.pdf", "page-2.png"],
+            ["document.designcraft", "proof.pdf", "proof.pdf"],
+        ] {
+            let proofs = names.into_iter().map(|name| worker::ProofArtifact { name: name.into(), bytes: vec![1] }).collect();
+            assert!(
+                runner
+                    .publish_batch(
+                        &mut session,
+                        &mut job,
+                        std::slice::from_ref(&plan),
+                        proofs,
+                        worker::BatchScope { start: 1, count: 1 },
+                        &mut BatchReport::default(),
+                        &mut report
+                    )
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+            assert_eq!(before.history.undo.len(), session.doc().unwrap().history.undo.len());
+            assert!(report.artifacts.is_empty());
+            assert!(!runner.root.join("runs").exists());
+        }
     }
 
     #[test]
@@ -1009,7 +1332,15 @@ mod tests {
             message: String::new(),
         };
         let error = runner
-            .publish_batch(&mut session, &mut job, &plan, proofs, worker::BatchScope { start: 0, count: 1 }, &mut BatchReport::default(), &mut report)
+            .publish_batch(
+                &mut session,
+                &mut job,
+                &[plan],
+                proofs,
+                worker::BatchScope { start: 0, count: 1 },
+                &mut BatchReport::default(),
+                &mut report,
+            )
             .unwrap_err();
         assert!(error.contains("preview"), "{error}");
         let after = session.doc().unwrap();

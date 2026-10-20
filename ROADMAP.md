@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI16 (2026-10-20): Keep the requested review group independent of bounded native/provider execution chunks, publish each group atomically with one undo, and require proof of every page before continuing. Full UTF-8 briefs up to 1 MiB share one admission limit; current-document work uses the selected open file's geometry and exposes its target in the production panel.
+
 - AI15 (2026-10-20): Preserve vocalized source copy, format non-adjacent bilingual template slots through native selections, and reject oversized image batches, ambiguous source slots and model-incompatible shared-image ratios before provider spending. Planning and publication use the same pinned print geometry; continuation verifies that geometry without changing the existing book.
 
 - AI14 (2026-10-20): Resolve the Windows icon from the Cargo manifest directory instead of the toolkit's drive-root working directory. Native builds can require resource embedding; the preview updater also retains extensionless font-license notices from the release package.

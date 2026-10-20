@@ -2,7 +2,7 @@
 use crate::worker::BatchScope;
 use designcraft_ai_skills::SkillSnapshot;
 use designcraft_ai_types::design::{DesignProfile, PageFamily};
-use designcraft_ai_types::protocol::{ImagePlacement, ProductionPlan};
+use designcraft_ai_types::protocol::{ImagePlacement, MAX_BRIEF_BYTES, ProductionPlan};
 use designcraft_ai_types::{EngineAction, OutputMode};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_JSON: usize = 1024 * 1024;
 const MAX_ACTIONS: usize = 512;
 const MAX_IMAGES: usize = 8;
+const MAX_INTERNAL_PAGES: u32 = 32;
 
 pub(crate) fn eligible(skill: &SkillSnapshot) -> bool {
     skill
@@ -79,7 +80,7 @@ fn scope_image_sources(profile: &DesignProfile, scope: BatchScope, mode: OutputM
         // request before buying text, without reducing any authored family's slots.
         let max_pages = MAX_IMAGES.checked_div(per_page).ok_or("Invalid template image capacity")?;
         return Err(format!(
-            "This template batch can exceed the eight-source image limit for the entire request; use at most {max_pages} pages per batch before generation"
+            "This internal template chunk can exceed the eight-source image limit; split generation into chunks of at most {max_pages} pages while preserving the requested human review group"
         ));
     }
     Ok(sources)
@@ -281,8 +282,8 @@ pub(crate) fn detect_curriculum_subject(prompt: &str) -> CurriculumSubject {
 /// Preserves the selected design profile's layout, art, cast, font, and language rules,
 /// providing fallback suggestions only when the user request or profile leaves them unspecified.
 pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: BatchScope, total_pages: u32) -> Result<Value, String> {
-    if prompt.trim().is_empty() || prompt.len() > 32_768 {
-        return Err("Enter a prompt of at most 32768 UTF-8 bytes".into());
+    if prompt.trim().is_empty() || prompt.len() > MAX_BRIEF_BYTES {
+        return Err(format!("Enter a nonempty brief of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
     }
     let profile = profile(skill)?;
     if scope.count == 0 || scope.count > 32 {
@@ -691,26 +692,47 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
     }))
 }
 
+/// Safe internal work size, independent of the requested human review group.
+/// Every declared family must fit without omitting authored content or views.
+pub(crate) fn capacity(skill: &SkillSnapshot, mode: OutputMode) -> Result<u32, String> {
+    let profile = profile(skill)?;
+    let mut largest = 0usize;
+    let mut max_placements = 0usize;
+    let mut max_sources = 0usize;
+    for family in &profile.page_families {
+        let text = family.text_slots.iter().map(|slot| (slot.id.clone(), "X".to_owned())).collect::<BTreeMap<_, _>>();
+        let sample = json!({"title":"Local template validation","pages":[{"page":0,"family":family.id,"text":text,"illustrations":[]}]});
+        let plan = compile(&sample.to_string(), skill, BatchScope { start: 0, count: 1 }, mode)?;
+        largest = largest.max(plan.commands.len());
+        let placements = family
+            .image_slots
+            .iter()
+            .try_fold(0usize, |count, slot| count.checked_add(slot.placement_count()))
+            .ok_or("Template image placement count overflow")?;
+        max_placements = max_placements.max(placements);
+        max_sources = max_sources.max(family.image_slots.len());
+    }
+    // Each independent view can need a frame, raster placement, fitting and label,
+    // while only its shared source consumes an image-provider request.
+    let extra = if mode == OutputMode::NativeOnly { 0 } else { max_placements.checked_mul(4).ok_or("Template image command count overflow")? };
+    let per_page = largest.checked_add(extra).ok_or("Template page command count overflow")?;
+    let command_pages =
+        MAX_ACTIONS.checked_div(per_page).filter(|count| *count > 0).ok_or("A single template page exceeds the local native command limit")?;
+    let image_pages = if mode == OutputMode::NativeOnly || max_sources == 0 {
+        usize::try_from(MAX_INTERNAL_PAGES).map_err(|_| "Invalid internal template capacity")?
+    } else {
+        MAX_IMAGES.checked_div(max_sources).filter(|count| *count > 0).ok_or("A single template page exceeds the eight-source image limit")?
+    };
+    Ok(u32::try_from(command_pages.min(image_pages)).map_err(|_| "Invalid internal template capacity")?.min(MAX_INTERNAL_PAGES))
+}
+
 /// Reject compiler-incompatible templates and guaranteed command overflows before any model call.
 pub(crate) fn preflight(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode) -> Result<(), String> {
     let profile = profile(skill)?;
     scope_end(scope)?;
     scope_image_sources(profile, scope, mode)?;
-    let mut largest = 0usize;
-    let mut max_placements = 0usize;
-    for family in &profile.page_families {
-        let text = family.text_slots.iter().map(|slot| (slot.id.clone(), "X".to_owned())).collect::<BTreeMap<_, _>>();
-        let sample = json!({"title":"Local template validation","pages":[{"page":scope.start,"family":family.id,"text":text,"illustrations":[]}]});
-        let plan = compile(&sample.to_string(), skill, BatchScope { start: scope.start, count: 1 }, mode)?;
-        largest = largest.max(plan.commands.len());
-        max_placements = max_placements.max(family.image_slots.iter().map(|slot| slot.placement_count()).sum());
-    }
-    let count = usize::try_from(scope.count).map_err(|_| "Invalid native template batch size")?;
-    // Each independent view can need a frame, raster placement, fitting and label,
-    // while only its shared source consumes an image-provider request.
-    let extra = if mode == OutputMode::NativeOnly { 0 } else { max_placements.saturating_mul(count).saturating_mul(4) };
-    if largest.checked_mul(count).and_then(|n| n.checked_add(extra)).is_none_or(|n| n > MAX_ACTIONS) {
-        return Err("This template batch exceeds the local native command limit; reduce pages per batch before generation".into());
+    if scope.count > capacity(skill, mode)? {
+        return Err("This internal template chunk exceeds the local native command limit; split internal generation without changing the requested human review group".into());
     }
     Ok(())
 }
@@ -1035,6 +1057,65 @@ mod tests {
         skill.templates.get_mut("templates/practice.json").unwrap()[1].params["ids"] = json!(["${0.id}"]);
         assert!(preflight(&skill, scope(), OutputMode::NativeOnly).is_err());
     }
+
+    #[test]
+    fn template_capacity_internal_chunks_are_bounded_to_thirty_two_pages() {
+        let skill = skill();
+        assert_eq!(capacity(&skill, OutputMode::NativeOnly).unwrap(), 32);
+        preflight(&skill, BatchScope { start: 0, count: 32 }, OutputMode::NativeOnly).unwrap();
+        assert!(preflight(&skill, BatchScope { start: 0, count: 33 }, OutputMode::NativeOnly).is_err());
+    }
+
+    #[test]
+    fn template_capacity_blueprint_accepts_long_briefs_within_the_shared_limit() {
+        let prompt = "Mathematics curriculum for 48 pages. صَمِّمْ دُرُوسَ الرِّيَاضِيَّاتِ كَامِلَةً.\n".repeat(512);
+        assert!(prompt.len() > 32_768 && prompt.len() < MAX_BRIEF_BYTES);
+        curriculum_blueprint(&prompt, &skill(), BatchScope { start: 0, count: 2 }, 48).unwrap();
+        let oversized = "x".repeat(MAX_BRIEF_BYTES + 1);
+        assert!(curriculum_blueprint(&oversized, &skill(), BatchScope { start: 0, count: 2 }, 48).is_err());
+    }
+
+    #[test]
+    fn template_capacity_counts_sources_separately_from_shared_placement_commands() {
+        let mut skill = skill();
+        let slots = &mut skill.design_profile.as_mut().unwrap().page_families[0].image_slots;
+        let mut second = slots[0].clone();
+        second.id = "second-picture".into();
+        second.rect = [200.0, 60.0, 280.0, 120.0];
+        slots.push(second);
+        for slot in slots {
+            slot.views = serde_json::from_value(json!(vec![json!({"rect":[200,180,300,280],"crop":[0,0,1,1]}); 3])).unwrap();
+        }
+        // 97 authored actions plus 3 language-direction actions; eight
+        // placements add at most 32 commands per page. Sources allow four
+        // pages, but the 132-command page bound permits only three.
+        skill
+            .templates
+            .get_mut("templates/practice.json")
+            .unwrap()
+            .resize(97, EngineAction { command: "frame.create".into(), params: json!({"content":"graphic","rect":[54,180,154,280]}) });
+        assert_eq!(capacity(&skill, OutputMode::NativeWithImages).unwrap(), 3);
+        assert_eq!(capacity(&skill, OutputMode::NativeOnly).unwrap(), 5);
+        preflight(&skill, BatchScope { start: 0, count: 3 }, OutputMode::NativeWithImages).unwrap();
+        assert!(preflight(&skill, BatchScope { start: 0, count: 4 }, OutputMode::NativeWithImages).is_err());
+        preflight(&skill, BatchScope { start: 0, count: 5 }, OutputMode::NativeOnly).unwrap();
+        assert!(preflight(&skill, BatchScope { start: 0, count: 6 }, OutputMode::NativeOnly).is_err());
+    }
+
+    #[test]
+    fn template_capacity_never_admits_an_oversized_single_illustrated_page() {
+        let mut skill = skill();
+        skill
+            .templates
+            .get_mut("templates/practice.json")
+            .unwrap()
+            .resize(509, EngineAction { command: "frame.create".into(), params: json!({"content":"graphic","rect":[54,180,154,280]}) });
+        assert_eq!(capacity(&skill, OutputMode::NativeOnly).unwrap(), 1);
+        assert!(capacity(&skill, OutputMode::NativeWithImages).is_err());
+        preflight(&skill, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
+        assert!(preflight(&skill, BatchScope { start: 0, count: 1 }, OutputMode::NativeWithImages).is_err());
+    }
+
     #[test]
     fn image_scope_budget_is_rejected_before_content_generation_and_schema_creation() {
         let mut skill = skill();
