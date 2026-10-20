@@ -355,7 +355,6 @@ impl ProductionRunner {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
             TaskTarget::ContinueBook => {
                 let current = session.doc().map_err(|e| e.to_string())?;
-                batch::continuation_progress(current)?;
                 if task.settings.pages_per_batch == 0 {
                     return Err("Continuing a book requires reviewed batches".into());
                 }
@@ -363,21 +362,12 @@ impl ProductionRunner {
             }
             TaskTarget::NewA4 { pages } => {
                 if !(1..=1000).contains(&pages) {
-                    return Err("AI new documents support 1–1000 A4 pages".into());
+                    return Err("AI new documents support 1–1000 pages".into());
                 }
                 if task.settings.pages_per_batch == 0 && pages > 8 {
                     return Err("Books over eight pages require reviewed batches".into());
                 }
                 None
-            }
-        };
-        let (base, context) = match task.target {
-            TaskTarget::CurrentDocument | TaskTarget::ContinueBook => (session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?),
-            TaskTarget::NewA4 { pages } => {
-                let mut scratch = Session::new();
-                scratch.execute("file.new", &new_a4(pages)).map_err(|e| e.to_string())?;
-                let context = compact_context(&scratch)?;
-                (scratch.doc().map_err(|e| e.to_string())?.clone(), context)
             }
         };
         let ids = if task.auto_select_skills {
@@ -413,7 +403,12 @@ impl ProductionRunner {
         if snapshots.iter().filter(|s| s.design_profile.is_some()).count() > 1 {
             return Err("Choose one design style per task to avoid conflicting identities".into());
         }
-        if let Some(profile) = snapshots.iter().find_map(|s| s.design_profile.as_ref()) {
+        let profile = snapshots.iter().find_map(|s| s.design_profile.as_ref());
+        let (base, context) = task_document_context(session, &task.target, profile)?;
+        if let TaskTarget::ContinueBook = task.target {
+            batch::continuation_progress(&base, profile)?;
+        }
+        if let Some(profile) = profile {
             crate::design::check_geometry(Some(&base), &base, profile)?;
         }
         let settings = task.settings.clone();
@@ -727,9 +722,13 @@ impl ProductionRunner {
                 self.profile_access.check(&runs, file_access::Access::Write)?;
                 std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
                 let trace = runs.join(format!("{}.json", report.id));
+                let page_params = match task.target {
+                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params(&report.skills, pages)?),
+                    _ => None,
+                };
                 let context = match task.target {
                     TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
-                    TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages}),
+                    TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages,"documentParams":page_params}),
                 };
                 write_json(
                     &self.profile_access,
@@ -739,8 +738,8 @@ impl ProductionRunner {
                 report.artifacts.push(trace.to_string_lossy().into_owned());
                 let previous_active = session.active_index();
                 let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
-                if let TaskTarget::NewA4 { pages } = task.target {
-                    session.execute("file.new", &new_a4(pages)).map_err(|e| e.to_string())?;
+                if let Some(params) = page_params {
+                    session.execute("file.new", &params).map_err(|e| e.to_string())?;
                 }
                 let current = session.doc().map_err(|e| e.to_string())?;
                 let params = json!({"commands":plan.commands,"outputMode":task.settings.output_mode,"label":plan.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true});
@@ -776,6 +775,21 @@ impl ProductionRunner {
 
     fn choose_skills(&self, prompt: &str) -> Vec<String> {
         choose_compatible_skills(prompt, self.registry.catalog(""), &supported_commands())
+    }
+
+    fn pinned_document_params(&self, pins: &[(String, String)], pages: u32) -> Result<Value, String> {
+        let mut profile = None;
+        for (id, revision) in pins {
+            let record = self.registry.revision(id, revision).map_err(|e| e.to_string())?;
+            if let Some(selected) = record.manifest.design_profile.as_ref() {
+                if profile.is_some() {
+                    return Err("New document has conflicting pinned design profiles".into());
+                }
+                selected.validate()?;
+                profile = Some(selected);
+            }
+        }
+        Ok(crate::design::document_params(profile, pages))
     }
 
     fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
@@ -1569,6 +1583,25 @@ fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     }
     Ok(())
 }
+fn task_document_context(
+    session: &Session,
+    target: &TaskTarget,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+) -> Result<(designcraft_engine::DocState, Value), String> {
+    match target {
+        TaskTarget::CurrentDocument | TaskTarget::ContinueBook => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
+        TaskTarget::NewA4 { pages } => {
+            if let Some(profile) = profile {
+                profile.validate()?;
+            }
+            let mut scratch = Session::new();
+            scratch.execute("file.new", &crate::design::document_params(profile, *pages)).map_err(|e| e.to_string())?;
+            let context = compact_context(&scratch)?;
+            Ok((scratch.doc().map_err(|e| e.to_string())?.clone(), context))
+        }
+    }
+}
+#[cfg(test)]
 fn new_a4(pages: u32) -> Value {
     json!({"preset":"A4","pages":pages,"facingPages":false,"margins":15.0*72.0/25.4,"bleed":0})
 }
@@ -1707,6 +1740,78 @@ mod tests {
             templates: runner.registry.review_templates(id, &card.revision).unwrap(),
             design_profile: record.manifest.design_profile.clone(),
         }
+    }
+
+    #[test]
+    fn new_document_context_and_publication_use_the_same_pinned_profile_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let card = runner.snapshot.skills.iter().find(|card| card.id == "early-years-clear-style").unwrap().clone();
+        let mut manifest = runner.registry.revision(&card.id, &card.revision).unwrap().manifest.clone();
+        let profile = manifest.design_profile.as_mut().unwrap();
+        profile.page_mm = [240.0, 320.0];
+        profile.margin_mm = 10.0;
+        let profile = profile.clone();
+        let mut files = runner.registry.review_files(&card.id, &card.revision).unwrap();
+        files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+        let pinned = runner.registry.import_files(files.clone(), Provenance::default()).unwrap();
+        // A later revision must never change the geometry of an in-flight task.
+        manifest.design_profile.as_mut().unwrap().page_mm = [250.0, 350.0];
+        files.insert("designcraft.json".into(), serde_json::to_vec(&manifest).unwrap());
+        runner.registry.import_files(files, Provenance::default()).unwrap();
+        let pins = vec![(pinned.skill_id.clone(), pinned.revision.clone())];
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let original = session.doc().unwrap().clone();
+        let target = TaskTarget::NewA4 { pages: 2 };
+        let (base, context) = task_document_context(&session, &target, Some(&profile)).unwrap();
+        assert!(!context.is_null());
+        let page = &base.doc.spreads[0].pages[0];
+        assert!((page.width - 240.0 * 72.0 / 25.4).abs() < 0.001);
+        assert!((page.height - 320.0 * 72.0 / 25.4).abs() < 0.001);
+        assert!((page.margins.top - 10.0 * 72.0 / 25.4).abs() < 0.001);
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.doc().unwrap().doc));
+        let task = TaskRequest {
+            prompt: "Create a native document in the selected print geometry".into(),
+            target,
+            settings: Default::default(),
+            skill_ids: vec![pinned.skill_id],
+            auto_select_skills: false,
+            export_directory: None,
+        };
+        let mut report = TaskReport {
+            design_style: None,
+            id: "pinned-print-geometry".into(),
+            status: String::new(),
+            title: String::new(),
+            provider: ProviderKind::Ollama,
+            model: "synthetic-local".into(),
+            settings: None,
+            skills: pins,
+            usage: Default::default(),
+            elapsed_ms: 0,
+            actions: 0,
+            issues: vec![],
+            artifacts: vec![],
+            message: String::new(),
+        };
+        let plan = ProductionPlan {
+            title: "Native print geometry".into(),
+            commands: vec![designcraft_ai_types::EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread":0,"rect":[50,50,100,100],"content":"unassigned"}),
+            }],
+            images: vec![],
+        };
+        runner.publish(&mut session, &Some(task), None, worker::Product::Plan(plan), &mut report).unwrap();
+        let published = session.doc().unwrap();
+        crate::design::check_geometry(None, published, &profile).unwrap();
+        let page = &published.doc.spreads[0].pages[0];
+        assert!((page.margins.top - 10.0 * 72.0 / 25.4).abs() < 0.001);
+        assert_eq!(session.documents().len(), 2);
+        session.execute("file.activate", &json!({"index":0})).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.doc().unwrap().doc));
+        assert!(runner.pinned_document_params(&[("missing".into(), "missing".into())], 1).is_err());
     }
 
     #[test]

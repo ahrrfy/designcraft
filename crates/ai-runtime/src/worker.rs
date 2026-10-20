@@ -256,6 +256,10 @@ impl Runner<'_> {
             return Err("Conflicting design styles in task snapshot".into());
         }
         let profile = profiles.first().copied();
+        if let Some(profile) = profile {
+            profile.validate()?;
+            preflight_profile_image_ratios(profile, &request.settings)?;
+        }
         if let Some(style) = skills.iter().find(|skill| crate::template_plan::eligible(skill))
             && matches!(
                 request.target,
@@ -301,7 +305,7 @@ impl Runner<'_> {
             self.progress(if attempt == 0 { "Generating editable native layout" } else { "Repairing native layout validation" }, 0.15)?;
             let response = self.generate(&request.settings.text_model, &generation)?;
             let parsed = parse_plan(&response.text, request.settings.output_mode, &catalog).and_then(|mut plan| {
-                prepare_editorial_plan(&mut plan, &request.prompt, scope)?;
+                prepare_editorial_plan(&mut plan, &request.prompt, &context, scope)?;
                 if let Some(profile) = profile {
                     crate::design::check_image_slots(&base, &plan.images, profile)?;
                 }
@@ -381,6 +385,9 @@ impl Runner<'_> {
             settings.comfy_workflow.as_ref().map(|value| bounded_json(value, MAX_PROMPT).map(|text| text.len())).transpose()?.unwrap_or(0);
         let mut projected = self.ledger.clone();
         for placement in &plan.images {
+            // Validate every pinned source before the first image purchase. A later
+            // unsupported atlas must not leave earlier paid images unusable.
+            let _ = image_request_size(placement, profile, &settings.image_model)?;
             let cache_key = bounded_json(&json!({"placement":placement,"illustration_style":style_context}), 32 * 1024)?;
             if !cache.contains_key(&cache_key) {
                 let input = placement.prompt.len().saturating_add(style_context.len()).saturating_add(workflow_bytes).saturating_add(512);
@@ -405,18 +412,13 @@ impl Runner<'_> {
                 } else {
                     None
                 };
-                let source_ratio = declared_image_slot(placement, profile)
-                    .and_then(|slot| slot.source_aspect_ratio)
-                    .unwrap_or((placement.rect[2] - placement.rect[0]) / (placement.rect[3] - placement.rect[1]));
-                if !source_ratio.is_finite() || source_ratio <= 0.0 {
-                    return Err("Image source aspect ratio must be finite and positive".into());
-                }
+                let source_ratio = image_source_ratio(placement, declared_image_slot(placement, profile))?;
                 let image_request = ImageRequest {
                     prompt: format!(
                         "{}\nCreate only this illustration, with no page layout, captions, typography or surrounding design. Target frame proportions: {:.4} x {:.4} points.\n{}",
                         placement.prompt, source_ratio, 1.0, style_context
                     ),
-                    size: (settings.image_model.provider == ProviderKind::Gemini).then(|| gemini_image_ratio(source_ratio).to_owned()),
+                    size: image_request_size(placement, profile, &settings.image_model)?,
                     quality: None,
                     comfy,
                     resources: settings.resources.clone(),
@@ -529,6 +531,8 @@ impl Runner<'_> {
     ) -> Result<Product, String> {
         self.progress("Planning short page content for native templates", 0.15)?;
         crate::template_plan::preflight(style, scope, request.settings.output_mode)?;
+        let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
+        preflight_profile_image_ratios(profile, &request.settings)?;
         let schema = crate::template_plan::schema(style, scope, request.settings.output_mode)?;
         let prompt = bounded_json(&json!({"request":request.prompt,"scope":scope,"document":context}), MAX_PROMPT / 2)?;
         let text_capacity = style
@@ -560,8 +564,7 @@ impl Runner<'_> {
         // Exactly one content-planning request. Native command assembly/validation is local.
         self.progress("Compiling page content into native engine commands locally", 0.45)?;
         let mut raw = crate::template_plan::compile(&response.text, style, scope, request.settings.output_mode)?;
-        prepare_editorial_plan(&mut raw, &request.prompt, Some(scope))?;
-        let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
+        prepare_editorial_plan(&mut raw, &request.prompt, &context, Some(scope))?;
         crate::design::check_image_slots(&base, &raw.images, profile)?;
         simulate_styled(&raw, &base, &prefs, request.settings.output_mode, self.cancel, Some(scope), Some(profile))?;
         let expanded = self.expand_images(raw, &request.settings, &mut BTreeMap::new(), &mut 0, Some(profile))?;
@@ -650,21 +653,29 @@ fn arabic_vowel_mark(c: char) -> bool {
 }
 
 /// Local editorial checks run before image reservations on either production path.
-fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, scope: Option<BatchScope>) -> Result<(), String> {
+fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Value, scope: Option<BatchScope>) -> Result<(), String> {
     let lower = prompt.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
-    let plain = has(&[
+    let explicitly_plain = has(&[
         "دون تشكيل",
         "بدون تشكيل",
         "بلا تشكيل",
         "بدون الحركات",
         "دون الحركات",
         "تقليل التشكيل",
+        "أزل التشكيل",
+        "إزالة التشكيل",
+        "حذف التشكيل",
         "without diacritics",
         "no diacritics",
+        "remove diacritics",
+        "remove vowel marks",
         "unvocalized",
-    ]) || (!prompt.chars().any(arabic_vowel_mark)
-        && !has(&["التشكيل الكامل", "مع التشكيل", "بالتشكيل", "بالحركات", "حركات الحروف", "fully vocalized", "with diacritics", "phonics"]));
+    ]);
+    let plain = explicitly_plain
+        || (!prompt.chars().any(arabic_vowel_mark)
+            && !context_has_vocalized_copy(context)
+            && !has(&["التشكيل الكامل", "مع التشكيل", "بالتشكيل", "بالحركات", "حركات الحروف", "fully vocalized", "with diacritics", "phonics"]));
     if plain {
         plan.title.retain(|c| !arabic_vowel_mark(c));
         for action in &mut plan.commands {
@@ -723,6 +734,21 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, scope: Option
         }
     }
     Ok(())
+}
+
+fn context_has_vocalized_copy(context: &Value) -> bool {
+    let vocalized = |text: &Value| text.as_str().is_some_and(|text| text.chars().any(arabic_vowel_mark));
+    if context.get("title").is_some_and(vocalized) {
+        return true;
+    }
+    // Current-document and continued-book contexts contain bounded source-copy
+    // fields. Do not infer editorial policy from skill guidance or model metadata.
+    for key in ["objects", "recentApprovedObjects"] {
+        if context.get(key).and_then(Value::as_array).is_some_and(|objects| objects.iter().any(|object| object.get("text").is_some_and(vocalized))) {
+            return true;
+        }
+    }
+    context.get("approvedPageBriefs").and_then(Value::as_array).is_some_and(|briefs| briefs.iter().any(|brief| brief.get(1).is_some_and(vocalized)))
 }
 
 fn production_system(catalog: &Value, skills: &[SkillSnapshot], mode: OutputMode) -> Result<String, String> {
@@ -1262,8 +1288,70 @@ fn declared_image_slot<'a>(
     })
 }
 
-fn gemini_image_ratio(ratio: f64) -> &'static str {
+fn image_request_size(
+    placement: &designcraft_ai_types::protocol::ImagePlacement,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    selection: &ModelSelection,
+) -> Result<Option<String>, String> {
+    let slot = declared_image_slot(placement, profile);
+    let source_ratio = image_source_ratio(placement, slot)?;
+    if selection.provider != ProviderKind::Gemini {
+        return Ok(None);
+    }
+    let (name, requested_ratio) = gemini_image_ratio(&selection.model, source_ratio);
+    if slot.is_some_and(|slot| !slot.views.is_empty() && slot.source_aspect_ratio.is_some()) && (requested_ratio / source_ratio - 1.0).abs() > 0.08 {
+        return Err(format!(
+            "Selected Gemini model '{}' cannot request the pinned shared illustration aspect ratio; no images were requested",
+            selection.model
+        ));
+    }
+    Ok(Some(name.to_owned()))
+}
+
+fn image_source_ratio(
+    placement: &designcraft_ai_types::protocol::ImagePlacement,
+    slot: Option<&designcraft_ai_types::design::DesignImageSlot>,
+) -> Result<f64, String> {
+    let ratio = match slot.and_then(|slot| slot.source_aspect_ratio) {
+        Some(ratio) => ratio,
+        None => {
+            let [left, top, right, bottom] = placement.rect;
+            let (width, height) = (right - left, bottom - top);
+            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                return Err("Invalid image source geometry".into());
+            }
+            width / height
+        }
+    };
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return Err("Image source aspect ratio must be finite and positive".into());
+    }
+    Ok(ratio)
+}
+
+fn preflight_profile_image_ratios(profile: &designcraft_ai_types::DesignProfile, settings: &AiSettings) -> Result<(), String> {
+    if settings.output_mode != OutputMode::NativeWithImages {
+        return Ok(());
+    }
+    for slot in profile.page_families.iter().flat_map(|family| &family.image_slots) {
+        let _ = image_request_size(
+            &designcraft_ai_types::protocol::ImagePlacement { prompt: String::new(), page: 0, rect: slot.rect, label: slot.purpose.clone() },
+            Some(profile),
+            &settings.image_model,
+        )?;
+    }
+    Ok(())
+}
+
+fn gemini_image_ratio(model: &str, ratio: f64) -> (&'static str, f64) {
+    let model = model.strip_prefix("models/").unwrap_or(model);
+    // Gemini 3.1 Flash Image documents the extra atlas ratios. Older and unknown
+    // models use the common ratio table unless support is explicitly known.
+    // https://ai.google.dev/gemini-api/docs/generate-content/image-generation
+    let atlas =
+        model == "gemini-3.1-flash-image" || model == "gemini-3.1-flash-image-preview" || model.starts_with("gemini-3.1-flash-image-preview-");
     let mut nearest = ("1:1", ratio.ln().abs());
+    let mut selected_ratio = 1.0;
     for (name, value) in [
         ("1:4", 0.25),
         ("1:8", 0.125),
@@ -1279,12 +1367,16 @@ fn gemini_image_ratio(ratio: f64) -> &'static str {
         ("16:9", 16.0 / 9.0),
         ("21:9", 21.0 / 9.0),
     ] {
+        if !atlas && matches!(name, "1:4" | "1:8" | "4:1" | "8:1") {
+            continue;
+        }
         let distance = (value / ratio).ln().abs();
         if distance < nearest.1 {
             nearest = (name, distance);
+            selected_ratio = value;
         }
     }
-    nearest.0
+    (nearest.0, selected_ratio)
 }
 
 fn image_view_fitting(frame: usize, rect: [f64; 4], crop: Option<[f64; 4]>, pixels: (u32, u32)) -> Result<Value, String> {
@@ -1565,6 +1657,30 @@ mod tests {
     }
 
     #[test]
+    fn editorial_reflow_preserves_vocalized_document_copy_unless_removal_is_explicit() {
+        let copy = "آدَابُ الْقِرَاءَةِ";
+        for context in [
+            json!({"title":copy}),
+            json!({"objects":[{"text":copy}]}),
+            json!({"recentApprovedObjects":[{"text":copy}]}),
+            json!({"approvedPageBriefs":[[0,copy]]}),
+        ] {
+            let mut plan = ProductionPlan {
+                title: copy.into(),
+                commands: vec![EngineAction { command: "type.insert".into(), params: json!({"text":copy}) }],
+                images: vec![],
+            };
+            prepare_editorial_plan(&mut plan, "Reflow existing text", &context, None).unwrap();
+            assert_eq!(plan.title, copy);
+            assert_eq!(plan.commands[0].params["text"], copy);
+            prepare_editorial_plan(&mut plan, "Reflow existing text without diacritics", &context, None).unwrap();
+            assert_eq!(plan.title, "آداب القراءة");
+            assert_eq!(plan.commands[0].params["text"], "آداب القراءة");
+        }
+        assert!(!context_has_vocalized_copy(&json!({"selected_skill_guidance":"نَبَاتٌ","fontFaces":[{"family":"نَبَاتٌ"}]})));
+    }
+
+    #[test]
     fn ai10_generated_arabic_is_plain_without_altering_explicitly_supplied_or_requested_marks() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
@@ -1575,11 +1691,13 @@ mod tests {
         else {
             return;
         };
-        for (prompt, expected) in [
-            ("أنشئ نشاط علوم بالعربية دون تشكيل", "نبات"),
-            ("أنشئ نشاط علوم بالعربية", "نبات"),
-            ("انسخ العنوان نَبَاتٌ كما هو", "نَبَاتٌ"),
-            ("أريد التشكيل الكامل لدرس القراءة", "نَبَاتٌ"),
+        for (prompt, context, expected) in [
+            ("أنشئ نشاط علوم بالعربية دون تشكيل", json!({}), "نبات"),
+            ("أنشئ نشاط علوم بالعربية", json!({}), "نبات"),
+            ("انسخ العنوان نَبَاتٌ كما هو", json!({}), "نَبَاتٌ"),
+            ("أريد التشكيل الكامل لدرس القراءة", json!({}), "نَبَاتٌ"),
+            ("Reflow existing text", json!({"objects":[{"text":"نَبَاتٌ"}]}), "نَبَاتٌ"),
+            ("Reflow existing text without diacritics", json!({"objects":[{"text":"نَبَاتٌ"}]}), "نبات"),
         ] {
             let mut session = Session::new();
             session.execute("file.new", &json!({"preset":"A4"})).unwrap();
@@ -1612,7 +1730,7 @@ mod tests {
             let Product::Plan(plan) = runner
                 .production(
                     request,
-                    json!({}),
+                    context,
                     session.execute("production.catalog", &json!({})).unwrap(),
                     vec![],
                     session.doc().unwrap().clone(),
@@ -1704,6 +1822,112 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut registry = SkillRegistry::open(temp.path()).unwrap();
         registry.install_builtin_drafts().unwrap().into_iter().find_map(|r| r.manifest.design_profile).unwrap()
+    }
+
+    fn shared_source_profile_fixture() -> designcraft_ai_types::DesignProfile {
+        let mut profile = design_profile_fixture();
+        profile.page_families[0].image_slots = vec![
+            serde_json::from_value(json!({
+                "id":"atlas", "purpose":"atlas art", "rect":[60,180,160,280],
+                "crop":[0,0,0.5,1], "source_aspect_ratio":4,
+                "views":[{"rect":[200,180,300,280],"crop":[0.5,0,1,1]}]
+            }))
+            .unwrap(),
+        ];
+        profile.validate().unwrap();
+        profile
+    }
+
+    #[test]
+    fn gemini_image_ratios_follow_the_selected_model_capabilities() {
+        for model in ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview", "models/gemini-3.1-flash-image-preview-01-01"] {
+            for (ratio, expected) in [(0.125, "1:8"), (0.25, "1:4"), (4.0, "4:1"), (8.0, "8:1")] {
+                assert_eq!(gemini_image_ratio(model, ratio).0, expected, "{model}");
+            }
+        }
+        for model in ["gemini-2.5-flash-image", "gemini-3-pro-image-preview", "gemini-3.1-pro-image", "unknown-image-model"] {
+            assert_eq!(gemini_image_ratio(model, 4.0).0, "21:9", "{model}");
+            assert_eq!(gemini_image_ratio(model, 0.25).0, "9:16", "{model}");
+            assert_eq!(gemini_image_ratio(model, 1.5).0, "3:2", "{model}");
+        }
+        let profile = shared_source_profile_fixture();
+        let mut settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image-preview".into(), endpoint: None },
+            ..Default::default()
+        };
+        preflight_profile_image_ratios(&profile, &settings).unwrap();
+        settings.image_model.model = "gemini-2.5-flash-image".into();
+        assert!(preflight_profile_image_ratios(&profile, &settings).unwrap_err().contains("cannot request"));
+        settings.output_mode = OutputMode::NativeOnly;
+        preflight_profile_image_ratios(&profile, &settings).unwrap();
+    }
+
+    #[test]
+    fn incompatible_shared_image_ratio_fails_before_text_or_any_image_purchase() {
+        let profile = shared_source_profile_fixture();
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash-image".into(), endpoint: None },
+            ..Default::default()
+        };
+        let skill = SkillSnapshot {
+            skill_id: "ratio-test".into(),
+            revision: "pin".into(),
+            instructions: "Keep exact source crops".into(),
+            references: BTreeMap::new(),
+            reference_hashes: BTreeMap::new(),
+            templates: BTreeMap::new(),
+            design_profile: Some(profile.clone()),
+        };
+        let provider = Mock { responses: RefCell::new(vec![]) };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4"})).unwrap();
+        let error = runner
+            .production(
+                TaskRequest {
+                    prompt: "Create an illustrated lesson".into(),
+                    settings: settings.clone(),
+                    skill_ids: vec!["ratio-test".into()],
+                    auto_select_skills: false,
+                    target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+                    export_directory: None,
+                },
+                json!({}),
+                catalog(),
+                vec![skill],
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("cannot request"), "{error}");
+        // The second placement is incompatible; even the first must remain unbought.
+        let plan = ProductionPlan {
+            title: "Whole set preflight".into(),
+            commands: vec![],
+            images: vec![
+                designcraft_ai_types::protocol::ImagePlacement {
+                    prompt: "Tree".into(),
+                    page: 0,
+                    rect: [60.0, 60.0, 160.0, 160.0],
+                    label: "tree".into(),
+                },
+                designcraft_ai_types::protocol::ImagePlacement {
+                    prompt: "Atlas".into(),
+                    page: 0,
+                    rect: [60.0, 180.0, 160.0, 280.0],
+                    label: "atlas art".into(),
+                },
+            ],
+        };
+        let error = runner.expand_images(plan, &settings, &mut BTreeMap::new(), &mut 0, Some(&profile)).unwrap_err();
+        assert!(error.contains("cannot request"), "{error}");
+        assert_eq!(ledger.summary().requests, 0);
     }
 
     #[test]

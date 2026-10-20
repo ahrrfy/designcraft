@@ -108,6 +108,7 @@ impl DesignProfile {
             return Err("Design profile needs 1–12 page families and at most 24 corrections".into());
         }
         let mut ids = BTreeSet::new();
+        let mut image_slots: Vec<&DesignImageSlot> = Vec::new();
         for family in &self.page_families {
             if !text(&family.id, 64)
                 || !family.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -164,6 +165,17 @@ impl DesignProfile {
                 {
                     return Err("Invalid design image slot or unsafe geometry".into());
                 }
+                // Serialized placements carry purpose and rect, without a family
+                // id. Any slots that could match one placement must agree on its
+                // source and views, including a slot with default fitting.
+                if image_slots.iter().any(|other| {
+                    other.purpose == slot.purpose
+                        && other.rect.iter().zip(slot.rect).all(|(a, b)| (a - b).abs() <= 0.02)
+                        && (other.crop != slot.crop || other.source_aspect_ratio != slot.source_aspect_ratio || other.views != slot.views)
+                }) {
+                    return Err("Ambiguous design image slots share a purpose and rectangle but disagree on their source or views".into());
+                }
+                image_slots.push(slot);
             }
         }
         if self.corrections.iter().any(|c| !text(&c.before, 512) || !text(&c.after, 512) || !text(&c.reason, 512)) {
@@ -188,6 +200,38 @@ pub struct DesignStyleUse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_slot_lookup_rejects_ambiguous_family_source_metadata() {
+        let mut p = profile();
+        let slot: DesignImageSlot = serde_json::from_value(serde_json::json!({
+            "id":"atlas", "purpose":"Shared source", "rect":[54,180,154,280],
+            "crop":[0,0,0.5,1], "source_aspect_ratio":2,
+            "views":[{"rect":[180,180,280,280],"crop":[0.5,0,1,1]}]
+        }))
+        .unwrap();
+        p.page_families[0].image_slots = vec![slot.clone()];
+        let mut other = p.page_families[0].clone();
+        other.id = "comparison".into();
+        other.template = "templates/comparison.json".into();
+        p.page_families.push(other);
+        p.validate().unwrap();
+        for changed in [
+            DesignImageSlot { crop: Some([0.0, 0.0, 1.0, 1.0]), ..slot.clone() },
+            DesignImageSlot { source_aspect_ratio: Some(1.5), ..slot.clone() },
+            DesignImageSlot { views: vec![], ..slot.clone() },
+            DesignImageSlot { crop: None, source_aspect_ratio: None, views: vec![], ..slot.clone() },
+        ] {
+            p.page_families[1].image_slots[0] = changed;
+            assert!(p.validate().unwrap_err().contains("Ambiguous"));
+        }
+        // One placement can match rectangles up to 0.02 points apart because
+        // each is compared with the same 0.01-point tolerance.
+        p.page_families[1].image_slots[0].rect[0] += 0.015;
+        assert!(p.validate().unwrap_err().contains("Ambiguous"));
+        p.page_families[1].image_slots[0].purpose = "Different illustration".into();
+        p.validate().unwrap();
+    }
+
     #[test]
     fn shared_illustration_views_are_bounded_and_stay_inside_print_margins() {
         let mut p = profile();

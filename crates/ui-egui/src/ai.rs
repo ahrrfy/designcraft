@@ -385,7 +385,7 @@ impl AiUiState {
         } else if self.settings.text_model.model.trim().is_empty() {
             ("Choose a text model above.", "اختر نموذج النص من الحقل أعلاه.")
         } else if !self.new_document && !document {
-            ("Open a document or choose New A4 document.", "افتح مستنداً أو اختر مستند A4 جديداً.")
+            ("Open a document or choose New document.", "افتح مستنداً أو اختر مستنداً جديداً.")
         } else if self.settings.output_mode == OutputMode::NativeWithImages
             && self.settings.image_model.provider != ProviderKind::ComfyUi
             && self.settings.image_model.model.trim().is_empty()
@@ -992,7 +992,10 @@ fn production(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, do
                 s.new_document = false;
                 s.continue_book = false;
             }
-            if ui.radio(s.new_document, rtl::widget(ui, text(a, "New A4 document", "مستند A4 جديد"))).clicked() {
+            if ui
+                .radio(s.new_document, rtl::widget(ui, text(a, "New document (style size; A4 default)", "مستند جديد (مقاس النمط؛ الافتراضي A4)")))
+                .clicked()
+            {
                 s.new_document = true;
                 s.continue_book = false;
             }

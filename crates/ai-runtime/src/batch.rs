@@ -52,7 +52,11 @@ pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRo
 
 /// A continuation starts only from a deliberately selected current book. Never
 /// infer permission or a page offset from stale, editable checkpoint metadata.
-pub(super) fn continuation_progress(base: &DocState) -> Result<(u32, u32), String> {
+pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraft_ai_types::DesignProfile>) -> Result<(u32, u32), String> {
+    if let Some(profile) = profile {
+        profile.validate()?;
+    }
+    let page_mm = profile.map_or([210.0, 297.0], |p| p.page_mm);
     let pages = u32::try_from(base.doc.spreads.len()).map_err(|_| "Invalid existing book page count")?;
     if !(1..=1000).contains(&pages)
         || base.doc.spreads.iter().any(|spread| {
@@ -60,12 +64,12 @@ pub(super) fn continuation_progress(base: &DocState) -> Result<(u32, u32), Strin
                 || spread.pages.iter().any(|page| {
                     !page.width.is_finite()
                         || !page.height.is_finite()
-                        || (page.width - 210.0 * 72.0 / 25.4).abs() > 0.1
-                        || (page.height - 297.0 * 72.0 / 25.4).abs() > 0.1
+                        || (page.width - page_mm[0] * 72.0 / 25.4).abs() > 0.1
+                        || (page.height - page_mm[1] * 72.0 / 25.4).abs() > 0.1
                 })
         })
     {
-        return Err("Continue book requires 1–1000 single A4 pages".into());
+        return Err("Continue book requires 1–1000 single pages matching the selected profile (A4 by default)".into());
     }
     let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
     if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
@@ -86,7 +90,7 @@ impl ProductionRunner {
         let (pages, completed, existing) = match task.target {
             TaskTarget::NewA4 { pages } => (pages, 0, None),
             TaskTarget::ContinueBook => {
-                let (pages, completed) = continuation_progress(&base)?;
+                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()))?;
                 (pages, completed, Some((base.uid, base.revision)))
             }
             TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
@@ -411,7 +415,8 @@ impl ProductionRunner {
         let first = job.snapshot.document_uid.is_none();
         let previous = session.active_index();
         if first {
-            session.execute("file.new", &new_a4(job.snapshot.total_pages)).map_err(|e| e.to_string())?;
+            let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
+            session.execute("file.new", &crate::design::document_params(profile, job.snapshot.total_pages)).map_err(|e| e.to_string())?;
         }
         let result = (|| {
             let current = session.doc().map_err(|e| e.to_string())?;
@@ -591,17 +596,33 @@ mod tests {
     fn continuation_refuses_blank_books_filled_books_holes_and_non_a4_pages() {
         let mut session = Session::new();
         session.execute("file.new", &new_a4(4)).unwrap();
-        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert_eq!(continuation_progress(session.doc().unwrap()).unwrap(), (4, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), None).unwrap(), (4, 1));
         session.execute("frame.create", &json!({"spread":2,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
         session.execute("frame.create", &json!({"spread":1,"rect":[50,50,100,100]})).unwrap();
         session.execute("frame.create", &json!({"spread":3,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
         session.execute("file.new", &json!({"width":400,"height":600,"pages":2,"facingPages":false})).unwrap();
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap()).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn continuation_matches_selected_non_a4_geometry_without_weakening_the_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
+        profile.page_mm = [240.0, 320.0];
+        profile.margin_mm = 10.0;
+        let mut session = Session::new();
+        session.execute("file.new", &crate::design::document_params(Some(&profile), 3)).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile)).unwrap(), (3, 1));
+        profile.page_mm = [250.0, 350.0];
+        assert!(continuation_progress(session.doc().unwrap(), Some(&profile)).is_err());
     }
     fn wait(runner: &mut ProductionRunner, session: &mut Session) -> AiSnapshot {
         let deadline = Instant::now() + Duration::from_secs(30);
