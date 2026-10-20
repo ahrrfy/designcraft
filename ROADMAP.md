@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI17 (2026-10-20): Validate template text with native composition instead of a copy-length estimate, retain authored typography and complete wording, and report exact invalid slots. Validate all text parts and project the complete image budget before purchasing artwork for a review group; preserve atomic publication and human checkpoints. Operational and design-quality follow-ups are documented in `docs/production-reliability-review.ar.md`.
+
 - AI16 (2026-10-20): Keep the requested review group independent of bounded native/provider execution chunks, publish each group atomically with one undo, and require proof of every page before continuing. Full UTF-8 briefs up to 1 MiB share one admission limit; current-document work uses the selected open file's geometry and exposes its target in the production panel.
 - AI16 review follow-up (2026-10-20): Partition generic book reviews before provider calls as well as template-backed reviews; retain pinned guidance, cumulative budgets and atomic proof publication for large groups without a selected template.
 

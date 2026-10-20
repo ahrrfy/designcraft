@@ -12,6 +12,9 @@ const MAX_JSON: usize = 1024 * 1024;
 const MAX_ACTIONS: usize = 512;
 const MAX_IMAGES: usize = 8;
 const MAX_INTERNAL_PAGES: u32 = 32;
+// Allocation/adversarial-input bound, independent of the template's copy-length
+// target. The engine must still compose every replacement at the authored size.
+const MAX_SLOT_CHARS: usize = 4096;
 
 pub(crate) fn eligible(skill: &SkillSnapshot) -> bool {
     skill
@@ -97,7 +100,13 @@ pub(crate) fn schema(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode)
             let properties: Map<String, Value> = family
                 .text_slots
                 .iter()
-                .map(|slot| (slot.id.clone(), json!({"type":"string","minLength":1,"maxLength":slot.max_chars,"description":slot.purpose})))
+                .map(|slot| {
+                    (
+                        slot.id.clone(),
+                        json!({"type":"string","minLength":1,"maxLength":MAX_SLOT_CHARS,
+                    "description":format!("{} Copy target: at most {} Unicode characters.",slot.purpose,slot.max_chars)}),
+                    )
+                })
                 .collect();
             let required: Vec<_> = family.text_slots.iter().map(|slot| &slot.id).collect();
             let image_slots: Vec<_> = family.image_slots.iter().map(|slot| &slot.id).collect();
@@ -134,8 +143,9 @@ pub(crate) fn system(skill: &SkillSnapshot) -> Result<String, String> {
          Return only the requested JSON schema. \
          Produce exactly one pages entry for every zero-based page in the supplied batch scope, with no gaps or duplicate pages. \
          Select a declared family according to its purpose, and vary families across adjacent pages when multiple families exist. \
-         Fill every declared text slot exactly once, using its purpose and max_chars Unicode character limit; supply nonempty complete content \
+         Fill every declared text slot exactly once, using its purpose and max_chars Unicode copy-length target; count spaces and combining vowel marks. Supply nonempty complete content \
          that fits, with no extra slot IDs. Adapt 100% of text slots—including headers, tags, cards, speech bubbles, diagrams, and tasks—to the user's exact subject and requested language. Never leave placeholder words from an unrelated topic. \
+         Keep each field focused on its declared purpose, rather than placing a full bilingual page script into one rule box. Preserve meaningful supplied wording and requested vocalization; do not cut a sentence or omit required content to satisfy a character estimate. Native composition decides actual fit without shrinking the authored typography. \
          Native typography, geometry and formatting are already fixed by the approved templates. \
          Adapt educational language, topic, sequence and difficulty to the brief and age range. Do not invent facts or claim live external research, reference coverage, publisher affiliation, endorsement, or standards certification. \
          Illustrations are allowed only in the selected family's image slots and only when the requested mode permits them. \
@@ -686,7 +696,7 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             },
             "typography_and_font_rules": {
                 "precedence": "Preserve the authored template font family, point size, and leading from the selected design_profile; glyph coverage is verified by actual native preflight.",
-                "direction_and_shaping": "Logical Unicode order, plain Arabic without unrequested diacritics, automatic rightToLeft for Arabic slots and leftToRight for English/equation slots, strict adherence to each slot's max_chars."
+                "direction_and_shaping": "Logical Unicode order, plain Arabic without unrequested diacritics, automatic rightToLeft for Arabic slots and leftToRight for English/equation slots. Aim for each slot's max_chars copy target; native composition verifies actual fit without deleting supplied wording or shrinking authored type."
             }
         }
     }))
@@ -838,13 +848,22 @@ pub(crate) fn compile(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode
     for page_number in scope.start..end {
         let page = pages.remove(&page_number).ok_or("Template content is missing a requested page")?;
         let family = profile.page_families.iter().find(|family| family.id == page.family).ok_or("Unknown content page family")?;
-        if page.text.len() != family.text_slots.len() {
-            return Err("Content text must supply exactly the declared slots".into());
-        }
         for slot in &family.text_slots {
-            if !page.text.get(&slot.id).is_some_and(|value| bounded_text(value, slot.max_chars)) {
-                return Err(format!("Text slot {} is missing, empty or exceeds its character limit", slot.id));
+            let location = format!("Page {} ({}) / text slot {}", u64::from(page_number) + 1, family.id, slot.id);
+            let value = page.text.get(&slot.id).ok_or_else(|| format!("{location} is missing"))?;
+            if value.trim().is_empty() {
+                return Err(format!("{location} is empty"));
             }
+            if value.contains('\0') {
+                return Err(format!("{location} contains a null character"));
+            }
+            let count = value.chars().count();
+            if count > MAX_SLOT_CHARS {
+                return Err(format!("{location} contains {count} characters; the safety limit is {MAX_SLOT_CHARS}"));
+            }
+        }
+        if page.text.len() != family.text_slots.len() {
+            return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
         }
         let template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
         let offset = plan.commands.len();
@@ -1244,13 +1263,20 @@ mod tests {
         preflight(&skill, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
     }
     #[test]
-    fn strict_slots_count_unicode_characters_and_reject_unknown_fields() {
+    fn slot_copy_keeps_unicode_intact_and_rejects_unsafe_or_undeclared_content() {
         let skill = skill();
         let mut value = content();
         value["pages"][0]["text"]["heading"] = json!("ع".repeat(12));
         assert!(compile_value(&value, &skill).is_ok());
         value["pages"][0]["text"]["heading"] = json!("ع".repeat(13));
-        assert!(compile_value(&value, &skill).is_err());
+        // Copy-length estimates must not discard fitting Arabic text. The worker
+        // performs mandatory native composition before any image request.
+        let plan = compile_value(&value, &skill).unwrap();
+        assert_eq!(plan.commands[0].params["text"], "ع".repeat(13));
+        value["pages"][0]["text"]["heading"] = json!("ع".repeat(MAX_SLOT_CHARS + 1));
+        assert!(compile_value(&value, &skill).unwrap_err().contains("4097 characters"));
+        value["pages"][0]["text"]["heading"] = json!("hello\0world");
+        assert!(compile_value(&value, &skill).unwrap_err().contains("null character"));
         for text in [json!({}), json!({"heading":"ok","extra":"injected"}), json!({"heading":" "})] {
             let mut value = content();
             value["pages"][0]["text"] = text;
@@ -1261,6 +1287,15 @@ mod tests {
         assert!(compile_value(&value, &skill).is_err());
         let duplicate = content().to_string().replacen("\"heading\":\"مرحبا\"", "\"heading\":\"a\",\"heading\":\"b\"", 1);
         assert!(compile(&duplicate, &skill, scope(), OutputMode::NativeOnly).is_err());
+    }
+    #[test]
+    fn slot_diagnostics_identify_the_page_family_field_and_exact_failure() {
+        let skill = skill();
+        let mut value = content();
+        value["pages"][0]["text"] = json!({});
+        assert_eq!(compile_value(&value, &skill).unwrap_err(), "Page 3 (practice) / text slot heading is missing");
+        value["pages"][0]["text"] = json!({"heading":"  "});
+        assert_eq!(compile_value(&value, &skill).unwrap_err(), "Page 3 (practice) / text slot heading is empty");
     }
     #[test]
     fn rejects_missing_duplicate_unknown_pages_families_and_global_commands() {
@@ -1324,7 +1359,8 @@ mod tests {
         let skill = skill();
         let schema = schema(&skill, scope(), OutputMode::NativeOnly).unwrap();
         let family = &schema["properties"]["pages"]["items"]["anyOf"][0];
-        assert_eq!(family["properties"]["text"]["properties"]["heading"]["maxLength"], 12);
+        assert_eq!(family["properties"]["text"]["properties"]["heading"]["maxLength"], MAX_SLOT_CHARS);
+        assert!(family["properties"]["text"]["properties"]["heading"]["description"].as_str().unwrap().contains("at most 12 Unicode"));
         assert_eq!(family["properties"]["illustrations"]["maxItems"], 0);
         let prompt = system(&skill).unwrap();
         assert!(!prompt.contains("frame.create"));
