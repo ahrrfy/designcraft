@@ -12,7 +12,7 @@ use std::sync::Mutex;
 
 const VERSION: u32 = 1;
 const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 512;
 const MAX_NODES: usize = 65_536;
@@ -36,6 +36,15 @@ struct ImagePayload {
     base64: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinaryImagePayload {
+    filename: String,
+    mime_type: String,
+    blob_sha256: String,
+    bytes: usize,
+}
+
 /// Hash the complete caller-supplied cache identity without persisting its inputs.
 pub(crate) fn digest(value: &Value) -> Result<String, String> {
     check_value(value)?;
@@ -57,6 +66,27 @@ pub(crate) fn store_plan(root: &Path, key: &str, plan: &ProductionPlan) -> Resul
 
 pub(crate) fn load_image(root: &Path, key: &str) -> Result<Option<GeneratedImage>, String> {
     let Some(payload) = load(root, key, "image")? else { return Ok(None) };
+    if payload.get("blob_sha256").is_some() {
+        let metadata: BinaryImagePayload = serde_json::from_value(payload).map_err(|e| format!("Production cache image metadata is corrupt: {e}"))?;
+        let sha256 = normalized_key(&metadata.blob_sha256)?;
+        if metadata.bytes == 0 || metadata.bytes > MAX_IMAGE_BYTES {
+            return Err("Production cache image exceeds its binary byte limit".into());
+        }
+        let path = root.join(format!("raster-{sha256}.bin"));
+        file_access::check_read(&path)?;
+        let stat = std::fs::symlink_metadata(&path).map_err(|e| format!("Cannot inspect production image blob: {e}"))?;
+        if is_link(&stat) || !stat.is_file() || stat.len() > MAX_IMAGE_BYTES as u64 {
+            return Err("Production cache image blob is not a bounded ordinary file".into());
+        }
+        let bytes = io::read_capped(&path, MAX_IMAGE_BYTES as u64).map_err(|e| format!("Cannot read production image blob: {e}"))?;
+        if bytes.len() != metadata.bytes || hash(&bytes) != sha256 {
+            return Err("Production cache image blob length or checksum is invalid".into());
+        }
+        let image = GeneratedImage { bytes, filename: metadata.filename, mime_type: metadata.mime_type };
+        validate_image(&image)?;
+        return Ok(Some(image));
+    }
+    // Existing small inline entries remain readable after upgrading the application.
     let image: ImagePayload = serde_json::from_value(payload).map_err(|e| format!("Production cache image is corrupt: {e}"))?;
     let encoded_cap = MAX_IMAGE_BYTES.saturating_add(2) / 3 * 4;
     if image.base64.len() > encoded_cap {
@@ -74,12 +104,15 @@ pub(crate) fn load_image(root: &Path, key: &str) -> Result<Option<GeneratedImage
 }
 
 pub(crate) fn store_image(root: &Path, key: &str, image: &GeneratedImage) -> Result<(), String> {
+    normalized_key(key)?;
     validate_image(image)?;
-    let payload = ImagePayload {
-        filename: image.filename.clone(),
-        mime_type: image.mime_type.clone(),
-        base64: base64::engine::general_purpose::STANDARD.encode(&image.bytes),
-    };
+    let sha256 = hash(&image.bytes);
+    let path = root.join(format!("raster-{sha256}.bin"));
+    if !write_cache_file(root, &path, &image.bytes)? {
+        return Ok(());
+    }
+    let payload =
+        BinaryImagePayload { filename: image.filename.clone(), mime_type: image.mime_type.clone(), blob_sha256: sha256, bytes: image.bytes.len() };
     store(root, key, "image", serde_json::to_value(payload).map_err(|e| format!("Cannot encode production cache image: {e}"))?)
 }
 
@@ -158,20 +191,26 @@ fn store(root: &Path, key: &str, kind: &str, payload: Value) -> Result<(), Strin
     let key = normalized_key(key)?;
     let entry = Entry { version: VERSION, kind: kind.into(), key: key.clone(), payload_sha256: digest(&payload)?, payload };
     let bytes = encode(&entry)?;
+    let path = entry_path(root, &key, kind);
+    write_cache_file(root, &path, &bytes).map(|_| ())
+}
+
+// Binary blobs and metadata share the same entry and byte quotas, including atomic-write
+// staging space. A declined write never deletes a previous cached result.
+fn write_cache_file(root: &Path, path: &Path, bytes: &[u8]) -> Result<bool, String> {
     let _lock = WRITES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     checked_root(root)?;
     file_access::check_write(root)?;
     std::fs::create_dir_all(root).map_err(|e| format!("Cannot create production cache directory: {e}"))?;
     checked_root(root)?;
-    let path = entry_path(root, &key, kind);
-    file_access::check_write(&path)?;
+    file_access::check_write(path)?;
     let mut count = 0usize;
     let mut total = 0u64;
     let mut replaced = None;
     for item in std::fs::read_dir(root).map_err(|e| format!("Cannot inspect production cache quota: {e}"))? {
         count = count.checked_add(1).ok_or("Production cache entry count overflow")?;
         if count > MAX_ENTRIES {
-            return Ok(());
+            return Ok(false);
         }
         let item = item.map_err(|e| format!("Cannot inspect production cache entry: {e}"))?;
         let candidate = item.path();
@@ -189,15 +228,16 @@ fn store(root: &Path, key: &str, kind: &str, payload: Value) -> Result<(), Strin
         total.checked_sub(replaced.unwrap_or(0)).and_then(|n| n.checked_add(bytes.len() as u64)).ok_or("Production cache byte count overflow")?;
     let staged = total.checked_add(bytes.len() as u64).ok_or("Production cache staging byte count overflow")?;
     if projected > MAX_CACHE_BYTES || staged > MAX_CACHE_BYTES || (replaced.is_none() && count >= MAX_ENTRIES) {
-        return Ok(());
+        return Ok(false);
     }
     // Recheck the target after scanning, before the engine's atomic replacement.
-    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
         && (is_link(&metadata) || !metadata.is_file())
     {
         return Err("Production cache target is not an ordinary file".into());
     }
-    io::write_file(&path, &bytes).map_err(|e| format!("Cannot write production cache entry: {e}"))
+    io::write_file(path, bytes).map_err(|e| format!("Cannot write production cache entry: {e}"))?;
+    Ok(true)
 }
 
 fn validate_plan(plan: &ProductionPlan) -> Result<(), String> {
@@ -242,7 +282,7 @@ fn validate_image(image: &GeneratedImage) -> Result<(), String> {
         return Err("Production cache image type, filename or byte limit is invalid".into());
     }
     let (width, height) = designcraft_images::pixel_size(&image.bytes).ok_or("Production cache image header is corrupt")?;
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 16_000_000 {
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 20_000_000 {
         return Err("Production cache image pixel limit is invalid".into());
     }
     Ok(())
@@ -321,6 +361,64 @@ mod tests {
     }
     fn key() -> String {
         digest(&json!({"model":"mock","prompt":"Exact brief","schema":{},"scope":[0,2],"revision":"pinned"})).unwrap()
+    }
+
+    #[test]
+    fn print_rasters_above_four_mib_roundtrip_as_bounded_binary_blobs() {
+        let root = temporary_root();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        let mut seed = 17u32;
+        let pixels = image::RgbImage::from_fn(1400, 1100, |_, _| {
+            let mut rgb = [0; 3];
+            for channel in &mut rgb {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *channel = seed as u8;
+            }
+            image::Rgb(rgb)
+        });
+        pixels.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
+        let image = GeneratedImage { bytes: encoded.into_inner(), filename: "print.png".into(), mime_type: "image/png".into() };
+        assert!(image.bytes.len() > 4 * 1024 * 1024);
+        store_image(root.path(), &key(), &image).unwrap();
+        let cached = load_image(root.path(), &key()).unwrap().unwrap();
+        assert_eq!(cached.bytes, image.bytes);
+        let metadata = std::fs::read(entry_path(root.path(), &key(), "image")).unwrap();
+        assert!(metadata.len() < 2048, "Image bytes must not inflate JSON metadata");
+        let binary: Vec<_> =
+            std::fs::read_dir(root.path()).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "bin")).collect();
+        assert_eq!(binary.len(), 1);
+        assert_eq!(std::fs::read(&binary[0]).unwrap(), image.bytes);
+        std::fs::write(&binary[0], b"replaced").unwrap();
+        assert!(load_image(root.path(), &key()).unwrap_err().contains("checksum"));
+    }
+
+    #[test]
+    fn square_and_non_square_four_k_cache_headers_fit_the_pixel_policy() {
+        for (width, height) in [(4096, 4096), (5056, 3392)] {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbImage::new(width, height).write_to(&mut png, image::ImageFormat::Png).unwrap();
+            validate_image(&GeneratedImage { bytes: png.into_inner(), filename: "4k.png".into(), mime_type: "image/png".into() }).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_inline_images_remain_readable_and_blob_traversal_is_rejected() {
+        let root = temporary_root();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(2, 2).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let bytes = png.into_inner();
+        store(
+            root.path(),
+            &key(),
+            "image",
+            json!({"filename":"legacy.png","mime_type":"image/png","base64":base64::engine::general_purpose::STANDARD.encode(&bytes)}),
+        )
+        .unwrap();
+        assert_eq!(load_image(root.path(), &key()).unwrap().unwrap().bytes, bytes);
+        store(root.path(), &key(), "image", json!({"filename":"legacy.png","mime_type":"image/png","blob_sha256":"../outside","bytes":12})).unwrap();
+        assert!(load_image(root.path(), &key()).is_err());
     }
 
     #[test]

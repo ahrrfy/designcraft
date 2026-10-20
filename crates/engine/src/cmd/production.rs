@@ -2,13 +2,20 @@
 //! successful draft is published. Neither provider output nor a caller's allowlist grants IO.
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 use super::{CommandSpec, always, bad, cmd, has_doc};
 use crate::{HistoryEntry, Result, Session};
 
 const ID: &str = "production.apply";
 const MAX_ACTIONS: usize = 512;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BYTES: usize = 48 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENCODED_IMAGE_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+const MAX_IMAGE_PIXELS: u64 = 20_000_000;
+const MAX_UNIQUE_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_UNIQUE_IMAGE_PIXELS: u64 = 40_000_000;
 const GROUP_ID: &str = "production.applyGroup";
 const MAX_GROUPS: usize = 1000;
 const MAX_GROUP_BYTES: usize = 512 * 1024 * 1024;
@@ -495,7 +502,17 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
             return Err(bad(ID, format!("{key}: document changed while generation was pending")));
         }
     }
-    let vetted = schemas();
+    let mut vetted = schemas();
+    // Providers cannot author file.place. Keep their public catalog stable,
+    // while validated host-generated inline assets receive the print allowance.
+    let image_schema = vetted.iter_mut().find(|(id, _, _)| *id == "file.place").ok_or_else(|| bad(ID, "missing inline image schema"))?;
+    let encoded_limit = image_schema
+        .1
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("base64"))
+        .and_then(|base64| base64.get_mut("maxLength"))
+        .ok_or_else(|| bad(ID, "missing inline image byte limit"))?;
+    *encoded_limit = json!(MAX_ENCODED_IMAGE_BYTES);
     // Reject every command and malformed envelope before executing the first draft action.
     for action in actions {
         let a = action.as_object().ok_or_else(|| bad(ID, "each action must be an object"))?;
@@ -521,6 +538,8 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
     // A draft needs no per-action history or journal retention.
     work.in_undo_step = true;
     let mut results = Vec::with_capacity(actions.len());
+    let mut image_sources = BTreeSet::new();
+    let mut image_bytes = 0usize;
     let mut image_pixels = 0u64;
     let mut table_cells = 0u64;
     for (i, action) in actions.iter().enumerate() {
@@ -542,9 +561,16 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
             }
         }
         if id == "file.place" {
-            image_pixels = image_pixels.saturating_add(check_image(&resolved)?);
-            if image_pixels > 32_000_000 {
-                return Err(bad(ID, "plan exceeds 32 million placed image pixels"));
+            let raster = check_image(&resolved)?;
+            if image_sources.insert(raster.sha256) {
+                image_bytes = image_bytes
+                    .checked_add(raster.bytes)
+                    .filter(|bytes| *bytes <= MAX_UNIQUE_IMAGE_BYTES)
+                    .ok_or_else(|| bad(ID, "plan exceeds 32 MiB of unique raster bytes"))?;
+                image_pixels = image_pixels
+                    .checked_add(raster.pixels)
+                    .filter(|pixels| *pixels <= MAX_UNIQUE_IMAGE_PIXELS)
+                    .ok_or_else(|| bad(ID, "plan exceeds 40 million unique image pixels"))?;
             }
         }
         if id == "table.insert" {
@@ -752,13 +778,25 @@ fn check_text_layout(original: &Session, draft: &Session) -> Result<()> {
     Ok(())
 }
 
-fn check_image(p: &Value) -> Result<u64> {
+struct CheckedRaster {
+    sha256: [u8; 32],
+    bytes: usize,
+    pixels: u64,
+}
+
+fn check_image(p: &Value) -> Result<CheckedRaster> {
     if p.get("frame").is_none() && !["x", "y", "width"].iter().all(|key| p.get(key).is_some()) {
         return Err(bad(ID, "image placement needs an explicit frame or x, y and width; loading the place cursor is not permitted"));
     }
     let encoded = p.get("base64").and_then(Value::as_str).ok_or_else(|| bad(ID, "inline image required"))?;
+    if encoded.len() > MAX_ENCODED_IMAGE_BYTES {
+        return Err(bad(ID, "inline image exceeds the 16 MiB encoded raster allowance"));
+    }
     let name = p.get("name").and_then(Value::as_str).ok_or_else(|| bad(ID, "image name required"))?.to_ascii_lowercase();
     let bytes = super::base64_decode(encoded);
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(bad(ID, "inline image exceeds 16 MiB of raster bytes"));
+    }
     let png = bytes.starts_with(b"\x89PNG\r\n\x1a\n") && name.ends_with(".png");
     let jpeg = bytes.starts_with(&[0xff, 0xd8, 0xff]) && (name.ends_with(".jpg") || name.ends_with(".jpeg"));
     if !png && !jpeg {
@@ -766,10 +804,11 @@ fn check_image(p: &Value) -> Result<u64> {
     }
     // Header inspection does not decode pixel data. Refuse PNG/JPEG decompression bombs first.
     let (w, h) = designcraft_images::pixel_size(&bytes).ok_or_else(|| bad(ID, "invalid raster image header"))?;
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 16_000_000 {
-        return Err(bad(ID, "image dimensions exceed 16 million pixels"));
+    let pixels = u64::from(w) * u64::from(h);
+    if w == 0 || h == 0 || pixels > MAX_IMAGE_PIXELS {
+        return Err(bad(ID, "image dimensions exceed 20 million pixels"));
     }
-    Ok(u64::from(w) * u64::from(h))
+    Ok(CheckedRaster { sha256: Sha256::digest(&bytes).into(), bytes: bytes.len(), pixels })
 }
 
 /// Validate and simulate a complete production against the current document without editing it.
@@ -1282,6 +1321,118 @@ mod tests {
         let p = json!({"outputMode":"native_with_images","commands":[{"command":"file.place","params":{"name":"illustration.png","base64":png,"x":36,"y":36,"width":100}}]});
         assert!(s.execute("production.apply", &p).is_ok());
         assert_eq!(s.doc().unwrap().history.undo.len(), 1);
+    }
+
+    // A complete grayscale PNG with stored DEFLATE blocks. The ancillary chunk
+    // models a large encoded provider asset without allocating a full RGBA raster.
+    fn inline_raster_png(width: u32, height: u32, padding: usize, marker: u8) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], bytes: &[u8]) {
+            let mut table = [0u32; 256];
+            for (index, entry) in table.iter_mut().enumerate() {
+                let mut crc = index as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 { crc >> 1 } else { (crc >> 1) ^ 0xedb8_8320 };
+                }
+                *entry = crc;
+            }
+            let mut crc = u32::MAX;
+            for &byte in kind.iter().chain(bytes) {
+                crc = (crc >> 8) ^ table[((crc ^ u32::from(byte)) & 255) as usize];
+            }
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(&(!crc).to_be_bytes());
+        }
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[1, 0, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &header);
+        let raw_bytes = (width as usize).div_ceil(8).checked_add(1).unwrap().checked_mul(height as usize).unwrap();
+        let mut remaining = raw_bytes;
+        let mut compressed = vec![0x78, 0x01];
+        while remaining > 0 {
+            let size = remaining.min(u16::MAX as usize) as u16;
+            remaining -= usize::from(size);
+            compressed.push(u8::from(remaining == 0));
+            compressed.extend_from_slice(&size.to_le_bytes());
+            compressed.extend_from_slice(&(!size).to_le_bytes());
+            compressed.resize(compressed.len() + usize::from(size), 0);
+        }
+        compressed.extend_from_slice(&((((raw_bytes % 65_521) as u32) << 16) | 1).to_be_bytes());
+        chunk(&mut png, b"IDAT", &compressed);
+        chunk(&mut png, b"raSt", &vec![marker; padding]);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    fn inline_raster_action(bytes: &[u8], x: u32) -> Value {
+        json!({"command":"file.place","params":{"name":"generated.png","base64":super::super::base64_encode(bytes),"x":x,"y":36,"width":100}})
+    }
+
+    #[test]
+    fn inline_raster_large_4k_shared_views_embed_exact_bytes_and_roundtrip_with_one_undo() {
+        let bytes = inline_raster_png(4096, 4096, 5 * 1024 * 1024, 7);
+        assert!(bytes.len() > 6 * 1024 * 1024 && bytes.len() < 16 * 1024 * 1024);
+        assert_eq!(designcraft_images::pixel_size(&bytes), Some((4096, 4096)));
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let commands: Vec<_> = [36, 150, 264].into_iter().map(|x| inline_raster_action(&bytes, x)).collect();
+        s.execute("production.apply", &json!({"outputMode":"native_with_images","commands":commands})).unwrap();
+        let state = s.doc().unwrap();
+        assert_eq!(state.history.undo.len(), before.history.undo.len() + 1);
+        assert_eq!(state.doc.assets.len(), 1, "Shared views must retain one source asset");
+        let asset = state.doc.assets.values().next().unwrap();
+        assert_eq!(asset.data.as_slice(), bytes);
+        assert_eq!(asset.pixels, Some((4096, 4096)));
+        assert!(asset.link.is_none(), "The generated image must remain embedded");
+        let saved = designcraft_format::save(&state.doc).unwrap();
+        let reopened = designcraft_format::load(&saved).unwrap();
+        assert_eq!(reopened.assets.len(), 1);
+        let asset = reopened.assets.values().next().unwrap();
+        assert_eq!(asset.data.as_slice(), bytes);
+        assert!(asset.link.is_none());
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn inline_raster_limits_and_unknown_paths_reject_atomically() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        let tiny = inline_raster_png(1, 1, 0, 0);
+        let mut path = inline_raster_action(&tiny, 36);
+        path["params"]["path"] = json!("private.png");
+        let oversized = inline_raster_png(1, 1, 16 * 1024 * 1024, 0);
+        let too_many_pixels = inline_raster_png(5000, 4001, 0, 0);
+        for rejected in [path, inline_raster_action(&oversized, 36), inline_raster_action(&too_many_pixels, 36)] {
+            let p = json!({"outputMode":"native_with_images","commands":[
+                {"command":"frame.create","params":{"rect":[36,36,72,72]}},rejected
+            ]});
+            assert!(s.execute("production.apply", &p).is_err());
+            let after = s.doc().unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &after.doc));
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.history.undo.len(), before.history.undo.len());
+            assert_eq!(s.journal.len(), journal);
+        }
+    }
+
+    #[test]
+    fn inline_raster_unique_source_aggregate_limits_reject_atomically() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        for (width, height, padding, expected) in [(4096, 4096, 1, "40 million"), (1, 1, 11 * 1024 * 1024, "32 MiB")] {
+            let commands: Vec<_> = (0..3).map(|marker| inline_raster_action(&inline_raster_png(width, height, padding, marker), 36)).collect();
+            let error = s.execute("production.apply", &json!({"outputMode":"native_with_images","commands":commands})).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+            assert_eq!(s.doc().unwrap().revision, before.revision);
+            assert_eq!(s.doc().unwrap().history.undo.len(), before.history.undo.len());
+        }
     }
     #[test]
     fn restricted_graphic_fitting_preserves_frame_and_rejects_hostile_parameters() {

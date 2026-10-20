@@ -7,9 +7,9 @@ use serde_json::json;
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
-const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SOURCE_PIXELS: u64 = 16_777_216;
+const MAX_SOURCE_PIXELS: u64 = 20_000_000;
 const MAX_INSPECTION_SIDE: u32 = 1536;
 const MAX_REASONS: usize = 8;
 const MAX_REASON_CHARS: usize = 256;
@@ -119,7 +119,7 @@ pub(crate) fn request(placement: &ImagePlacement, image: &GeneratedImage, settin
 /// raster is reduced; the borrowed full-resolution publication asset is untouched.
 fn inspection_image(image: &GeneratedImage) -> Result<(ImageInput, bool), String> {
     if image.bytes.is_empty() || image.bytes.len() > MAX_SOURCE_BYTES {
-        return Err("Illustration review source must be nonempty and within the 4-MiB raster limit".into());
+        return Err("Illustration review source must be nonempty and within the 16-MiB raster limit".into());
     }
     if !matches!(image.mime_type.as_str(), "image/png" | "image/jpeg" | "image/webp") {
         return Err("Illustration review supports PNG, JPEG or WebP input only".into());
@@ -142,11 +142,11 @@ fn inspection_image(image: &GeneratedImage) -> Result<(ImageInput, bool), String
         .into_dimensions()
         .map_err(|error| format!("Cannot read illustration inspection dimensions: {error}"))?;
     if dimensions.0 == 0 || dimensions.1 == 0 || u64::from(dimensions.0) * u64::from(dimensions.1) > MAX_SOURCE_PIXELS {
-        return Err("Illustration inspection source exceeds the 16-megapixel decoding limit".into());
+        return Err("Illustration inspection source exceeds the 20-megapixel decoding limit".into());
     }
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_777_216);
-    limits.max_image_height = Some(16_777_216);
+    limits.max_image_width = Some(20_000_000);
+    limits.max_image_height = Some(20_000_000);
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let decoded = reader.decode().map_err(|error| format!("Cannot decode illustration inspection source: {error}"))?;
@@ -297,7 +297,7 @@ mod tests {
         let settings = settings();
         let mut image = fixture_image();
         image.bytes = vec![0; MAX_SOURCE_BYTES + 1];
-        assert!(request(&placement(), &image, &settings).unwrap_err().contains("4-MiB"));
+        assert!(request(&placement(), &image, &settings).unwrap_err().contains("16-MiB"));
         image.bytes.clear();
         assert!(request(&placement(), &image, &settings).is_err());
         image.bytes.push(1);
@@ -314,11 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn image_review_large_reference_is_bounded_and_source_pixels_are_unchanged() {
+    fn image_review_high_resolution_reference_is_bounded_and_source_pixels_are_unchanged() {
         // Random RGB under transparent alpha keeps the PNG above the API input
         // cap while proving that inspection composites against paper white.
         let mut random = 0x1234_5678_u32;
-        let pixels = image::RgbaImage::from_fn(1600, 512, |_, _| {
+        let pixels = image::RgbaImage::from_fn(2048, 1024, |_, _| {
             let mut pixel = [0_u8; 4];
             for channel in pixel.iter_mut().take(3) {
                 random ^= random << 13;
@@ -331,7 +331,7 @@ mod tests {
         let mut encoded = std::io::Cursor::new(Vec::new());
         pixels.write_to(&mut encoded, image::ImageFormat::Png).unwrap();
         let image = GeneratedImage { bytes: encoded.into_inner(), filename: "print-original.png".into(), mime_type: "image/png".into() };
-        assert!(image.bytes.len() > MAX_IMAGE_BYTES && image.bytes.len() <= MAX_SOURCE_BYTES);
+        assert!(image.bytes.len() > 4 * 1024 * 1024 && image.bytes.len() <= 16 * 1024 * 1024);
         let original = image.bytes.clone();
         let request = request(&placement(), &image, &settings()).unwrap();
         let inspection = &request.images[0];

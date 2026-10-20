@@ -19,6 +19,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 const MAX_JSON: usize = 4 * 1024 * 1024;
 const MAX_PROMPT: usize = 4 * 1024 * 1024;
+// Raster admission is independent of model text/JSON size. Inline placements
+// count each view; the source/cache budget counts a shared source only once.
+const MAX_RASTER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UNIQUE_RASTER_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INLINE_RASTER_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RASTER_PIXELS: u64 = 20_000_000;
 const MAX_IMAGES: usize = 8;
 const MAX_ACTIONS: usize = 512;
 const MAX_REVIEW_PAGES: u32 = 1000;
@@ -245,8 +251,10 @@ impl Runner<'_> {
             match crate::production_cache::load_image(root, &disk_key) {
                 Ok(Some(image)) => {
                     validate_image(&image)?;
-                    *bytes =
-                        bytes.checked_add(image.bytes.len()).filter(|n| *n <= MAX_JSON).ok_or("Cached images exceed this plan's raster budget")?;
+                    *bytes = bytes
+                        .checked_add(image.bytes.len())
+                        .filter(|n| *n <= MAX_UNIQUE_RASTER_BYTES)
+                        .ok_or("Cached unique image sources exceed this plan's 32-MiB raster budget")?;
                     cache.insert(key, image);
                     self.cache_notice(format!("Reused page {} artwork locally; no new image request was billed", placement.page.saturating_add(1)))?;
                     if settings.verify_generated_images {
@@ -990,10 +998,10 @@ impl Runner<'_> {
                         self.cache_notice(format!("Could not cache this illustration: {error}"))?;
                     }
                 }
-                *bytes_used = bytes_used.checked_add(image.bytes.len()).ok_or("Generated image byte count overflow")?;
-                if *bytes_used > MAX_JSON {
-                    return Err("Generated images exceed the task's 4-MiB raster limit".into());
-                }
+                *bytes_used = bytes_used
+                    .checked_add(image.bytes.len())
+                    .filter(|bytes| *bytes <= MAX_UNIQUE_RASTER_BYTES)
+                    .ok_or("Unique generated image sources exceed this plan's 32-MiB raster budget")?;
                 cache.insert(cache_key, image.clone());
                 image
             };
@@ -1005,8 +1013,8 @@ impl Runner<'_> {
             placed_bytes = placed_bytes
                 .checked_add(image.bytes.len().checked_mul(views.len()).ok_or("Image placement byte count overflow")?)
                 .ok_or("Image placement byte count overflow")?;
-            if placed_bytes > 10 * 1024 * 1024 {
-                return Err("Shared image placements exceed the bounded native plan byte limit".into());
+            if placed_bytes > MAX_INLINE_RASTER_BYTES {
+                return Err("Inline image placements, including repeated views, exceed this plan's 32-MiB raster budget".into());
             }
             let dimensions = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
                 .with_guessed_format()
@@ -2171,8 +2179,8 @@ fn batch_proofs_from_draft(scratch: &mut Session, cancel: &AtomicBool, scope: Ba
 fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<providers::GeneratedImage, String> {
     if generated.mime_type == "image/webp" {
         use image::{ImageDecoder, ImageEncoder};
-        if generated.bytes.len() > MAX_JSON || !generated.bytes.starts_with(b"RIFF") || generated.bytes.get(8..12) != Some(b"WEBP") {
-            return Err("Generated WebP must have a valid header and fit within 4 MiB".into());
+        if generated.bytes.len() > MAX_RASTER_BYTES || !generated.bytes.starts_with(b"RIFF") || generated.bytes.get(8..12) != Some(b"WEBP") {
+            return Err("Generated WebP must have a valid header and fit within 16 MiB".into());
         }
         validate_webp_chunks(&generated.bytes)?;
         let mut decoder =
@@ -2183,7 +2191,7 @@ fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<p
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(width);
         limits.max_image_height = Some(height);
-        limits.max_alloc = Some(64 * 1024 * 1024);
+        limits.max_alloc = Some(128 * 1024 * 1024);
         limits.reserve(decoder.total_bytes()).map_err(|e| format!("Generated WebP exceeds decoding memory limit: {e}"))?;
         decoder.set_limits(limits).map_err(|e| format!("Cannot limit generated WebP: {e}"))?;
         let profile = decoder.icc_profile().map_err(|e| format!("Cannot read generated WebP color profile: {e}"))?;
@@ -2195,7 +2203,7 @@ fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<p
         }
         encoder
             .write_image(decoded.as_bytes(), width, height, decoded.color().into())
-            .map_err(|e| format!("Cannot encode generated WebP as PNG within 4 MiB: {e}"))?;
+            .map_err(|e| format!("Cannot encode generated WebP as lossless PNG within 16 MiB: {e}"))?;
         generated.bytes = output.0;
         generated.filename = "generated.png".into();
         generated.mime_type = "image/png".into();
@@ -2246,8 +2254,8 @@ fn validate_webp_chunks(bytes: &[u8]) -> Result<(), String> {
 struct BoundedImageBytes(Vec<u8>);
 impl std::io::Write for BoundedImageBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_JSON.saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other("Generated PNG exceeds 4 MiB"));
+        if bytes.len() > MAX_RASTER_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("Generated lossless PNG exceeds 16 MiB"));
         }
         self.0.try_reserve_exact(bytes.len()).map_err(|_| std::io::Error::other("Cannot allocate generated PNG"))?;
         self.0.extend_from_slice(bytes);
@@ -2264,15 +2272,15 @@ fn validate_image(image: &providers::GeneratedImage) -> Result<(), String> {
         "image/jpeg" => image.bytes.starts_with(&[0xff, 0xd8, 0xff]),
         _ => false,
     };
-    if !valid_header || image.bytes.len() > MAX_JSON {
-        return Err("Image generation must return a PNG/JPEG within 4 MiB".into());
+    if !valid_header || image.bytes.len() > MAX_RASTER_BYTES {
+        return Err("Image generation must return a PNG/JPEG within 16 MiB".into());
     }
     let (width, height) = designcraft_images::pixel_size(&image.bytes).ok_or("Invalid generated raster header")?;
     validate_image_dimensions(width, height)
 }
 fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 16_777_216 {
-        return Err("Generated raster exceeds the 4096-square pixel allowance".into());
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_RASTER_PIXELS {
+        return Err("Generated raster dimensions must be positive and at most 20 million pixels".into());
     }
     Ok(())
 }
@@ -4790,11 +4798,11 @@ mod tests {
         // The fixture is a real VP8L image; replace only its 14-bit width/height header.
         assert_eq!(bomb.bytes.get(12..16).unwrap(), b"VP8L");
         bomb.bytes.get_mut(21..25).unwrap().copy_from_slice(&0x0fff_ffff_u32.to_le_bytes());
-        assert!(prepare_generated_image(bomb).err().unwrap().contains("4096-square"));
+        assert!(prepare_generated_image(bomb).err().unwrap().contains("20 million pixels"));
         assert!(validate_image_dimensions(4096, 4096).is_ok());
-        assert!(validate_image_dimensions(4097, 4097).is_err());
+        assert!(validate_image_dimensions(5001, 4000).is_err());
         let (mut oversized, _) = webp_fixture(None);
-        oversized.bytes.resize(MAX_JSON + 1, 0);
+        oversized.bytes.resize(MAX_RASTER_BYTES + 1, 0);
         assert!(prepare_generated_image(oversized).is_err());
         let (mut animated, pixels) = webp_fixture(None);
         let frame_chunk = animated.bytes.get(12..).unwrap().to_vec();
@@ -4817,11 +4825,134 @@ mod tests {
     #[test]
     fn normalized_png_writer_refuses_to_allocate_beyond_task_image_limit() {
         use std::io::Write;
-        let mut output = BoundedImageBytes(vec![0; MAX_JSON - 1]);
+        let mut output = BoundedImageBytes(vec![0; MAX_RASTER_BYTES - 1]);
         assert!(output.write_all(&[1, 2]).is_err());
-        assert_eq!(output.0.len(), MAX_JSON - 1);
+        assert_eq!(output.0.len(), MAX_RASTER_BYTES - 1);
         output.write_all(&[1]).unwrap();
-        assert_eq!(output.0.len(), MAX_JSON);
+        assert_eq!(output.0.len(), MAX_RASTER_BYTES);
+    }
+
+    fn high_resolution_fixture() -> (providers::GeneratedImage, image::RgbImage) {
+        let mut state = 0x6d2b_79f5_u32;
+        let pixels = image::RgbImage::from_fn(1536, 1024, |_, _| {
+            let mut pixel = [0_u8; 3];
+            for channel in &mut pixel {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *channel = state as u8;
+            }
+            image::Rgb(pixel)
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let image = providers::GeneratedImage { bytes: bytes.into_inner(), filename: "high-resolution.png".into(), mime_type: "image/png".into() };
+        assert!(image.bytes.len() > 4 * 1024 * 1024 && image.bytes.len() <= 16 * 1024 * 1024);
+        (image, pixels)
+    }
+
+    #[test]
+    fn high_resolution_png_exceeding_model_json_limit_is_preserved_byte_for_byte() {
+        let (image, _) = high_resolution_fixture();
+        let original = image.bytes.clone();
+        let result = prepare_generated_image(image).unwrap();
+        assert_eq!(result.bytes, original);
+        assert_eq!(designcraft_images::pixel_size(&result.bytes), Some((1536, 1024)));
+        assert!(validate_image_dimensions(4096, 4096).is_ok());
+        assert!(validate_image_dimensions(5056, 3392).is_ok());
+        assert!(validate_image_dimensions(6336, 2688).is_ok());
+        assert!(validate_image_dimensions(5000, 4000).is_ok());
+        assert!(validate_image_dimensions(5001, 4000).is_err());
+        assert!(validate_image_dimensions(0, 4000).is_err());
+        let mut oversized = result;
+        oversized.bytes.resize(MAX_RASTER_BYTES + 1, 0);
+        assert!(prepare_generated_image(oversized).unwrap_err().contains("within 16 MiB"));
+    }
+
+    #[test]
+    fn high_resolution_lossless_webp_preserves_pixels_alpha_and_icc_when_normalized() {
+        use image::{ImageDecoder, ImageEncoder};
+        let (_, rgb) = high_resolution_fixture();
+        let rgba = image::RgbaImage::from_fn(rgb.width(), rgb.height(), |x, y| {
+            let [r, g, b] = rgb.get_pixel(x, y).0;
+            image::Rgba([r, g, b, if x % 2 == 0 { 128 } else { 255 }])
+        });
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        encoder.set_icc_profile(TEST_SRGB_ICC.to_vec()).unwrap();
+        encoder.encode(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8).unwrap();
+        assert!(bytes.len() > 4 * 1024 * 1024 && bytes.len() <= 16 * 1024 * 1024);
+        let expected = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let normalized =
+            prepare_generated_image(providers::GeneratedImage { bytes, filename: "print.webp".into(), mime_type: "image/webp".into() }).unwrap();
+        assert_eq!(normalized.mime_type, "image/png");
+        assert_eq!(image::load_from_memory(&normalized.bytes).unwrap().to_rgba8(), expected);
+        assert_eq!(expected, rgba);
+        assert_eq!(
+            image::codecs::png::PngDecoder::new(std::io::Cursor::new(&normalized.bytes)).unwrap().icc_profile().unwrap().unwrap(),
+            TEST_SRGB_ICC
+        );
+    }
+
+    #[test]
+    fn high_resolution_shared_sources_have_separate_unique_and_inline_byte_budgets() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct LargeImage(providers::GeneratedImage, std::cell::Cell<u32>);
+        impl Provider for LargeImage {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                Err("No model text".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                self.1.set(self.1.get() + 1);
+                Ok(ImageResponse { images: vec![self.0.clone()], usage: Usage::default(), error: None })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let (source, _) = high_resolution_fixture();
+        let source_bytes = source.bytes.len();
+        let provider = LargeImage(source, std::cell::Cell::new(0));
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 500_000, max_requests: 8, ..Default::default() },
+            ..Default::default()
+        };
+        let placement = designcraft_ai_types::protocol::ImagePlacement {
+            prompt: "One original scene reused".into(),
+            page: 0,
+            rect: [60.0, 60.0, 160.0, 160.0],
+            label: "Scene".into(),
+        };
+        let plan = ProductionPlan { title: "Large shared source".into(), commands: vec![], images: vec![placement.clone(); 3] };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let mut cache = BTreeMap::new();
+        let mut unique_bytes = 0;
+        let expanded = runner.expand_images(plan, &settings, &mut cache, &mut unique_bytes, None).unwrap();
+        assert_eq!(provider.1.get(), 1, "Shared source should be generated once");
+        assert_eq!(unique_bytes, source_bytes, "Unique source bytes are counted once");
+        assert_eq!(expanded.commands.iter().filter(|action| action.command == "file.place").count(), 3);
+        assert!(serde_json::to_vec(&expanded).unwrap().len() > 16 * 1024 * 1024);
+        assert!(serde_json::to_vec(&expanded).unwrap().len() < 48 * 1024 * 1024);
+        let repeated = ProductionPlan { title: "Bound repeated inline bytes".into(), commands: vec![], images: vec![placement; 8] };
+        let error = runner.expand_images(repeated, &settings, &mut cache, &mut unique_bytes, None).unwrap_err();
+        assert!(error.contains("including repeated views"), "{error}");
+        assert_eq!(unique_bytes, source_bytes, "Repeated serialization must not recharge the unique source budget");
+        assert_eq!(provider.1.get(), 1, "Oversized repetitions must use the already cached source");
     }
 
     #[test]
