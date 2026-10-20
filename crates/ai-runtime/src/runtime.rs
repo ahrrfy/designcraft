@@ -630,7 +630,14 @@ impl ProductionRunner {
                     }
                 }
                 Ok(worker::Message::Diagnostic(issue)) => {
-                    if self.snapshot.current_issues.len() < 1024 {
+                    // A long review group may repair many pages. Retain the
+                    // latest bounded planning evidence without growing each
+                    // poll/history response by a plan for every attempt.
+                    if issue.get("kind").and_then(Value::as_str) == Some("nativePlanningValidation")
+                        && let Some(previous) = self.snapshot.current_issues.iter_mut().find(|old| old.get("kind") == issue.get("kind"))
+                    {
+                        *previous = issue;
+                    } else if self.snapshot.current_issues.len() < 1024 {
                         self.snapshot.current_issues.push(issue);
                     }
                 }
@@ -3329,11 +3336,18 @@ mod tests {
             }))
             .unwrap();
         sender.send(worker::Message::Diagnostic(json!({"kind":"printRequirement","message":"full detailed cause\npossible remedy"}))).unwrap();
+        for attempt in 1..=3 {
+            sender
+                .send(worker::Message::Diagnostic(json!({"kind":"nativePlanningValidation","attempt":attempt,"message":"bounded evidence"})))
+                .unwrap();
+        }
         let snapshot = runner.handle(&mut session, AiRequest::Poll);
         assert!(snapshot.busy);
         assert_eq!(snapshot.current_usage.requests, 2);
         assert_eq!(snapshot.current_usage.input_tokens, 123);
         assert_eq!(snapshot.current_issues[0]["message"], "full detailed cause\npossible remedy");
+        assert_eq!(snapshot.current_issues.len(), 2, "Repeated planning attempts must not multiply large history/poll payloads");
+        assert_eq!(snapshot.current_issues[1]["attempt"], 3);
         assert!(snapshot.reports.is_empty());
         assert!(session.documents().is_empty());
         assert!(runner.pending.is_some());

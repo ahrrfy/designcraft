@@ -4,11 +4,39 @@ use designcraft_ai_types::EngineAction;
 use designcraft_ai_types::protocol::{ImagePlacement, MAX_BRIEF_BYTES, ProductionPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_PAGES: u32 = 1000;
 const MAX_ACTIONS: usize = 512;
 const MAX_IMAGE_PROMPT: usize = 8192;
+const MAX_COPY_BINDINGS: usize = 256;
+const MAX_COPY_WORDS: usize = 65_536;
+const COPY_LABEL: &str = "designcraft.copy.v1:";
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CopyBinding {
+    frame: usize,
+    copy_id: String,
+    word_range: [usize; 2],
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CopyProvenance {
+    brief_sha256: String,
+    copy_id: String,
+    word_range: [usize; 2],
+}
+
+struct CopySource {
+    page: u32,
+    language: &'static str,
+    segment: usize,
+    text: String,
+    words: Vec<String>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ScriptPage {
@@ -361,7 +389,7 @@ fn reference_index(value: Option<&Value>) -> Result<usize, String> {
     index.parse().map_err(|_| "Invalid script-copy story index".into())
 }
 
-fn native_copy(plan: &ProductionPlan) -> Result<BTreeMap<u32, String>, String> {
+fn native_stories(plan: &ProductionPlan) -> Result<BTreeMap<usize, (u32, String)>, String> {
     let mut stories: BTreeMap<usize, (u32, String)> = BTreeMap::new();
     for (index, action) in plan.commands.iter().enumerate() {
         if action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text") {
@@ -383,6 +411,11 @@ fn native_copy(plan: &ProductionPlan) -> Result<BTreeMap<u32, String>, String> {
             );
         }
     }
+    Ok(stories)
+}
+
+fn native_copy(plan: &ProductionPlan) -> Result<BTreeMap<u32, String>, String> {
+    let stories = native_stories(plan)?;
     let mut pages: BTreeMap<u32, String> = BTreeMap::new();
     for (page, text) in stories.into_values() {
         let copy = pages.entry(page).or_default();
@@ -400,6 +433,7 @@ pub(crate) fn validate_plan(brief: &str, scope: BatchScope, plan: &ProductionPla
     let Some(contract) = parse(brief)? else {
         return Ok(());
     };
+    let bound = bound_copy_ids(brief, scope, plan)?;
     let copy = native_copy(plan)?;
     for page in contract.scoped_pages(scope)? {
         let actual = copy
@@ -407,10 +441,14 @@ pub(crate) fn validate_plan(brief: &str, scope: BatchScope, plan: &ProductionPla
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| format!("Page {} has no verifiable native printable copy", u64::from(page.page) + 1))?;
         let mut designated = false;
-        for (language, expected) in [("English", &page.english_print_copy), ("Arabic", &page.arabic_print_copy)] {
+        for (language, code, expected) in [("English", "en", &page.english_print_copy), ("Arabic", "ar", &page.arabic_print_copy)] {
             if let Some(expected) = expected {
                 designated = true;
-                for segment in expected.split('|').map(printable_segment).filter(|segment| !segment.is_empty()) {
+                for (index, raw) in expected.split('|').enumerate() {
+                    let segment = printable_segment(raw);
+                    if segment.is_empty() || bound.contains(&copy_id(page.page, code, index)?) {
+                        continue;
+                    }
                     if !contains_copy(actual, &segment) {
                         let preview: String = segment.chars().take(100).collect();
                         return Err(format!("Page {} is missing or changes supplied {language} print copy: {preview}", u64::from(page.page) + 1));
@@ -577,6 +615,10 @@ pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, ac
 /// Backward-compatible plan envelope. Activities become engine commands before
 /// any image purchase; they never enter an immutable style manifest.
 pub(crate) fn compile_native_plan(text: &str, scope: BatchScope) -> Result<ProductionPlan, String> {
+    compile_native_content(text, scope, None)
+}
+
+fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) -> Result<ProductionPlan, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Content {
@@ -586,6 +628,8 @@ pub(crate) fn compile_native_plan(text: &str, scope: BatchScope) -> Result<Produ
         images: Vec<ImagePlacement>,
         #[serde(default)]
         activities: Vec<NativeActivity>,
+        #[serde(default)]
+        copy_bindings: Vec<CopyBinding>,
     }
     if text.len() > MAX_BRIEF_BYTES {
         return Err("Native content plan exceeds 1 MiB".into());
@@ -594,9 +638,236 @@ pub(crate) fn compile_native_plan(text: &str, scope: BatchScope) -> Result<Produ
     if content.commands.len() > MAX_ACTIONS {
         return Err("Native content plan exceeds 512 commands".into());
     }
+    if content.commands.iter().any(|action| {
+        action.command == "object.label"
+            && action.params.get("label").and_then(Value::as_str).is_some_and(|label| label.starts_with("designcraft.copy."))
+    }) {
+        return Err("Provider commands cannot supply reserved host copy provenance labels".into());
+    }
     let mut plan = ProductionPlan { title: content.title, commands: content.commands, images: content.images };
+    if !content.copy_bindings.is_empty() {
+        bind_copy(&mut plan, scope, brief.ok_or("Copy bindings require the original explicit page brief")?, &content.copy_bindings)?;
+    }
     append_activities(&mut plan, scope, &content.activities)?;
     Ok(plan)
+}
+
+fn copy_id(page: u32, language: &str, index: usize) -> Result<String, String> {
+    Ok(format!("p{}.{}.{}", u64::from(page) + 1, language, index.checked_add(1).ok_or("Copy segment index overflow")?))
+}
+
+fn copy_sources(brief: &str, scope: BatchScope) -> Result<BTreeMap<String, CopySource>, String> {
+    end(scope)?;
+    let Some(contract) = parse(brief)? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut sources = BTreeMap::new();
+    let mut word_count = 0usize;
+    for page in contract.scoped_pages(scope)? {
+        for (language, field) in [("en", &page.english_print_copy), ("ar", &page.arabic_print_copy)] {
+            if let Some(field) = field {
+                for (segment, raw) in field.split('|').enumerate() {
+                    let text = printable_segment(raw);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let mut words = Vec::new();
+                    for word in text.split_whitespace() {
+                        word_count =
+                            word_count.checked_add(1).filter(|count| *count <= MAX_COPY_WORDS).ok_or("Source copy exceeds 65536 bounded words")?;
+                        words.push(word.to_owned());
+                    }
+                    sources.insert(copy_id(page.page, language, segment)?, CopySource { page: page.page, language, segment, text, words });
+                }
+            }
+        }
+    }
+    Ok(sources)
+}
+
+fn copy_words(source: &CopySource, range: [usize; 2]) -> Result<String, String> {
+    let [start, end] = range;
+    if start >= end || end > MAX_COPY_WORDS {
+        return Err("Copy binding word range must be nonempty and within the source word limit".into());
+    }
+    source.words.get(start..end).map(|words| words.join(" ")).ok_or_else(|| "Copy binding word range exceeds its original source segment".into())
+}
+
+fn complete_copy_ranges(coverage: &mut BTreeMap<String, Vec<[usize; 2]>>, sources: &BTreeMap<String, CopySource>) -> Result<(), String> {
+    for (id, ranges) in coverage {
+        ranges.sort_unstable();
+        let mut cursor = 0usize;
+        for &[start, end] in ranges.iter() {
+            if start != cursor || end <= start {
+                return Err(format!("Copy binding {id} has missing or duplicate source-word coverage"));
+            }
+            cursor = end;
+        }
+        if cursor != sources.get(id).ok_or("Copy binding source is not in the current page scope")?.words.len() {
+            return Err(format!("Copy binding {id} must cover its complete original segment"));
+        }
+    }
+    Ok(())
+}
+
+fn bind_copy(plan: &mut ProductionPlan, scope: BatchScope, brief: &str, bindings: &[CopyBinding]) -> Result<(), String> {
+    if bindings.len() > MAX_COPY_BINDINGS || plan.commands.len().checked_add(bindings.len()).is_none_or(|count| count > MAX_ACTIONS) {
+        return Err("Copy bindings exceed 256 entries or the complete 512-command plan limit".into());
+    }
+    let sources = copy_sources(brief, scope)?;
+    let digest = format!("{:x}", Sha256::digest(brief.as_bytes()));
+    let mut frames = BTreeSet::new();
+    let mut coverage: BTreeMap<String, Vec<[usize; 2]>> = BTreeMap::new();
+    let mut assignments = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if binding.copy_id.is_empty() || binding.copy_id.len() > 64 || !frames.insert(binding.frame) {
+            return Err("Copy binding has an invalid source ID or repeats a native frame".into());
+        }
+        let source = sources.get(&binding.copy_id).ok_or("Copy binding source is not in the current explicit page scope")?;
+        let frame = plan.commands.get(binding.frame).ok_or("Copy binding frame is outside the authored command plan")?;
+        if frame.command != "frame.create"
+            || frame.params.get("content").and_then(Value::as_str) != Some("text")
+            || frame.params.get("spread").and_then(Value::as_u64) != Some(u64::from(source.page))
+        {
+            return Err("Copy binding must target a native text frame on its exact source page".into());
+        }
+        let text = copy_words(source, binding.word_range)?;
+        coverage.entry(binding.copy_id.clone()).or_default().push(binding.word_range);
+        let provenance = CopyProvenance { brief_sha256: digest.clone(), copy_id: binding.copy_id.clone(), word_range: binding.word_range };
+        let label = format!("{COPY_LABEL}{}", serde_json::to_string(&provenance).map_err(|error| error.to_string())?);
+        assignments.push((binding.frame, text, label));
+    }
+    complete_copy_ranges(&mut coverage, &sources)?;
+    for (frame, text, label) in assignments {
+        plan.commands
+            .get_mut(frame)
+            .and_then(|action| action.params.as_object_mut())
+            .ok_or("Copy binding frame parameters must be an object")?
+            .insert("text".into(), json!(text.replace('$', "$$")));
+        plan.commands.push(EngineAction { command: "object.label".into(), params: json!({"ids":[format!("${frame}.id")],"label":label}) });
+    }
+    // A later story.setText must not undo a host-bound fragment before caching.
+    bound_copy_ids(brief, scope, plan)?;
+    Ok(())
+}
+
+fn label_frame(action: &EngineAction, index: usize) -> Result<usize, String> {
+    let ids = action
+        .params
+        .get("ids")
+        .and_then(Value::as_array)
+        .filter(|ids| ids.len() == 1)
+        .ok_or("Copy provenance must label exactly one native frame")?;
+    let reference = ids.first().and_then(Value::as_str).ok_or("Copy provenance requires an earlier native frame reference")?;
+    direct_frame(reference, index)
+}
+
+fn direct_frame(reference: &str, index: usize) -> Result<usize, String> {
+    let body = reference
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| reference.strip_prefix('$'))
+        .ok_or("Invalid copy provenance frame reference")?;
+    let (frame, path) = body.split_once('.').ok_or("Invalid copy provenance frame reference")?;
+    let frame = frame.parse::<usize>().map_err(|_| "Invalid copy provenance frame index")?;
+    if path != "id" || frame >= index {
+        return Err("Copy provenance must reference an earlier direct native frame ID".into());
+    }
+    Ok(frame)
+}
+
+fn bound_copy_ids(brief: &str, scope: BatchScope, plan: &ProductionPlan) -> Result<BTreeSet<String>, String> {
+    let mut provenance = Vec::new();
+    for (index, action) in plan.commands.iter().enumerate().filter(|(_, action)| action.command == "object.label") {
+        if let Some(label) = action.params.get("label").and_then(Value::as_str).filter(|label| label.starts_with("designcraft.copy.")) {
+            let body = label.strip_prefix(COPY_LABEL).filter(|body| body.len() <= 2048).ok_or("Unknown or oversized host copy provenance label")?;
+            let value: CopyProvenance = serde_json::from_str(body).map_err(|error| format!("Invalid host copy provenance: {error}"))?;
+            if provenance.len() >= MAX_COPY_BINDINGS {
+                return Err("Cached copy provenance exceeds 256 bindings".into());
+            }
+            provenance.push((index, label_frame(action, index)?, label, value));
+        }
+    }
+    if provenance.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let sources = copy_sources(brief, scope)?;
+    let stories = native_stories(plan)?;
+    let digest = format!("{:x}", Sha256::digest(brief.as_bytes()));
+    let mut frames = BTreeSet::new();
+    let mut coverage: BTreeMap<String, Vec<[usize; 2]>> = BTreeMap::new();
+    for (label_index, frame, label, value) in provenance {
+        if value.brief_sha256 != digest || value.copy_id.len() > 64 || !frames.insert(frame) {
+            return Err("Host copy provenance is stale, forged or repeated for a native frame".into());
+        }
+        let source = sources.get(&value.copy_id).ok_or("Host copy provenance source is outside the current page scope")?;
+        let (page, text) = stories.get(&frame).ok_or("Host copy provenance does not reference a native text story")?;
+        if *page != source.page || normalized(text) != copy_words(source, value.word_range)? {
+            return Err(format!("Bound copy {} changed its page, original words, numerals or diacritics", value.copy_id));
+        }
+        if plan
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| action.command == "object.label")
+            .filter(|(index, action)| {
+                action
+                    .params
+                    .get("ids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ids| ids.iter().filter_map(Value::as_str).any(|reference| direct_frame(reference, *index).ok() == Some(frame)))
+            })
+            .map(|(_, action)| action)
+            .next_back()
+            .and_then(|action| action.params.get("label"))
+            .and_then(Value::as_str)
+            != Some(label)
+        {
+            return Err("Host copy provenance was overwritten after binding".into());
+        }
+        if plan
+            .commands
+            .iter()
+            .skip(label_index.saturating_add(1))
+            .any(|action| action.command == "object.label" && action.params.get("ids").is_none())
+        {
+            return Err("An implicit later label could overwrite host copy provenance; use explicit object references".into());
+        }
+        coverage.entry(value.copy_id).or_default().push(value.word_range);
+    }
+    complete_copy_ranges(&mut coverage, &sources)?;
+    Ok(coverage.into_keys().collect())
+}
+
+pub(crate) fn source_copy_context(brief: &str, scope: BatchScope) -> Result<Value, String> {
+    let sources = copy_sources(brief, scope)?;
+    let mut ordered: Vec<_> = sources.iter().collect();
+    ordered.sort_by_key(|(_, source)| (source.page, source.language == "ar", source.segment));
+    let segments: Vec<_> = ordered
+        .into_iter()
+        .map(|(id, source)| {
+            json!({"id":id,"page":source.page,"language":source.language,
+        "text":source.text,"words":source.words.iter().enumerate().map(|(index,text)|json!({"index":index,"text":text})).collect::<Vec<_>>() })
+        })
+        .collect();
+    let context = json!({"segments":segments,"range_convention":"word_range is zero-based [start,end), excluding end; words retain exact punctuation, numerals and Arabic diacritics",
+        "binding_policy":"Optional copy_bindings reference segments[].id. Bind each native text frame once. If any part of a segment is bound, partition all its words exactly once across bound frames. The host injects original words, so placeholder frame text is replaced. Unbound segments must satisfy the existing strict literal copy gate. Do not supply host provenance labels."});
+    if serde_json::to_vec(&context).map_err(|error| error.to_string())?.len() > MAX_BRIEF_BYTES {
+        return Err("Indexed source copy context exceeds 1 MiB; reduce the internal page scope".into());
+    }
+    Ok(context)
+}
+
+pub(crate) fn copy_binding_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["frame","copy_id","word_range"],"properties":{
+        "frame":{"type":"integer","minimum":0,"maximum":511,"description":"Index of an authored native text frame.create command"},
+        "copy_id":{"type":"string","minLength":1,"maxLength":64},
+        "word_range":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"integer","minimum":0,"maximum":MAX_COPY_WORDS}}
+    }})
+}
+
+pub(crate) fn compile_native_plan_for_brief(text: &str, scope: BatchScope, brief: &str) -> Result<ProductionPlan, String> {
+    compile_native_content(text, scope, Some(brief))
 }
 
 #[cfg(test)]
@@ -615,6 +886,121 @@ mod tests {
             ],
             images: vec![],
         }
+    }
+
+    const BINDING_SCRIPT: &str = "### PAGE 01 — Cover\n* **English Print Copy (LTR):**\n  > Level KG2 (Ages 5–6) | Price $5\n* **Arabic Print Copy (RTL - Vocalized):**\n  > الرَّوْضَةُ الثَّانِيَةُ (KG2) - الأَعْمَارُ ٥-٦ سَنَوَاتٍ\n";
+
+    fn binding_content() -> Value {
+        json!({"title":"Bound copy","commands":[
+            {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,45,250,90],"text":"placeholder"}},
+            {"command":"frame.create","params":{"spread":0,"content":"text","rect":[250,45,550,140],"text":"placeholder"}},
+            {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,100,250,145],"text":"placeholder"}},
+            {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,160,250,205],"text":"placeholder"}}
+        ],"images":[],"copy_bindings":[
+            {"frame":0,"copy_id":"p1.en.1","word_range":[0,2]},
+            {"frame":1,"copy_id":"p1.ar.1","word_range":[0,7]},
+            {"frame":2,"copy_id":"p1.en.1","word_range":[2,4]},
+            {"frame":3,"copy_id":"p1.en.2","word_range":[0,2]}
+        ]})
+    }
+
+    #[test]
+    fn copy_bindings_inject_original_words_across_interleaved_frames_and_survive_cache_roundtrip() {
+        let scope = BatchScope { start: 0, count: 1 };
+        let bound = compile_native_plan_for_brief(&binding_content().to_string(), scope, BINDING_SCRIPT).unwrap();
+        assert_eq!(bound.commands[0].params["text"], "Level KG2");
+        assert_eq!(bound.commands[1].params["text"], "الرَّوْضَةُ الثَّانِيَةُ (KG2) - الأَعْمَارُ ٥-٦ سَنَوَاتٍ");
+        assert_eq!(bound.commands[2].params["text"], "(Ages 5–6)");
+        assert_eq!(bound.commands[3].params["text"], "Price $$5");
+        assert!(bound.commands.iter().any(|action| action.command == "object.label"));
+        let cached: ProductionPlan = serde_json::from_value(serde_json::to_value(&bound).unwrap()).unwrap();
+        validate_plan(BINDING_SCRIPT, scope, &cached).unwrap();
+        let mut changed = cached.clone();
+        changed.commands.push(EngineAction { command: "story.setText".into(), params: json!({"story":"$2.story","text":"(Ages 5–7)"}) });
+        assert!(validate_plan(BINDING_SCRIPT, scope, &changed).is_err());
+        let mut unvocalized = cached.clone();
+        unvocalized.commands[1].params["text"] = json!("الروضة الثانية (KG2) - الأعمار ٥-٦ سنوات");
+        assert!(validate_plan(BINDING_SCRIPT, scope, &unvocalized).is_err());
+        assert!(validate_plan(&BINDING_SCRIPT.replace("5–6", "5–7"), scope, &cached).is_err());
+    }
+
+    #[test]
+    fn copy_bindings_context_exposes_stable_source_words_and_bounded_schema() {
+        let context = source_copy_context(BINDING_SCRIPT, BatchScope { start: 0, count: 1 }).unwrap();
+        let segments = context["segments"].as_array().unwrap();
+        let en = segments.iter().find(|source| source["id"] == "p1.en.1").unwrap();
+        assert_eq!(en["words"], json!([{"index":0,"text":"Level"},{"index":1,"text":"KG2"},{"index":2,"text":"(Ages"},{"index":3,"text":"5–6)"}]));
+        assert_eq!(copy_binding_schema()["properties"]["word_range"]["minItems"], 2);
+    }
+
+    #[test]
+    fn copy_bindings_reject_gaps_duplicate_coverage_invalid_references_and_wrong_pages() {
+        let scope = BatchScope { start: 0, count: 1 };
+        for binding in [
+            json!({"frame":0,"copy_id":"p1.en.1","word_range":[0,1]}),
+            json!({"frame":0,"copy_id":"p1.en.1","word_range":[0,3]}),
+            json!({"frame":999,"copy_id":"p1.en.1","word_range":[0,2]}),
+            json!({"frame":0,"copy_id":"p2.en.1","word_range":[0,2]}),
+            json!({"frame":0,"copy_id":"p1.en.1","word_range":[2,1]}),
+            json!({"frame":0,"copy_id":"p1.en.1","word_range":[0,999999]}),
+        ] {
+            let mut content = binding_content();
+            content["copy_bindings"][0] = binding;
+            assert!(compile_native_plan_for_brief(&content.to_string(), scope, BINDING_SCRIPT).is_err());
+        }
+        let mut wrong_page = binding_content();
+        wrong_page["commands"][0]["params"]["spread"] = json!(1);
+        assert!(compile_native_plan_for_brief(&wrong_page.to_string(), scope, BINDING_SCRIPT).is_err());
+        let mut duplicate_frame = binding_content();
+        duplicate_frame["copy_bindings"][2]["frame"] = json!(0);
+        assert!(compile_native_plan_for_brief(&duplicate_frame.to_string(), scope, BINDING_SCRIPT).is_err());
+        assert!(compile_native_plan(&binding_content().to_string(), scope).is_err());
+    }
+
+    #[test]
+    fn copy_bindings_keep_twenty_native_chart_cards_independent_of_creation_order() {
+        let names =
+            "One Two Three Four Five Six Seven Eight Nine Ten Eleven Twelve Thirteen Fourteen Fifteen Sixteen Seventeen Eighteen Nineteen Twenty";
+        let brief = format!(
+            "### PAGE 01 — Number Chart\n* **English Print Copy (LTR):**\n  > MY NUMBER CHART 1–20 ({})\n",
+            names.split_whitespace().collect::<Vec<_>>().join(", ")
+        );
+        let mut content = json!({"title":"Twenty cards","commands":[{"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,45,550,90],"text":"placeholder"}}],"images":[],"copy_bindings":[{"frame":0,"copy_id":"p1.en.1","word_range":[0,4]}]});
+        for index in 0..20 {
+            let commands = content["commands"].as_array_mut().unwrap();
+            let frame = commands.len();
+            commands.push(json!({"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,100,100,145],"text":"placeholder"}}));
+            commands.push(json!({"command":"frame.create","params":{"spread":0,"content":"text","rect":[105,100,160,145],"text":"بِطَاقَةٌ"}}));
+            content["copy_bindings"].as_array_mut().unwrap().push(json!({"frame":frame,"copy_id":"p1.en.1","word_range":[index+4,index+5]}));
+        }
+        let scope = BatchScope { start: 0, count: 1 };
+        let plan = compile_native_plan_for_brief(&content.to_string(), scope, &brief).unwrap();
+        validate_plan(&brief, scope, &plan).unwrap();
+        assert_eq!(plan.commands[1].params["text"], "(One,");
+        assert_eq!(plan.commands[39].params["text"], "Twenty)");
+    }
+
+    #[test]
+    fn copy_bindings_reject_forged_or_overwritten_provenance_and_keep_unbound_copy_strict() {
+        let scope = BatchScope { start: 0, count: 1 };
+        let bound = compile_native_plan_for_brief(&binding_content().to_string(), scope, BINDING_SCRIPT).unwrap();
+        assert!(validate_plan(&format!("# Changed global specification\n{BINDING_SCRIPT}"), scope, &bound).is_err());
+        let mut forged = binding_content();
+        forged["commands"].as_array_mut().unwrap().push(serde_json::to_value(&bound.commands[4]).unwrap());
+        assert!(compile_native_plan_for_brief(&forged.to_string(), scope, BINDING_SCRIPT).is_err());
+        let mut overwritten = bound.clone();
+        overwritten
+            .commands
+            .push(EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id","$2.id"],"label":"lost provenance"}) });
+        assert!(validate_plan(BINDING_SCRIPT, scope, &overwritten).is_err());
+        let mut partial = binding_content();
+        partial["copy_bindings"].as_array_mut().unwrap().pop();
+        partial["commands"][3]["params"]["text"] = json!("Price $15");
+        let plan = compile_native_plan_for_brief(&partial.to_string(), scope, BINDING_SCRIPT).unwrap();
+        assert!(validate_plan(BINDING_SCRIPT, scope, &plan).is_err());
+        let mut too_many = binding_content();
+        too_many["copy_bindings"] = json!(vec![too_many["copy_bindings"][0].clone(); MAX_COPY_BINDINGS + 1]);
+        assert!(compile_native_plan_for_brief(&too_many.to_string(), scope, BINDING_SCRIPT).unwrap_err().contains("256"));
     }
 
     #[test]

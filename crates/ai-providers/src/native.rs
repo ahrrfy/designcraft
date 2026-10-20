@@ -8,6 +8,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(90);
+// Complex native-page plans and high-resolution artwork can legitimately
+// exceed 90 seconds. Keep connection/discovery bounds and never retry a POST;
+// only Gemini generation receives this longer, still bounded response window.
+const GEMINI_GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
 const IMAGE_JSON_LIMIT: usize = 24 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -104,7 +108,11 @@ impl<'a> Transport<'a> {
     }
 
     fn request(&self, method: reqwest::Method, url: Url) -> Result<RequestBuilder, String> {
+        let generation = self.provider == ProviderKind::Gemini && method == reqwest::Method::POST;
         let mut request = self.client.request(method, url);
+        if generation {
+            request = request.timeout(GEMINI_GENERATION_TIMEOUT);
+        }
         if let Some(key) = self.key {
             let mut value = HeaderValue::from_str(if self.provider == ProviderKind::Gemini { key } else { "" }).map_err(|_| "Invalid API key")?;
             if self.provider != ProviderKind::Gemini {

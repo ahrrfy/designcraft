@@ -612,6 +612,13 @@ impl Runner<'_> {
         if current_document || adaptive_layout {
             opened_document_geometry(&mut document_context, base)?;
         }
+        if explicit_script && let Some(scope) = scope {
+            document_context
+                .as_object_mut()
+                .ok_or("Invalid explicit-copy context")?
+                .insert("source_copy".into(), crate::script_contract::source_copy_context(&request.prompt, scope)?);
+            system.push_str("\nNATIVE SOURCE COPY BINDINGS: document.source_copy contains immutable print-copy segments and indexed words. Prefer copy_bindings:[{frame:ZERO_BASED_COMMAND_INDEX,copy_id,word_range:[START,EXCLUSIVE_END]}] with an empty text placeholder in each referenced frame.create. The host inserts the exact source words, punctuation and Arabic marks locally. Split a segment across its designed native frames using complete non-overlapping word ranges; this supports bilingual interleaving and separate number-chart cards without retyping or changing copy. Each bound frame must be on the copy segment's page. Bind all words of any segment you bind, exactly once. Do not overwrite bound stories or their reserved provenance labels. Font/direction/alignment commands still apply normally. Unbound copy is checked literally as before.");
+        }
         if request.settings.facing_pages
             && let Some(scope) = scope
         {
@@ -625,6 +632,9 @@ impl Runner<'_> {
         let mut schema = plan_schema(catalog, request.settings.output_mode)?;
         if scope.is_some() {
             schema["properties"]["activities"] = json!({"type":"array","maxItems":16,"items":crate::script_contract::activity_schema()});
+            if explicit_script {
+                schema["properties"]["copy_bindings"] = json!({"type":"array","maxItems":256,"items":crate::script_contract::copy_binding_schema()});
+            }
         }
         let mut generation = GenerationRequest {
             system,
@@ -659,7 +669,13 @@ impl Runner<'_> {
                 .map(|scope| {
                     parse_json::<Value>(&response.text)
                         .and_then(|value| bounded_json(&value, MAX_JSON))
-                        .and_then(|text| crate::script_contract::compile_native_plan(&text, scope))
+                        .and_then(|text| {
+                            if explicit_script {
+                                crate::script_contract::compile_native_plan_for_brief(&text, scope, &request.prompt)
+                            } else {
+                                crate::script_contract::compile_native_plan(&text, scope)
+                            }
+                        })
                         .and_then(|plan| bounded_json(&serde_json::to_value(plan).map_err(|e| e.to_string())?, MAX_JSON))
                 })
                 .transpose();
@@ -720,6 +736,26 @@ impl Runner<'_> {
                 Err(error) => (response.text, error),
             };
             check_cancel(self.cancel)?;
+            // Keep bounded local evidence, never a validated cache entry or
+            // executable input. Large plans expose only bounded native text.
+            let rejected_text =
+                parse_json::<Value>(&previous).ok().and_then(|value| {
+                    let text: Vec<_> = value.get("commands")?.as_array()?.iter().enumerate().filter_map(|(index, action)| {
+                    let command = action.get("command")?.as_str()?;
+                    if !matches!(command, "frame.create" | "story.setText") { return None; }
+                    let params = action.get("params")?;
+                    let text = params.get("text")?.as_str()?;
+                    Some(json!({"command_index":index,"command":command,"spread":params.get("spread"),"story":params.get("story"),"text":text}))
+                }).collect();
+                    bounded_json(&json!(text), 8192).ok()
+                });
+            self.diagnostics(vec![json!({
+                "kind":"nativePlanningValidation", "attempt":attempt.saturating_add(1),
+                "message":validation, "rejected_plan_included":previous.len() <= 8192,
+                "rejected_plan":if previous.len() <= 8192 {Some(previous.as_str())} else {None},
+                "rejected_native_text":if previous.len() > 8192 {rejected_text} else {None},
+                "scope":scope,
+            })])?;
             if attempt == repair_attempts {
                 return Err(format!("AI plan rejected: {validation}"));
             }
@@ -4295,7 +4331,7 @@ mod tests {
             export_directory: None,
         };
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
-        let (sender, _receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let mut runner = Runner {
             cache_root: None,
@@ -4309,6 +4345,16 @@ mod tests {
         };
         assert!(runner.production(request, json!({}), catalog(), vec![], base, session.prefs.clone()).is_err());
         assert_eq!(ledger.summary().requests, 1);
+        let diagnostic = receiver
+            .try_iter()
+            .find_map(|message| match message {
+                Message::Diagnostic(value) if value["kind"] == "nativePlanningValidation" => Some(value),
+                _ => None,
+            })
+            .expect("Rejected plans must leave bounded local diagnostic evidence");
+        assert_eq!(diagnostic["attempt"], 1);
+        assert_eq!(diagnostic["rejected_plan_included"], true);
+        assert_eq!(serde_json::from_str::<Value>(diagnostic["rejected_plan"].as_str().unwrap()).unwrap(), invalid);
     }
     impl Provider for Mock {
         fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
@@ -5227,6 +5273,9 @@ mod tests {
                 let input: Value = serde_json::from_str(&request.prompt).unwrap();
                 assert_eq!(input["document"]["pageWidth"].as_f64(), Some(720.0));
                 assert_eq!(input["document"]["pageGeometry"][0]["margins"]["inside"].as_f64(), Some(51.0));
+                assert_eq!(input["document"]["source_copy"]["segments"][0]["id"], "p1.en.1");
+                assert_eq!(input["document"]["source_copy"]["segments"][0]["text"], "My book");
+                assert!(request.json_schema["properties"]["copy_bindings"].is_object());
                 Err("Adaptive context reached the selected provider".into())
             }
             fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
