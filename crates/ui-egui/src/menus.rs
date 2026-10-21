@@ -16,6 +16,7 @@ pub fn shown(app: &DesignApp, id: &str) -> bool {
 
 /// UI commands: (id, label, shortcut, params).
 pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
+    ("app.checkPreviewUpdate", "Check & Stage Preview Update", None, "{} — check verified launcher updates without closing documents"),
     ("ai.production", "AI Production…", None, "{} — open native AI production"),
     ("ai.skills", "AI Skills…", None, "{} — review, sample and approve skills"),
     ("ai.usage", "AI Usage…", None, "{} — session task and usage reports"),
@@ -1011,6 +1012,7 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
             crate::ai::dispatch(app, designcraft_ai_types::protocol::AiRequest::Poll)
         }
         "ai.request" => crate::ai::request_command(app, p),
+        "app.checkPreviewUpdate" => app.ui.ai.preview_update.command(p),
         "window.minimize" => {
             app.pending_window_commands.push(egui::ViewportCommand::Minimized(true));
             Ok(Value::Null)
@@ -2130,6 +2132,9 @@ fn window_control_available(app: &DesignApp, id: &str) -> bool {
 
 /// Is a command enabled (for menu greying)?
 pub fn enabled(app: &DesignApp, id: &str) -> bool {
+    if id == "app.checkPreviewUpdate" {
+        return app.ui.ai.preview_update.enabled();
+    }
     if waits_for_ime(app, id) {
         return false;
     }
@@ -2451,6 +2456,9 @@ pub fn checked(app: &DesignApp, id: &str, params: &Value) -> Option<bool> {
 
 /// Enablement for menu display (UI commands need a document unless they're app/window-level).
 pub fn menu_enabled(app: &DesignApp, id: &str) -> bool {
+    if id == "app.checkPreviewUpdate" {
+        return enabled(app, id);
+    }
     if waits_for_ime(app, id) {
         return false;
     }

@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
     let mut candidate = plan.clone();
+    let mut notes = format_populated_new_stories(&mut candidate)?;
+    crate::image_repetition::normalize(&mut candidate)?;
+    crate::design::check_document_image_slots(base, &candidate.images)?;
     let mut scratch = Session::new();
     scratch.prefs = prefs.clone();
     scratch.add_document(base.clone());
@@ -34,7 +37,7 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
             frames.push((index, ItemId(id), StoryId(story)));
         }
     }
-    let mut notes = recover_text_positions(&mut candidate, &mut scratch, base, &frames, cancel)?;
+    notes.extend(recover_text_positions(&mut candidate, &mut scratch, base, &frames, cancel)?);
     let mut seen = BTreeSet::new();
     for (index, id, story_id) in frames {
         if cancel.load(Ordering::Relaxed) {
@@ -184,8 +187,105 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     verified
         .execute("production.apply", &json!({"commands":candidate.commands,"outputMode":"native_with_images","requirePreflight":true}))
         .map_err(|e| e.to_string())?;
+    check_repeated_slots(&candidate, verified.doc().map_err(|e| e.to_string())?, cancel)?;
     *plan = candidate;
     Ok(notes)
+}
+
+/// A generation plan has already supplied its complete copy. A start caret
+/// followed by character formatting would otherwise style only future typing,
+/// leaving the generated words at the engine defaults. Recover this narrow
+/// no-op using a real UTF-8 selection, never changing general caret semantics.
+fn format_populated_new_stories(plan: &mut ProductionPlan) -> Result<Vec<Value>, String> {
+    // Editing plans may intentionally set insertion formatting before replacing
+    // or inserting copy. Their cursor/range contract stays untouched.
+    if plan.commands.iter().any(|action| matches!(action.command.as_str(), "text.insert" | "text.delete" | "text.replace" | "story.setText")) {
+        return Ok(Vec::new());
+    }
+    let mut notes = Vec::new();
+    for index in 0..plan.commands.len() {
+        let Some(action) = plan.commands.get(index) else { continue };
+        if action.command != "text.select"
+            || action.params.get("anchor").and_then(Value::as_u64) != Some(0)
+            || action.params.get("focus").and_then(Value::as_u64) != Some(0)
+            || plan.commands.get(index.saturating_add(1)).is_none_or(|next| next.command != "type.char")
+        {
+            continue;
+        }
+        let Some(source) = action
+            .params
+            .get("story")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix('$')?.strip_suffix(".story")?.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if source >= index {
+            continue;
+        }
+        let earlier = plan.commands.get(source.saturating_add(1)..index).ok_or("Invalid generated formatting range")?;
+        let story_reference = format!("${source}.story");
+        let frame_reference = format!("${source}.id");
+        if earlier.iter().any(|previous| {
+            (previous.command == "text.select" && previous.params.get("story").and_then(Value::as_str) == Some(story_reference.as_str()))
+                || (previous.command == "selection.set"
+                    && previous
+                        .params
+                        .get("ids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(frame_reference.as_str()))))
+        }) {
+            // An earlier explicit range/frame selection may carry deliberately
+            // mixed typography. Do not reinterpret its later insertion caret.
+            continue;
+        }
+        let Some(frame) = plan
+            .commands
+            .get(source)
+            .filter(|frame| frame.command == "frame.create" && frame.params.get("content").and_then(Value::as_str) == Some("text"))
+        else {
+            continue;
+        };
+        let Some(copy) = frame.params.get("text").and_then(Value::as_str).filter(|copy| !copy.is_empty()) else { continue };
+        let bytes = copy.len();
+        let selection = plan.commands.get_mut(index).ok_or("Generated formatting selection disappeared")?;
+        *selection.params.get_mut("focus").ok_or("Generated formatting selection has no focus")? = json!(bytes);
+        notes.push(json!({"kind":"nativeFormattingRange","command":index,"frame":source,"utf8_bytes":bytes,
+            "message":"Applied generated character formatting to the complete newly supplied copy, using a native UTF-8 text selection"}));
+    }
+    Ok(notes)
+}
+
+fn check_repeated_slots(plan: &ProductionPlan, state: &DocState, cancel: &AtomicBool) -> Result<(), String> {
+    for (index, image) in plan.images.iter().enumerate().filter(|(_, image)| image.instance_count() > 1) {
+        let obstacles = fitting_obstacles(&state.doc, image.page, cancel)?;
+        for r in image.all_rects() {
+            let bounds = Rect::new(r[0], r[1], r[2], r[3]);
+            if plan.commands.iter().any(|a| {
+                a.command == "frame.create"
+                    && a.params.get("content").and_then(Value::as_str) == Some("graphic")
+                    && a.params.get("spread").and_then(Value::as_u64).unwrap_or(0) == image.page as u64
+                    && a.params.get("rect").is_some_and(|v| *v == serde_json::json!(r))
+            }) {
+                return Err("Do not precreate repeated graphic cells; the host duplicates the source frame".into());
+            }
+            for obstacle in &obstacles {
+                let Some(item) = state.doc.item(obstacle.id) else { continue };
+                if item.text_frame().is_some() && overlaps(bounds, obstacle.bounds) {
+                    return Err("Repeated illustration cells overlap native text; reflow the cells before image generation".into());
+                }
+                if item.graphic().is_some() && overlaps(bounds, obstacle.bounds) {
+                    return Err("Repeated illustration cells overlap existing artwork; no images were requested".into());
+                }
+            }
+            if plan.images.iter().enumerate().any(|(other_index, other)| {
+                other_index != index && other.page == image.page && other.all_rects().any(|other| crate::image_repetition::overlaps(r, other))
+            }) {
+                return Err("Repeated illustration cells overlap another pending image; no images were requested".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn frame_identity(spread: usize, index: usize, id: ItemId, rect: Rect, text: &str) -> String {
@@ -286,8 +386,7 @@ fn containing_background_growths(
             return Ok(None);
         }
     }
-    for image in plan.images.iter().filter(|image| image.page == text.spread) {
-        let [x0, y0, x1, y1] = image.rect;
+    for [x0, y0, x1, y1] in plan.images.iter().filter(|image| image.page == text.spread).flat_map(|image| image.all_rects()) {
         if overlaps(text.target, Rect::new(x0, y0, x1, y1)) && !overlaps(text.original, Rect::new(x0, y0, x1, y1)) {
             return Ok(None);
         }
@@ -312,8 +411,7 @@ fn containing_background_growths(
                 return Ok(None);
             }
         }
-        for image in plan.images.iter().filter(|image| image.page == text.spread) {
-            let [x0, y0, x1, y1] = image.rect;
+        for [x0, y0, x1, y1] in plan.images.iter().filter(|image| image.page == text.spread).flat_map(|image| image.all_rects()) {
             let bounds = Rect::new(x0, y0, x1, y1);
             if background_growth_blocks(background, bounds, bounds, band) {
                 return Ok(None);
@@ -645,8 +743,7 @@ fn position_collision(
             return Ok(true);
         }
     }
-    for image in plan.images.iter().filter(|image| image.page == position.spread) {
-        let [x0, y0, x1, y1] = image.rect;
+    for [x0, y0, x1, y1] in plan.images.iter().filter(|image| image.page == position.spread).flat_map(|image| image.all_rects()) {
         if blocks_translation(Rect::new(x0, y0, x1, y1), position.original, position.target) {
             return Ok(true);
         }
@@ -674,6 +771,86 @@ fn contains(a: Rect, b: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai24_formatting_range_recovery_is_utf8_exact_idempotent_and_preserves_editing_ranges() {
+        let copy = "الأعداد ١٥ و١٦";
+        let base: ProductionPlan = serde_json::from_value(json!({"title":"Arabic header","images":[],"commands":[
+            {"command":"frame.create","params":{"spread":0,"content":"text","rect":[50,50,400,100],"text":copy}},
+            {"command":"text.select","params":{"story":"$0.story","anchor":0,"focus":0}},
+            {"command":"type.char","params":{"attrs":{"size":15}}}
+        ]}))
+        .unwrap();
+        let mut recovered = base.clone();
+        assert_eq!(format_populated_new_stories(&mut recovered).unwrap().len(), 1);
+        assert_eq!(recovered.commands[1].params["focus"], copy.len());
+        assert!(format_populated_new_stories(&mut recovered).unwrap().is_empty());
+        assert_eq!(recovered.commands[0].params["text"], copy);
+        for change in ["insert", "replace", "external", "midstory", "range", "prior_range"] {
+            let mut plan = base.clone();
+            match change {
+                "insert" => plan.commands.push(EngineAction { command: "text.insert".into(), params: json!({"text":"A"}) }),
+                "replace" => plan.commands.push(EngineAction { command: "story.setText".into(), params: json!({"story":"$0.story","text":"B"}) }),
+                "external" => plan.commands[1].params["story"] = json!(123),
+                "midstory" => {
+                    plan.commands[1].params["anchor"] = json!(2);
+                    plan.commands[1].params["focus"] = json!(2);
+                }
+                "prior_range" => {
+                    plan.commands.insert(1, EngineAction { command: "text.select".into(), params: json!({"story":"$0.story","anchor":0,"focus":2}) });
+                }
+                _ => plan.commands[1].params["focus"] = json!(2),
+            }
+            let before = serde_json::to_value(&plan).unwrap();
+            assert!(format_populated_new_stories(&mut plan).unwrap().is_empty(), "{change}");
+            assert_eq!(serde_json::to_value(&plan).unwrap(), before, "{change}");
+        }
+    }
+
+    #[test]
+    fn ai24_new_story_caret_formatting_targets_existing_copy_without_changing_engine_caret_semantics() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({"title":"Header formatting","images":[],"commands":[
+            {"command":"frame.create","params":{"spread":0,"content":"text","rect":[54,76,280,110],"text":"Numbers 15 & 16: Ocean Treasure Counting"}},
+            {"command":"text.select","params":{"story":"$0.story","anchor":0,"focus":0}},
+            {"command":"type.char","params":{"attrs":{"size":9.5}}}
+        ]})).unwrap();
+        let notes = prepare(&mut plan, session.doc().unwrap(), &session.prefs, &AtomicBool::new(false)).unwrap();
+        assert_eq!(plan.commands[1].params["focus"], plan.commands[0].params["text"].as_str().unwrap().len());
+        assert!(notes.iter().any(|note| note["kind"] == "nativeFormattingRange"));
+        let result =
+            session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        let story = session.doc().unwrap().doc.story(StoryId(result["results"][0]["story"].as_u64().unwrap())).unwrap();
+        let doc = &session.doc().unwrap().doc;
+        let (_, base) = doc.styles.resolve_para(&story.paras[0]);
+        for byte in [0, story.text.len() - 1] {
+            assert_eq!(doc.styles.resolve_char(&base, story.char_format_of(byte)).size, 9.5);
+        }
+        // The general engine retains insertion-only semantics at a real caret.
+        session.execute("text.select", &json!({"story":story.id.0,"anchor":0,"focus":0})).unwrap();
+        session.execute("type.char", &json!({"attrs":{"size":30}})).unwrap();
+        let doc = &session.doc().unwrap().doc;
+        let story = doc.story(StoryId(result["results"][0]["story"].as_u64().unwrap())).unwrap();
+        assert_eq!(doc.styles.resolve_char(&base, story.char_format_of(0)).size, 9.5);
+    }
+
+    #[test]
+    fn ai24_each_repeated_cell_is_a_pre_image_margin_and_text_obstacle() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":1,"facingPages":false})).unwrap();
+        for (cell, expected) in [([220.0, 180.0, 260.0, 220.0], "overlap native text"), ([1.0, 180.0, 41.0, 220.0], "safe margin")] {
+            let mut plan: ProductionPlan = serde_json::from_value(json!({"title":"Units","commands":[
+                {"command":"frame.create","params":{"spread":0,"rect":[215,180,360,225],"content":"text","text":"Keep this copy"}}
+            ],"images":[{"prompt":"One fish","page":0,"rect":[60,180,100,220],"label":"Fish","repeat_rects":[cell]}]}))
+            .unwrap();
+            let before = serde_json::to_value(&plan).unwrap();
+            let error = prepare(&mut plan, session.doc().unwrap(), &session.prefs, &AtomicBool::new(false)).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+            assert!(session.doc().unwrap().doc.spreads[0].items.is_empty());
+        }
+    }
     use designcraft_engine::Session;
     use serde_json::json;
 
@@ -974,6 +1151,8 @@ mod tests {
                     session.execute("frame.create", &obstacle).unwrap();
                 }
                 "image" => plan.images.push(designcraft_ai_types::protocol::ImagePlacement {
+                    repeat_rects: Vec::new(),
+                    repeat_groups: Vec::new(),
                     prompt: "Synthetic obstacle".into(),
                     page: 0,
                     rect: [300.0, 99.0, 540.0, 125.0],

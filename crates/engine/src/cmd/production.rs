@@ -145,7 +145,10 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
         ),
         (
             "transform.move",
-            object(&[("ids", ids()), ("dx", number(-15552.0, 15552.0)), ("dy", number(-15552.0, 15552.0))], &["ids", "dx", "dy"]),
+            object(
+                &[("ids", ids()), ("dx", number(-15552.0, 15552.0)), ("dy", number(-15552.0, 15552.0)), ("copy", boolean())],
+                &["ids", "dx", "dy"],
+            ),
             json!({"ids":["$0.id"],"dx":0,"dy":20}),
         ),
         (
@@ -539,6 +542,7 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
     work.in_undo_step = true;
     let mut results = Vec::with_capacity(actions.len());
     let mut image_sources = BTreeSet::new();
+    let mut placed_raster_frames = BTreeSet::new();
     let mut image_bytes = 0usize;
     let mut image_pixels = 0u64;
     let mut table_cells = 0u64;
@@ -552,6 +556,22 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
         bounded(&resolved)?;
         let schema = vetted.iter().find(|(c, _, _)| *c == id).ok_or_else(|| bad(ID, "command not vetted"))?;
         check(&schema.1, &resolved, id)?;
+        if id == "transform.move" && resolved.get("copy").and_then(Value::as_bool) == Some(true) {
+            let targets = resolved.get("ids").and_then(Value::as_array).ok_or_else(|| bad(ID, "raster copy needs explicit targets"))?;
+            let source = targets.first().and_then(Value::as_u64).filter(|_| targets.len() == 1);
+            let current = work.doc()?;
+            if !images
+                || !source.is_some_and(|source| {
+                    placed_raster_frames.contains(&source)
+                        && current
+                            .doc
+                            .item(designcraft_doc::ItemId(source))
+                            .is_some_and(|item| item.graphic().is_some() && item.children().is_empty())
+                })
+            {
+                return Err(bad(ID, "production copy requires one validated raster leaf placed in this private draft"));
+            }
+        }
         if id == "frame.create" {
             let coordinates: Vec<_> = resolved.get("rect").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_f64).collect();
             if coordinates.get(2).zip(coordinates.first()).is_none_or(|(right, left)| right <= left)
@@ -582,6 +602,10 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
             }
         }
         let result = work.execute(id, &resolved).map_err(|e| bad(ID, format!("step {i} ({id}): {e}")))?;
+        if id == "file.place" {
+            let frame = result.get("id").and_then(Value::as_u64).ok_or_else(|| bad(ID, "validated raster placement did not return a frame"))?;
+            placed_raster_frames.insert(frame);
+        }
         if work.doc()?.doc.page_count() > 1000 {
             return Err(bad(ID, "production page limit exceeded"));
         }
@@ -954,6 +978,21 @@ pub fn specs() -> Vec<CommandSpec> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ai24_production_copy_cannot_duplicate_unvalidated_or_grouped_objects() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &serde_json::json!({})).unwrap();
+        let before = s.doc().unwrap().doc.clone();
+        let result = s.execute(
+            "production.apply",
+            &serde_json::json!({"outputMode":"native_with_images","commands":[
+                {"command":"frame.create","params":{"rect":[60,60,120,120]}},
+                {"command":"transform.move","params":{"ids":["$0.id"],"dx":100,"dy":0,"copy":true}}
+            ]}),
+        );
+        assert!(result.is_err(), "copy must be limited to a validated raster leaf placed in this private draft");
+        assert_eq!(s.doc().unwrap().doc, before);
+    }
     use super::*;
     use std::sync::Arc;
 

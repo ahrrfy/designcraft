@@ -311,6 +311,7 @@ impl Runner<'_> {
         prefs: &Prefs,
         scope: Option<BatchScope>,
         catalog: &Value,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
     ) -> Result<Option<ProductionPlan>, String> {
         let (Some(root), Some(key)) = (&self.cache_root, key) else {
             return Ok(None);
@@ -334,6 +335,7 @@ impl Runner<'_> {
             }
             self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
             validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+            image_command_budget(&plan, profile)?;
             Ok::<_, String>(())
         })();
         if let Err(error) = valid {
@@ -358,18 +360,30 @@ impl Runner<'_> {
         selection: &ModelSelection,
     ) -> Result<Option<String>, String> {
         let original = image_request_size(placement, profile, selection)?;
-        let Some(contract) = self.print.as_ref() else {
+        let Some(required) = self.required_source_pixels(placement, profile)? else {
             return Ok(original);
         };
-        let Some(mut required) = contract.required_image_pixels(placement.rect)? else {
-            return Ok(original);
-        };
+        if selection.provider == ProviderKind::Gemini {
+            let ratio = original.as_deref().ok_or("Gemini print image has no aspect ratio")?;
+            return providers::gemini_print_size(&selection.model, ratio, required).map(Some);
+        }
+        Ok(original)
+    }
+    fn required_source_pixels(
+        &self,
+        placement: &designcraft_ai_types::protocol::ImagePlacement,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+    ) -> Result<Option<[u32; 2]>, String> {
+        let Some(contract) = self.print.as_ref() else { return Ok(None) };
+        let Some(mut required) = contract.required_image_pixels(placement.rect)? else { return Ok(None) };
         let slot = declared_image_slot(placement, profile);
         let mut crops = vec![(placement.rect, slot.and_then(|slot| slot.crop))];
         if let Some(slot) = slot {
             for view in &slot.views {
                 crops.push((view.rect, Some(view.crop)));
             }
+        } else {
+            crops.extend(placement.repeat_rects.iter().map(|rect| (*rect, None)));
         }
         for (rect, crop) in crops {
             if let Some(pixels) = contract.required_image_pixels(rect)? {
@@ -388,11 +402,103 @@ impl Runner<'_> {
                 required[1] = required[1].max(h as u32);
             }
         }
-        if selection.provider == ProviderKind::Gemini {
-            let ratio = original.as_deref().ok_or("Gemini print image has no aspect ratio")?;
-            return providers::gemini_print_size(&selection.model, ratio, required).map(Some);
+        Ok(Some(required))
+    }
+    /// Provider outputs are alternatives for one native placement. Quality here
+    /// means bounded decodability, geometry and resolution, never semantic approval.
+    fn choose_placement_image(
+        &self,
+        images: Vec<providers::GeneratedImage>,
+        placement: &designcraft_ai_types::protocol::ImagePlacement,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+    ) -> Result<providers::GeneratedImage, String> {
+        if images.is_empty() || images.len() > MAX_IMAGES {
+            return Err(format!(
+                "Image provider returned {} final images for page {}; expected 1–{MAX_IMAGES} bounded alternatives",
+                images.len(),
+                placement.page.saturating_add(1)
+            ));
         }
-        Ok(original)
+        let count = images.len();
+        let slot = declared_image_slot(placement, profile);
+        let ratio = image_source_ratio(placement, slot)?;
+        let required = self.required_source_pixels(placement, profile)?;
+        let mut best: Option<(usize, f64, u64, providers::GeneratedImage)> = None;
+        let mut candidates = Vec::with_capacity(count);
+        let mut normalized_bytes = 0usize;
+        for (index, raw) in images.into_iter().enumerate() {
+            check_cancel(self.cancel)?;
+            let checked = (|| -> Result<(providers::GeneratedImage, u32, u32), String> {
+                let image = prepare_generated_image(raw)?;
+                normalized_bytes = normalized_bytes
+                    .checked_add(image.bytes.len())
+                    .filter(|total| *total <= MAX_UNIQUE_RASTER_BYTES)
+                    .ok_or("Normalized image alternatives exceed the 32-MiB response budget")?;
+                let mut reader =
+                    image::ImageReader::new(std::io::Cursor::new(&image.bytes)).with_guessed_format().map_err(|error| error.to_string())?;
+                let mut limits = image::Limits::default();
+                limits.max_alloc = Some(128 * 1024 * 1024);
+                limits.max_image_width = Some(16384);
+                limits.max_image_height = Some(16384);
+                reader.limits(limits);
+                let decoded = reader.decode().map_err(|error| format!("Invalid image alternative: {error}"))?;
+                let (width, height) = (decoded.width(), decoded.height());
+                validate_image_dimensions(width, height)?;
+                Ok((image, width, height))
+            })();
+            let (image, width, height) = match checked {
+                Ok(value) => value,
+                Err(error) => {
+                    candidates.push(json!({"index":index,"eligible":false,"reason":error}));
+                    continue;
+                }
+            };
+            let digest = format!("{:x}", Sha256::digest(&image.bytes));
+            let mut evidence = json!({"index":index,"width":width,"height":height,"sha256":digest,"eligible":false});
+            if count > 1
+                && let Some(root) = &self.cache_root
+            {
+                let key = crate::production_cache::digest(&json!({"policy":"ai24-image-alternative-v1","placement":placement,"sha256":digest}))?;
+                match crate::production_cache::store_image(root, &key, &image) {
+                    Ok(()) => evidence["alternative_cache_key"] = json!(key),
+                    Err(error) => evidence["cache_warning"] = json!(error),
+                }
+            }
+            let actual = f64::from(width) / f64::from(height);
+            let reason = if required.is_some_and(|[w, h]| width < w || height < h) {
+                Some("Below the requested print resolution")
+            } else if slot.filter(|slot| !slot.views.is_empty()).is_some() && (actual / ratio - 1.0).abs() > 0.08 {
+                Some("Incompatible with the declared shared-image crop geometry")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                evidence["reason"] = json!(reason);
+            } else {
+                let loss = 1.0 - (actual / ratio).min(ratio / actual);
+                let pixels = u64::from(width) * u64::from(height);
+                evidence["eligible"] = json!(true);
+                evidence["crop_loss"] = json!(loss);
+                if best.as_ref().is_none_or(|(_, old_loss, old_pixels, _)| loss < *old_loss || (loss == *old_loss && pixels > *old_pixels)) {
+                    best = Some((index, loss, pixels, image));
+                }
+            }
+            candidates.push(evidence);
+        }
+        let selected = best.as_ref().map(|(index, _, _, _)| *index);
+        if count > 1 || selected.is_none() {
+            self.diagnostics(vec![json!({"kind":"imageOutputSelection","page":placement.page.saturating_add(1),"final_images":count,
+                "selected_index":selected,"policy":"valid printable image, minimum crop loss, higher pixel count, then provider order",
+                "candidates":candidates,"human_review_required":true,"semantic_content_verified":false,
+                "message":"One alternative fills one editable native frame; provider usage includes every output. No additional generation request was made for selection."})])?;
+        }
+        check_cancel(self.cancel)?;
+        best.map(|(_, _, _, image)| image).ok_or_else(|| {
+            format!(
+                "No valid final image meets geometry and print resolution for page {}; inspect imageOutputSelection diagnostics",
+                placement.page.saturating_add(1)
+            )
+        })
     }
     fn audit_print(&self, plan: &ProductionPlan, base: &DocState, prefs: &Prefs) -> Result<(), String> {
         let min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
@@ -624,7 +730,7 @@ impl Runner<'_> {
             system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
         }
         if crate::script_contract::parse(&request.prompt)?.is_some() {
-            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten-frame: {page,rect,frame:five|ten,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrations must depict the stated subjects and quantities; leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
+            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten-frame: {page,rect,frame:five|ten,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
         }
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
@@ -648,6 +754,11 @@ impl Runner<'_> {
                 .insert("facing_page_context".into(), crate::script_contract::facing_context(&request.prompt, scope)?);
             system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
         }
+        system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
+        if request.settings.output_mode == OutputMode::NativeWithImages {
+            system.push('\n');
+            system.push_str(crate::image_repetition::POLICY);
+        }
         let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
         let mut schema = plan_schema(catalog, request.settings.output_mode)?;
         if scope.is_some() {
@@ -665,7 +776,7 @@ impl Runner<'_> {
             resources: request.settings.resources.clone(),
         };
         let cache_key = self.plan_key(request, &generation, base)?;
-        if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog)? {
+        if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog, geometry_profile)? {
             if let Some(profile) = geometry_profile {
                 crate::design::check_image_slots(base, &plan.images, profile)?;
             }
@@ -712,6 +823,7 @@ impl Runner<'_> {
                     }
                     self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
                     validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+                    image_command_budget(&plan, geometry_profile)?;
                     if let Some(profile) = geometry_profile {
                         crate::design::check_image_slots(base, &plan.images, profile)?;
                     }
@@ -940,26 +1052,20 @@ impl Runner<'_> {
         if plan.images.is_empty() {
             return Ok(plan);
         }
+        crate::image_repetition::normalize(&mut plan)?;
         if settings.output_mode == OutputMode::NativeOnly {
             return Err("Native-only output forbids generated raster images".into());
         }
         validate_image_review_settings(settings)?;
         let style_context = illustration_style(style_profile)?;
+        image_command_budget(&plan, profile)?;
         self.preload_images(&plan, settings, profile, &style_context, cache, bytes_used)?;
         // Reject an unsupported resolution tier before buying any member of the set.
         for placement in &plan.images {
+            if placement.instance_count() > 1 && declared_image_slot(placement, profile).is_some() {
+                return Err("Counted single-subject frames cannot also be pinned atlas crops; no images were requested".into());
+            }
             self.print_image_size(placement, profile, &settings.image_model)?;
-        }
-        let placements = plan
-            .images
-            .iter()
-            .try_fold(0usize, |count, image| count.checked_add(declared_image_slot(image, profile).map_or(1, |slot| slot.placement_count())));
-        if placements
-            .and_then(|count| count.checked_mul(4))
-            .and_then(|extra| plan.commands.len().checked_add(extra))
-            .is_none_or(|total| total > MAX_ACTIONS)
-        {
-            return Err("Image placement commands exceed the native action limit; no images were requested".into());
         }
         // Check capacity for the whole image set before purchasing its first member.
         // This conservative input bound includes the fixed image instructions and frame dimensions.
@@ -986,8 +1092,11 @@ impl Runner<'_> {
                 let source_ratio = image_source_ratio(placement, declared_image_slot(placement, profile))?;
                 let image_request = ImageRequest {
                     prompt: format!(
-                        "{}\nCreate only this illustration, with no page layout, captions, typography or surrounding design. Target frame proportions: {:.4} x {:.4} points.\n{}",
-                        placement.prompt, source_ratio, 1.0, style_context
+                        "{}\nReturn exactly ONE complete final illustration for this single placement, without alternative versions or a sequence. No page layout, captions, typography or surrounding design. Target frame proportions: {:.4} x {:.4} points.\n{}",
+                        crate::image_repetition::unit_prompt(placement),
+                        source_ratio,
+                        1.0,
+                        style_context
                     ),
                     size: self.print_image_size(placement, profile, &settings.image_model)?,
                     quality: None,
@@ -1016,15 +1125,7 @@ impl Runner<'_> {
                 if let Some(error) = &response.error {
                     return Err(error.clone());
                 }
-                if response.images.len() != 1 {
-                    let count = response.images.len();
-                    self.diagnostics(vec![json!({"kind":"imageOutputCount","page":placement.page.saturating_add(1),"provider":settings.image_model.provider,"final_images":count,"message":"No automatic selection among multiple final illustrations; no partial review was published"})])?;
-                    return Err(format!(
-                        "Image provider must return exactly one final image per placement; got {count} for page {}",
-                        placement.page.saturating_add(1)
-                    ));
-                }
-                let image = prepare_generated_image(response.images.into_iter().next().ok_or("Image provider returned no image")?)?;
+                let image = self.choose_placement_image(response.images, placement, profile)?;
                 if settings.verify_generated_images {
                     self.progress(&format!("Reviewing illustration subjects for page {}", placement.page.saturating_add(1)), 0.65)?;
                     let review_request = crate::image_review::request(placement, &image, settings)?;
@@ -1062,9 +1163,12 @@ impl Runner<'_> {
             let mut views = vec![(placement.rect, declared.and_then(|slot| slot.crop))];
             if let Some(slot) = declared {
                 views.extend(slot.views.iter().map(|view| (view.rect, Some(view.crop))));
+            } else {
+                views.extend(placement.repeat_rects.iter().map(|rect| (*rect, None)));
             }
+            let repeated = !placement.repeat_rects.is_empty();
             placed_bytes = placed_bytes
-                .checked_add(image.bytes.len().checked_mul(views.len()).ok_or("Image placement byte count overflow")?)
+                .checked_add(image.bytes.len().checked_mul(if repeated { 1 } else { views.len() }).ok_or("Image placement byte count overflow")?)
                 .ok_or("Image placement byte count overflow")?;
             if placed_bytes > MAX_INLINE_RASTER_BYTES {
                 return Err("Inline image placements, including repeated views, exceed this plan's 32-MiB raster budget".into());
@@ -1080,25 +1184,32 @@ impl Runner<'_> {
                 return Err("Generated shared illustration aspect ratio differs from the pinned source; no incorrect crops were published".into());
             }
             let encoded = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+            let mut unit_source = None;
             for (view_index, (view_rect, crop)) in views.into_iter().enumerate() {
+                if repeated && let Some(source) = unit_source {
+                    let copied = plan.commands.len();
+                    plan.commands.push(EngineAction {command:"transform.move".into(),params:json!({"ids":[format!("${source}.id")],"dx":view_rect[0]-placement.rect[0],"dy":view_rect[1]-placement.rect[1],"copy":true})});
+                    let ids = format!("${copied}.ids");
+                    if !crate::image_repetition::same_cell_size(placement.rect, view_rect) {
+                        plan.commands.push(EngineAction {
+                            command: "transform.set".into(),
+                            params: json!({"ids":ids,"width":view_rect[2]-view_rect[0],"height":view_rect[3]-view_rect[1]}),
+                        });
+                        plan.commands.push(EngineAction {
+                            command: "object.fittingOptions".into(),
+                            params: json!({"ids":ids,"fitting":"fitProportionally","align":4}),
+                        });
+                    }
+                    plan.commands.push(EngineAction {
+                        command: "object.label".into(),
+                        params: json!({"ids":ids,"label":format!("{} / unit {}",placement.label,view_index+1)}),
+                    });
+                    continue;
+                }
                 // Fill an explicitly authored slot in place: new top-level frames would
                 // otherwise paint over the native dialogue/labels above its artwork.
-                let slot = plan.commands.iter().take(authored_count).enumerate().find_map(|(index, action)| {
-                    if filled_frames.contains(&index)
-                        || action.command != "frame.create"
-                        || action.params.get("content").and_then(Value::as_str) != Some("graphic")
-                        || !action
-                            .params
-                            .get("spread")
-                            .filter(|value| !value.is_null())
-                            .map_or(placement.page == 0, |value| value.as_u64().and_then(|page| usize::try_from(page).ok()) == Some(placement.page))
-                    {
-                        return None;
-                    }
-                    let rect = action.params.get("rect").and_then(Value::as_array)?;
-                    (rect.len() == 4 && rect.iter().zip(view_rect).all(|(a, b)| a.as_f64().is_some_and(|a| a.is_finite() && (a - b).abs() <= 0.01)))
-                        .then_some(index)
-                });
+                let authored = plan.commands.get(..authored_count).ok_or("Authored image slots disappeared")?;
+                let slot = authored_image_frame(authored, placement.page, view_rect, &filled_frames);
                 let index = if let Some(index) = slot {
                     filled_frames.insert(index);
                     index
@@ -1111,14 +1222,20 @@ impl Runner<'_> {
                     index
                 };
                 plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
-                if declared.is_some() {
+                if repeated {
+                    unit_source = Some(index);
+                    plan.commands.push(EngineAction {
+                        command: "object.fittingOptions".into(),
+                        params: json!({"ids":[format!("${index}.id")],"fitting":"fitProportionally","align":4}),
+                    });
+                } else if declared.is_some() {
                     plan.commands.push(EngineAction {
                         command: "object.fittingOptions".into(),
                         params: image_view_fitting(index, view_rect, crop, dimensions)?,
                     });
                 }
                 plan.commands
-                .push(EngineAction { command: "object.label".into(), params: json!({"ids":[format!("${index}.id")],"label":if view_index == 0 { placement.label.clone() } else {format!("{} / view {}",placement.label,view_index + 1)}}) });
+                .push(EngineAction { command: "object.label".into(), params: json!({"ids":[format!("${index}.id")],"label":if repeated {format!("{} / unit {}",placement.label,view_index+1)} else if view_index == 0 { placement.label.clone() } else {format!("{} / view {}",placement.label,view_index + 1)}}) });
                 if plan.commands.len() > MAX_ACTIONS {
                     return Err("Generated placements exceed the 512-command plan limit".into());
                 }
@@ -1212,9 +1329,16 @@ impl Runner<'_> {
             resources: request.settings.resources.clone(),
         };
         let cache_key = self.plan_key(request, &generation, base)?;
-        if let Some(plan) =
-            self.cached_plan(cache_key.as_deref(), request, &context, base, prefs, Some(scope), &designcraft_engine::cmd::production::catalog())?
-        {
+        if let Some(plan) = self.cached_plan(
+            cache_key.as_deref(),
+            request,
+            &context,
+            base,
+            prefs,
+            Some(scope),
+            &designcraft_engine::cmd::production::catalog(),
+            Some(profile),
+        )? {
             match validate_template_family_sequence(&plan, style, previous.clone(), scope, &families, &request.prompt) {
                 Ok(()) => {
                     crate::design::check_image_slots(base, &plan.images, profile)?;
@@ -1434,7 +1558,11 @@ fn project_image_requests(
         let _ = image_request_size(placement, profile, &settings.image_model)?;
         let cache_key = image_memory_key(placement, style_context, settings)?;
         if !cache.contains_key(&cache_key) {
-            let input = placement.prompt.len().saturating_add(style_context.len()).saturating_add(workflow_bytes).saturating_add(512);
+            let input = crate::image_repetition::unit_prompt(placement)
+                .len()
+                .saturating_add(style_context.len())
+                .saturating_add(workflow_bytes)
+                .saturating_add(512);
             ledger.reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
             if let Some(image) = &review_image {
                 let review = crate::image_review::request(placement, image, settings)?;
@@ -1768,7 +1896,9 @@ fn validate_previous_body_layout(
                 let bounds = parent.transform_rect_bbox(item.bounds());
                 let image_slot = plan.images.iter().any(|image| {
                     u32::try_from(image.page).ok() == Some(page)
-                        && image.rect.iter().zip([bounds.x0, bounds.y0, bounds.x1, bounds.y1]).all(|(a, b)| (*a - b).abs() <= 0.01)
+                        && image
+                            .all_rects()
+                            .any(|rect| rect.iter().zip([bounds.x0, bounds.y0, bounds.x1, bounds.y1]).all(|(a, b)| (*a - b).abs() <= 0.01))
                 });
                 let content = if item.text_frame().is_some() {
                     "text"
@@ -1833,6 +1963,7 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
     if scope.is_none_or(|scope| scope.count < 2) || identical_layout_requested(&lower) {
         return Ok(());
     }
+    let authored_layouts = crate::script_contract::authored_layout_signatures(prompt)?;
     let mut pages: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
     for action in &plan.commands {
         if action.command != "frame.create" {
@@ -1856,6 +1987,9 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
     let pages = pages.iter().collect::<Vec<_>>();
     for (left, right) in pages.iter().zip(pages.iter().skip(1)) {
         if left.0.saturating_add(1) != *right.0 || left.1.len() < 4 || right.1.len() < 4 {
+            continue;
+        }
+        if authored_layouts.get(left.0).zip(authored_layouts.get(right.0)).is_some_and(|(a, b)| a == b) {
             continue;
         }
         let common = left.1.intersection(right.1).count();
@@ -1922,6 +2056,10 @@ fn production_system(
     );
     system.push('\n');
     system.push_str(EDITORIAL_POLICY);
+    if mode == OutputMode::NativeWithImages {
+        system.push('\n');
+        system.push_str(crate::image_repetition::POLICY);
+    }
     if current_document {
         system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Each pageGeometry.safeRect is the exact [left,top,right,bottom] live area in native spread coordinates, with inside/outside margins already resolved for its side. Keep every text frame, including headers and footers, fully inside safeRect; leave a visible gap between bilingual columns. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
     } else if skills.iter().any(|s| s.design_profile.is_some()) {
@@ -2140,7 +2278,9 @@ fn plan_schema(catalog: &Value, mode: OutputMode) -> Result<Value, String> {
         "commands":{"type":"array","minItems":1,"maxItems":500,"items":action_schema(catalog)?},
         "images":{"type":"array","maxItems":if mode==OutputMode::NativeOnly {0} else {MAX_IMAGES},"items":{"type":"object","additionalProperties":false,"required":["prompt","page","rect","label"],"properties":{
             "prompt":{"type":"string","minLength":1,"maxLength":8192},"page":{"type":"integer","minimum":0,"maximum":999},
-            "rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":-15552,"maximum":15552}},"label":{"type":"string","minLength":1,"maxLength":256}}}}
+            "rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":-15552,"maximum":15552}},"label":{"type":"string","minLength":1,"maxLength":256},
+            "repeat_rects":{"type":"array","maxItems":23,"items":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":0,"maximum":15552}}},
+            "repeat_groups":{"type":"array","maxItems":4,"items":{"type":"integer","minimum":1,"maximum":20}}}}}
     }}))
 }
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
@@ -2163,7 +2303,8 @@ fn validate_actions(actions: &[EngineAction], catalog: &Value, mode: OutputMode)
     Ok(())
 }
 fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<ProductionPlan, String> {
-    let plan: ProductionPlan = parse_json(text)?;
+    let mut plan: ProductionPlan = parse_json(text)?;
+    crate::image_repetition::normalize(&mut plan)?;
     if plan.title.trim().is_empty() || plan.title.len() > 256 {
         return Err("Plan title must contain 1 to 256 bytes".into());
     }
@@ -2718,6 +2859,61 @@ fn declared_image_slot<'a>(
     })
 }
 
+fn authored_image_frame(commands: &[EngineAction], page: usize, rect: [f64; 4], filled: &BTreeSet<usize>) -> Option<usize> {
+    commands.iter().enumerate().find_map(|(index, action)| {
+        if filled.contains(&index)
+            || action.command != "frame.create"
+            || action.params.get("content").and_then(Value::as_str) != Some("graphic")
+            || !action
+                .params
+                .get("spread")
+                .filter(|v| !v.is_null())
+                .map_or(page == 0, |v| v.as_u64().and_then(|n| usize::try_from(n).ok()) == Some(page))
+        {
+            return None;
+        }
+        let authored = action.params.get("rect").and_then(Value::as_array)?;
+        (authored.len() == 4 && authored.iter().zip(rect).all(|(a, b)| a.as_f64().is_some_and(|a| a.is_finite() && (a - b).abs() <= 0.01)))
+            .then_some(index)
+    })
+}
+
+/// Shared planning/purchase guard. Includes authored slots and every native copy;
+/// a cached layout cannot postpone a known action overflow until after planning.
+fn image_command_budget(plan: &ProductionPlan, profile: Option<&designcraft_ai_types::DesignProfile>) -> Result<(), String> {
+    let mut total = plan.commands.len();
+    let mut filled = BTreeSet::new();
+    for image in &plan.images {
+        let declared = declared_image_slot(image, profile);
+        let mut views = vec![image.rect];
+        if let Some(slot) = declared {
+            views.extend(slot.views.iter().map(|v| v.rect));
+        } else {
+            views.extend(image.repeat_rects.iter().copied());
+        }
+        for (index, rect) in views.into_iter().enumerate() {
+            let actions = if image.instance_count() > 1 && index > 0 {
+                if crate::image_repetition::same_cell_size(image.rect, rect) { 2usize } else { 4usize }
+            } else {
+                let slot = authored_image_frame(&plan.commands, image.page, rect, &filled);
+                if let Some(slot) = slot {
+                    filled.insert(slot);
+                }
+                2usize + usize::from(slot.is_none()) + usize::from(image.instance_count() > 1 || declared.is_some())
+            };
+            total = total.checked_add(actions).ok_or("Native image action count overflow")?;
+        }
+    }
+    if total > MAX_ACTIONS {
+        return Err(format!(
+            "Image placement commands exceed the native action limit: {total} total ({} layout + {} pending image actions), maximum {MAX_ACTIONS}. Simplify this page's formatting/layout while preserving all source copy, quantities and review size. No images were requested.",
+            plan.commands.len(),
+            total.saturating_sub(plan.commands.len())
+        ));
+    }
+    Ok(())
+}
+
 fn image_request_size(
     placement: &designcraft_ai_types::protocol::ImagePlacement,
     profile: Option<&designcraft_ai_types::DesignProfile>,
@@ -2765,7 +2961,14 @@ fn preflight_profile_image_ratios(profile: &designcraft_ai_types::DesignProfile,
     }
     for slot in profile.page_families.iter().flat_map(|family| &family.image_slots) {
         let _ = image_request_size(
-            &designcraft_ai_types::protocol::ImagePlacement { prompt: String::new(), page: 0, rect: slot.rect, label: slot.purpose.clone() },
+            &designcraft_ai_types::protocol::ImagePlacement {
+                repeat_rects: Vec::new(),
+                repeat_groups: Vec::new(),
+                prompt: String::new(),
+                page: 0,
+                rect: slot.rect,
+                label: slot.purpose.clone(),
+            },
             Some(profile),
             &settings.image_model,
         )?;
@@ -3054,6 +3257,380 @@ mod tests {
     use super::*;
     use designcraft_ai_providers::Usage;
     use std::cell::RefCell;
+
+    fn ai24_png(width: u32, height: u32, color: u8) -> providers::GeneratedImage {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(width, height, image::Rgb([color, 80, 120])).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        providers::GeneratedImage { bytes: bytes.into_inner(), mime_type: "image/png".into(), filename: "candidate.png".into() }
+    }
+
+    #[test]
+    fn ai24_repeated_unit_placements_stay_within_inline_raster_and_action_limits() {
+        struct UnitProvider {
+            image: providers::GeneratedImage,
+            requests: RefCell<Vec<String>>,
+        }
+        impl Provider for UnitProvider {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, r: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                self.requests.borrow_mut().push(r.prompt.clone());
+                Ok(GenerationResponse { text: json!({"verdict":"pass","reasons":[]}).to_string(), usage: Usage::default(), error: None })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, r: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                self.requests.borrow_mut().push(r.prompt.clone());
+                Ok(ImageResponse { images: vec![self.image.clone()], usage: Usage::default(), error: None })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let mut rng = 87u32;
+        let pixels = image::RgbImage::from_fn(1024, 1024, |_, _| {
+            let color = std::array::from_fn(|_| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                rng as u8
+            });
+            image::Rgb(color)
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let image = providers::GeneratedImage { bytes: bytes.into_inner(), mime_type: "image/png".into(), filename: "fish.png".into() };
+        assert!(image.bytes.len() > 3 * 1024 * 1024);
+        for groups in [vec![10, 4], vec![20, 4]] {
+            let count: usize = groups.iter().sum();
+            let raw = json!({"title":"Counted subjects", "commands":[], "images":[{
+                "prompt":"One isolated reef fish", "page":13,"rect":[60,180,540,430],"label":"Fish", "repeat_groups":groups
+            }]});
+            let mut plan = crate::script_contract::compile_native_plan(&raw.to_string(), BatchScope { start: 13, count: 1 }).unwrap();
+            if count == 24
+                && let Some(last) = plan.images[0].repeat_rects.last_mut()
+            {
+                last[2] = last[0] + (last[2] - last[0]) * 0.8;
+                last[3] = last[1] + (last[3] - last[1]) * 0.8;
+            }
+            let cells: Vec<_> = plan.images[0].all_rects().collect();
+            let settings = AiSettings {
+                output_mode: OutputMode::NativeWithImages,
+                verify_generated_images: true,
+                text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+                image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+                budget: BudgetSpec { token_limit: 500_000, ..Default::default() },
+                ..Default::default()
+            };
+            let provider = UnitProvider { image: image.clone(), requests: RefCell::new(vec![]) };
+            let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let mut runner = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            };
+            let expanded = runner.expand_images(plan, &settings, &mut BTreeMap::new(), &mut 0, None).unwrap();
+            assert_eq!(ledger.summary().requests, 2, "one image and one advisory review for the whole set");
+            assert_eq!(provider.requests.borrow().len(), 2);
+            assert!(provider.requests.borrow().iter().all(|request| request.contains("EXACTLY ONE single isolated subject")));
+            assert_eq!(expanded.commands.iter().filter(|a| a.command == "file.place").count(), 1, "inline source is embedded once");
+            assert!(serde_json::to_vec(&expanded).unwrap().len() < 6 * 1024 * 1024);
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"pages":14,"facingPages":false})).unwrap();
+            session
+                .execute("production.apply", &json!({"commands":expanded.commands,"outputMode":"native_with_images","requirePreflight":false}))
+                .unwrap();
+            let doc = &session.doc().unwrap().doc;
+            let items: Vec<_> = doc.spreads[13].items.iter().filter(|item| item.graphic().is_some()).collect();
+            assert_eq!(items.len(), count);
+            let asset = items[0].graphic().unwrap().asset;
+            assert!(items.iter().all(|item| item.graphic().unwrap().asset == asset));
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(item.label, format!("Fish / unit {}", index + 1));
+                let r = item.bounds();
+                assert!(cells[index].iter().zip([r.x0, r.y0, r.x1, r.y1]).all(|(a, b)| (*a - b).abs() < 0.001));
+                assert!(r.x0 >= 60.0 && r.x1 <= 540.0 && r.y0 >= 180.0 && r.y1 <= 430.0);
+                assert!(items.iter().take(index).all(|other| {
+                    let o = other.bounds();
+                    r.x1 <= o.x0 || r.x0 >= o.x1 || r.y1 <= o.y0 || r.y0 >= o.y1
+                }));
+            }
+            let first = items[0].id;
+            session.execute("object.label", &json!({"ids":[first.0],"label":"Manual native edit"})).unwrap();
+            session.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(session.doc().unwrap().doc.item(first).unwrap().label, "Fish / unit 1");
+            let first_graphic = session.doc().unwrap().doc.item(first).unwrap().graphic().cloned();
+            session.execute("object.fittingOptions", &json!({"ids":[first.0],"fitting":"fitProportionally","crop":[1,1,1,1]})).unwrap();
+            session.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(session.doc().unwrap().doc.item(first).unwrap().graphic().cloned(), first_graphic);
+            session.execute("edit.undo", &json!({})).unwrap();
+            assert!(session.doc().unwrap().doc.spreads[13].items.is_empty());
+        }
+    }
+
+    #[test]
+    fn ai24_repeated_cell_action_reservation_matches_native_copy_cost() {
+        for (authored, accepted) in [(420, true), (470, false)] {
+            let mut plan = crate::script_contract::compile_native_plan(
+                &json!({"title":"Units","commands":[],"images":[{
+                    "prompt":"One fish","page":0,"rect":[60,180,540,430],"label":"Fish","repeat_groups":[20,4]
+                }]})
+                .to_string(),
+                BatchScope { start: 0, count: 1 },
+            )
+            .unwrap();
+            plan.commands = vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,100,100]}) }; authored];
+            let settings = AiSettings {
+                output_mode: OutputMode::NativeWithImages,
+                image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+                ..Default::default()
+            };
+            let provider = Ai23SyntheticProvider::new(vec![]);
+            let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let mut runner = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            };
+            let result = runner.expand_images(plan, &settings, &mut BTreeMap::new(), &mut 0, None);
+            if accepted {
+                let result = result.expect("uniform-size native copies need only move-copy and label; do not reject a valid dense page");
+                assert_eq!(result.commands.len(), 470);
+                assert_eq!(ledger.summary().requests, 1);
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("action limit"), "{error}");
+                assert_eq!(ledger.summary().requests, 0);
+                assert!(provider.image_sizes.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ai24_cached_plan_with_no_room_for_repeated_images_is_rejected_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"facingPages":false})).unwrap();
+        let mut plan = crate::script_contract::compile_native_plan(
+            &json!({"title":"Dense page","commands":[],"images":[{
+                "prompt":"One fish","page":0,"rect":[60,180,540,430],"label":"Fish","repeat_groups":[20,4]
+            }]})
+            .to_string(),
+            BatchScope { start: 0, count: 1 },
+        )
+        .unwrap();
+        plan.commands =
+            vec![EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[60,60,100,100],"content":"unassigned"}) }; 470];
+        let key = "f".repeat(64);
+        crate::production_cache::store_plan(dir.path(), &key, &plan).unwrap();
+        let provider = Ai23SyntheticProvider::new(vec![]);
+        let request = TaskRequest {
+            prompt: "Draw counted units".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: true,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let runner = Runner {
+            cache_root: Some(dir.path().to_path_buf()),
+            print: None,
+            planning_only: true,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let cached = runner
+            .cached_plan(
+                Some(&key),
+                &request,
+                &json!({}),
+                session.doc().unwrap(),
+                &session.prefs,
+                None,
+                &designcraft_engine::cmd::production::catalog(),
+                None,
+            )
+            .unwrap();
+        assert!(cached.is_none(), "a cached native draft must reserve space for its pending generated-image commands");
+        assert_eq!(ledger.summary().requests, 0);
+    }
+
+    #[test]
+    fn ai24_authored_matching_page_zones_override_only_the_matching_novelty_pair() {
+        let actions = |page| {
+            [[60, 160, 285, 240], [310, 160, 540, 240], [60, 300, 285, 380], [310, 300, 540, 380]]
+                .into_iter()
+                .map(|rect| EngineAction { command: "frame.create".into(), params: json!({"spread":page,"content":"unassigned","rect":rect}) })
+                .collect::<Vec<_>>()
+        };
+        let script = |second: &str| {
+            format!(
+                "### PAGE 01 — First numbers\n* **Layout & Grid Architecture:** Top 42%: First number. Middle 42%: Second number. Bottom 16%: Match.\n### PAGE 02 — Next numbers\n{second}\n"
+            )
+        };
+        let authored = script("* **Layout & Grid Architecture:** Top 42%: Third number. Middle 42%: Fourth number. Bottom 16%: Complete.");
+        let mut plan =
+            ProductionPlan { title: "Two authored lessons".into(), commands: actions(0).into_iter().chain(actions(1)).collect(), images: vec![] };
+        prepare_editorial_plan(&mut plan, &authored, &json!({}), Some(BatchScope { start: 0, count: 2 })).unwrap();
+        for brief in [
+            "Create two varied lessons".to_owned(),
+            script("* **Layout & Grid Architecture:** Top 50%: Explore. Middle 30%: Draw. Bottom 20%: Explain."),
+            script("* **English Print Copy (LTR):** Next lesson."),
+        ] {
+            assert!(
+                prepare_editorial_plan(&mut plan, &brief, &json!({}), Some(BatchScope { start: 0, count: 2 }))
+                    .unwrap_err()
+                    .contains("Repeated body layout")
+            );
+        }
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":2,"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"outputMode":"native_only","commands":actions(0),"requirePreflight":false})).unwrap();
+        let next = ProductionPlan { title: "Continue authored lesson".into(), commands: actions(1), images: vec![] };
+        validate_previous_body_layout(&next, session.doc().unwrap(), &session.prefs, Some(BatchScope { start: 1, count: 1 }), &authored).unwrap();
+        assert!(
+            validate_previous_body_layout(
+                &next,
+                session.doc().unwrap(),
+                &session.prefs,
+                Some(BatchScope { start: 1, count: 1 }),
+                "Create varied lessons"
+            )
+            .unwrap_err()
+            .contains("Repeated body layout")
+        );
+    }
+
+    fn ai24_expand_candidates(
+        images: Vec<providers::GeneratedImage>,
+        min_ppi: Option<f64>,
+    ) -> (Result<ProductionPlan, String>, UsageSummary, Vec<Value>) {
+        struct Candidates(Vec<providers::GeneratedImage>);
+        impl Provider for Candidates {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                Err("No extra paid planning or inspection is authorized by this fixture".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Ok(ImageResponse {
+                    images: self.0.clone(),
+                    usage: Usage { input_tokens: Some(41), output_tokens: Some(91), ..Default::default() },
+                    error: None,
+                })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 500_000, ..Default::default() },
+            ..Default::default()
+        };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let result = Runner {
+            cache_root: None,
+            print: min_ppi.map(|min_ppi| crate::print_contract::PrintContract { min_ppi: Some(min_ppi), ..Default::default() }),
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &Candidates(images),
+        }
+        .expand_images(
+            ProductionPlan {
+                title: "Page 16".into(),
+                commands: vec![],
+                images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                    repeat_rects: Vec::new(),
+                    repeat_groups: Vec::new(),
+                    prompt: "One complete classroom illustration".into(),
+                    page: 15,
+                    rect: [60.0, 160.0, 420.0, 280.0],
+                    label: "Native editable image frame".into(),
+                }],
+            },
+            &settings,
+            &mut BTreeMap::new(),
+            &mut 0,
+            None,
+        );
+        let issues = receiver.try_iter().filter_map(|message| if let Message::Diagnostic(value) = message { Some(value) } else { None }).collect();
+        (result, ledger.summary(), issues)
+    }
+
+    #[test]
+    fn ai24_multiple_final_images_choose_matching_geometry_without_an_extra_request() {
+        let wide = ai24_png(900, 300, 200);
+        let (result, usage, issues) = ai24_expand_candidates(vec![ai24_png(300, 900, 20), wide.clone()], None);
+        let plan = result.unwrap();
+        assert_eq!(usage.requests, 1);
+        assert_eq!(usage.output_tokens, 91);
+        assert!(plan.images.is_empty());
+        let placed: Vec<_> = plan.commands.iter().filter(|action| action.command == "file.place").collect();
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].params["base64"], base64::engine::general_purpose::STANDARD.encode(wide.bytes));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue["kind"] == "imageOutputSelection" && issue["selected_index"] == 1 && issue["human_review_required"] == true)
+        );
+    }
+
+    #[test]
+    fn ai24_final_image_selection_filters_print_resolution_before_aspect_score() {
+        let printable = ai24_png(1800, 700, 200);
+        let (result, usage, _) = ai24_expand_candidates(vec![ai24_png(900, 300, 20), printable.clone()], Some(300.0));
+        let plan = result.unwrap();
+        assert_eq!(usage.requests, 1);
+        let placed = plan.commands.iter().find(|action| action.command == "file.place").unwrap();
+        assert_eq!(placed.params["base64"], base64::engine::general_purpose::STANDARD.encode(printable.bytes));
+    }
+
+    #[test]
+    fn ai24_image_selection_rejects_empty_invalid_or_unprintable_sets_and_keeps_usage() {
+        let invalid = providers::GeneratedImage { bytes: vec![0; 8], mime_type: "image/png".into(), filename: "bad.png".into() };
+        for images in [vec![], vec![invalid], vec![ai24_png(900, 300, 10), ai24_png(600, 200, 50)]] {
+            let (result, usage, _) = ai24_expand_candidates(images, Some(300.0));
+            assert!(result.is_err());
+            assert_eq!(usage.requests, 1);
+            assert_eq!(usage.input_tokens, 41);
+        }
+    }
+
+    #[test]
+    fn ai24_final_image_selection_is_stable_and_can_skip_a_bad_candidate() {
+        let first = ai24_png(900, 300, 10);
+        for candidates in [
+            vec![first.clone(), ai24_png(900, 300, 200)],
+            vec![providers::GeneratedImage { bytes: vec![], mime_type: "image/png".into(), filename: "bad.png".into() }, first.clone()],
+        ] {
+            let (result, usage, _) = ai24_expand_candidates(candidates, None);
+            let plan = result.unwrap();
+            assert_eq!(usage.requests, 1);
+            let placed = plan.commands.iter().find(|action| action.command == "file.place").unwrap();
+            assert_eq!(placed.params["base64"], base64::engine::general_purpose::STANDARD.encode(&first.bytes));
+        }
+    }
 
     struct Ai23SyntheticProvider {
         plans: RefCell<Vec<ProductionPlan>>,
@@ -3355,7 +3932,7 @@ mod tests {
             sender: &sender,
             provider: &provider,
         }
-        .cached_plan(Some(&key), &request, &json!({}), &base, &session.prefs, None, &designcraft_engine::cmd::production::catalog())
+        .cached_plan(Some(&key), &request, &json!({}), &base, &session.prefs, None, &designcraft_engine::cmd::production::catalog(), None)
         .unwrap();
         assert!(
             cached.is_some(),
@@ -4481,12 +5058,16 @@ mod tests {
             commands: vec![],
             images: vec![
                 designcraft_ai_types::protocol::ImagePlacement {
+                    repeat_rects: Vec::new(),
+                    repeat_groups: Vec::new(),
                     prompt: "Tree".into(),
                     page: 0,
                     rect: [60.0, 60.0, 160.0, 160.0],
                     label: "tree".into(),
                 },
                 designcraft_ai_types::protocol::ImagePlacement {
+                    repeat_rects: Vec::new(),
+                    repeat_groups: Vec::new(),
                     prompt: "Atlas".into(),
                     page: 0,
                     rect: [60.0, 180.0, 160.0, 280.0],
@@ -5120,6 +5701,8 @@ mod tests {
             title: "Capacity test".into(),
             commands: vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,100,100]}) }; 510],
             images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                repeat_rects: Vec::new(),
+                repeat_groups: Vec::new(),
                 prompt: "Tree".into(),
                 page: 0,
                 rect: [60.0, 60.0, 160.0, 160.0],
@@ -5149,8 +5732,14 @@ mod tests {
             sender: &sender,
             provider: &provider,
         };
-        let image =
-            designcraft_ai_types::protocol::ImagePlacement { prompt: "Tree".into(), page: 0, rect: [60.0, 60.0, 160.0, 160.0], label: "tree".into() };
+        let image = designcraft_ai_types::protocol::ImagePlacement {
+            repeat_rects: Vec::new(),
+            repeat_groups: Vec::new(),
+            prompt: "Tree".into(),
+            page: 0,
+            rect: [60.0, 60.0, 160.0, 160.0],
+            label: "tree".into(),
+        };
         let plan = ProductionPlan { title: "Whole set admission".into(), commands: vec![], images: vec![image.clone(), image] };
         let error = runner
             .expand_images(plan, &AiSettings { output_mode: OutputMode::NativeWithImages, ..Default::default() }, &mut BTreeMap::new(), &mut 0, None)
@@ -5697,6 +6286,8 @@ mod tests {
                 },
             ],
             images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                repeat_rects: Vec::new(),
+                repeat_groups: Vec::new(),
                 prompt: "A tree illustration".into(),
                 page: 0,
                 rect: [120.0, 220.0, 270.0, 360.0],
@@ -5937,6 +6528,8 @@ mod tests {
             ..Default::default()
         };
         let placement = designcraft_ai_types::protocol::ImagePlacement {
+            repeat_rects: Vec::new(),
+            repeat_groups: Vec::new(),
             prompt: "One original scene reused".into(),
             page: 0,
             rect: [60.0, 60.0, 160.0, 160.0],
@@ -6100,6 +6693,8 @@ mod tests {
             title: "Review scene".into(),
             commands: vec![],
             images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                repeat_rects: Vec::new(),
+                repeat_groups: Vec::new(),
                 prompt: "Five monkeys sitting in a tree".into(),
                 page: 0,
                 rect: [60.0, 60.0, 160.0, 160.0],

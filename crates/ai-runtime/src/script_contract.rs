@@ -102,6 +102,80 @@ fn field_heading(line: &str) -> Option<(&str, &str)> {
     Some((label.trim_end_matches(':').trim(), value.trim_start_matches(':').trim()))
 }
 
+/// Equal, explicit percentage bands are a user layout request, not an inferred
+/// agent template. Missing, ambiguous or different layouts retain novelty checks.
+pub(crate) fn authored_layout_signatures(brief: &str) -> Result<BTreeMap<u64, String>, String> {
+    let Some(contract) = parse(brief)? else { return Ok(BTreeMap::new()) };
+    Ok(contract.pages.iter().filter_map(|page| layout_signature(&page.full_script).map(|signature| (u64::from(page.page), signature))).collect())
+}
+
+fn layout_signature(script: &str) -> Option<String> {
+    let mut layout = None;
+    let mut active = false;
+    let mut fenced = false;
+    for line in script.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some((label, value)) = field_heading(line) {
+            let label = label.to_ascii_lowercase();
+            active = label == "layout & grid architecture" || label == "layout architecture";
+            if active {
+                if layout.is_some() {
+                    return None;
+                }
+                layout = Some(value.to_owned());
+            }
+        } else if active && let Some(value) = &mut layout {
+            value.push(' ');
+            value.push_str(line.trim());
+        }
+    }
+    let layout = layout?;
+    let mut parts = layout.split('%').peekable();
+    let mut zones = BTreeMap::new();
+    let mut total = 0u16;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        let part = part.trim_end();
+        let prefix = part.trim_end_matches(|c: char| c.is_ascii_digit());
+        if prefix.ends_with(['.', ',']) {
+            return None;
+        }
+        let percent = part.get(prefix.len()..)?.parse::<u8>().ok().filter(|n| (1..=100).contains(n))?;
+        let name = prefix
+            .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '(' | ':' | '*' | '`'))
+            .rsplit(|c: char| !c.is_alphabetic())
+            .next()?
+            .to_ascii_lowercase();
+        let region = match name.as_str() {
+            "top" => "top",
+            "middle" | "central" | "center" | "centre" => "middle",
+            "bottom" => "bottom",
+            "left" => "left",
+            "right" => "right",
+            "header" => "header",
+            "footer" => "footer",
+            "body" | "main" => "body",
+            _ => return None,
+        };
+        if zones.insert(region, percent).is_some() || zones.len() > 8 {
+            return None;
+        }
+        total = total.checked_add(u16::from(percent))?;
+    }
+    if zones.len() < 2 || total != 100 {
+        return None;
+    }
+    Some(zones.into_iter().map(|(name, percent)| format!("{name}:{percent}")).collect::<Vec<_>>().join(";"))
+}
+
 fn page_fields(body: &str) -> Result<(Option<String>, Option<String>, Option<String>), String> {
     let mut fields: [Option<String>; 3] = [None, None, None];
     let mut active = None;
@@ -477,12 +551,23 @@ pub(crate) fn anchor_images(brief: &str, scope: BatchScope, plan: &mut Productio
             .find(|page| u64::from(page.page) == u64::try_from(image.page).unwrap_or(u64::MAX))
             .ok_or("Illustration is outside its explicit page contract")?;
         let art = page.illustration_prompt.as_deref().unwrap_or("");
-        let prompt = format!(
-            "USER PAGE {} — {}\nSUPPLIED SCENE AND SUBJECT REQUIREMENTS:\n{art}\nSELECTED ILLUSTRATION DETAIL:\n{}\nRender only the requested illustrative scene, objects and characters for this page. Preserve the supplied entities and requested quantities. All words, numerals, diagrams, number frames, tracing lines, labels and page layout in the source directions are handled as editable native objects: include none of them in raster artwork. No text, captions, letters, numerals or speech bubbles. This prompt does not certify the generated pixels; human visual proof remains required.",
-            u64::from(page.page) + 1,
-            page.title,
-            image.prompt
-        );
+        let prompt = if image.instance_count() > 1 {
+            format!(
+                "USER PAGE {} — {}\nNATIVE REPEATED COUNT UNIT (1 OF {} NATIVE FRAMES):\nPAGE CONTEXT (FOR SUBJECT IDENTITY AND ART STYLE ONLY — DO NOT RENDER THE TOTAL GROUP COUNT IN THIS SINGLE FRAME):\n{art}\nSINGLE-UNIT SUBJECT TO RENDER:\n{}\nRender EXACTLY ONE single isolated subject matching the page's object identity and style on a clean plain background with generous margin. Do NOT draw multiple copies or groups in this image. The host repeats the single unit in {} native frames to form the exact quantity. Include no text, captions, letters, numerals, borders or speech bubbles. Human visual proof remains required.",
+                u64::from(page.page) + 1,
+                page.title,
+                image.instance_count(),
+                image.prompt,
+                image.instance_count()
+            )
+        } else {
+            format!(
+                "USER PAGE {} — {}\nSUPPLIED SCENE AND SUBJECT REQUIREMENTS:\n{art}\nSELECTED ILLUSTRATION DETAIL:\n{}\nRender only the requested illustrative scene, objects and characters for this page. Preserve the supplied entities and requested quantities. All words, numerals, diagrams, number frames, tracing lines, labels and page layout in the source directions are handled as editable native objects: include none of them in raster artwork. No text, captions, letters, numerals or speech bubbles. This prompt does not certify the generated pixels; human visual proof remains required.",
+                u64::from(page.page) + 1,
+                page.title,
+                image.prompt
+            )
+        };
         if prompt.len() > MAX_IMAGE_PROMPT {
             return Err("Page-anchored illustration prompt exceeds 8192 bytes; split the illustration into focused scene slots".into());
         }
@@ -520,27 +605,14 @@ pub(crate) fn activity_schema() -> Value {
     }})
 }
 
-fn activity_shape(
-    commands: &mut Vec<EngineAction>,
-    base: usize,
-    page: u32,
-    rect: [f64; 4],
-    shape: &str,
-    filled: bool,
-    label: String,
-) -> Result<(), String> {
+fn activity_shape(commands: &mut Vec<EngineAction>, base: usize, page: u32, rect: [f64; 4], shape: &str, label: String) -> Result<String, String> {
     let index = base.checked_add(commands.len()).ok_or("Native activity reference overflow")?;
-    if index.checked_add(4).is_none_or(|end| end > MAX_ACTIONS) {
+    if index.checked_add(2).is_none_or(|end| end > MAX_ACTIONS) {
         return Err("Native count-frame activities exceed the 512-command plan limit; split the internal page chunk".into());
     }
     commands.push(EngineAction { command: "frame.create".into(), params: json!({"spread":page,"rect":rect,"content":"unassigned","shape":shape}) });
-    commands.push(EngineAction {
-        command: "object.fill".into(),
-        params: json!({"ids":[format!("${index}.id")],"swatch":if filled {"[Black]"} else {"[None]"}}),
-    });
-    commands.push(EngineAction { command: "object.stroke".into(), params: json!({"ids":[format!("${index}.id")],"swatch":"[Black]","weight":0.8}) });
     commands.push(EngineAction { command: "object.label".into(), params: json!({"ids":[format!("${index}.id")],"label":label}) });
-    Ok(())
+    Ok(format!("${index}.id"))
 }
 
 /// Build mathematical counters locally; a five-frame has 1×5 cells and a
@@ -580,32 +652,46 @@ pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, ac
             CountFrame::Five => "five",
             CountFrame::Ten => "ten",
         };
+        let mut all = Vec::new();
+        let mut outlined = Vec::new();
+        let mut filled = Vec::new();
         for cell in 0..capacity {
             let x = left + f64::from(cell % 5) * width;
             let y = top + f64::from(cell / 5) * height;
-            activity_shape(
+            let cell_id = activity_shape(
                 &mut commands,
                 plan.commands.len(),
                 activity.page,
                 [x, y, x + width, y + height],
                 "rectangle",
-                false,
                 format!("activity.count_frame.{activity_index}.{frame}.cell.{cell}"),
             )?;
+            all.push(cell_id.clone());
+            outlined.push(cell_id);
             if cell < activity.quantity {
                 let radius = width.min(height) * 0.24;
                 let center_x = x + width / 2.0;
                 let center_y = y + height / 2.0;
-                activity_shape(
+                let token = activity_shape(
                     &mut commands,
                     plan.commands.len(),
                     activity.page,
                     [center_x - radius, center_y - radius, center_x + radius, center_y + radius],
                     "ellipse",
-                    activity.filled,
                     format!("activity.count_frame.{activity_index}.{frame}.token.{cell}"),
                 )?;
+                all.push(token.clone());
+                if activity.filled { filled.push(token) } else { outlined.push(token) }
             }
+        }
+        for (ids, swatch) in [(&outlined, "[None]"), (&filled, "[Black]")] {
+            if !ids.is_empty() {
+                commands.push(EngineAction { command: "object.fill".into(), params: json!({"ids":ids,"swatch":swatch}) });
+            }
+        }
+        commands.push(EngineAction { command: "object.stroke".into(), params: json!({"ids":all,"swatch":"[Black]","weight":0.8}) });
+        if plan.commands.len().checked_add(commands.len()).is_none_or(|n| n > MAX_ACTIONS) {
+            return Err("Native activity formatting exceeds the 512-command plan limit; simplify this page without changing review size".into());
         }
     }
     plan.commands.extend(commands);
@@ -645,6 +731,7 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
         return Err("Provider commands cannot supply reserved host copy provenance labels".into());
     }
     let mut plan = ProductionPlan { title: content.title, commands: content.commands, images: content.images };
+    crate::image_repetition::normalize(&mut plan)?;
     if !content.copy_bindings.is_empty() {
         bind_copy(&mut plan, scope, brief.ok_or("Copy bindings require the original explicit page brief")?, &content.copy_bindings)?;
     }
@@ -874,6 +961,56 @@ pub(crate) fn compile_native_plan_for_brief(text: &str, scope: BatchScope, brief
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ai24_dense_teen_activities_batch_format_without_changing_native_cells() {
+        let mut plan = ProductionPlan { title: "Seventeen and eighteen".into(), commands: vec![], images: vec![] };
+        let activities: Vec<_> = [10, 7, 10, 8]
+            .into_iter()
+            .enumerate()
+            .map(|(index, quantity)| NativeActivity {
+                page: 0,
+                rect: [60.0, 100.0 + index as f64 * 60.0, 260.0, 140.0 + index as f64 * 60.0],
+                frame: CountFrame::Ten,
+                quantity,
+                filled: true,
+            })
+            .collect();
+        append_activities(&mut plan, BatchScope { start: 0, count: 1 }, &activities).unwrap();
+        assert_eq!(plan.commands.len(), 162, "75 native cells/tokens need 150 creation/label actions plus 12 shared format actions");
+        let mut session = designcraft_engine::Session::new();
+        session.execute("file.new", &json!({"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+        let items = &session.doc().unwrap().doc.spreads[0].items;
+        assert_eq!(items.len(), 75);
+        assert_eq!(items.iter().filter(|i| i.fill.swatch == "[Black]").count(), 35);
+        assert!(items.iter().all(|i| i.stroke.swatch == "[Black]" && (i.stroke.weight - 0.8).abs() < 0.0001));
+        assert_eq!(items.iter().filter(|i| i.label.contains(".cell.")).count(), 40);
+    }
+
+    #[test]
+    fn ai24_anchor_images_rewrites_repeated_unit_placement_to_single_isolated_subject() {
+        let mut brief = (1..14)
+            .map(|n| format!("### PAGE {n:02} — Earlier approved lesson\n* **English Print Copy (LTR):**\n  > Earlier copy\n"))
+            .collect::<String>();
+        brief.push_str("### PAGE 14 — Fourteen fish\n* **English Print Copy (LTR):**\n  > 14 = 10 + 4\n* **Visual & Illustration Prompt (Art Direction):** 14 colorful reef fish arranged in a group of 10 and a group of 4.\n");
+        let scope = BatchScope { start: 13, count: 1 };
+        let mut plan = compile_native_plan(
+            &json!({"title":"Fourteen", "commands":[], "images":[{
+                "prompt":"One isolated reef fish", "page":13,"rect":[60,180,540,390],"label":"Fish", "repeat_groups":[10,4]
+            }]})
+            .to_string(),
+            scope,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&plan.images[0]).unwrap();
+        assert_eq!(value["repeat_rects"].as_array().unwrap().len(), 13);
+        anchor_images(&brief, scope, &mut plan).unwrap();
+        assert!(plan.images[0].prompt.contains("1 OF 14 NATIVE FRAMES"));
+        assert!(plan.images[0].prompt.contains("EXACTLY ONE single isolated subject"));
+        assert!(!plan.images[0].prompt.contains("Preserve the supplied entities and requested quantities"));
+        assert!(plan.images[0].prompt.contains("human visual proof") || plan.images[0].prompt.contains("Human visual proof"));
+    }
 
     const SCRIPT: &str = "# Global print specs\nA4; bleed 3 mm; vocalized Arabic.\n### PAGE 01 — Cover\n* **English Print Copy (LTR):**\n  > MY MATH BOOK\n* **Arabic Print Copy (RTL - Vocalized):**\n  > كِتَابُ الرِّيَاضِيَّاتِ\n* **Visual & Illustration Prompt (Art Direction):** Noor and Leo with a lion.\n### PAGE 02 — Ownership & Number Chart\n* **English Print Copy (LTR):**\n  > THIS BOOK BELONGS TO: [Name Line] | MY NUMBER CHART 1–20\n* **Visual & Illustration Prompt (Art Direction):** Twenty number cards.\n";
 
