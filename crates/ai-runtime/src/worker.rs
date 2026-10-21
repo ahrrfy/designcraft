@@ -1175,6 +1175,15 @@ impl Runner<'_> {
         let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
         preflight_profile_image_ratios(profile, &request.settings)?;
         let schema = crate::template_plan::schema_for_brief(style, scope, request.settings.output_mode, &request.prompt)?;
+        let families: BTreeSet<String> = schema["properties"]["pages"]["items"]["anyOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|family| family["properties"]["family"]["enum"].as_array()?.first()?.as_str().map(str::to_owned))
+            .collect();
+        let previous = previous_template_family(style, base, scope, &families)?;
+        let mut context = context.clone();
+        context.as_object_mut().ok_or("Invalid template planning context")?.insert("previousTemplateFamily".into(), json!(previous));
         let prompt = bounded_json(&json!({"request":request.prompt,"scope":scope,"document":context}), MAX_PROMPT)?;
         let text_capacity = style
             .design_profile
@@ -1192,7 +1201,10 @@ impl Runner<'_> {
         let output_limit =
             scope.count.saturating_mul(per_page).saturating_add(512).saturating_add(thinking_margin).min(request.settings.budget.max_output_tokens);
         let generation = GenerationRequest {
-            system: format!("{}\n{EDITORIAL_POLICY}", crate::template_plan::system_for_brief(style, &request.prompt)?),
+            system: format!(
+                "{}\n{EDITORIAL_POLICY}\nWhen multiple declared families are available, avoid document.previousTemplateFamily on the first requested page and vary subsequent families, unless the user explicitly requests identical layouts. That field is inferred from actual native item labels; null means unknown, not an approval.",
+                crate::template_plan::system_for_brief(style, &request.prompt)?
+            ),
             prompt,
             json_schema: schema,
             max_output_tokens: output_limit,
@@ -1201,17 +1213,23 @@ impl Runner<'_> {
         };
         let cache_key = self.plan_key(request, &generation, base)?;
         if let Some(plan) =
-            self.cached_plan(cache_key.as_deref(), request, context, base, prefs, Some(scope), &designcraft_engine::cmd::production::catalog())?
+            self.cached_plan(cache_key.as_deref(), request, &context, base, prefs, Some(scope), &designcraft_engine::cmd::production::catalog())?
         {
-            crate::design::check_image_slots(base, &plan.images, profile)?;
-            simulate_styled(&plan, base, prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
-            return Ok(plan);
+            match validate_template_family_sequence(&plan, style, previous.clone(), scope, &families, &request.prompt) {
+                Ok(()) => {
+                    crate::design::check_image_slots(base, &plan.images, profile)?;
+                    simulate_styled(&plan, base, prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
+                    return Ok(plan);
+                }
+                Err(error) => self.cache_notice(format!("Ignored cached family sequence: {error}"))?,
+            }
         }
         let response = self.generate(&request.settings.text_model, &generation)?;
         // Exactly one content-planning request. Native command assembly/validation is local.
         self.progress("Compiling page content into native engine commands locally", 0.45)?;
         let mut raw = crate::template_plan::compile_for_brief(&response.text, style, scope, request.settings.output_mode, &request.prompt)?;
-        prepare_editorial_plan(&mut raw, &request.prompt, context, None)?;
+        validate_template_family_sequence(&raw, style, previous, scope, &families, &request.prompt)?;
+        prepare_editorial_plan(&mut raw, &request.prompt, &context, None)?;
         if let Some(contract) = &self.print {
             self.diagnostics(crate::native_print_fonts::apply(&mut raw, base, prefs, contract)?)?;
         }
@@ -1589,6 +1607,119 @@ fn internal_template_context(context: &Value, state: &DocState, review: BatchSco
     Ok(value)
 }
 
+fn identical_layout_requested(lower: &str) -> bool {
+    ["نفس التخطيط", "نفس التوزيع", "تخطيط متطابق", "قالب متكرر", "same layout", "identical layouts", "repeat layout", "identical worksheets"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Infer only a unique declared family whose static labels survive in native content.
+/// Missing or ambiguous labels are unknown; never manufacture approved history.
+fn template_family_for_labels(style: &SkillSnapshot, labels: &BTreeSet<&str>, allowed: &BTreeSet<String>) -> Option<String> {
+    let mut matched = None;
+    for family in &style.design_profile.as_ref()?.page_families {
+        if !allowed.contains(family.id.as_str()) {
+            continue;
+        }
+        let template = style.templates.get(&family.template)?;
+        let expected: BTreeSet<_> = template
+            .iter()
+            .filter(|action| action.command == "object.label")
+            .filter_map(|action| action.params.get("label").and_then(Value::as_str))
+            .filter(|label| !label.is_empty())
+            .collect();
+        if !expected.is_empty() && expected.is_subset(labels) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(family.id.clone());
+        }
+    }
+    matched
+}
+
+fn previous_template_family(style: &SkillSnapshot, base: &DocState, scope: BatchScope, allowed: &BTreeSet<String>) -> Result<Option<String>, String> {
+    let Some(previous) = scope.start.checked_sub(1).filter(|_| allowed.len() > 1) else { return Ok(None) };
+    let spread =
+        base.doc.spreads.get(usize::try_from(previous).map_err(|_| "Invalid previous template page")?).ok_or("Previous template page is missing")?;
+    let mut pending = Vec::new();
+    for item in &spread.items {
+        if pending.len() >= 10_000 {
+            return Err("Template family traversal exceeds its limit".into());
+        }
+        pending.push((item.as_ref(), 0usize));
+    }
+    let mut labels = BTreeSet::new();
+    let mut visited = 0usize;
+    while let Some((item, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 10_000 || depth > 64 {
+            return Err("Template family traversal exceeds its limit".into());
+        }
+        if !item.label.is_empty() {
+            labels.insert(item.label.as_str());
+        }
+        for child in item.children() {
+            if pending.len() >= 10_000 {
+                return Err("Template family traversal exceeds its limit".into());
+            }
+            pending.push((child.as_ref(), depth.saturating_add(1)));
+        }
+    }
+    Ok(template_family_for_labels(style, &labels, allowed))
+}
+
+fn validate_template_family_sequence(
+    plan: &ProductionPlan,
+    style: &SkillSnapshot,
+    mut previous: Option<String>,
+    scope: BatchScope,
+    allowed: &BTreeSet<String>,
+    brief: &str,
+) -> Result<(), String> {
+    if allowed.len() < 2 || identical_layout_requested(&brief.to_lowercase()) {
+        return Ok(());
+    }
+    if plan.commands.len() > MAX_ACTIONS {
+        return Err("Template family commands exceed their limit".into());
+    }
+    let mut results: Vec<BTreeSet<u64>> = Vec::with_capacity(plan.commands.len());
+    let mut labels: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+    for (index, action) in plan.commands.iter().enumerate() {
+        let mut pages = BTreeSet::new();
+        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "file.place") {
+            pages.insert(action.params.get("spread").and_then(Value::as_u64).unwrap_or(0));
+        } else if let Some(ids) = action.params.get("ids").and_then(Value::as_array) {
+            for reference in ids.iter().filter_map(Value::as_str) {
+                if let Some(source) = reference_source(reference, index).and_then(|source| results.get(source)) {
+                    pages.extend(source);
+                }
+            }
+        }
+        if action.command == "object.label"
+            && let Some(label) = action.params.get("label").and_then(Value::as_str).filter(|label| !label.is_empty())
+        {
+            for page in &pages {
+                labels.entry(*page).or_default().insert(label);
+            }
+        }
+        results.push(pages);
+    }
+    for page in scope.start..review_end(scope)? {
+        let family = labels.get(&u64::from(page)).and_then(|labels| template_family_for_labels(style, labels, allowed));
+        if let Some(family) = &family
+            && previous.as_ref() == Some(family)
+        {
+            return Err(format!(
+                "Repeated template family '{family}' on page {}; choose another available family or explicitly request identical layouts. No images were requested.",
+                page.saturating_add(1)
+            ));
+        }
+        previous = family;
+    }
+    Ok(())
+}
+
 /// Local editorial checks run before image reservations on either production path.
 fn validate_previous_body_layout(
     plan: &ProductionPlan,
@@ -1699,18 +1830,7 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
             }
         }
     }
-    if scope.is_none_or(|scope| scope.count < 2)
-        || has(&[
-            "نفس التخطيط",
-            "نفس التوزيع",
-            "تخطيط متطابق",
-            "قالب متكرر",
-            "same layout",
-            "identical layouts",
-            "repeat layout",
-            "identical worksheets",
-        ])
-    {
+    if scope.is_none_or(|scope| scope.count < 2) || identical_layout_requested(&lower) {
         return Ok(());
     }
     let mut pages: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
@@ -2938,22 +3058,24 @@ mod tests {
     struct Ai23SyntheticProvider {
         plans: RefCell<Vec<ProductionPlan>>,
         image_sizes: RefCell<Vec<Option<String>>>,
+        content: Option<Value>,
     }
 
     impl Ai23SyntheticProvider {
         fn new(plans: Vec<ProductionPlan>) -> Self {
-            Self { plans: RefCell::new(plans), image_sizes: RefCell::new(vec![]) }
+            Self { plans: RefCell::new(plans), image_sizes: RefCell::new(vec![]), content: None }
         }
     }
 
     impl Provider for Ai23SyntheticProvider {
         fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
-            let plan = self.plans.borrow_mut().pop().ok_or("Unexpected synthetic planning request")?;
-            Ok(GenerationResponse {
-                text: serde_json::to_string(&plan).map_err(|error| error.to_string())?,
-                usage: Usage { input_tokens: Some(10), output_tokens: Some(10), ..Default::default() },
-                error: None,
-            })
+            let text = if let Some(content) = &self.content {
+                content.to_string()
+            } else {
+                let plan = self.plans.borrow_mut().pop().ok_or("Unexpected synthetic planning request")?;
+                serde_json::to_string(&plan).map_err(|error| error.to_string())?
+            };
+            Ok(GenerationResponse { text, usage: Usage { input_tokens: Some(10), output_tokens: Some(10), ..Default::default() }, error: None })
         }
 
         fn images(&self, _: &ModelSelection, _: Option<&str>, request: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
@@ -2975,6 +3097,104 @@ mod tests {
 
         fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
             Err("No synthetic model discovery".into())
+        }
+    }
+
+    #[test]
+    fn ai23_template_family_checks_previous_native_page_and_internal_sequence() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut profile = shared_source_profile_fixture();
+        let original = profile.page_families[0].clone();
+        let mut templates = BTreeMap::new();
+        profile.page_families.clear();
+        for id in ["family-a", "family-b"] {
+            let mut family = original.clone();
+            family.id = id.into();
+            family.template = format!("templates/{id}.json");
+            family.image_slots.clear();
+            family.text_slots =
+                vec![designcraft_ai_types::DesignTextSlot { id: "heading".into(), purpose: "Lesson".into(), command: 0, max_chars: 50 }];
+            templates.insert(
+                family.template.clone(),
+                vec![
+                    EngineAction {
+                        command: "frame.create".into(),
+                        params: json!({"spread":0,"content":"text","text":"Lesson","rect":[60,180,300,230],"caret":false}),
+                    },
+                    EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":format!("native.{id}")}) },
+                ],
+            );
+            profile.page_families.push(family);
+        }
+        let style = SkillSnapshot {
+            skill_id: "family-fixture".into(),
+            revision: "fixed".into(),
+            instructions: String::new(),
+            references: BTreeMap::new(),
+            reference_hashes: BTreeMap::new(),
+            templates,
+            design_profile: Some(profile.clone()),
+        };
+        for (start, families, brief, repeated) in [
+            (1, vec!["family-a"], "Vary the science lessons", true),
+            (1, vec!["family-b"], "Vary the science lessons", false),
+            (1, vec!["family-a"], "Use the same layout", false),
+            (0, vec!["family-a", "family-a"], "Vary the science lessons", true),
+            (0, vec!["family-a", "family-b"], "Vary the science lessons", false),
+        ] {
+            let mut session = Session::new();
+            session.execute("file.new", &crate::design::document_params(Some(&profile), 2)).unwrap();
+            if start > 0 {
+                let item = session
+                    .execute("frame.create", &json!({"spread":0,"content":"text","text":"Previous","rect":[60,180,300,230],"caret":false}))
+                    .unwrap();
+                session.execute("object.label", &json!({"ids":[item["id"]],"label":"native.family-a"})).unwrap();
+                let other = session.execute("frame.create", &json!({"spread":0,"content":"unassigned","rect":[60,240,80,260]})).unwrap();
+                session.execute("object.group", &json!({"ids":[item["id"],other["id"]]})).unwrap();
+            }
+            let scope = BatchScope { start, count: families.len() as u32 };
+            let pages: Vec<_> = families
+                .iter()
+                .enumerate()
+                .map(|(index, family)| json!({"page":start+index as u32,"family":family,"text":{"heading":"Next"},"illustrations":[]}))
+                .collect();
+            let provider =
+                Ai23SyntheticProvider { content: Some(json!({"title":"Family sequence","pages":pages})), ..Ai23SyntheticProvider::new(vec![]) };
+            let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+            let request = TaskRequest {
+                prompt: brief.into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+                export_directory: None,
+            };
+            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let before = session.doc().unwrap().doc.clone();
+            let result = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .template_content(&request, &json!({}), &style, session.doc().unwrap(), &session.prefs, scope);
+            if repeated {
+                assert!(
+                    result.err().is_some_and(|error| error.contains("Repeated template family")),
+                    "The same family must not repeat across a native boundary or within one internal part"
+                );
+            } else {
+                assert!(result.is_ok(), "{brief}: {:?}", result.err());
+            }
+            assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+            assert!(provider.image_sizes.borrow().is_empty());
         }
     }
 

@@ -1,6 +1,6 @@
 # DesignCraft roadmap
 
-- AI23 (2026-10-21): Complete the governed handoff against verified current source: retain bounded group image context and print admission, bind supported CPA ten-frames to authored quantities, compare adjacent native layouts across parts, and add local curriculum previews, explicit whole-book request allowances and guarded spread review navigation. Preserve separate human group approval. See `docs/production-governed-handoff-ai23.ar.md`.
+- AI23 (2026-10-21): Complete the governed handoff against verified current source: retain bounded group image context and print admission, bind supported CPA ten-frames to authored quantities, compare adjacent native layouts and template families across parts, and add local curriculum previews, explicit whole-book request allowances and guarded spread review navigation. Preserve separate human group approval. See `docs/production-governed-handoff-ai23.ar.md`.
 
 - AI22 (2026-10-21): Exclude Gemini thought images from final placement outputs while preserving measured usage and genuine multi-image guards. Recover tiny same-column header-stack overlaps in verified free space; keep body content, existing artwork and human review protected. See `docs/production-gemini-images-ai22.ar.md`.
 
