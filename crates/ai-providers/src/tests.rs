@@ -407,12 +407,48 @@ mod native_tests {
             parse_generation(ProviderKind::Ollama, &json!({"done":true,"done_reason":"length","message":{"content":"{}"},"eval_count":12})).unwrap();
         assert!(ollama.error.is_some());
         assert_eq!(ollama.usage.output_tokens, Some(12));
-        let gemini=parse_generation(ProviderKind::Gemini,&json!({"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":2,"thoughtsTokenCount":3}})).unwrap();
-        assert!(gemini.error.is_some());
+        let gemini = parse_generation(
+            ProviderKind::Gemini,
+            &json!({
+                "candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{\"title\":\"partial"}]}}],
+                "usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":2,"thoughtsTokenCount":3}
+            }),
+        )
+        .unwrap();
+        assert_eq!(gemini.error.as_deref(), Some("Gemini response did not finish normally"));
+        assert_eq!(gemini.text, "{\"title\":\"partial");
         assert_eq!(gemini.usage.output_tokens, Some(5));
+        let gemini_complete = parse_generation(
+            ProviderKind::Gemini,
+            &json!({
+                "candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{\"title\":\"complete\",\"commands\":[],\"images\":[]}"}]}}],
+                "usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":12,"thoughtsTokenCount":4}
+            }),
+        )
+        .unwrap();
+        assert!(gemini_complete.error.is_none());
+        assert_eq!(gemini_complete.text, "{\"title\":\"complete\",\"commands\":[],\"images\":[]}");
+        assert_eq!(gemini_complete.usage.output_tokens, Some(16));
         let mut model = selection(ProviderKind::Gemini, None);
         model.model = "../key".into();
         assert!(generation_body(&model, &request()).is_err());
+    }
+
+    #[test]
+    fn gemini_thinking_config_caps_reasoning_tokens_for_json_layout_planning() {
+        let mut req = request();
+        req.max_output_tokens = 16384;
+        for (model, expected) in [
+            ("gemini-flash-latest", json!({"thinkingBudget": 1024})),
+            ("gemini-2.5-flash", json!({"thinkingBudget": 1024})),
+            ("gemini-2.5-flash-lite", json!({"thinkingBudget": 0})),
+            ("gemini-2.5-pro", json!({"thinkingBudget": 2048})),
+            ("gemini-3.8-flash", json!({"thinkingLevel": "low"})),
+        ] {
+            let sel = ModelSelection { provider: ProviderKind::Gemini, model: model.into(), endpoint: None };
+            let body = generation_body(&sel, &req).unwrap();
+            assert_eq!(body.pointer("/generationConfig/thinkingConfig"), Some(&expected), "{model}");
+        }
     }
 
     #[test]

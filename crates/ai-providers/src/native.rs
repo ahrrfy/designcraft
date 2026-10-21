@@ -244,6 +244,36 @@ fn gemini_json_prompt(request: &GenerationRequest) -> Result<String, String> {
     Ok(format!("{}{PREFIX}{schema}", request.prompt))
 }
 
+fn gemini_thinking_config(model: &str, max_output_tokens: u32) -> Option<Value> {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("models/").unwrap_or(&model);
+    if model.contains("-image")
+        || model.contains("-tts")
+        || model.contains("-live")
+        || model.contains("embedding")
+        || model.contains("imagen")
+        || model.contains("veo")
+        || model.contains("lyria")
+    {
+        return None;
+    }
+    if model.starts_with("gemini-3") || model.starts_with("gemini-4") {
+        return Some(json!({"thinkingLevel": "low"}));
+    }
+    if model.starts_with("gemini-2.5-pro") || model == "gemini-pro" || model == "gemini-pro-latest" {
+        let budget = if max_output_tokens < 256 { 128 } else { (max_output_tokens / 8).clamp(128, 2048) };
+        return Some(json!({"thinkingBudget": budget}));
+    }
+    if model.contains("flash-lite") {
+        return Some(json!({"thinkingBudget": 0}));
+    }
+    if model.starts_with("gemini-2.5-flash") || model == "gemini-flash" || model == "gemini-flash-latest" {
+        let budget = if max_output_tokens < 1024 { 0 } else { (max_output_tokens / 8).clamp(256, 1024) };
+        return Some(json!({"thinkingBudget": budget}));
+    }
+    None
+}
+
 pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRequest) -> Result<Value, String> {
     if request.prompt.len().saturating_add(request.system.len()) > MAX_JSON_BYTES / 2 || !request.json_schema.is_object() {
         return Err("AI prompt is too large or schema is not an object".into());
@@ -272,8 +302,14 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
         ProviderKind::OpenAi => json!({"model":model,"instructions":request.system,"input":request.prompt,"store":false,
             "max_output_tokens":request.max_output_tokens,"text":{"format":{"type":"json_schema","name":"designcraft_plan","schema":request.json_schema,"strict":false}}}),
         ProviderKind::Gemini => {
+            let mut generation_config = json!({"responseMimeType":"application/json","maxOutputTokens":request.max_output_tokens});
+            if let Some(thinking_config) = gemini_thinking_config(model, request.max_output_tokens)
+                && let Some(config) = generation_config.as_object_mut()
+            {
+                config.insert("thinkingConfig".into(), thinking_config);
+            }
             json!({"systemInstruction":{"parts":[{"text":request.system}]},"contents":[{"role":"user","parts":[{"text":gemini_json_prompt(request)?}]}],
-            "generationConfig":{"responseMimeType":"application/json","maxOutputTokens":request.max_output_tokens}})
+            "generationConfig":generation_config})
         }
         ProviderKind::Ollama => {
             request.resources.validate()?;
@@ -369,11 +405,33 @@ pub(super) fn parse_usage(provider: ProviderKind, value: &Value) -> Usage {
     }
 }
 
+fn gemini_candidate_text(candidate: &Value) -> String {
+    candidate
+        .pointer("/content/parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
+        .filter_map(|p| p.get("text").and_then(Value::as_str))
+        .collect::<String>()
+}
+
 pub(super) fn parse_generation(provider: ProviderKind, value: &Value) -> Result<GenerationResponse, String> {
     let usage = parse_usage(provider, value);
     let (text, error) = match generation_text(provider, value) {
         Ok(text) => (text, None),
-        Err(error) => (String::new(), Some(error)),
+        Err(error) => {
+            let partial = if provider == ProviderKind::Gemini
+                && let Some(candidate) = value.get("candidates").and_then(Value::as_array).and_then(|v| v.first())
+                && candidate.get("finishReason").and_then(Value::as_str) == Some("MAX_TOKENS")
+            {
+                let text = gemini_candidate_text(candidate);
+                if text.len() <= MAX_JSON_BYTES { text } else { String::new() }
+            } else {
+                String::new()
+            };
+            (partial, Some(error))
+        }
     };
     Ok(GenerationResponse { text, usage, error })
 }
@@ -405,17 +463,20 @@ fn generation_text(provider: ProviderKind, value: &Value) -> Result<String, Stri
         ProviderKind::Gemini => {
             let candidate =
                 value.get("candidates").and_then(Value::as_array).and_then(|v| v.first()).ok_or("Gemini returned no candidate (possibly blocked)")?;
-            if candidate.get("finishReason").and_then(Value::as_str) != Some("STOP") {
-                return Err("Gemini response did not finish normally".into());
+            let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+            let text = gemini_candidate_text(candidate);
+            if finish_reason != Some("STOP") {
+                // If MAX_TOKENS fired on the exact closing boundary of a complete JSON object,
+                // let the worker validate the JSON; otherwise report the abnormal finish.
+                let boundary_complete = finish_reason == Some("MAX_TOKENS")
+                    && !text.is_empty()
+                    && text.len() <= MAX_JSON_BYTES
+                    && serde_json::from_str::<Value>(&text).is_ok_and(|v| v.is_object());
+                if !boundary_complete {
+                    return Err("Gemini response did not finish normally".into());
+                }
             }
-            candidate
-                .pointer("/content/parts")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<String>()
+            text
         }
         ProviderKind::Ollama => {
             if value.get("done").and_then(Value::as_bool) != Some(true) || value.get("done_reason").and_then(Value::as_str) == Some("length") {

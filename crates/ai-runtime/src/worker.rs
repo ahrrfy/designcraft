@@ -566,6 +566,13 @@ impl Runner<'_> {
         }
     }
     fn generate(&mut self, selection: &ModelSelection, request: &GenerationRequest) -> Result<GenerationResponse, String> {
+        let response = self.generate_plan_candidate(selection, request)?;
+        if let Some(error) = &response.error {
+            return Err(error.clone());
+        }
+        Ok(response)
+    }
+    fn generate_plan_candidate(&mut self, selection: &ModelSelection, request: &GenerationRequest) -> Result<GenerationResponse, String> {
         check_cancel(self.cancel)?;
         let _resources = crate::resources::LocalRequestGuard::acquire(selection, &request.resources)?;
         let input = request.system.len().saturating_add(request.prompt.len()).saturating_add(bounded_json(&request.json_schema, MAX_PROMPT)?.len());
@@ -580,9 +587,6 @@ impl Runner<'_> {
         self.usage()?;
         check_cancel(self.cancel)?;
         let response = result?;
-        if let Some(error) = &response.error {
-            return Err(error.clone());
-        }
         if response.text.len() > MAX_JSON {
             return Err("AI response exceeds the 4-MiB limit".into());
         }
@@ -812,43 +816,48 @@ impl Runner<'_> {
                 (n, None) => format!("Repairing native layout validation (attempt {n} of {repair_attempts})"),
             };
             self.progress(&stage, 0.15)?;
-            let response = self.generate(&request.settings.text_model, &generation)?;
-            let native_text = scope
-                .map(|scope| {
-                    parse_json::<Value>(&response.text)
-                        .and_then(|value| bounded_json(&value, MAX_JSON))
-                        .and_then(|text| {
-                            if explicit_script {
-                                crate::script_contract::compile_native_plan_for_brief(&text, scope, &request.prompt)
-                            } else {
-                                crate::script_contract::compile_native_plan(&text, scope)
-                            }
-                        })
-                        .and_then(|plan| bounded_json(&serde_json::to_value(plan).map_err(|e| e.to_string())?, MAX_JSON))
-                })
-                .transpose();
-            let parsed = native_text
-                .and_then(|text| parse_plan(text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog))
-                .and_then(|mut plan| {
-                    prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
-                    if let Some(contract) = &self.print {
-                        self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
-                    }
-                    if let Some(scope) = scope {
-                        crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
-                        crate::script_contract::anchor_images(&request.prompt, scope, &mut plan)?;
-                    }
-                    self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
-                    validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
-                    image_command_budget(&plan, geometry_profile)?;
-                    if let Some(profile) = geometry_profile {
-                        crate::design::check_image_slots(base, &plan.images, profile)?;
-                    }
-                    if let Some(scope) = scope {
-                        validate_batch_plan(&plan, scope)?;
-                    }
-                    Ok(plan)
-                });
+            let response = self.generate_plan_candidate(&request.settings.text_model, &generation)?;
+            let has_provider_error = response.error.is_some();
+            let parsed = if let Some(error) = response.error.clone() {
+                Err(error)
+            } else {
+                let native_text = scope
+                    .map(|scope| {
+                        parse_json::<Value>(&response.text)
+                            .and_then(|value| bounded_json(&value, MAX_JSON))
+                            .and_then(|text| {
+                                if explicit_script {
+                                    crate::script_contract::compile_native_plan_for_brief(&text, scope, &request.prompt)
+                                } else {
+                                    crate::script_contract::compile_native_plan(&text, scope)
+                                }
+                            })
+                            .and_then(|plan| bounded_json(&serde_json::to_value(plan).map_err(|e| e.to_string())?, MAX_JSON))
+                    })
+                    .transpose();
+                native_text.and_then(|text| parse_plan(text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog)).and_then(
+                    |mut plan| {
+                        prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
+                        if let Some(contract) = &self.print {
+                            self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
+                        }
+                        if let Some(scope) = scope {
+                            crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
+                            crate::script_contract::anchor_images(&request.prompt, scope, &mut plan)?;
+                        }
+                        self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
+                        validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+                        image_command_budget(&plan, geometry_profile)?;
+                        if let Some(profile) = geometry_profile {
+                            crate::design::check_image_slots(base, &plan.images, profile)?;
+                        }
+                        if let Some(scope) = scope {
+                            validate_batch_plan(&plan, scope)?;
+                        }
+                        Ok(plan)
+                    },
+                )
+            };
             let (previous, validation) = match parsed {
                 Ok(raw_plan) => {
                     // Repairs consume the authored envelope, including copy_bindings and
@@ -901,7 +910,9 @@ impl Runner<'_> {
                 }).collect();
                     bounded_json(&json!(text), 8192).ok()
                 });
-            let rejected_response_path = if let Some(root) = &self.cache_root {
+            let rejected_response_path = if let Some(root) = &self.cache_root
+                && !previous.is_empty()
+            {
                 match crate::production_cache::store_rejected_response(root, &previous) {
                     Ok(path) => path,
                     Err(error) => {
@@ -921,7 +932,7 @@ impl Runner<'_> {
                 "scope":scope,
             })])?;
             if attempt == repair_attempts {
-                return Err(format!("AI plan rejected: {validation}"));
+                return Err(if has_provider_error { validation } else { format!("AI plan rejected: {validation}") });
             }
             generation.prompt = repair_prompt(&original, &previous, &validation)?;
         }
@@ -2347,9 +2358,19 @@ fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<Productio
     Ok(plan)
 }
 fn repair_prompt(original: &str, previous: &str, error: &str) -> Result<String, String> {
-    // Do not truncate a document or previous plan at an arbitrary Unicode/JSON boundary.
+    let rejected_plan = if previous.len() > 8192 {
+        let end = previous.floor_char_boundary(8192);
+        format!("{}...[truncated {} bytes]", &previous[..end], previous.len() - end)
+    } else {
+        previous.to_owned()
+    };
     bounded_json(
-        &json!({"original_request_and_document":original,"rejected_plan":previous,"validation_error":error,"instruction":"Return the complete corrected plan; preserve original content, dimensions, output mode and native command restrictions."}),
+        &json!({
+            "original_request_and_document": original,
+            "rejected_plan": rejected_plan,
+            "validation_error": error,
+            "instruction": "Return the complete corrected plan as compact single-line JSON without extra whitespace; batch shared object.fill and object.stroke across multiple $N.id references, omit redundant selection.set commands, and preserve original content, dimensions, output mode and native command restrictions."
+        }),
         MAX_PROMPT,
     )
 }
@@ -7209,5 +7230,95 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("Opened continuation reached"), "{error}");
+    }
+
+    #[test]
+    fn incomplete_provider_generation_enters_repair_loop_and_records_partial_evidence() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct RecoverAfterIncomplete(std::cell::Cell<u32>);
+        impl Provider for RecoverAfterIncomplete {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                let call = self.0.get();
+                self.0.set(call + 1);
+                if call == 0 {
+                    Ok(GenerationResponse {
+                        text: "{\"title\":\"partial truncated".into(),
+                        usage: Usage { input_tokens: Some(120), output_tokens: Some(240), ..Default::default() },
+                        error: Some("Gemini response did not finish normally".into()),
+                    })
+                } else {
+                    let repair: Value = serde_json::from_str(&request.prompt).unwrap();
+                    assert_eq!(repair["validation_error"], "Gemini response did not finish normally");
+                    assert_eq!(repair["rejected_plan"], "{\"title\":\"partial truncated");
+                    assert!(repair["instruction"].as_str().unwrap_or_default().contains("compact single-line JSON"), "{repair}");
+                    Ok(GenerationResponse {
+                        text: serde_json::to_string(&json!({
+                            "title": "Recovered compact plan",
+                            "commands": [
+                                {"command":"frame.create","params":{"spread":0,"rect":[72.0,72.0,300.0,160.0],"content":"text","text":"Recovered heading"}}
+                            ],
+                            "images": []
+                        }))
+                        .unwrap(),
+                        usage: Usage { input_tokens: Some(140), output_tokens: Some(90), ..Default::default() },
+                        error: None,
+                    })
+                }
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No image generation".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4"})).unwrap();
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeOnly,
+            allow_paid_repairs: true,
+            budget: BudgetSpec { token_limit: 500_000, repair_attempts: 2, ..Default::default() },
+            ..Default::default()
+        };
+        let request = TaskRequest {
+            prompt: "Create one heading frame on page 1.".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let provider = RecoverAfterIncomplete(std::cell::Cell::new(0));
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let product = runner.production(request, json!({}), catalog(), vec![], session.doc().unwrap().clone(), session.prefs.clone()).unwrap();
+        assert_eq!(provider.0.get(), 2);
+        let Product::Plan(plan) = product else {
+            panic!("expected single-scope production plan");
+        };
+        assert_eq!(plan.title, "Recovered compact plan");
+        assert_eq!(ledger.summary().requests, 2);
+        let bounded = repair_prompt("orig", &"x".repeat(12_000), "Gemini response did not finish normally").unwrap();
+        let bounded_json: Value = serde_json::from_str(&bounded).unwrap();
+        assert!(bounded_json["rejected_plan"].as_str().unwrap_or_default().ends_with("...[truncated 3808 bytes]"));
+        assert!(bounded_json["instruction"].as_str().unwrap_or_default().contains("batch shared object.fill"));
     }
 }

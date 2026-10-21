@@ -18,6 +18,7 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
     let selected = contract.select_fonts(base)?;
     let mut notes: Vec<Value> = selected.notices.iter().map(|message| json!({"kind":"printFontFallback","message":message})).collect();
     let mut candidate = plan.clone();
+    notes.extend(crate::native_layout::recover_unregistered_swatches(&mut candidate, base)?);
     let mut scratch = Session::new();
     scratch.prefs = prefs.clone();
     scratch.add_document(base.clone());
@@ -271,5 +272,31 @@ mod tests {
         let missing = PrintContract { arabic_fonts: vec!["Missing Print Font 12345".into()], ..Default::default() };
         assert!(apply(&mut plan, session.doc().unwrap(), &session.prefs, &missing).is_err());
         assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+    }
+
+    #[test]
+    fn print_font_binding_recovers_unregistered_inline_swatches_before_scratch_apply() {
+        let Some(family) = fonts() else { return };
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","facingPages":false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Print fonts with inline swatch",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"rect": [45, 45, 300, 100], "content": "text", "text": "Animals in the Garden", "caret": false}},
+                {"command": "type.char", "params": {"attrs": {"fontFamily": family, "fontStyle": "Regular", "size": 18, "fill": "C:85 M:75 Y:0 K:0"}}},
+                {"command": "frame.create", "params": {"rect": [45, 120, 200, 180], "content": "unassigned"}},
+                {"command": "object.fill", "params": {"ids": ["$2.id"], "swatch": "C=0 M=15 Y=95 K=0", "tint": 0.15}},
+                {"command": "object.stroke", "params": {"ids": ["$2.id"], "swatch": "Paper", "weight": 1.0}}
+            ]
+        }))
+        .unwrap();
+        let contract = PrintContract { english_fonts: vec![family.clone()], arabic_fonts: vec![family], ..Default::default() };
+        let notes = apply(&mut plan, &base, &session.prefs, &contract).unwrap();
+        assert_eq!(plan.commands[1].params["attrs"]["fill"], "C=100 M=90 Y=10 K=0");
+        assert_eq!(plan.commands[3].params["swatch"], "C=0 M=0 Y=100 K=0");
+        assert_eq!(plan.commands[4].params["swatch"], "[Paper]");
+        assert_eq!(notes.iter().filter(|n| n["kind"] == "nativeSwatchFallback").count(), 3);
     }
 }

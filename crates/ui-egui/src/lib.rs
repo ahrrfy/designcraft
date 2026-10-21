@@ -781,7 +781,11 @@ impl DesignApp {
 
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        let prev_active = self.session.active_index();
         if let Some(r) = menus::run_ui(self, id, &params) {
+            if r.is_ok() && matches!(id, "window.nextDocument" | "window.previousDocument") {
+                self.ui.status.clear();
+            }
             return r;
         }
         // Only user-initiated runs touch the system clipboard, never the control channel's.
@@ -832,6 +836,12 @@ impl DesignApp {
                 }
             }
             Ok(_) => {}
+        }
+        if r.is_ok()
+            && (self.session.active_index() != prev_active
+                || matches!(id, "file.activate" | "file.switch" | "file.new" | "file.close" | "file.open" | "file.openIdml" | "file.openBytes"))
+        {
+            self.ui.status.clear();
         }
         if r.is_ok() && matches!(id, "file.open" | "file.openIdml" | "file.openBytes") {
             if self.ui.dialog.as_ref().is_some_and(|d| d.id == "findFont") {
@@ -3230,5 +3240,21 @@ mod load_styles_tests {
         assert_eq!(app.session.active_index(), Some(0));
         assert_eq!(names(&app), (vec![], vec!["Lead".to_string()]));
         assert!(app.session.documents()[1].doc.styles.char_style("Lead").is_none());
+    }
+
+    #[test]
+    fn document_switch_clears_stale_status_bar_errors() {
+        let mut app = DesignApp::new(Session::new(), Services::default());
+        app.run("file.new", json!({"title": "book-48-production-working-copy"})).unwrap();
+        app.run("file.new", json!({"title": "Untitled-11"})).unwrap();
+        assert!(app.run("nonexistent.command", json!({})).is_err());
+        assert!(!app.ui.status.is_empty());
+        app.run("file.switch", json!({"index": 0})).unwrap();
+        assert_eq!(app.session.active_index(), Some(0));
+        assert_eq!(app.ui.status, "");
+        app.status("stale error");
+        app.run("window.nextDocument", json!({})).unwrap();
+        assert_eq!(app.session.active_index(), Some(1));
+        assert_eq!(app.ui.status, "");
     }
 }
