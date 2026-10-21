@@ -1963,6 +1963,7 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
     if scope.is_none_or(|scope| scope.count < 2) || identical_layout_requested(&lower) {
         return Ok(());
     }
+    let authored_layouts = crate::script_contract::authored_layout_signatures(prompt)?;
     let mut pages: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
     for action in &plan.commands {
         if action.command != "frame.create" {
@@ -1986,6 +1987,9 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
     let pages = pages.iter().collect::<Vec<_>>();
     for (left, right) in pages.iter().zip(pages.iter().skip(1)) {
         if left.0.saturating_add(1) != *right.0 || left.1.len() < 4 || right.1.len() < 4 {
+            continue;
+        }
+        if authored_layouts.get(left.0).zip(authored_layouts.get(right.0)).is_some_and(|(a, b)| a == b) {
             continue;
         }
         let common = left.1.intersection(right.1).count();
@@ -3465,6 +3469,52 @@ mod tests {
             .unwrap();
         assert!(cached.is_none(), "a cached native draft must reserve space for its pending generated-image commands");
         assert_eq!(ledger.summary().requests, 0);
+    }
+
+    #[test]
+    fn ai24_authored_matching_page_zones_override_only_the_matching_novelty_pair() {
+        let actions = |page| {
+            [[60, 160, 285, 240], [310, 160, 540, 240], [60, 300, 285, 380], [310, 300, 540, 380]]
+                .into_iter()
+                .map(|rect| EngineAction { command: "frame.create".into(), params: json!({"spread":page,"content":"unassigned","rect":rect}) })
+                .collect::<Vec<_>>()
+        };
+        let script = |second: &str| {
+            format!(
+                "### PAGE 01 — First numbers\n* **Layout & Grid Architecture:** Top 42%: First number. Middle 42%: Second number. Bottom 16%: Match.\n### PAGE 02 — Next numbers\n{second}\n"
+            )
+        };
+        let authored = script("* **Layout & Grid Architecture:** Top 42%: Third number. Middle 42%: Fourth number. Bottom 16%: Complete.");
+        let mut plan =
+            ProductionPlan { title: "Two authored lessons".into(), commands: actions(0).into_iter().chain(actions(1)).collect(), images: vec![] };
+        prepare_editorial_plan(&mut plan, &authored, &json!({}), Some(BatchScope { start: 0, count: 2 })).unwrap();
+        for brief in [
+            "Create two varied lessons".to_owned(),
+            script("* **Layout & Grid Architecture:** Top 50%: Explore. Middle 30%: Draw. Bottom 20%: Explain."),
+            script("* **English Print Copy (LTR):** Next lesson."),
+        ] {
+            assert!(
+                prepare_editorial_plan(&mut plan, &brief, &json!({}), Some(BatchScope { start: 0, count: 2 }))
+                    .unwrap_err()
+                    .contains("Repeated body layout")
+            );
+        }
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":2,"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"outputMode":"native_only","commands":actions(0),"requirePreflight":false})).unwrap();
+        let next = ProductionPlan { title: "Continue authored lesson".into(), commands: actions(1), images: vec![] };
+        validate_previous_body_layout(&next, session.doc().unwrap(), &session.prefs, Some(BatchScope { start: 1, count: 1 }), &authored).unwrap();
+        assert!(
+            validate_previous_body_layout(
+                &next,
+                session.doc().unwrap(),
+                &session.prefs,
+                Some(BatchScope { start: 1, count: 1 }),
+                "Create varied lessons"
+            )
+            .unwrap_err()
+            .contains("Repeated body layout")
+        );
     }
 
     fn ai24_expand_candidates(

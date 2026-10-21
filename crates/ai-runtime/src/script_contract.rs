@@ -102,6 +102,80 @@ fn field_heading(line: &str) -> Option<(&str, &str)> {
     Some((label.trim_end_matches(':').trim(), value.trim_start_matches(':').trim()))
 }
 
+/// Equal, explicit percentage bands are a user layout request, not an inferred
+/// agent template. Missing, ambiguous or different layouts retain novelty checks.
+pub(crate) fn authored_layout_signatures(brief: &str) -> Result<BTreeMap<u64, String>, String> {
+    let Some(contract) = parse(brief)? else { return Ok(BTreeMap::new()) };
+    Ok(contract.pages.iter().filter_map(|page| layout_signature(&page.full_script).map(|signature| (u64::from(page.page), signature))).collect())
+}
+
+fn layout_signature(script: &str) -> Option<String> {
+    let mut layout = None;
+    let mut active = false;
+    let mut fenced = false;
+    for line in script.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some((label, value)) = field_heading(line) {
+            let label = label.to_ascii_lowercase();
+            active = label == "layout & grid architecture" || label == "layout architecture";
+            if active {
+                if layout.is_some() {
+                    return None;
+                }
+                layout = Some(value.to_owned());
+            }
+        } else if active && let Some(value) = &mut layout {
+            value.push(' ');
+            value.push_str(line.trim());
+        }
+    }
+    let layout = layout?;
+    let mut parts = layout.split('%').peekable();
+    let mut zones = BTreeMap::new();
+    let mut total = 0u16;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        let part = part.trim_end();
+        let prefix = part.trim_end_matches(|c: char| c.is_ascii_digit());
+        if prefix.ends_with(['.', ',']) {
+            return None;
+        }
+        let percent = part.get(prefix.len()..)?.parse::<u8>().ok().filter(|n| (1..=100).contains(n))?;
+        let name = prefix
+            .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '(' | ':' | '*' | '`'))
+            .rsplit(|c: char| !c.is_alphabetic())
+            .next()?
+            .to_ascii_lowercase();
+        let region = match name.as_str() {
+            "top" => "top",
+            "middle" | "central" | "center" | "centre" => "middle",
+            "bottom" => "bottom",
+            "left" => "left",
+            "right" => "right",
+            "header" => "header",
+            "footer" => "footer",
+            "body" | "main" => "body",
+            _ => return None,
+        };
+        if zones.insert(region, percent).is_some() || zones.len() > 8 {
+            return None;
+        }
+        total = total.checked_add(u16::from(percent))?;
+    }
+    if zones.len() < 2 || total != 100 {
+        return None;
+    }
+    Some(zones.into_iter().map(|(name, percent)| format!("{name}:{percent}")).collect::<Vec<_>>().join(";"))
+}
+
 fn page_fields(body: &str) -> Result<(Option<String>, Option<String>, Option<String>), String> {
     let mut fields: [Option<String>; 3] = [None, None, None];
     let mut active = None;
