@@ -19,6 +19,28 @@ pub(crate) fn is_non_text_model(model: &str) -> bool {
 #[derive(Clone, Default)]
 struct Secret(String);
 
+fn collect_page_ranges(pages: usize, mut predicate: impl FnMut(usize) -> bool) -> Vec<[usize; 2]> {
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    for page in 0..pages {
+        if predicate(page) {
+            let one_based = page.saturating_add(1);
+            if let Some(last) = ranges.last_mut().filter(|last| last[1].saturating_add(1) == one_based) {
+                last[1] = one_based;
+            } else {
+                ranges.push([one_based, one_based]);
+            }
+        }
+    }
+    ranges
+}
+
+fn format_page_ranges(ranges: &[[usize; 2]], arabic: bool) -> String {
+    if ranges.is_empty() {
+        return text(arabic, "none", "لا شيء").to_string();
+    }
+    ranges.iter().map(|[start, end]| if start == end { start.to_string() } else { format!("{start}–{end}") }).collect::<Vec<_>>().join(", ")
+}
+
 struct OpenDocument {
     index: usize,
     uid: u64,
@@ -29,11 +51,15 @@ struct OpenDocument {
     pages: usize,
     remaining_pages: usize,
     continuable: bool,
+    filled_ranges: Vec<[usize; 2]>,
+    blank_ranges: Vec<[usize; 2]>,
 }
 impl OpenDocument {
     fn from_document(index: usize, document: &designcraft_engine::DocState) -> Self {
         let pages = document.doc.page_count();
         let first_blank = (0..pages).find(|page| !document.doc.page_has_items(*page));
+        let filled_ranges = collect_page_ranges(pages, |page| document.doc.page_has_items(page));
+        let blank_ranges = collect_page_ranges(pages, |page| !document.doc.page_has_items(page));
         Self {
             index,
             uid: document.uid,
@@ -44,6 +70,87 @@ impl OpenDocument {
             pages,
             remaining_pages: first_blank.map_or(0, |first| pages.saturating_sub(first)),
             continuable: first_blank.is_some_and(|first| first > 0 && (first..pages).all(|page| !document.doc.page_has_items(page))),
+            filled_ranges,
+            blank_ranges,
+        }
+    }
+
+    fn effective_filled_ranges(&self) -> Vec<[usize; 2]> {
+        if !self.filled_ranges.is_empty() || !self.blank_ranges.is_empty() {
+            return self.filled_ranges.clone();
+        }
+        let completed = self.pages.saturating_sub(self.remaining_pages);
+        if completed > 0 { vec![[1, completed]] } else { Vec::new() }
+    }
+
+    fn effective_blank_ranges(&self) -> Vec<[usize; 2]> {
+        if !self.filled_ranges.is_empty() || !self.blank_ranges.is_empty() {
+            return self.blank_ranges.clone();
+        }
+        let completed = self.pages.saturating_sub(self.remaining_pages);
+        if self.remaining_pages > 0 { vec![[completed.saturating_add(1), self.pages]] } else { Vec::new() }
+    }
+
+    fn page_map_line(&self, arabic: bool) -> String {
+        let filled = format_page_ranges(&self.effective_filled_ranges(), arabic);
+        let blank = format_page_ranges(&self.effective_blank_ranges(), arabic);
+        if arabic {
+            format!("خريطة الصفحات — المنجزة: {filled} · الفارغة: {blank}")
+        } else {
+            format!("Page map — Completed: {filled} · Blank: {blank}")
+        }
+    }
+
+    fn non_continuable_reason(&self, arabic: bool) -> Option<String> {
+        if self.continuable {
+            return None;
+        }
+        let filled = self.effective_filled_ranges();
+        let blank = self.effective_blank_ranges();
+        if filled.is_empty() {
+            Some(
+                text(
+                    arabic,
+                    "All pages are blank; use New document or Edit current document to start from page 1.",
+                    "جميع الصفحات فارغة؛ اختر مستنداً جديداً أو تحرير المستند الحالي للبدء من الصفحة 1.",
+                )
+                .to_string(),
+            )
+        } else if blank.is_empty() {
+            Some(
+                text(
+                    arabic,
+                    "All pages already contain items; there are no trailing blank pages to continue.",
+                    "جميع الصفحات تحتوي على عناصر؛ لا توجد صفحات فارغة متبقية للاستكمال.",
+                )
+                .to_string(),
+            )
+        } else if blank.first().is_some_and(|[start, _]| *start == 1) {
+            Some(if arabic {
+                format!(
+                    "الصفحة الأولى فارغة بينما توجد صفحات ممتلئة لاحقاً ({})؛ يتطلب الاستكمال التلقائي بادئة مكتملة تبدأ من الصفحة 1.",
+                    format_page_ranges(&filled, true)
+                )
+            } else {
+                format!(
+                    "Leading page 1 is blank while later pages contain items ({}); prefix continuation requires completed pages starting at page 1.",
+                    format_page_ranges(&filled, false)
+                )
+            })
+        } else {
+            Some(if arabic {
+                format!(
+                    "توجد فجوة صفحات فارغة ({}) قبل صفحات ممتلئة ({})؛ يتطلب الاستكمال التلقائي صفحات مكتملة متصلة متبوعة بصفحات فارغة.",
+                    format_page_ranges(&blank, true),
+                    format_page_ranges(&filled, true)
+                )
+            } else {
+                format!(
+                    "Blank gap ({}) precedes filled pages ({}); prefix continuation requires a contiguous completed prefix followed by blank pages.",
+                    format_page_ranges(&blank, false),
+                    format_page_ranges(&filled, false)
+                )
+            })
         }
     }
 }
@@ -776,6 +883,92 @@ impl AiUiState {
             vision_allowance,
         })
     }
+
+    fn live_phase(stage: &str, arabic: bool) -> &'static str {
+        let (en, ar) = match stage {
+            "planning" | "curriculum_plan" | "validating_skills" => ("Planning", "التخطيط"),
+            "repair" => ("Repair", "الإصلاح"),
+            "generating_images" => ("Image generation", "توليد الصور"),
+            "executing" => ("Execution & preflight", "التنفيذ والفحص المطبعي"),
+            "rendering_proof" => ("Proof preparation", "تجهيز البروفة"),
+            "awaiting_human_proof" => ("Awaiting human proof", "بانتظار اعتماد البروفة"),
+            _ => ("Processing", "قيد المعالجة"),
+        };
+        text(arabic, en, ar)
+    }
+
+    fn extract_message_page(message: &str, total_pages: u32) -> Option<(u32, u32)> {
+        let lower = message.to_ascii_lowercase();
+        for marker in ["pages ", "page "] {
+            if let Some(idx) = lower.find(marker) {
+                let rest = lower.get(idx + marker.len()..)?.trim_start();
+                let end_first = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+                if let Some(first) = rest.get(..end_first).and_then(|s| s.parse::<u32>().ok())
+                    && first >= 1
+                    && first <= total_pages
+                {
+                    let after_first = rest.get(end_first..)?.trim_start();
+                    if let Some(after_dash) = after_first.strip_prefix('–').or_else(|| after_first.strip_prefix('-')) {
+                        let after_dash = after_dash.trim_start();
+                        let end_second = after_dash.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_dash.len());
+                        if let Some(second) = after_dash.get(..end_second).and_then(|s| s.parse::<u32>().ok())
+                            && second >= first
+                            && second <= total_pages
+                        {
+                            return Some((first, second));
+                        }
+                    }
+                    return Some((first, first));
+                }
+            }
+        }
+        None
+    }
+
+    fn live_status_line(&self, arabic: bool) -> String {
+        let phase = Self::live_phase(&self.snapshot.stage, arabic);
+        let elapsed_ms = self.snapshot.batch.as_ref().map_or(0, |b| b.elapsed_ms);
+        let timer = elapsed(elapsed_ms);
+        if let Some(batch) = &self.snapshot.batch
+            && batch.total_pages > 0
+        {
+            let batch_num = batch.current_batch.max(1);
+            let total_batches = batch.total_batches.max(1);
+            let (start_page, end_page) = Self::extract_message_page(&self.snapshot.message, batch.total_pages).unwrap_or_else(|| {
+                if let Some(report) = batch.batches.iter().find(|r| r.batch == batch.current_batch)
+                    && report.page_count > 0
+                {
+                    let start = report.page_start.saturating_add(1).min(batch.total_pages);
+                    let end = report.page_start.saturating_add(report.page_count).min(batch.total_pages);
+                    (start, end.max(start))
+                } else {
+                    let start = batch.completed_pages.saturating_add(1).min(batch.total_pages);
+                    let end = batch.completed_pages.saturating_add(batch.pages_per_batch.max(1)).min(batch.total_pages);
+                    (start, end.max(start))
+                }
+            });
+            let page_part = if start_page == end_page {
+                if arabic {
+                    format!("الصفحة {start_page} / {}", batch.total_pages)
+                } else {
+                    format!("Page {start_page} / {}", batch.total_pages)
+                }
+            } else if arabic {
+                format!("الصفحات {start_page}–{end_page} / {}", batch.total_pages)
+            } else {
+                format!("Pages {start_page}–{end_page} / {}", batch.total_pages)
+            };
+            if arabic {
+                format!("الدفعة {batch_num} / {total_batches} · {page_part} · المرحلة: {phase} · {timer}")
+            } else {
+                format!("Batch {batch_num} / {total_batches} · {page_part} · Phase: {phase} · {timer}")
+            }
+        } else if arabic {
+            format!("المرحلة: {phase} · {timer}")
+        } else {
+            format!("Phase: {phase} · {timer}")
+        }
+    }
 }
 
 /// Typed UI path shared by all panel buttons. Credentials move directly to the host without JSON,
@@ -1062,10 +1255,13 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         }
                     ),
                 );
-                if button(ui, a, "Cancel task — keep produced pages", "إلغاء المهمة مع الاحتفاظ بالصفحات المنتجة")
-                {
-                    requests.push(AiRequest::Cancel);
-                }
+                ui.horizontal(|ui| {
+                    if button(ui, a, "Cancel task — keep produced pages", "إلغاء المهمة مع الاحتفاظ بالصفحات المنتجة")
+                    {
+                        requests.push(AiRequest::Cancel);
+                    }
+                    rtl::label(ui, state.live_status_line(a));
+                });
             }
             let status_message = if state.error.is_empty() { &state.snapshot.message } else { &state.error };
             if !status_message.is_empty() {
@@ -1730,9 +1926,9 @@ fn production(
         });
         production_binding(ui, s, a, documents, *activate_document);
         if !s.new_document {
+            let selected = documents.iter().find(|document| Some(document.index) == *activate_document);
             ui.horizontal_wrapped(|ui| {
                 label(ui, a, "Target document", "المستند المستهدف");
-                let selected = documents.iter().find(|document| Some(document.index) == *activate_document);
                 egui::ComboBox::from_id_salt("ai_target_document")
                     .selected_text(selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً")))
                     .show_ui(ui, |ui| {
@@ -1744,8 +1940,15 @@ fn production(
                     });
                 if let Some(selected) = selected {
                     rtl::label(ui, format!("{} {}", selected.pages, text(a, "pages", "صفحة")));
+                    rtl::label(ui, selected.page_map_line(a));
                 }
             });
+            if let Some(selected) = selected
+                && s.continue_book
+                && let Some(reason) = selected.non_continuable_reason(a)
+            {
+                rtl::label(ui, reason);
+            }
             if !s.continue_book {
                 label(
                     ui,
@@ -1753,6 +1956,73 @@ fn production(
                     "Edits existing content in one task. Choose Continue remaining book pages for production in review groups.",
                     "يحرر المحتوى الموجود بمهمة واحدة. اختر استكمال صفحات الكتاب المتبقية للإنتاج في مجموعات مراجعة.",
                 );
+            }
+        }
+        if let Some(script_pages) = explicit_script_pages(&s.prompt) {
+            if s.new_document && s.pages != script_pages {
+                ui.horizontal_wrapped(|ui| {
+                    rtl::label(
+                        ui,
+                        if a {
+                            format!("تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
+                        } else {
+                            format!("Script defines {script_pages} explicit PAGE blocks, but New document is set to {} pages.", s.pages)
+                        },
+                    );
+                    let match_label = if a {
+                        format!("مطابقة عدد صفحات المستند للتعليمات ({script_pages} صفحة)")
+                    } else {
+                        format!("Match document page count to script ({script_pages} pages)")
+                    };
+                    if ui.button(rtl::widget(ui, &match_label)).clicked() {
+                        s.pages = script_pages;
+                    }
+                });
+            } else if !s.new_document
+                && let Some(selected) = documents.iter().find(|document| Some(document.index) == *activate_document)
+                && u32::try_from(selected.pages).ok() != Some(script_pages)
+            {
+                ui.horizontal_wrapped(|ui| {
+                    rtl::label(
+                        ui,
+                        if a {
+                            format!(
+                                "تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما يحتوي المستند المحدد '{}' على {} صفحة.",
+                                selected.title, selected.pages
+                            )
+                        } else {
+                            format!(
+                                "Script defines {script_pages} explicit PAGE blocks, but selected document '{}' has {} pages.",
+                                selected.title, selected.pages
+                            )
+                        },
+                    );
+                    if let Some(matching_doc) = documents
+                        .iter()
+                        .find(|doc| doc.index != selected.index && u32::try_from(doc.pages).ok() == Some(script_pages))
+                    {
+                        let switch_book_label = if a {
+                            format!("التبديل إلى الكتاب المطابق ({})", matching_doc.title)
+                        } else {
+                            format!("Switch to matching book ({})", matching_doc.title)
+                        };
+                        if ui.button(rtl::widget(ui, &switch_book_label)).clicked() {
+                            *activate_document = Some(matching_doc.index);
+                            s.restored_target_unconfirmed = false;
+                        }
+                    }
+                    let switch_new_label = if a {
+                        format!("التبديل إلى مستند جديد من {script_pages} صفحة")
+                    } else {
+                        format!("Switch to new {script_pages}-page document")
+                    };
+                    if ui.button(rtl::widget(ui, &switch_new_label)).clicked() {
+                        s.new_document = true;
+                        s.continue_book = false;
+                        s.pages = script_pages;
+                        s.restored_target_unconfirmed = false;
+                    }
+                });
             }
         }
         if s.automatic_skills {
@@ -1867,6 +2137,24 @@ fn production(
                 }
             }
         }
+        let script_conflict_issue = explicit_script_pages(&s.prompt)
+            .and_then(|script_pages| {
+                let mismatch = if s.new_document {
+                    s.pages != script_pages
+                } else if s.continue_book {
+                    documents
+                        .iter()
+                        .find(|document| Some(document.index) == *activate_document)
+                        .is_some_and(|document| u32::try_from(document.pages).ok() != Some(script_pages))
+                } else {
+                    false
+                };
+                mismatch.then_some(text(
+                    a,
+                    "Explicit PAGE script count must match the target book page count.",
+                    "يجب أن يطابق عدد صفحات التعليمات الصريحة (PAGE) عدد صفحات الكتاب المستهدف.",
+                ))
+            });
         let continuation_issue = (s.continue_book
             && !documents.iter().any(|document| Some(document.index) == *activate_document && document.continuable))
         .then_some(text(
@@ -1874,7 +2162,7 @@ fn production(
             "Select a book with completed opening pages and remaining blank pages, or choose Edit current document.",
             "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر تحرير المستند الحالي.",
         ));
-        let issue = s.production_issue(available, activate_document.is_some(), a).or(continuation_issue);
+        let issue = s.production_issue(available, activate_document.is_some(), a).or(continuation_issue).or(script_conflict_issue);
         if let Some(reason) = issue {
             rtl::label(ui, reason);
         }
@@ -3313,6 +3601,8 @@ mod tests {
             pages: 4,
             remaining_pages: 3,
             continuable: true,
+            filled_ranges: vec![[1, 1]],
+            blank_ranges: vec![[2, 4]],
         }];
         let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
             move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
@@ -3720,6 +4010,8 @@ mod tests {
             pages: 8,
             remaining_pages: 2,
             continuable: true,
+            filled_ranges: vec![[1, 6]],
+            blank_ranges: vec![[7, 8]],
         };
         let estimate = state.request_estimate(&[document], Some(3)).unwrap();
         assert_eq!(estimate.review_pages, 2);
@@ -4568,5 +4860,104 @@ mod tests {
         assert!(model_state.production_issue(true, true, true).is_some_and(|msg| msg.contains("للصور أو الوسائط")));
         model_state.settings.text_model.model = "gemini-3.8-flash".into();
         assert_eq!(model_state.production_issue(true, true, false), None);
+    }
+
+    #[test]
+    fn live_status_page_map_and_script_conflict_actions_work_without_starting_production() {
+        let mut live = AiUiState {
+            snapshot: AiSnapshot {
+                busy: true,
+                stage: "planning".into(),
+                message: "Generating editable native layout for page 23".into(),
+                batch: Some(BatchSnapshot {
+                    status: "running".into(),
+                    current_batch: 1,
+                    total_batches: 13,
+                    completed_pages: 22,
+                    total_pages: 48,
+                    pages_per_batch: 2,
+                    elapsed_ms: 5_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(live.live_status_line(false), "Batch 1 / 13 · Page 23 / 48 · Phase: Planning · 00:00:05");
+        assert_eq!(live.live_status_line(true), "الدفعة 1 / 13 · الصفحة 23 / 48 · المرحلة: التخطيط · 00:00:05");
+        live.snapshot.stage = "rendering_proof".into();
+        live.snapshot.message = "Preparing complete review proofs".into();
+        live.snapshot.batch.as_mut().unwrap().elapsed_ms = 18_000;
+        assert_eq!(live.live_status_line(false), "Batch 1 / 13 · Pages 23–24 / 48 · Phase: Proof preparation · 00:00:18");
+
+        let mut state = AiUiState {
+            new_document: false,
+            continue_book: true,
+            prompt: (1..=48).map(|page| format!("### PAGE {page:02} — Lesson {page}\n")).collect(),
+            ..Default::default()
+        };
+        state.settings.text_model.model = "fixture-model".into();
+        let documents = vec![
+            OpenDocument {
+                index: 0,
+                uid: 10,
+                path: None,
+                title: "Untitled-11".into(),
+                facing_pages: true,
+                right_to_left_binding: false,
+                pages: 49,
+                remaining_pages: 49,
+                continuable: false,
+                filled_ranges: vec![[2, 15]],
+                blank_ranges: vec![[1, 1], [16, 49]],
+            },
+            OpenDocument {
+                index: 1,
+                uid: 11,
+                path: None,
+                title: "book-48".into(),
+                facing_pages: true,
+                right_to_left_binding: false,
+                pages: 48,
+                remaining_pages: 26,
+                continuable: true,
+                filled_ranges: vec![[1, 22]],
+                blank_ranges: vec![[23, 48]],
+            },
+        ];
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+            move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
+            (state, Vec::new(), Some(0)),
+        );
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Page map — Completed: 2–15 · Blank: 1, 16–49").is_some());
+        assert!(
+            panel
+                .query_by_label(
+                    "Leading page 1 is blank while later pages contain items (2–15); prefix continuation requires completed pages starting at page 1."
+                )
+                .is_some()
+        );
+        assert!(panel.query_by_label("Script defines 48 explicit PAGE blocks, but selected document 'Untitled-11' has 49 pages.").is_some());
+        assert!(panel.get_by_label("Produce").accesskit_node().is_disabled());
+
+        panel.get_by_label("Switch to matching book (book-48)").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().2, Some(1));
+        assert!(panel.state().1.is_empty(), "switching to the matching book never starts production automatically");
+        assert!(panel.query_by_label("Page map — Completed: 1–22 · Blank: 23–48").is_some());
+        assert!(!panel.get_by_label("Produce").accesskit_node().is_disabled());
+
+        panel.state_mut().0.new_document = true;
+        panel.state_mut().0.continue_book = false;
+        panel.state_mut().0.pages = 8;
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Script defines 48 explicit PAGE blocks, but New document is set to 8 pages.").is_some());
+        assert!(panel.get_by_label("Produce").accesskit_node().is_disabled());
+        panel.get_by_label("Match document page count to script (48 pages)").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.pages, 48);
+        assert!(!panel.get_by_label("Produce").accesskit_node().is_disabled());
+        assert!(panel.state().1.is_empty());
     }
 }

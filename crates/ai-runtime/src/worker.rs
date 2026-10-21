@@ -677,6 +677,7 @@ impl Runner<'_> {
         }
         let plan = self.generic_production_plan(&request, &context, &catalog, &skills, &base, &prefs, scope)?;
         if let Some(scope) = scope {
+            self.progress("Preparing complete review proofs", 0.9)?;
             let proofs = batch_proofs_with_layout(&plan, &base, &prefs, &request.settings, &request.prompt, self.cancel, scope)?;
             Ok(Product::BatchPlan { plan, proofs })
         } else {
@@ -730,7 +731,7 @@ impl Runner<'_> {
             system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
         }
         if crate::script_contract::parse(&request.prompt)?.is_some() {
-            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten-frame: {page,rect,frame:five|ten,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
+            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten/twenty-frame: {page,rect,frame:five|ten|twenty,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
         }
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
@@ -754,7 +755,7 @@ impl Runner<'_> {
                 .insert("facing_page_context".into(), crate::script_contract::facing_context(&request.prompt, scope)?);
             system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
         }
-        system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
+        system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten/twenty-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
         if request.settings.output_mode == OutputMode::NativeWithImages {
             system.push('\n');
             system.push_str(crate::image_repetition::POLICY);
@@ -794,7 +795,23 @@ impl Runner<'_> {
         let mut image_bytes = 0usize;
         let repair_attempts = if request.settings.allow_paid_repairs { request.settings.budget.repair_attempts } else { 0 };
         for attempt in 0..=repair_attempts {
-            self.progress(if attempt == 0 { "Generating editable native layout" } else { "Repairing native layout validation" }, 0.15)?;
+            let stage = match (attempt, scope) {
+                (0, Some(s)) if s.count == 1 => format!("Generating editable native layout for page {}", u64::from(s.start) + 1),
+                (0, Some(s)) => {
+                    format!("Generating editable native layout for pages {}–{}", u64::from(s.start) + 1, u64::from(s.start) + u64::from(s.count))
+                }
+                (0, None) => "Generating editable native layout".into(),
+                (n, Some(s)) if s.count == 1 => {
+                    format!("Repairing native layout validation for page {} (attempt {n} of {repair_attempts})", u64::from(s.start) + 1)
+                }
+                (n, Some(s)) => format!(
+                    "Repairing native layout validation for pages {}–{} (attempt {n} of {repair_attempts})",
+                    u64::from(s.start) + 1,
+                    u64::from(s.start) + u64::from(s.count)
+                ),
+                (n, None) => format!("Repairing native layout validation (attempt {n} of {repair_attempts})"),
+            };
+            self.progress(&stage, 0.15)?;
             let response = self.generate(&request.settings.text_model, &generation)?;
             let native_text = scope
                 .map(|scope| {
@@ -1010,6 +1027,7 @@ impl Runner<'_> {
                 .checked_add(expanded_bytes)
                 .filter(|bytes| *bytes <= MAX_GROUP_PLAN_BYTES)
                 .ok_or("Expanded review plans exceed the 256-MiB limit")?;
+            self.progress(&format!("Validating commands and print preflight for page {}", u64::from(scope.start) + 1), 0.8)?;
             simulate_styled(
                 &plan,
                 scratch.doc().map_err(|e| e.to_string())?,

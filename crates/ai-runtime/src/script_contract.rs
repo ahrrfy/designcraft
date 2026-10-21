@@ -584,6 +584,7 @@ pub(crate) fn anchor_images(brief: &str, scope: BatchScope, plan: &mut Productio
 pub(crate) enum CountFrame {
     Five,
     Ten,
+    Twenty,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -600,7 +601,7 @@ pub(crate) fn activity_schema() -> Value {
     json!({"type":"object","additionalProperties":false,"required":["page","rect","frame","quantity","filled"],"properties":{
         "page":{"type":"integer","minimum":0,"maximum":999},
         "rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":0,"maximum":100000}},
-        "frame":{"type":"string","enum":["five","ten"]},"quantity":{"type":"integer","minimum":0,"maximum":10},
+        "frame":{"type":"string","enum":["five","ten","twenty"]},"quantity":{"type":"integer","minimum":0,"maximum":20},
         "filled":{"type":"boolean","description":"true for filled counters; false for outlined circles to color"}
     }})
 }
@@ -615,8 +616,8 @@ fn activity_shape(commands: &mut Vec<EngineAction>, base: usize, page: u32, rect
     Ok(format!("${index}.id"))
 }
 
-/// Build mathematical counters locally; a five-frame has 1×5 cells and a
-/// ten-frame has 2×5, filled left-to-right across the top row first.
+/// Build mathematical counters locally; a five-frame has 1×5 cells, a
+/// ten-frame has 2×5, and a twenty-frame has 4×5, filled left-to-right across the top row first.
 /// The caller still validates page geometry and human-reviewed pedagogy.
 pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, activities: &[NativeActivity]) -> Result<(), String> {
     let end = end(scope)?;
@@ -628,6 +629,7 @@ pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, ac
         let rows = match activity.frame {
             CountFrame::Five => 1u8,
             CountFrame::Ten => 2u8,
+            CountFrame::Twenty => 4u8,
         };
         let capacity = rows.saturating_mul(5);
         let [left, top, right, bottom] = activity.rect;
@@ -638,7 +640,7 @@ pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, ac
             || right - left < 25.0
             || bottom - top < f64::from(rows) * 5.0
         {
-            return Err("Native count frame has an invalid page, rectangle or quantity for its five/ten cells".into());
+            return Err("Native count frame has an invalid page, rectangle or quantity for its five/ten/twenty cells".into());
         }
         for earlier in activities.get(..activity_index).ok_or("Invalid native activity range")? {
             let [a, b, c, d] = earlier.rect;
@@ -651,6 +653,7 @@ pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, ac
         let frame = match activity.frame {
             CountFrame::Five => "five",
             CountFrame::Ten => "ten",
+            CountFrame::Twenty => "twenty",
         };
         let mut all = Vec::new();
         let mut outlined = Vec::new();
@@ -889,11 +892,30 @@ fn bind_copy(plan: &mut ProductionPlan, scope: BatchScope, brief: &str, bindings
         *id_counts.entry(binding.copy_id.as_str()).or_default() += 1;
     }
     for binding in bindings {
-        if binding.copy_id.is_empty() || binding.copy_id.len() > 64 || !frames.insert(binding.frame) {
+        if binding.copy_id.is_empty() || binding.copy_id.len() > 64 {
             return Err("Copy binding has an invalid source ID or repeats a native frame".into());
         }
         let source = sources.get(&binding.copy_id).ok_or("Copy binding source is not in the current explicit page scope")?;
-        let frame = plan.commands.get(binding.frame).ok_or("Copy binding frame is outside the authored command plan")?;
+        let candidate = plan.commands.get(binding.frame).ok_or("Copy binding frame is outside the authored command plan")?;
+        let resolved_frame = if candidate.command == "frame.create" {
+            binding.frame
+        } else {
+            (0..=binding.frame)
+                .rev()
+                .find(|&idx| {
+                    !frames.contains(&idx)
+                        && plan.commands.get(idx).is_some_and(|action| {
+                            action.command == "frame.create"
+                                && action.params.get("content").and_then(Value::as_str) == Some("text")
+                                && action.params.get("spread").and_then(Value::as_u64) == Some(u64::from(source.page))
+                        })
+                })
+                .unwrap_or(binding.frame)
+        };
+        if !frames.insert(resolved_frame) {
+            return Err("Copy binding has an invalid source ID or repeats a native frame".into());
+        }
+        let frame = plan.commands.get(resolved_frame).ok_or("Copy binding frame is outside the authored command plan")?;
         if frame.command != "frame.create"
             || frame.params.get("content").and_then(Value::as_str) != Some("text")
             || frame.params.get("spread").and_then(Value::as_u64) != Some(u64::from(source.page))
@@ -913,7 +935,7 @@ fn bind_copy(plan: &mut ProductionPlan, scope: BatchScope, brief: &str, bindings
         coverage.entry(binding.copy_id.clone()).or_default().push(word_range);
         let provenance = CopyProvenance { brief_sha256: digest.clone(), copy_id: binding.copy_id.clone(), word_range };
         let label = format!("{COPY_LABEL}{}", serde_json::to_string(&provenance).map_err(|error| error.to_string())?);
-        assignments.push((binding.frame, text, label));
+        assignments.push((resolved_frame, text, label));
     }
     complete_copy_ranges(&mut coverage, &sources)?;
     for (frame, text, label) in assignments {
@@ -1372,5 +1394,54 @@ mod tests {
         let mut session = designcraft_engine::Session::new();
         session.execute("file.new", &json!({"facingPages":false})).unwrap();
         session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+    }
+
+    #[test]
+    fn twenty_count_frame_and_copy_binding_formatting_index_normalize_cleanly() {
+        let mut native = ProductionPlan { title: "Fourteen".into(), commands: vec![], images: vec![] };
+        let twenty: NativeActivity =
+            serde_json::from_value(json!({"page":0,"rect":[50,100,300,260],"frame":"twenty","quantity":14,"filled":true})).unwrap();
+        append_activities(&mut native, BatchScope { start: 0, count: 1 }, &[twenty]).unwrap();
+        assert_eq!(
+            native
+                .commands
+                .iter()
+                .filter(|a| a.params.get("label").and_then(Value::as_str).is_some_and(|label| label.contains(".twenty.cell.")))
+                .count(),
+            20
+        );
+        assert_eq!(
+            native
+                .commands
+                .iter()
+                .filter(|a| a.params.get("label").and_then(Value::as_str).is_some_and(|label| label.contains(".twenty.token.")))
+                .count(),
+            14
+        );
+        let invalid: NativeActivity =
+            serde_json::from_value(json!({"page":0,"rect":[50,100,300,260],"frame":"twenty","quantity":21,"filled":true})).unwrap();
+        assert!(append_activities(&mut native, BatchScope { start: 0, count: 1 }, &[invalid]).is_err());
+
+        let brief = "### PAGE 01 — Fourteen\n* **English Print Copy (LTR):**\n  > Fourteen (10 + 4)\n* **Arabic Print Copy (RTL - Vocalized):**\n  > أَرْبَعَةَ عَشَرَ\n";
+        let scope = BatchScope { start: 0, count: 1 };
+        let raw = json!({
+            "title": "Page 1 — Fourteen",
+            "commands": [
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,45,280,100],"text":"placeholder"}},
+                {"command":"type.char","params":{"attrs":{"size":18}}},
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[300,45,550,100],"text":"placeholder"}},
+                {"command":"type.para","params":{"attrs":{"align":"right","direction":"rightToLeft"}}}
+            ],
+            "images": [],
+            "activities": [{"page":0,"rect":[50,120,300,280],"frame":"twenty","quantity":14,"filled":true}],
+            "copy_bindings": [
+                {"frame": 1, "copy_id": "p1.en.1", "word_range": [0, 1]},
+                {"frame": 3, "copy_id": "p1.ar.1", "word_range": [0, 1]}
+            ]
+        });
+        let plan = compile_native_plan_for_brief(&raw.to_string(), scope, brief).unwrap();
+        assert_eq!(plan.commands[0].params["text"], "Fourteen (10 + 4)");
+        assert_eq!(plan.commands[2].params["text"], "أَرْبَعَةَ عَشَرَ");
+        validate_plan(brief, scope, &plan).unwrap();
     }
 }
