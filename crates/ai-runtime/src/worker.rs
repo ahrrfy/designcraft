@@ -311,6 +311,7 @@ impl Runner<'_> {
         prefs: &Prefs,
         scope: Option<BatchScope>,
         catalog: &Value,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
     ) -> Result<Option<ProductionPlan>, String> {
         let (Some(root), Some(key)) = (&self.cache_root, key) else {
             return Ok(None);
@@ -334,6 +335,7 @@ impl Runner<'_> {
             }
             self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
             validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+            image_command_budget(&plan, profile)?;
             Ok::<_, String>(())
         })();
         if let Err(error) = valid {
@@ -728,7 +730,7 @@ impl Runner<'_> {
             system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
         }
         if crate::script_contract::parse(&request.prompt)?.is_some() {
-            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten-frame: {page,rect,frame:five|ten,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrations must depict the stated subjects and quantities; leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
+            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten-frame: {page,rect,frame:five|ten,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
         }
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
@@ -752,6 +754,11 @@ impl Runner<'_> {
                 .insert("facing_page_context".into(), crate::script_contract::facing_context(&request.prompt, scope)?);
             system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
         }
+        system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
+        if request.settings.output_mode == OutputMode::NativeWithImages {
+            system.push('\n');
+            system.push_str(crate::image_repetition::POLICY);
+        }
         let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
         let mut schema = plan_schema(catalog, request.settings.output_mode)?;
         if scope.is_some() {
@@ -769,7 +776,7 @@ impl Runner<'_> {
             resources: request.settings.resources.clone(),
         };
         let cache_key = self.plan_key(request, &generation, base)?;
-        if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog)? {
+        if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog, geometry_profile)? {
             if let Some(profile) = geometry_profile {
                 crate::design::check_image_slots(base, &plan.images, profile)?;
             }
@@ -816,6 +823,7 @@ impl Runner<'_> {
                     }
                     self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
                     validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+                    image_command_budget(&plan, geometry_profile)?;
                     if let Some(profile) = geometry_profile {
                         crate::design::check_image_slots(base, &plan.images, profile)?;
                     }
@@ -1050,6 +1058,7 @@ impl Runner<'_> {
         }
         validate_image_review_settings(settings)?;
         let style_context = illustration_style(style_profile)?;
+        image_command_budget(&plan, profile)?;
         self.preload_images(&plan, settings, profile, &style_context, cache, bytes_used)?;
         // Reject an unsupported resolution tier before buying any member of the set.
         for placement in &plan.images {
@@ -1057,19 +1066,6 @@ impl Runner<'_> {
                 return Err("Counted single-subject frames cannot also be pinned atlas crops; no images were requested".into());
             }
             self.print_image_size(placement, profile, &settings.image_model)?;
-        }
-        let image_actions = plan.images.iter().try_fold(0usize, |count, image| {
-            let actions = if image.instance_count() > 1 {
-                image.repeat_rects.iter().try_fold(4usize, |actions, rect| {
-                    actions.checked_add(if crate::image_repetition::same_cell_size(image.rect, *rect) { 2 } else { 4 })
-                })
-            } else {
-                declared_image_slot(image, profile).map_or(1, |slot| slot.placement_count()).checked_mul(4)
-            };
-            actions.and_then(|actions| count.checked_add(actions))
-        });
-        if image_actions.and_then(|extra| plan.commands.len().checked_add(extra)).is_none_or(|total| total > MAX_ACTIONS) {
-            return Err("Image placement commands exceed the native action limit; no images were requested".into());
         }
         // Check capacity for the whole image set before purchasing its first member.
         // This conservative input bound includes the fixed image instructions and frame dimensions.
@@ -1212,22 +1208,8 @@ impl Runner<'_> {
                 }
                 // Fill an explicitly authored slot in place: new top-level frames would
                 // otherwise paint over the native dialogue/labels above its artwork.
-                let slot = plan.commands.iter().take(authored_count).enumerate().find_map(|(index, action)| {
-                    if filled_frames.contains(&index)
-                        || action.command != "frame.create"
-                        || action.params.get("content").and_then(Value::as_str) != Some("graphic")
-                        || !action
-                            .params
-                            .get("spread")
-                            .filter(|value| !value.is_null())
-                            .map_or(placement.page == 0, |value| value.as_u64().and_then(|page| usize::try_from(page).ok()) == Some(placement.page))
-                    {
-                        return None;
-                    }
-                    let rect = action.params.get("rect").and_then(Value::as_array)?;
-                    (rect.len() == 4 && rect.iter().zip(view_rect).all(|(a, b)| a.as_f64().is_some_and(|a| a.is_finite() && (a - b).abs() <= 0.01)))
-                        .then_some(index)
-                });
+                let authored = plan.commands.get(..authored_count).ok_or("Authored image slots disappeared")?;
+                let slot = authored_image_frame(authored, placement.page, view_rect, &filled_frames);
                 let index = if let Some(index) = slot {
                     filled_frames.insert(index);
                     index
@@ -1347,9 +1329,16 @@ impl Runner<'_> {
             resources: request.settings.resources.clone(),
         };
         let cache_key = self.plan_key(request, &generation, base)?;
-        if let Some(plan) =
-            self.cached_plan(cache_key.as_deref(), request, &context, base, prefs, Some(scope), &designcraft_engine::cmd::production::catalog())?
-        {
+        if let Some(plan) = self.cached_plan(
+            cache_key.as_deref(),
+            request,
+            &context,
+            base,
+            prefs,
+            Some(scope),
+            &designcraft_engine::cmd::production::catalog(),
+            Some(profile),
+        )? {
             match validate_template_family_sequence(&plan, style, previous.clone(), scope, &families, &request.prompt) {
                 Ok(()) => {
                     crate::design::check_image_slots(base, &plan.images, profile)?;
@@ -2063,8 +2052,10 @@ fn production_system(
     );
     system.push('\n');
     system.push_str(EDITORIAL_POLICY);
-    system.push('\n');
-    system.push_str(crate::image_repetition::POLICY);
+    if mode == OutputMode::NativeWithImages {
+        system.push('\n');
+        system.push_str(crate::image_repetition::POLICY);
+    }
     if current_document {
         system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Each pageGeometry.safeRect is the exact [left,top,right,bottom] live area in native spread coordinates, with inside/outside margins already resolved for its side. Keep every text frame, including headers and footers, fully inside safeRect; leave a visible gap between bilingual columns. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
     } else if skills.iter().any(|s| s.design_profile.is_some()) {
@@ -2864,6 +2855,61 @@ fn declared_image_slot<'a>(
     })
 }
 
+fn authored_image_frame(commands: &[EngineAction], page: usize, rect: [f64; 4], filled: &BTreeSet<usize>) -> Option<usize> {
+    commands.iter().enumerate().find_map(|(index, action)| {
+        if filled.contains(&index)
+            || action.command != "frame.create"
+            || action.params.get("content").and_then(Value::as_str) != Some("graphic")
+            || !action
+                .params
+                .get("spread")
+                .filter(|v| !v.is_null())
+                .map_or(page == 0, |v| v.as_u64().and_then(|n| usize::try_from(n).ok()) == Some(page))
+        {
+            return None;
+        }
+        let authored = action.params.get("rect").and_then(Value::as_array)?;
+        (authored.len() == 4 && authored.iter().zip(rect).all(|(a, b)| a.as_f64().is_some_and(|a| a.is_finite() && (a - b).abs() <= 0.01)))
+            .then_some(index)
+    })
+}
+
+/// Shared planning/purchase guard. Includes authored slots and every native copy;
+/// a cached layout cannot postpone a known action overflow until after planning.
+fn image_command_budget(plan: &ProductionPlan, profile: Option<&designcraft_ai_types::DesignProfile>) -> Result<(), String> {
+    let mut total = plan.commands.len();
+    let mut filled = BTreeSet::new();
+    for image in &plan.images {
+        let declared = declared_image_slot(image, profile);
+        let mut views = vec![image.rect];
+        if let Some(slot) = declared {
+            views.extend(slot.views.iter().map(|v| v.rect));
+        } else {
+            views.extend(image.repeat_rects.iter().copied());
+        }
+        for (index, rect) in views.into_iter().enumerate() {
+            let actions = if image.instance_count() > 1 && index > 0 {
+                if crate::image_repetition::same_cell_size(image.rect, rect) { 2usize } else { 4usize }
+            } else {
+                let slot = authored_image_frame(&plan.commands, image.page, rect, &filled);
+                if let Some(slot) = slot {
+                    filled.insert(slot);
+                }
+                2usize + usize::from(slot.is_none()) + usize::from(image.instance_count() > 1 || declared.is_some())
+            };
+            total = total.checked_add(actions).ok_or("Native image action count overflow")?;
+        }
+    }
+    if total > MAX_ACTIONS {
+        return Err(format!(
+            "Image placement commands exceed the native action limit: {total} total ({} layout + {} pending image actions), maximum {MAX_ACTIONS}. Simplify this page's formatting/layout while preserving all source copy, quantities and review size. No images were requested.",
+            plan.commands.len(),
+            total.saturating_sub(plan.commands.len())
+        ));
+    }
+    Ok(())
+}
+
 fn image_request_size(
     placement: &designcraft_ai_types::protocol::ImagePlacement,
     profile: Option<&designcraft_ai_types::DesignProfile>,
@@ -3366,6 +3412,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ai24_cached_plan_with_no_room_for_repeated_images_is_rejected_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"facingPages":false})).unwrap();
+        let mut plan = crate::script_contract::compile_native_plan(
+            &json!({"title":"Dense page","commands":[],"images":[{
+                "prompt":"One fish","page":0,"rect":[60,180,540,430],"label":"Fish","repeat_groups":[20,4]
+            }]})
+            .to_string(),
+            BatchScope { start: 0, count: 1 },
+        )
+        .unwrap();
+        plan.commands =
+            vec![EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[60,60,100,100],"content":"unassigned"}) }; 470];
+        let key = "f".repeat(64);
+        crate::production_cache::store_plan(dir.path(), &key, &plan).unwrap();
+        let provider = Ai23SyntheticProvider::new(vec![]);
+        let request = TaskRequest {
+            prompt: "Draw counted units".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: true,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let runner = Runner {
+            cache_root: Some(dir.path().to_path_buf()),
+            print: None,
+            planning_only: true,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let cached = runner
+            .cached_plan(
+                Some(&key),
+                &request,
+                &json!({}),
+                session.doc().unwrap(),
+                &session.prefs,
+                None,
+                &designcraft_engine::cmd::production::catalog(),
+                None,
+            )
+            .unwrap();
+        assert!(cached.is_none(), "a cached native draft must reserve space for its pending generated-image commands");
+        assert_eq!(ledger.summary().requests, 0);
+    }
+
     fn ai24_expand_candidates(
         images: Vec<providers::GeneratedImage>,
         min_ppi: Option<f64>,
@@ -3781,7 +3882,7 @@ mod tests {
             sender: &sender,
             provider: &provider,
         }
-        .cached_plan(Some(&key), &request, &json!({}), &base, &session.prefs, None, &designcraft_engine::cmd::production::catalog())
+        .cached_plan(Some(&key), &request, &json!({}), &base, &session.prefs, None, &designcraft_engine::cmd::production::catalog(), None)
         .unwrap();
         assert!(
             cached.is_some(),

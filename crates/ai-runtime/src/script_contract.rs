@@ -531,27 +531,14 @@ pub(crate) fn activity_schema() -> Value {
     }})
 }
 
-fn activity_shape(
-    commands: &mut Vec<EngineAction>,
-    base: usize,
-    page: u32,
-    rect: [f64; 4],
-    shape: &str,
-    filled: bool,
-    label: String,
-) -> Result<(), String> {
+fn activity_shape(commands: &mut Vec<EngineAction>, base: usize, page: u32, rect: [f64; 4], shape: &str, label: String) -> Result<String, String> {
     let index = base.checked_add(commands.len()).ok_or("Native activity reference overflow")?;
-    if index.checked_add(4).is_none_or(|end| end > MAX_ACTIONS) {
+    if index.checked_add(2).is_none_or(|end| end > MAX_ACTIONS) {
         return Err("Native count-frame activities exceed the 512-command plan limit; split the internal page chunk".into());
     }
     commands.push(EngineAction { command: "frame.create".into(), params: json!({"spread":page,"rect":rect,"content":"unassigned","shape":shape}) });
-    commands.push(EngineAction {
-        command: "object.fill".into(),
-        params: json!({"ids":[format!("${index}.id")],"swatch":if filled {"[Black]"} else {"[None]"}}),
-    });
-    commands.push(EngineAction { command: "object.stroke".into(), params: json!({"ids":[format!("${index}.id")],"swatch":"[Black]","weight":0.8}) });
     commands.push(EngineAction { command: "object.label".into(), params: json!({"ids":[format!("${index}.id")],"label":label}) });
-    Ok(())
+    Ok(format!("${index}.id"))
 }
 
 /// Build mathematical counters locally; a five-frame has 1×5 cells and a
@@ -591,32 +578,46 @@ pub(crate) fn append_activities(plan: &mut ProductionPlan, scope: BatchScope, ac
             CountFrame::Five => "five",
             CountFrame::Ten => "ten",
         };
+        let mut all = Vec::new();
+        let mut outlined = Vec::new();
+        let mut filled = Vec::new();
         for cell in 0..capacity {
             let x = left + f64::from(cell % 5) * width;
             let y = top + f64::from(cell / 5) * height;
-            activity_shape(
+            let cell_id = activity_shape(
                 &mut commands,
                 plan.commands.len(),
                 activity.page,
                 [x, y, x + width, y + height],
                 "rectangle",
-                false,
                 format!("activity.count_frame.{activity_index}.{frame}.cell.{cell}"),
             )?;
+            all.push(cell_id.clone());
+            outlined.push(cell_id);
             if cell < activity.quantity {
                 let radius = width.min(height) * 0.24;
                 let center_x = x + width / 2.0;
                 let center_y = y + height / 2.0;
-                activity_shape(
+                let token = activity_shape(
                     &mut commands,
                     plan.commands.len(),
                     activity.page,
                     [center_x - radius, center_y - radius, center_x + radius, center_y + radius],
                     "ellipse",
-                    activity.filled,
                     format!("activity.count_frame.{activity_index}.{frame}.token.{cell}"),
                 )?;
+                all.push(token.clone());
+                if activity.filled { filled.push(token) } else { outlined.push(token) }
             }
+        }
+        for (ids, swatch) in [(&outlined, "[None]"), (&filled, "[Black]")] {
+            if !ids.is_empty() {
+                commands.push(EngineAction { command: "object.fill".into(), params: json!({"ids":ids,"swatch":swatch}) });
+            }
+        }
+        commands.push(EngineAction { command: "object.stroke".into(), params: json!({"ids":all,"swatch":"[Black]","weight":0.8}) });
+        if plan.commands.len().checked_add(commands.len()).is_none_or(|n| n > MAX_ACTIONS) {
+            return Err("Native activity formatting exceeds the 512-command plan limit; simplify this page without changing review size".into());
         }
     }
     plan.commands.extend(commands);
@@ -886,6 +887,32 @@ pub(crate) fn compile_native_plan_for_brief(text: &str, scope: BatchScope, brief
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ai24_dense_teen_activities_batch_format_without_changing_native_cells() {
+        let mut plan = ProductionPlan { title: "Seventeen and eighteen".into(), commands: vec![], images: vec![] };
+        let activities: Vec<_> = [10, 7, 10, 8]
+            .into_iter()
+            .enumerate()
+            .map(|(index, quantity)| NativeActivity {
+                page: 0,
+                rect: [60.0, 100.0 + index as f64 * 60.0, 260.0, 140.0 + index as f64 * 60.0],
+                frame: CountFrame::Ten,
+                quantity,
+                filled: true,
+            })
+            .collect();
+        append_activities(&mut plan, BatchScope { start: 0, count: 1 }, &activities).unwrap();
+        assert_eq!(plan.commands.len(), 162, "75 native cells/tokens need 150 creation/label actions plus 12 shared format actions");
+        let mut session = designcraft_engine::Session::new();
+        session.execute("file.new", &json!({"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+        let items = &session.doc().unwrap().doc.spreads[0].items;
+        assert_eq!(items.len(), 75);
+        assert_eq!(items.iter().filter(|i| i.fill.swatch == "[Black]").count(), 35);
+        assert!(items.iter().all(|i| i.stroke.swatch == "[Black]" && (i.stroke.weight - 0.8).abs() < 0.0001));
+        assert_eq!(items.iter().filter(|i| i.label.contains(".cell.")).count(), 40);
+    }
 
     #[test]
     fn ai24_anchor_images_rewrites_repeated_unit_placement_to_single_isolated_subject() {
