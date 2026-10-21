@@ -477,12 +477,23 @@ pub(crate) fn anchor_images(brief: &str, scope: BatchScope, plan: &mut Productio
             .find(|page| u64::from(page.page) == u64::try_from(image.page).unwrap_or(u64::MAX))
             .ok_or("Illustration is outside its explicit page contract")?;
         let art = page.illustration_prompt.as_deref().unwrap_or("");
-        let prompt = format!(
-            "USER PAGE {} — {}\nSUPPLIED SCENE AND SUBJECT REQUIREMENTS:\n{art}\nSELECTED ILLUSTRATION DETAIL:\n{}\nRender only the requested illustrative scene, objects and characters for this page. Preserve the supplied entities and requested quantities. All words, numerals, diagrams, number frames, tracing lines, labels and page layout in the source directions are handled as editable native objects: include none of them in raster artwork. No text, captions, letters, numerals or speech bubbles. This prompt does not certify the generated pixels; human visual proof remains required.",
-            u64::from(page.page) + 1,
-            page.title,
-            image.prompt
-        );
+        let prompt = if image.instance_count() > 1 {
+            format!(
+                "USER PAGE {} — {}\nNATIVE REPEATED COUNT UNIT (1 OF {} NATIVE FRAMES):\nPAGE CONTEXT (FOR SUBJECT IDENTITY AND ART STYLE ONLY — DO NOT RENDER THE TOTAL GROUP COUNT IN THIS SINGLE FRAME):\n{art}\nSINGLE-UNIT SUBJECT TO RENDER:\n{}\nRender EXACTLY ONE single isolated subject matching the page's object identity and style on a clean plain background with generous margin. Do NOT draw multiple copies or groups in this image. The host repeats the single unit in {} native frames to form the exact quantity. Include no text, captions, letters, numerals, borders or speech bubbles. Human visual proof remains required.",
+                u64::from(page.page) + 1,
+                page.title,
+                image.instance_count(),
+                image.prompt,
+                image.instance_count()
+            )
+        } else {
+            format!(
+                "USER PAGE {} — {}\nSUPPLIED SCENE AND SUBJECT REQUIREMENTS:\n{art}\nSELECTED ILLUSTRATION DETAIL:\n{}\nRender only the requested illustrative scene, objects and characters for this page. Preserve the supplied entities and requested quantities. All words, numerals, diagrams, number frames, tracing lines, labels and page layout in the source directions are handled as editable native objects: include none of them in raster artwork. No text, captions, letters, numerals or speech bubbles. This prompt does not certify the generated pixels; human visual proof remains required.",
+                u64::from(page.page) + 1,
+                page.title,
+                image.prompt
+            )
+        };
         if prompt.len() > MAX_IMAGE_PROMPT {
             return Err("Page-anchored illustration prompt exceeds 8192 bytes; split the illustration into focused scene slots".into());
         }
@@ -645,6 +656,7 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
         return Err("Provider commands cannot supply reserved host copy provenance labels".into());
     }
     let mut plan = ProductionPlan { title: content.title, commands: content.commands, images: content.images };
+    crate::image_repetition::normalize(&mut plan)?;
     if !content.copy_bindings.is_empty() {
         bind_copy(&mut plan, scope, brief.ok_or("Copy bindings require the original explicit page brief")?, &content.copy_bindings)?;
     }
@@ -874,6 +886,30 @@ pub(crate) fn compile_native_plan_for_brief(text: &str, scope: BatchScope, brief
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ai24_anchor_images_rewrites_repeated_unit_placement_to_single_isolated_subject() {
+        let mut brief = (1..14)
+            .map(|n| format!("### PAGE {n:02} — Earlier approved lesson\n* **English Print Copy (LTR):**\n  > Earlier copy\n"))
+            .collect::<String>();
+        brief.push_str("### PAGE 14 — Fourteen fish\n* **English Print Copy (LTR):**\n  > 14 = 10 + 4\n* **Visual & Illustration Prompt (Art Direction):** 14 colorful reef fish arranged in a group of 10 and a group of 4.\n");
+        let scope = BatchScope { start: 13, count: 1 };
+        let mut plan = compile_native_plan(
+            &json!({"title":"Fourteen", "commands":[], "images":[{
+                "prompt":"One isolated reef fish", "page":13,"rect":[60,180,540,390],"label":"Fish", "repeat_groups":[10,4]
+            }]})
+            .to_string(),
+            scope,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&plan.images[0]).unwrap();
+        assert_eq!(value["repeat_rects"].as_array().unwrap().len(), 13);
+        anchor_images(&brief, scope, &mut plan).unwrap();
+        assert!(plan.images[0].prompt.contains("1 OF 14 NATIVE FRAMES"));
+        assert!(plan.images[0].prompt.contains("EXACTLY ONE single isolated subject"));
+        assert!(!plan.images[0].prompt.contains("Preserve the supplied entities and requested quantities"));
+        assert!(plan.images[0].prompt.contains("human visual proof") || plan.images[0].prompt.contains("Human visual proof"));
+    }
 
     const SCRIPT: &str = "# Global print specs\nA4; bleed 3 mm; vocalized Arabic.\n### PAGE 01 — Cover\n* **English Print Copy (LTR):**\n  > MY MATH BOOK\n* **Arabic Print Copy (RTL - Vocalized):**\n  > كِتَابُ الرِّيَاضِيَّاتِ\n* **Visual & Illustration Prompt (Art Direction):** Noor and Leo with a lion.\n### PAGE 02 — Ownership & Number Chart\n* **English Print Copy (LTR):**\n  > THIS BOOK BELONGS TO: [Name Line] | MY NUMBER CHART 1–20\n* **Visual & Illustration Prompt (Art Direction):** Twenty number cards.\n";
 

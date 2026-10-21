@@ -190,6 +190,39 @@ impl BatchReviewKey {
         if batch.status != "awaiting_human_proof" {
             return None;
         }
+        let display = ProofDisplay::from_batch(batch)?;
+        Some(Self {
+            job_id: batch.job_id.clone(),
+            checkpoint: batch.checkpoint,
+            batch: batch.current_batch,
+            document: (batch.document_uid?, batch.document_revision?),
+            page_range: display.page_range,
+            task_shape: (batch.total_pages, batch.pages_per_batch, batch.total_batches),
+            proofs: display.proofs,
+        })
+    }
+
+    fn pages(&self) -> impl Iterator<Item = &(String, String)> {
+        self.proofs.iter().filter(|(path, _)| path.to_ascii_lowercase().ends_with(".png"))
+    }
+
+    fn same_proof_except_revision(&self, other: &Self) -> bool {
+        let mut normalized = other.clone();
+        normalized.document.1 = self.document.1;
+        self == &normalized
+    }
+}
+
+/// A saved proof is display data, never authority to approve or resume a worker.
+#[derive(Clone, PartialEq, Eq)]
+struct ProofDisplay {
+    job_id: String,
+    batch: u32,
+    page_range: (u32, u32),
+    proofs: Vec<(String, String)>,
+}
+impl ProofDisplay {
+    fn from_batch(batch: &BatchSnapshot) -> Option<Self> {
         let mut reports = batch.batches.iter().filter(|report| report.batch == batch.current_batch);
         let current = reports.next()?;
         if reports.next().is_some() {
@@ -222,23 +255,14 @@ impl BatchReviewKey {
         }
         Some(Self {
             job_id: batch.job_id.clone(),
-            checkpoint: batch.checkpoint,
             batch: batch.current_batch,
-            document: (batch.document_uid?, batch.document_revision?),
             page_range: (current.page_start, current.page_count),
-            task_shape: (batch.total_pages, batch.pages_per_batch, batch.total_batches),
             proofs: current.proof_paths.iter().cloned().zip(current.proof_sha256.iter().cloned()).collect(),
         })
     }
 
     fn pages(&self) -> impl Iterator<Item = &(String, String)> {
         self.proofs.iter().filter(|(path, _)| path.to_ascii_lowercase().ends_with(".png"))
-    }
-
-    fn same_proof_except_revision(&self, other: &Self) -> bool {
-        let mut normalized = other.clone();
-        normalized.document.1 = self.document.1;
-        self == &normalized
     }
 }
 
@@ -283,6 +307,8 @@ pub struct AiUiState {
     workflow_json: String,
     workflow_error: String,
     proof_key: Option<BatchReviewKey>,
+    proof_display: Option<ProofDisplay>,
+    show_saved_proof: bool,
     reviewed_proofs: BTreeSet<(String, String)>,
     proof_document_version: Option<(u64, u64)>,
     proof_validation_requested: Option<(u64, u64)>,
@@ -360,6 +386,8 @@ impl Default for AiUiState {
             workflow_json: String::new(),
             workflow_error: String::new(),
             proof_key: None,
+            proof_display: None,
+            show_saved_proof: true,
             reviewed_proofs: BTreeSet::new(),
             proof_document_version: None,
             proof_validation_requested: None,
@@ -439,7 +467,9 @@ impl AiUiState {
             self.preview = None;
         }
         let proof_key = snapshot.batch.as_ref().and_then(BatchReviewKey::from_batch);
-        if self.proof_key != proof_key {
+        let proof_display = snapshot.batch.as_ref().and_then(ProofDisplay::from_batch);
+        if self.proof_key != proof_key || self.proof_display != proof_display {
+            self.show_saved_proof = true;
             let preserve_review = self
                 .proof_key
                 .as_ref()
@@ -449,7 +479,7 @@ impl AiUiState {
             self.batch_approval_gesture = None;
             self.proof_validation_requested = None;
             if !preserve_review {
-                self.proof_path = proof_key.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
+                self.proof_path = proof_display.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
                 self.reviewed_proofs.clear();
                 self.proof_binding = None;
                 self.proof_loaded = None;
@@ -459,6 +489,7 @@ impl AiUiState {
             }
             self.proof_document_matches = false;
             self.proof_key = proof_key;
+            self.proof_display = proof_display;
         }
         if !snapshot.busy
             && let Some(selection) = self.pending_models.take()
@@ -506,7 +537,7 @@ impl AiUiState {
 
     /// Navigation never carries a loaded texture or a held review gesture to another page.
     fn select_proof(&mut self, path: &str) -> bool {
-        if self.proof_path.as_deref() == Some(path) || !self.proof_key.as_ref().is_some_and(|key| key.pages().any(|(page, _)| page == path)) {
+        if self.proof_path.as_deref() == Some(path) || !self.proof_display.as_ref().is_some_and(|key| key.pages().any(|(page, _)| page == path)) {
             return false;
         }
         self.proof_path = Some(path.into());
@@ -521,7 +552,7 @@ impl AiUiState {
         if !self.settings.facing_pages || !self.proof_pair_view {
             return None;
         }
-        let key = self.proof_key.as_ref()?;
+        let key = self.proof_display.as_ref()?;
         let selected = key.pages().position(|(path, _)| self.proof_path.as_deref() == Some(path.as_str()))?;
         let page = key.page_range.0.checked_add(u32::try_from(selected).ok()?)?;
         let pair = facing_proof_pair(page, false)?;
@@ -1026,7 +1057,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                 let summary: String = status_message.lines().next().unwrap_or("").chars().take(140).collect();
                 rtl::label(ui, summary);
             }
-            let reviewing = state.tab == 0 && state.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof");
+            let reviewing = state.tab == 0
+                && ((state.proof_display.is_some() && state.show_saved_proof)
+                    || state.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof"));
             if reviewing {
                 // The proof and its actions share a bounded, non-scrolling workspace.
                 production(ui, &mut state, a, available, &documents, &mut activate_document, &mut requests);
@@ -1513,7 +1546,18 @@ fn production(
     requests: &mut Vec<AiRequest>,
 ) {
     production_recovery(ui, s, a, available, documents, activate_document, requests);
-    if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
+    if (s.proof_display.is_some() && s.show_saved_proof) || s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
+        if s.proof_key.is_none() {
+            label(
+                ui,
+                a,
+                "Saved proof — view only. Restore the request to continue the opened book; this proof grants no approval.",
+                "بروف محفوظ للعرض فقط. استعد الطلب لاستكمال الكتاب المفتوح؛ هذه المعاينة لا تمنح اعتماداً.",
+            );
+            if button(ui, a, "Return to production settings", "العودة إلى إعدادات الإنتاج") {
+                s.show_saved_proof = false;
+            }
+        }
         batch_review(ui, s, a, requests);
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Production request", "تعليمات الإنتاج"))).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("ai_review_request").max_height(140.0).show(ui, |ui| {
@@ -1938,7 +1982,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
     let can_review = s.can_review_selected_proof();
     let pair_visible = s.companion_proof_path().is_some();
     let can_approve = s.can_approve_batch();
-    let pages: Vec<_> = s.proof_key.as_ref().map_or_else(Vec::new, |key| key.pages().collect());
+    let pages: Vec<_> = s.proof_display.as_ref().map_or_else(Vec::new, |key| key.pages().collect());
     let page_count = pages.len();
     let reviewed_count = pages.iter().filter(|page| s.reviewed_proofs.contains(**page)).count();
     let selected = pages.iter().position(|(path, _)| s.proof_path.as_deref() == Some(path.as_str()));
@@ -1965,7 +2009,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             batch.status
         ),
     );
-    if let Some(current) = batch.batches.iter().find(|report| report.batch == batch.current_batch) {
+    if let Some(current) = batch.batches.iter().find(|report| report.batch == batch.current_batch).filter(|_| !pages.is_empty()) {
         egui::ScrollArea::horizontal().id_salt("ai_review_page_strip").max_height(30.0).show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (index, page) in pages.iter().enumerate() {
@@ -2192,6 +2236,13 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                 }
             });
         });
+    } else if matches!(batch.status.as_str(), "failed" | "interrupted" | "cancelled") {
+        label(
+            ui,
+            a,
+            "This group has no complete published page proofs. Resolve the reported error and retry the unfinished pages; there is nothing new to approve.",
+            "لا توجد بروفات منشورة مكتملة لهذه المجموعة. عالج الخطأ الظاهر ثم أعد محاولة الصفحات غير المكتملة؛ لا يوجد ناتج جديد لاعتماده.",
+        );
     } else {
         label(ui, a, "Current group usage and proof have not yet been reported.", "لم تُبلغ بيانات استخدام المجموعة الحالية ومعاينتها بعد.");
     }
@@ -3863,6 +3914,62 @@ mod tests {
         ctx: egui::Context,
         checkpoint: AiSnapshot,
         calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+    #[test]
+    fn ai24_recovered_proofs_remain_visible_without_restoring_approval_authority() {
+        let mut fixture = ProofFixture::new();
+        let batch = fixture.checkpoint.batch.as_mut().unwrap();
+        batch.status = "interrupted".into();
+        batch.checkpoint = 0;
+        batch.document_uid = None;
+        batch.document_revision = None;
+        fixture.app.ui.ai.accept(fixture.checkpoint.clone());
+        assert_eq!(fixture.app.ui.ai.proof_path.as_deref(), Some("page-1.png"));
+        assert!(fixture.app.ui.ai.proof_key.is_none());
+        assert!(fixture.app.ui.ai.select_proof("page-2.png"));
+        fixture.view("page-2.png");
+        fixture.app.ui.ai.review_selected_proof();
+        assert!(fixture.app.ui.ai.reviewed_proofs.is_empty());
+        assert!(!fixture.app.ui.ai.can_review_selected_proof());
+        assert_eq!(fixture.calls.get(), 0);
+    }
+    #[test]
+    fn ai24_saved_proof_navigation_and_return_to_composer_do_not_approve_or_generate() {
+        let mut fixture = ProofFixture::new();
+        let batch = fixture.checkpoint.batch.as_mut().unwrap();
+        batch.status = "interrupted".into();
+        batch.document_uid = None;
+        batch.document_revision = None;
+        fixture.app.ui.ai.accept(fixture.checkpoint.clone());
+        let calls = fixture.calls.clone();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Selected page proof").is_some());
+        assert!(panel.query_by_label("Approve and generate next review group").is_none());
+        panel.get_by_label("Next").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.proof_path.as_deref(), Some("page-2.png"));
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        panel.get_by_label("Return to production settings").click();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("What would you like to create?").is_some());
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn ai24_failed_unpublished_group_explains_why_there_are_no_proofs_to_approve() {
+        let mut fixture = ProofFixture::new();
+        let batch = fixture.checkpoint.batch.as_mut().unwrap();
+        batch.status = "failed".into();
+        batch.batches[0].proof_paths.clear();
+        batch.batches[0].proof_sha256.clear();
+        fixture.app.ui.ai.accept(fixture.checkpoint);
+        let mut panel =
+            egui_kittest::Harness::builder().build_ui_state(|ui, state| batch_review(ui, state, false, &mut Vec::new()), fixture.app.ui.ai);
+        panel.run_steps(3);
+        assert!(panel.query_by_label("This group has no complete published page proofs. Resolve the reported error and retry the unfinished pages; there is nothing new to approve.").is_some());
+        assert!(panel.query_by_label("Approve and generate next review group").is_none());
+        assert!(panel.query_by_label("Selected page proof").is_none());
     }
     impl ProofFixture {
         fn new() -> Self {

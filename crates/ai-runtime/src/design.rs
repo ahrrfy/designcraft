@@ -71,9 +71,29 @@ pub(crate) fn check_image_slots(
     let margin = profile.margin_mm * 72.0 / 25.4;
     for image in images {
         let spread = base.doc.spreads.get(image.page).ok_or("Design image refers to a missing page")?;
-        let [left, top, right, bottom] = image.rect;
-        if !spread.pages.iter().any(|p| left >= p.x + margin && right <= p.x + p.width - margin && top >= margin && bottom <= p.height - margin) {
-            return Err("Design image slot crosses the pinned safe margin; correct it before requesting an illustration".into());
+        for [left, top, right, bottom] in image.all_rects() {
+            if !spread.pages.iter().any(|p| left >= p.x + margin && right <= p.x + p.width - margin && top >= margin && bottom <= p.height - margin) {
+                return Err("Design image slot crosses the pinned safe margin; correct it before requesting an illustration".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_document_image_slots(base: &DocState, images: &[designcraft_ai_types::protocol::ImagePlacement]) -> Result<(), String> {
+    for image in images {
+        let spread = base.doc.spreads.get(image.page).ok_or("Illustration refers to a missing native page")?;
+        for r in image.all_rects() {
+            if r.iter().any(|v| !v.is_finite())
+                || r[2] <= r[0]
+                || r[3] <= r[1]
+                || !spread.pages.iter().any(|p| {
+                    let safe = p.margin_rect();
+                    r[0] >= safe.x0 - 0.01 && r[1] >= safe.y0 - 0.01 && r[2] <= safe.x1 + 0.01 && r[3] <= safe.y1 + 0.01
+                })
+            {
+                return Err("Illustration cell crosses the opened document safe margin; no images were requested".into());
+            }
         }
     }
     Ok(())
@@ -118,8 +138,14 @@ mod tests {
         session.execute("frame.create", &json!({"rect":[60,60,150,150]})).unwrap();
         check_geometry(Some(&base), session.doc().unwrap(), &profile).unwrap();
         assert!(check_geometry(None, session.doc().unwrap(), &profile).is_err());
-        let mut image =
-            designcraft_ai_types::protocol::ImagePlacement { prompt: "Tree".into(), page: 0, rect: [1.0, 60.0, 100.0, 160.0], label: "tree".into() };
+        let mut image = designcraft_ai_types::protocol::ImagePlacement {
+            repeat_rects: Vec::new(),
+            repeat_groups: Vec::new(),
+            prompt: "Tree".into(),
+            page: 0,
+            rect: [1.0, 60.0, 100.0, 160.0],
+            label: "tree".into(),
+        };
         assert!(check_image_slots(&base, &[image.clone()], &profile).is_err());
         image.rect = [60.0, 60.0, 160.0, 160.0];
         check_image_slots(&base, &[image], &profile).unwrap();

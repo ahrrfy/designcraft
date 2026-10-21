@@ -113,13 +113,28 @@ pub struct ProductionDraft {
     pub document_path: Option<String>,
     pub document_title: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImagePlacement {
     pub prompt: String,
     pub page: usize,
     pub rect: [f64; 4],
     pub label: String,
+    /// Additional native frames sharing one generated single-subject source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repeat_rects: Vec<[f64; 4]>,
+    /// Host-compiled groups inside `rect`; mutually exclusive with explicit cells.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repeat_groups: Vec<u8>,
+}
+impl ImagePlacement {
+    /// Group declarations are normalized before consumers use these cells.
+    pub fn instance_count(&self) -> usize {
+        self.repeat_rects.len().saturating_add(1)
+    }
+    pub fn all_rects(&self) -> impl Iterator<Item = [f64; 4]> + '_ {
+        std::iter::once(self.rect).chain(self.repeat_rects.iter().copied())
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

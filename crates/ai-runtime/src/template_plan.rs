@@ -1424,7 +1424,14 @@ fn append_images(
         if prompt.len() > 8192 {
             return Err("Bound CPA illustration prompt exceeds its limit".into());
         }
-        plan.images.push(ImagePlacement { prompt, page: usize::try_from(page.page).map_err(|_| "Invalid image page")?, rect: slot.rect, label });
+        plan.images.push(ImagePlacement {
+            repeat_rects: Vec::new(),
+            repeat_groups: Vec::new(),
+            prompt,
+            page: usize::try_from(page.page).map_err(|_| "Invalid image page")?,
+            rect: slot.rect,
+            label,
+        });
     }
     Ok(())
 }

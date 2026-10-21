@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
     let mut candidate = plan.clone();
+    crate::image_repetition::normalize(&mut candidate)?;
+    crate::design::check_document_image_slots(base, &candidate.images)?;
     let mut scratch = Session::new();
     scratch.prefs = prefs.clone();
     scratch.add_document(base.clone());
@@ -184,8 +186,41 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     verified
         .execute("production.apply", &json!({"commands":candidate.commands,"outputMode":"native_with_images","requirePreflight":true}))
         .map_err(|e| e.to_string())?;
+    check_repeated_slots(&candidate, verified.doc().map_err(|e| e.to_string())?, cancel)?;
     *plan = candidate;
     Ok(notes)
+}
+
+fn check_repeated_slots(plan: &ProductionPlan, state: &DocState, cancel: &AtomicBool) -> Result<(), String> {
+    for (index, image) in plan.images.iter().enumerate().filter(|(_, image)| image.instance_count() > 1) {
+        let obstacles = fitting_obstacles(&state.doc, image.page, cancel)?;
+        for r in image.all_rects() {
+            let bounds = Rect::new(r[0], r[1], r[2], r[3]);
+            if plan.commands.iter().any(|a| {
+                a.command == "frame.create"
+                    && a.params.get("content").and_then(Value::as_str) == Some("graphic")
+                    && a.params.get("spread").and_then(Value::as_u64).unwrap_or(0) == image.page as u64
+                    && a.params.get("rect").is_some_and(|v| *v == serde_json::json!(r))
+            }) {
+                return Err("Do not precreate repeated graphic cells; the host duplicates the source frame".into());
+            }
+            for obstacle in &obstacles {
+                let Some(item) = state.doc.item(obstacle.id) else { continue };
+                if item.text_frame().is_some() && overlaps(bounds, obstacle.bounds) {
+                    return Err("Repeated illustration cells overlap native text; reflow the cells before image generation".into());
+                }
+                if item.graphic().is_some() && overlaps(bounds, obstacle.bounds) {
+                    return Err("Repeated illustration cells overlap existing artwork; no images were requested".into());
+                }
+            }
+            if plan.images.iter().enumerate().any(|(other_index, other)| {
+                other_index != index && other.page == image.page && other.all_rects().any(|other| crate::image_repetition::overlaps(r, other))
+            }) {
+                return Err("Repeated illustration cells overlap another pending image; no images were requested".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn frame_identity(spread: usize, index: usize, id: ItemId, rect: Rect, text: &str) -> String {
@@ -286,8 +321,7 @@ fn containing_background_growths(
             return Ok(None);
         }
     }
-    for image in plan.images.iter().filter(|image| image.page == text.spread) {
-        let [x0, y0, x1, y1] = image.rect;
+    for [x0, y0, x1, y1] in plan.images.iter().filter(|image| image.page == text.spread).flat_map(|image| image.all_rects()) {
         if overlaps(text.target, Rect::new(x0, y0, x1, y1)) && !overlaps(text.original, Rect::new(x0, y0, x1, y1)) {
             return Ok(None);
         }
@@ -312,8 +346,7 @@ fn containing_background_growths(
                 return Ok(None);
             }
         }
-        for image in plan.images.iter().filter(|image| image.page == text.spread) {
-            let [x0, y0, x1, y1] = image.rect;
+        for [x0, y0, x1, y1] in plan.images.iter().filter(|image| image.page == text.spread).flat_map(|image| image.all_rects()) {
             let bounds = Rect::new(x0, y0, x1, y1);
             if background_growth_blocks(background, bounds, bounds, band) {
                 return Ok(None);
@@ -645,8 +678,7 @@ fn position_collision(
             return Ok(true);
         }
     }
-    for image in plan.images.iter().filter(|image| image.page == position.spread) {
-        let [x0, y0, x1, y1] = image.rect;
+    for [x0, y0, x1, y1] in plan.images.iter().filter(|image| image.page == position.spread).flat_map(|image| image.all_rects()) {
         if blocks_translation(Rect::new(x0, y0, x1, y1), position.original, position.target) {
             return Ok(true);
         }
@@ -674,6 +706,23 @@ fn contains(a: Rect, b: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai24_each_repeated_cell_is_a_pre_image_margin_and_text_obstacle() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":1,"facingPages":false})).unwrap();
+        for (cell, expected) in [([220.0, 180.0, 260.0, 220.0], "overlap native text"), ([1.0, 180.0, 41.0, 220.0], "safe margin")] {
+            let mut plan: ProductionPlan = serde_json::from_value(json!({"title":"Units","commands":[
+                {"command":"frame.create","params":{"spread":0,"rect":[215,180,360,225],"content":"text","text":"Keep this copy"}}
+            ],"images":[{"prompt":"One fish","page":0,"rect":[60,180,100,220],"label":"Fish","repeat_rects":[cell]}]}))
+            .unwrap();
+            let before = serde_json::to_value(&plan).unwrap();
+            let error = prepare(&mut plan, session.doc().unwrap(), &session.prefs, &AtomicBool::new(false)).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+            assert!(session.doc().unwrap().doc.spreads[0].items.is_empty());
+        }
+    }
     use designcraft_engine::Session;
     use serde_json::json;
 
@@ -974,6 +1023,8 @@ mod tests {
                     session.execute("frame.create", &obstacle).unwrap();
                 }
                 "image" => plan.images.push(designcraft_ai_types::protocol::ImagePlacement {
+                    repeat_rects: Vec::new(),
+                    repeat_groups: Vec::new(),
                     prompt: "Synthetic obstacle".into(),
                     page: 0,
                     rect: [300.0, 99.0, 540.0, 125.0],

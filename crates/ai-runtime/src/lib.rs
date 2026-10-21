@@ -4,6 +4,7 @@
 
 mod design;
 mod facing_pages;
+mod image_repetition;
 mod image_review;
 pub mod indesign;
 pub mod ledger;
