@@ -699,6 +699,11 @@ fn image_contents(provider: ProviderKind, value: &Value, cancel: &AtomicBool) ->
                 return Err("Gemini image response did not finish normally".into());
             }
             for part in candidate.pointer("/content/parts").and_then(Value::as_array).into_iter().flatten() {
+                // Gemini image models may return draft thought images before the
+                // final artwork. They are billed usage, not placement outputs.
+                if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
                 if let Some(encoded) = part.pointer("/inlineData/data").and_then(Value::as_str) {
                     add(encoded)?;
                 }

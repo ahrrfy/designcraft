@@ -469,8 +469,8 @@ fn recover_text_positions(
             },
         });
     }
-    // A crossing can be recovered only when two aligned, single-language header
-    // columns are unambiguous. Body activities and mixed-language frames are never guessed.
+    // Only tiny stacked headers and unambiguous bilingual header columns may
+    // move. Body activities and mixed-language frames are never guessed.
     for _ in 0..positions.len() {
         let mut crossing = None;
         'pairs: for (left, a) in positions.iter().enumerate() {
@@ -484,6 +484,34 @@ fn recover_text_positions(
         let Some((a, b)) = crossing else { break };
         let first = positions.get(a).ok_or("Missing header position")?.clone();
         let second = positions.get(b).ok_or("Missing header position")?.clone();
+        if first.language != 0
+            && first.language == second.language
+            && (first.target.x0 - second.target.x0).abs() < 0.01
+            && (first.target.x1 - second.target.x1).abs() < 0.01
+        {
+            let (upper, mut lower, lower_index) = if first.target.y0 < second.target.y0 { (first, second, b) } else { (second, first, a) };
+            let overlap = upper.target.y1 - lower.target.y0;
+            let header_bottom = lower.safe.y0 + (lower.safe.height() * 0.25).min(72.0);
+            if upper.target.y0 + 0.01 < lower.target.y0
+                && upper.target.y1 + 0.01 < lower.target.y1
+                && overlap > 0.0
+                && overlap <= 12.0
+                && upper.target.y1 <= header_bottom
+                && lower.target.y1 + overlap <= header_bottom
+            {
+                lower.target = shift(lower.target, 0.0, overlap);
+                let mut targets: BTreeMap<_, _> = positions.iter().map(|position| (position.id, position.target)).collect();
+                targets.insert(lower.id, lower.target);
+                // Check before changing another position: an activity immediately
+                // below this pair must remain an obstruction, never a reflow chain.
+                if !contains(lower.safe, lower.target) || position_collision(&lower, &targets, &doc, plan, cancel)? {
+                    return Err("Stacked native headers have no safe free space for a minimal downward translation; copy, fonts and existing artwork were preserved".into());
+                }
+                positions.get_mut(lower_index).ok_or("Missing lower header position")?.target = lower.target;
+                continue;
+            }
+            return Err("Overlapping native text is not a small unambiguous stack within the unit header; reflow the layout".into());
+        }
         if first.language == 0
             || second.language == 0
             || first.language == second.language
@@ -869,6 +897,131 @@ mod tests {
         let notes = prepare(&mut plan, session.doc().unwrap(), &session.prefs, &AtomicBool::new(false)).unwrap();
         assert!(notes.is_empty());
         assert_eq!(serde_json::to_value(&plan).unwrap(), original);
+    }
+
+    fn stacked_header_fixture(card: bool, overlap: f64) -> (Session, ProductionPlan, usize, usize) {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false,"margins":42.52})).unwrap();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({"title":"Stacked unit header","commands":[],"images":[]})).unwrap();
+        if card {
+            plan.commands
+                .push(EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[290,44,548,112],"content":"unassigned"}) });
+        }
+        let upper = plan.commands.len();
+        for (rect, text) in [([300.0, 50.0, 540.0, 72.0 + overlap], "Unit Two"), ([300.0, 72.0, 540.0, 98.0], "Numbers and Patterns")] {
+            let index = plan.commands.len();
+            plan.commands.push(EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread":0,"rect":rect,"content":"text","text":text,"caret":false}),
+            });
+            plan.commands
+                .push(EngineAction { command: "type.char".into(), params: json!({"attrs":{"size":10,"leading":{"kind":"points","value":12}}}) });
+            plan.commands
+                .push(EngineAction { command: "object.textFrameOptions".into(), params: json!({"ids":[format!("${index}.id")],"inset":[1,2,1,2]}) });
+        }
+        (session, plan, upper, upper + 3)
+    }
+
+    #[test]
+    fn ai22_stacked_header_translation_keeps_copy_fonts_size_and_containing_card() {
+        for (card, overlap) in [(true, 2.0), (false, 2.0), (true, 12.0)] {
+            let (session, mut plan, upper, lower) = stacked_header_fixture(card, overlap);
+            let authored = plan.clone();
+            let base = session.doc().unwrap().clone();
+            let notes = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap();
+            assert_eq!(plan.commands.len(), authored.commands.len() + 1, "Only the lower header may move");
+            for (before, after) in authored.commands.iter().zip(&plan.commands) {
+                assert_eq!(before.command, after.command);
+                assert_eq!(before.params, after.params, "Authored copy, font size, insets, rectangles and source indices must remain unchanged");
+            }
+            let movement = plan.commands.last().unwrap();
+            assert_eq!(movement.command, "transform.move");
+            assert_eq!(movement.params["ids"], json!([format!("${lower}.id")]));
+            assert_eq!(movement.params["dx"].as_f64().unwrap(), 0.0);
+            assert!((movement.params["dy"].as_f64().unwrap() - overlap).abs() < 0.02, "Use the minimal downward translation");
+            assert_eq!(notes.iter().filter(|note| note["kind"] == "nativeTextTranslation").count(), 1);
+            let mut proof = Session::new();
+            proof.prefs = session.prefs.clone();
+            proof.add_document(base.clone());
+            let applied =
+                proof.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":true})).unwrap();
+            let doc = &proof.doc().unwrap().doc;
+            let upper_bounds = doc.item(ItemId(applied["results"][upper]["id"].as_u64().unwrap())).unwrap().bounds();
+            let lower_bounds = doc.item(ItemId(applied["results"][lower]["id"].as_u64().unwrap())).unwrap().bounds();
+            assert_eq!(upper_bounds, Rect::new(300.0, 50.0, 540.0, 72.0 + overlap));
+            assert!(!overlaps(upper_bounds, lower_bounds));
+            assert_eq!((lower_bounds.x0, lower_bounds.x1, lower_bounds.height()), (300.0, 540.0, 26.0));
+            assert!((lower_bounds.y0 - 72.0 - overlap).abs() < 0.02);
+            assert!(contains(doc.spreads[0].pages[0].margin_rect(), lower_bounds));
+            if card {
+                let card_bounds = doc.item(ItemId(applied["results"][0]["id"].as_u64().unwrap())).unwrap().bounds();
+                assert_eq!(card_bounds, Rect::new(290.0, 44.0, 548.0, 112.0));
+                assert!(contains(card_bounds, upper_bounds) && contains(card_bounds, lower_bounds));
+            }
+            assert_eq!(doc.story(StoryId(applied["results"][upper]["story"].as_u64().unwrap())).unwrap().text, "Unit Two");
+            assert_eq!(doc.story(StoryId(applied["results"][lower]["story"].as_u64().unwrap())).unwrap().text, "Numbers and Patterns");
+            assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+        }
+    }
+
+    #[test]
+    fn ai22_stacked_header_translation_refuses_real_inherited_image_and_new_body_obstructions() {
+        for kind in ["existing", "inherited", "image", "new_body", "new_artwork", "card_edge"] {
+            let (mut session, mut plan, _, _) = stacked_header_fixture(true, 2.0);
+            let obstacle = json!({"spread":if kind == "inherited" {json!({"kind":"parent","index":0})} else {json!(0)},"rect":[300,99,540,125],"content":"unassigned"});
+            match kind {
+                "existing" | "inherited" => {
+                    session.execute("frame.create", &obstacle).unwrap();
+                }
+                "image" => plan.images.push(designcraft_ai_types::protocol::ImagePlacement {
+                    prompt: "Synthetic obstacle".into(),
+                    page: 0,
+                    rect: [300.0, 99.0, 540.0, 125.0],
+                    label: "Fixed illustration".into(),
+                }),
+                "new_body" => {
+                    plan.commands.push(EngineAction {
+                        command: "frame.create".into(),
+                        params: json!({"spread":0,"rect":[300,99,540,125],"content":"text","text":"Practice below","caret":false}),
+                    });
+                    plan.commands.push(EngineAction {
+                        command: "type.char".into(),
+                        params: json!({"attrs":{"size":10,"leading":{"kind":"points","value":12}}}),
+                    });
+                }
+                "new_artwork" => plan.commands.push(EngineAction { command: "frame.create".into(), params: obstacle }),
+                "card_edge" => plan.commands[0].params["rect"][3] = json!(98.5),
+                _ => panic!("Unexpected obstruction fixture: {kind}"),
+            }
+            let authored = serde_json::to_value(&plan).unwrap();
+            let base = session.doc().unwrap().clone();
+            assert!(prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).is_err(), "{kind} must block header recovery");
+            assert_eq!(serde_json::to_value(&plan).unwrap(), authored, "{kind} must leave the authored plan intact");
+            assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+        }
+    }
+
+    #[test]
+    fn ai22_stacked_header_translation_rejects_mixed_duplicate_ambiguous_large_and_body_crossings() {
+        for kind in ["mixed", "identical", "partial_column", "large_overlap", "body"] {
+            let (session, mut plan, upper, lower) = stacked_header_fixture(false, 2.0);
+            match kind {
+                "mixed" => plan.commands[lower].params["text"] = json!("Numbers ب"),
+                "identical" => plan.commands[lower].params["rect"] = plan.commands[upper].params["rect"].clone(),
+                "partial_column" => plan.commands[lower].params["rect"][0] = json!(310),
+                "large_overlap" => plan.commands[upper].params["rect"][3] = json!(84.1),
+                "body" => {
+                    plan.commands[upper].params["rect"] = json!([300, 122, 540, 146]);
+                    plan.commands[lower].params["rect"] = json!([300, 144, 540, 170]);
+                }
+                _ => panic!("Unexpected header fixture: {kind}"),
+            }
+            let authored = serde_json::to_value(&plan).unwrap();
+            let base = session.doc().unwrap().clone();
+            assert!(prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).is_err(), "{kind} must remain an explicit layout error");
+            assert_eq!(serde_json::to_value(&plan).unwrap(), authored);
+            assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+        }
     }
 
     #[test]

@@ -994,7 +994,12 @@ impl Runner<'_> {
                     return Err(error.clone());
                 }
                 if response.images.len() != 1 {
-                    return Err("Image provider must return exactly one image per placement".into());
+                    let count = response.images.len();
+                    self.diagnostics(vec![json!({"kind":"imageOutputCount","page":placement.page.saturating_add(1),"provider":settings.image_model.provider,"final_images":count,"message":"No automatic selection among multiple final illustrations; no partial review was published"})])?;
+                    return Err(format!(
+                        "Image provider must return exactly one final image per placement; got {count} for page {}",
+                        placement.page.saturating_add(1)
+                    ));
                 }
                 let image = prepare_generated_image(response.images.into_iter().next().ok_or("Image provider returned no image")?)?;
                 if settings.verify_generated_images {

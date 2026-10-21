@@ -252,6 +252,99 @@ mod native_tests {
     }
 
     #[test]
+    fn ai21_gemini_image_thoughts_do_not_become_placement_images() {
+        use base64::Engine;
+        let thought = base64::engine::general_purpose::STANDARD.encode(b"RIFFxxxxWEBPthought");
+        let final_bytes = b"RIFFxxxxWEBPfinal";
+        let final_image = base64::engine::general_purpose::STANDARD.encode(final_bytes);
+        let value = json!({
+            "candidates":[{"finishReason":"STOP","content":{"parts":[
+                {"thought":true,"inlineData":{"mimeType":"image/webp","data":thought}},
+                {"text":"Final illustration"},
+                {"inlineData":{"mimeType":"image/webp","data":final_image}}
+            ]}}],
+            "usageMetadata":{"promptTokenCount":42,"candidatesTokenCount":100,"thoughtsTokenCount":17,"cachedContentTokenCount":8}
+        });
+        let response = crate::native::parse_images(ProviderKind::Gemini, &value, &AtomicBool::new(false)).unwrap();
+        assert!(response.error.is_none());
+        assert_eq!(response.images.len(), 1, "Thought images must not count as final placement images");
+        assert_eq!(response.images[0].bytes, final_bytes);
+        assert_eq!(response.images[0].filename, "generated-1.webp");
+        assert_eq!(response.usage.input_tokens, Some(42));
+        assert_eq!(response.usage.output_tokens, Some(117));
+        assert_eq!(response.usage.reasoning_tokens, Some(17));
+        assert_eq!(response.usage.cached_input_tokens, Some(8));
+    }
+
+    #[test]
+    fn ai21_gemini_malformed_image_thoughts_do_not_discard_final_image() {
+        use base64::Engine;
+        let final_bytes = b"RIFFxxxxWEBPfinal";
+        let final_image = base64::engine::general_purpose::STANDARD.encode(final_bytes);
+        for inline_data in [
+            json!({"mimeType":"image/webp","data":"not-valid!"}),
+            json!({"mimeType":"image/webp","data":"AQID"}),
+            json!({"mimeType":"image/webp","data":17}),
+            json!({}),
+        ] {
+            let value = json!({
+                "candidates":[{"finishReason":"STOP","content":{"parts":[
+                    {"thought":true,"inlineData":inline_data},
+                    {"inlineData":{"mimeType":"image/webp","data":final_image}}
+                ]}}],
+                "usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":12,"thoughtsTokenCount":3}
+            });
+            let response = crate::native::parse_images(ProviderKind::Gemini, &value, &AtomicBool::new(false)).unwrap();
+            assert!(response.error.is_none(), "Thought blobs must be skipped before decoding: {:?}", response.error);
+            assert_eq!(response.images.len(), 1);
+            assert_eq!(response.images[0].bytes, final_bytes);
+            assert_eq!(response.usage.input_tokens, Some(9));
+            assert_eq!(response.usage.output_tokens, Some(15));
+            assert_eq!(response.usage.reasoning_tokens, Some(3));
+        }
+    }
+
+    #[test]
+    fn ai21_gemini_thought_only_images_fail_without_losing_measured_usage() {
+        use base64::Engine;
+        let thought = base64::engine::general_purpose::STANDARD.encode(b"RIFFxxxxWEBPthought");
+        for data in [thought.as_str(), "not-valid!"] {
+            let value = json!({
+                "candidates":[{"finishReason":"STOP","content":{"parts":[
+                    {"thought":true,"inlineData":{"mimeType":"image/webp","data":data}}
+                ]}}],
+                "usageMetadata":{"promptTokenCount":6,"candidatesTokenCount":0,"thoughtsTokenCount":11}
+            });
+            let response = crate::native::parse_images(ProviderKind::Gemini, &value, &AtomicBool::new(false)).unwrap();
+            assert!(response.images.is_empty(), "A thought cannot satisfy the requested final illustration");
+            assert_eq!(response.error.as_deref(), Some("Selected model returned no generated images"));
+            assert_eq!(response.usage.input_tokens, Some(6));
+            assert_eq!(response.usage.output_tokens, Some(11));
+            assert_eq!(response.usage.reasoning_tokens, Some(11));
+        }
+    }
+
+    #[test]
+    fn ai21_gemini_multiple_final_images_remain_visible_to_host_validation() {
+        use base64::Engine;
+        let first_bytes = b"RIFFxxxxWEBPfirst";
+        let second_bytes = b"RIFFxxxxWEBPsecond";
+        let first = base64::engine::general_purpose::STANDARD.encode(first_bytes);
+        let second = base64::engine::general_purpose::STANDARD.encode(second_bytes);
+        let value = json!({"candidates":[{"finishReason":"STOP","content":{"parts":[
+            {"inlineData":{"mimeType":"image/webp","data":first}},
+            {"thought":false,"inlineData":{"mimeType":"image/webp","data":second}}
+        ]}}]});
+        let response = crate::native::parse_images(ProviderKind::Gemini, &value, &AtomicBool::new(false)).unwrap();
+        assert!(response.error.is_none());
+        assert_eq!(response.images.len(), 2, "The adapter must not silently select one of multiple final images");
+        assert_eq!(response.images[0].bytes, first_bytes);
+        assert_eq!(response.images[1].bytes, second_bytes);
+        assert_eq!(response.images[0].filename, "generated-1.webp");
+        assert_eq!(response.images[1].filename, "generated-2.webp");
+    }
+
+    #[test]
     fn image_failure_preserves_measured_provider_usage() {
         let cancel = AtomicBool::new(false);
         let openai = json!({"data":[{"b64_json":"not-valid!"}],"usage":{"input_tokens":42,"output_tokens":100}});

@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI22 (2026-10-21): Exclude Gemini thought images from final placement outputs while preserving measured usage and genuine multi-image guards. Recover tiny same-column header-stack overlaps in verified free space; keep body content, existing artwork and human review protected. See `docs/production-gemini-images-ai22.ar.md`.
+
 - AI21 (2026-10-21): Fit tiny native text overflows without shrinking copy or fonts: co-grow eligible new rectangular backgrounds, recover safe footer height, retain fixed/inherited artwork and exact source command indices. Send resolved print fonts before layout planning and retain one bounded private rejected response for offline diagnosis. See `docs/production-native-fit-ai21.ar.md`.
 
 - AI20 (2026-10-21): Preserve actual opened-book trim and bounded continuation context across new groups and retries; keep discovered models selectable, estimate natural-language review requests, expose truthful binding controls, and separate skill/document export destinations. Align recommended template families with strict math guards and absolute page-one openers; preserve LTR numeric expressions. Integrate upstream 0.10.0 without replacing local AI features. See `docs/production-workflow-ai20.ar.md`.
