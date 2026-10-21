@@ -731,12 +731,90 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
         return Err("Provider commands cannot supply reserved host copy provenance labels".into());
     }
     let mut plan = ProductionPlan { title: content.title, commands: content.commands, images: content.images };
+    normalize_command_references(&mut plan.commands);
     crate::image_repetition::normalize(&mut plan)?;
     if !content.copy_bindings.is_empty() {
         bind_copy(&mut plan, scope, brief.ok_or("Copy bindings require the original explicit page brief")?, &content.copy_bindings)?;
     }
     append_activities(&mut plan, scope, &content.activities)?;
     Ok(plan)
+}
+
+fn produces_result_field(action: &EngineAction, field: &str) -> bool {
+    match field {
+        "id" => matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.group" | "file.place"),
+        "story" => {
+            (action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text"))
+                || action.command == "table.insert"
+        }
+        "ids" => action.command == "transform.move",
+        "asset" => action.command == "file.place",
+        "table" => action.command == "table.insert",
+        "name" => action.command == "swatch.create",
+        _ => false,
+    }
+}
+
+fn is_non_text_creation(action: &EngineAction) -> bool {
+    matches!(action.command.as_str(), "line.create" | "path.create")
+        || (action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) != Some("text"))
+}
+
+fn rewrite_reference_token(token: &str, earlier: &[EngineAction], prefer_non_text_next: bool) -> Option<String> {
+    let (braced, body) = if let Some(inner) = token.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        (true, inner)
+    } else if let Some(inner) = token.strip_prefix('$') {
+        (false, inner)
+    } else {
+        return None;
+    };
+    let (step_str, field) = body.split_once('.')?;
+    if !matches!(field, "id" | "story") {
+        return None;
+    }
+    let step = step_str.parse::<usize>().ok()?;
+    if step >= earlier.len() || produces_result_field(&earlier[step], field) {
+        return None;
+    }
+    let resolved = if field == "id" && prefer_non_text_next && step + 1 < earlier.len() && is_non_text_creation(&earlier[step + 1]) {
+        Some(step + 1)
+    } else {
+        (0..=step)
+            .rev()
+            .find(|&candidate| produces_result_field(&earlier[candidate], field))
+            .or_else(|| ((step + 1)..earlier.len()).find(|&candidate| produces_result_field(&earlier[candidate], field)))
+    }?;
+    Some(if braced { format!("${{{resolved}.{field}}}") } else { format!("${resolved}.{field}") })
+}
+
+fn normalize_command_references(commands: &mut [EngineAction]) {
+    for index in 0..commands.len() {
+        let (earlier, rest) = commands.split_at_mut(index);
+        let action = &mut rest[0];
+        let prefer_non_text_next = matches!(action.command.as_str(), "object.stroke" | "object.fill" | "object.fittingOptions");
+        let Some(params) = action.params.as_object_mut() else {
+            continue;
+        };
+        for key in ["ids", "frame", "story"] {
+            match params.get_mut(key) {
+                Some(Value::String(reference)) => {
+                    if let Some(rewritten) = rewrite_reference_token(reference, earlier, prefer_non_text_next) {
+                        *reference = rewritten;
+                    }
+                }
+                Some(Value::Array(items)) => {
+                    for item in items.iter_mut() {
+                        if let Value::String(reference) = item
+                            && let Some(rewritten) = rewrite_reference_token(reference, earlier, prefer_non_text_next)
+                        {
+                            *reference = rewritten;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn copy_id(page: u32, language: &str, index: usize) -> Result<String, String> {
@@ -806,6 +884,10 @@ fn bind_copy(plan: &mut ProductionPlan, scope: BatchScope, brief: &str, bindings
     let mut frames = BTreeSet::new();
     let mut coverage: BTreeMap<String, Vec<[usize; 2]>> = BTreeMap::new();
     let mut assignments = Vec::with_capacity(bindings.len());
+    let mut id_counts = BTreeMap::<&str, usize>::new();
+    for binding in bindings {
+        *id_counts.entry(binding.copy_id.as_str()).or_default() += 1;
+    }
     for binding in bindings {
         if binding.copy_id.is_empty() || binding.copy_id.len() > 64 || !frames.insert(binding.frame) {
             return Err("Copy binding has an invalid source ID or repeats a native frame".into());
@@ -818,9 +900,18 @@ fn bind_copy(plan: &mut ProductionPlan, scope: BatchScope, brief: &str, bindings
         {
             return Err("Copy binding must target a native text frame on its exact source page".into());
         }
-        let text = copy_words(source, binding.word_range)?;
-        coverage.entry(binding.copy_id.clone()).or_default().push(binding.word_range);
-        let provenance = CopyProvenance { brief_sha256: digest.clone(), copy_id: binding.copy_id.clone(), word_range: binding.word_range };
+        let word_range = if id_counts.get(binding.copy_id.as_str()) == Some(&1)
+            && binding.word_range[0] == 0
+            && (1..=MAX_COPY_WORDS).contains(&binding.word_range[1])
+            && !source.words.is_empty()
+        {
+            [0, source.words.len()]
+        } else {
+            binding.word_range
+        };
+        let text = copy_words(source, word_range)?;
+        coverage.entry(binding.copy_id.clone()).or_default().push(word_range);
+        let provenance = CopyProvenance { brief_sha256: digest.clone(), copy_id: binding.copy_id.clone(), word_range };
         let label = format!("{COPY_LABEL}{}", serde_json::to_string(&provenance).map_err(|error| error.to_string())?);
         assignments.push((binding.frame, text, label));
     }
@@ -1255,5 +1346,31 @@ mod tests {
             serde_json::from_value(json!({"page":0,"rect":[50,100,300,200],"frame":"five","quantity":6,"filled":true})).unwrap();
         assert!(append_activities(&mut native, BatchScope { start: 0, count: 1 }, &[invalid]).is_err());
         assert_eq!(serde_json::to_value(&native).unwrap(), before);
+        let brief = "### PAGE 01 — Solid 3D Shapes\n* **English Print Copy (LTR):**\n  > Cone (like a party hat)\n* **Arabic Print Copy (RTL - Vocalized):**\n  > مخروط (مثل قبعة الحفلة)\n";
+        let scope = BatchScope { start: 0, count: 1 };
+        let raw = json!({
+            "title": "Page 1 — Solid 3D Shapes",
+            "commands": [
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,45,280,100],"text":"Cone (like a party hat)"}},
+                {"command":"type.char","params":{"attrs":{"size":16}}},
+                {"command":"type.para","params":{"attrs":{"align":"left","direction":"leftToRight"}}},
+                {"command":"frame.create","params":{"spread":0,"content":"unassigned","rect":[45,120,280,220]}},
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[300,45,550,100],"text":"placeholder"}},
+                {"command":"object.stroke","params":{"ids":["$2.id"],"swatch":"[Black]","weight":1.0}},
+                {"command":"object.textFrameOptions","params":{"ids":["$1.id"],"inset":[4,4,4,4]}}
+            ],
+            "images": [],
+            "copy_bindings": [
+                {"frame": 4, "copy_id": "p1.ar.1", "word_range": [0, 3]}
+            ]
+        });
+        let plan = compile_native_plan_for_brief(&raw.to_string(), scope, brief).unwrap();
+        assert_eq!(plan.commands[4].params["text"], "مخروط (مثل قبعة الحفلة)");
+        assert_eq!(plan.commands[5].params["ids"], json!(["$3.id"]));
+        assert_eq!(plan.commands[6].params["ids"], json!(["$0.id"]));
+        validate_plan(brief, scope, &plan).unwrap();
+        let mut session = designcraft_engine::Session::new();
+        session.execute("file.new", &json!({"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
     }
 }

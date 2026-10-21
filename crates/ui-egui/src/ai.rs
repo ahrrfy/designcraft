@@ -10,6 +10,11 @@ use serde_json::Value;
 
 const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
 
+pub(crate) fn is_non_text_model(model: &str) -> bool {
+    let model = model.trim().trim_start_matches("models/").to_ascii_lowercase();
+    ["image", "imagen", "tts", "audio", "embedding", "live", "veo", "aqa", "dall-e", "gpt-image"].iter().any(|token| model.contains(token))
+}
+
 /// Never persisted, and never included in a debug dump.
 #[derive(Clone, Default)]
 struct Secret(String);
@@ -701,6 +706,11 @@ impl AiUiState {
             )
         } else if self.settings.text_model.model.trim().is_empty() {
             ("Choose a text model above.", "اختر نموذج النص من الحقل أعلاه.")
+        } else if is_non_text_model(&self.settings.text_model.model) {
+            (
+                "The selected text model is an image/media model. Choose a text model (for example gemini-3.8-flash) above.",
+                "نموذج النص المختار مخصص للصور أو الوسائط. اختر نموذج نص (مثل gemini-3.8-flash) من الحقل أعلاه.",
+            )
         } else if !self.new_document && !document {
             ("Open a document or choose New document.", "افتح مستنداً أو اختر مستنداً جديداً.")
         } else if self.restored_target_unconfirmed {
@@ -1321,7 +1331,7 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
                 if *connected && models.is_empty() { label(ui, a, "The service reported no available models.", "لم تبلغ الخدمة عن نماذج متاحة."); }
                 if !models.is_empty() {
                     egui::ComboBox::from_id_salt(("local_model", images)).selected_text(&selection.model).show_ui(ui, |ui| {
-                        for name in models { ui.selectable_value(&mut selection.model, name.clone(), name); }
+                        for name in models.iter().filter(|name| images || !is_non_text_model(name)) { ui.selectable_value(&mut selection.model, name.clone(), name); }
                     });
                 }
             } else {
@@ -1583,7 +1593,22 @@ fn production(
                     s.continue_book = true;
                     s.restored_target_unconfirmed = false;
                 }
-                rtl::label(ui, &document.title);
+                let completed = document.pages.saturating_sub(document.remaining_pages);
+                let next_page = completed.saturating_add(1);
+                rtl::label(
+                    ui,
+                    if a {
+                        format!(
+                            "{} · الصفحات المكتملة 1–{} · الصفحة التالية {} من {}",
+                            document.title, completed, next_page, document.pages
+                        )
+                    } else {
+                        format!(
+                            "{} · Completed pages 1–{} · Next page {} of {}",
+                            document.title, completed, next_page, document.pages
+                        )
+                    },
+                );
             });
         }
         ui.horizontal_wrapped(|ui| {
@@ -1604,7 +1629,7 @@ fn production(
             egui::ComboBox::from_id_salt("production_discovered_models").selected_text(text(a, "Available models", "النماذج المتاحة")).show_ui(
                 ui,
                 |ui| {
-                    for name in models {
+                    for name in models.iter().filter(|name| !is_non_text_model(name)) {
                         ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
                     }
                 },
@@ -4529,5 +4554,19 @@ mod tests {
         dispatch(&mut fixture.app, AiRequest::ApproveSkill { id: "fixture".into(), revision: "1".into() }).unwrap();
         dispatch(&mut fixture.app, AiRequest::SubmitPreparedPrint { token: "fixture".into(), request_id: "fixture-op".into() }).unwrap();
         assert_eq!(fixture.calls.get(), 2, "ordinary human typed actions still reach the mock host");
+        assert!(is_non_text_model("gemini-3.1-flash-lite-image"));
+        assert!(is_non_text_model("models/imagen-3.0-generate-002"));
+        assert!(is_non_text_model("gemini-3.8-flash-tts"));
+        assert!(!is_non_text_model("gemini-3.8-flash"));
+        assert!(!is_non_text_model("gemini-flash-latest"));
+        assert!(!is_non_text_model("gemini-pro-latest"));
+        let mut model_state = AiUiState { prompt: "Page 1 brief".into(), new_document: true, ..Default::default() };
+
+        model_state.settings.output_mode = OutputMode::NativeOnly;
+        model_state.settings.text_model.model = "gemini-3.1-flash-lite-image".into();
+        assert!(model_state.production_issue(true, true, false).is_some_and(|msg| msg.contains("image/media model")));
+        assert!(model_state.production_issue(true, true, true).is_some_and(|msg| msg.contains("للصور أو الوسائط")));
+        model_state.settings.text_model.model = "gemini-3.8-flash".into();
+        assert_eq!(model_state.production_issue(true, true, false), None);
     }
 }
