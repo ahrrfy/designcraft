@@ -24,7 +24,243 @@ pub(crate) fn eligible(skill: &SkillSnapshot) -> bool {
 }
 
 fn has_unbound_counting_frame(template: &[EngineAction]) -> bool {
-    template.iter().any(|action| action.command == "object.label" && action.params.get("label").and_then(Value::as_str) == Some("part.cpa.tf.outer"))
+    template.iter().any(|action| {
+        action.command == "object.label" && action.params.get("label").and_then(Value::as_str).is_some_and(|label| label.starts_with("part.cpa.tf."))
+    })
+}
+
+fn counting_family(family: &PageFamily, template: &[EngineAction]) -> bool {
+    family.id == CAMBRIDGE_ID || has_unbound_counting_frame(template)
+}
+
+// Only the shipped, explicitly identified Cambridge topology is supported. A
+// changed skill never gains permission merely by copying its family/label IDs.
+const CAMBRIDGE_ID: &str = "cambridge-cpa-grammar";
+const CAMBRIDGE_NATIVE: &str = include_str!("../../../skills/kg-oxford-cambridge-style/templates/cambridge-cpa-grammar.json");
+const CAMBRIDGE_EXTRA_ACTIONS: usize = 29; // 2 divider triples, 7 counter triples, group + label.
+
+fn bindable_counting_family(family: &PageFamily, template: &[EngineAction]) -> bool {
+    static NATIVE: std::sync::OnceLock<Option<Vec<EngineAction>>> = std::sync::OnceLock::new();
+    let slots = [
+        ("title-main", 13),
+        ("header-tag", 21),
+        ("grammar-prompt", 39),
+        ("grammar-q", 55),
+        ("grammar-a", 69),
+        ("grammar-rule-1", 83),
+        ("grammar-rule-2", 91),
+        ("grammar-focus", 99),
+        ("cpa-prompt", 105),
+        ("cpa-concrete-label", 121),
+        ("cpa-pictorial-label", 157),
+        ("cpa-bond-label", 193),
+    ];
+    family.id == CAMBRIDGE_ID
+        && family.text_slots.len() == slots.len()
+        && slots.iter().all(|(id, command)| family.text_slots.iter().any(|slot| slot.id == *id && slot.command == *command))
+        && family.image_slots.len() == 2
+        && [("grammar-scene", [48.0, 138.0, 332.0, 404.0]), ("cpa-concrete", [48.0, 440.0, 206.0, 684.0])].iter().all(|(id, rect)| {
+            family.image_slots.iter().any(|slot| {
+                slot.id == *id && slot.rect == *rect && slot.views.is_empty() && slot.crop.is_none() && slot.source_aspect_ratio.is_none()
+            })
+        })
+        && template.len() == 199
+        && NATIVE.get_or_init(|| serde_json::from_str(CAMBRIDGE_NATIVE).ok()).as_ref().is_some_and(|native| native.as_slice() == template)
+}
+
+/// Math can retain the template path only when every fixed counting template is
+/// the supported topology with explicit CPA slot bindings. No quantity defaults.
+pub(crate) fn requires_adaptive_math(brief: &str, skills: &[SkillSnapshot]) -> bool {
+    let lower = brief.to_lowercase();
+    let math_request = detect_curriculum_subject(brief) == CurriculumSubject::Mathematics
+        || ["math", "count", "five-frame", "ten-frame", "رياضيات", "العد", "أعداد", "أرقام", "إطار عشري", "إطار خماسي"]
+            .iter()
+            .any(|word| lower.contains(word));
+    math_request
+        && skills.iter().any(|skill| {
+            skill.templates.iter().any(|(path, template)| {
+                (has_unbound_counting_frame(template)
+                    || skill
+                        .design_profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.page_families.iter().any(|family| family.template == *path && family.id == CAMBRIDGE_ID)))
+                    && !skill.design_profile.as_ref().is_some_and(|profile| {
+                        profile.page_families.iter().any(|family| family.template == *path && bindable_counting_family(family, template))
+                    })
+            })
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NumberTriplet {
+    left: u32,
+    right: u32,
+    total: u32,
+}
+
+fn decimal_digit(c: char) -> Option<u32> {
+    match c {
+        '0'..='9' => c.to_digit(10),
+        '\u{0660}'..='\u{0669}' => Some(u32::from(c) - u32::from('\u{0660}')),
+        '\u{06f0}'..='\u{06f9}' => Some(u32::from(c) - u32::from('\u{06f0}')),
+        _ => None,
+    }
+}
+
+fn equation_spacing(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn equation_operator(c: char) -> bool {
+    matches!(
+        c,
+        '+' | '='
+            | '-'
+            | '\u{2212}'
+            | '*'
+            | '\u{00d7}'
+            | '/'
+            | '\u{00f7}'
+            | '<'
+            | '>'
+            | '\u{2264}'
+            | '\u{2265}'
+            | '－'
+            | '﹣'
+            | '‐'
+            | '‑'
+            | '‒'
+            | '–'
+            | '—'
+            | '±'
+            | '∓'
+            | '＋'
+            | '﹢'
+    )
+}
+
+fn equation_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<u32, String> {
+    while chars.peek().is_some_and(|c| equation_spacing(*c)) {
+        let _ = chars.next();
+    }
+    let mut number = None::<u32>;
+    while let Some(digit) = chars.peek().and_then(|c| decimal_digit(*c)) {
+        let _ = chars.next();
+        number = Some(number.unwrap_or(0).checked_mul(10).and_then(|n| n.checked_add(digit)).ok_or("CPA quantity overflow")?);
+    }
+    number.ok_or_else(|| "CPA equation requires nonnegative integers".into())
+}
+
+fn equation_symbol(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, symbol: char) -> Result<(), String> {
+    while chars.peek().is_some_and(|c| equation_spacing(*c)) {
+        let _ = chars.next();
+    }
+    if chars.next() != Some(symbol) {
+        return Err("CPA requires one explicit left + right = total addition equation".into());
+    }
+    Ok(())
+}
+
+fn additive_triplet(text: &str) -> Result<NumberTriplet, String> {
+    let start = text
+        .char_indices()
+        .find(|(_, c)| decimal_digit(*c).is_some())
+        .map(|(index, _)| index)
+        .ok_or("CPA requires an authored addition equation; template counter counts are never defaults")?;
+    let prefix = text.get(..start).ok_or("Invalid CPA equation boundary")?;
+    if prefix.chars().any(|c| c.is_numeric() || equation_operator(c)) {
+        return Err("CPA equation prefix contains unsupported quantities or operators".into());
+    }
+    let mut chars = text.get(start..).ok_or("Invalid CPA equation boundary")?.chars().peekable();
+    let left = equation_number(&mut chars)?;
+    equation_symbol(&mut chars, '+')?;
+    let right = equation_number(&mut chars)?;
+    equation_symbol(&mut chars, '=')?;
+    let total = equation_number(&mut chars)?;
+    if chars.any(|c| c.is_numeric() || equation_operator(c)) {
+        return Err("CPA requires exactly one addition equation per authored CPA slot".into());
+    }
+    if left.checked_add(right) != Some(total) || total > 10 {
+        return Err("CPA authored quantities must satisfy left + right = total, with total at most 10".into());
+    }
+    Ok(NumberTriplet { left, right, total })
+}
+
+fn number_triplet(slots: &BTreeMap<String, String>) -> Result<NumberTriplet, String> {
+    let pictorial = additive_triplet(slots.get("cpa-pictorial-label").ok_or("Missing authored pictorial equation")?)?;
+    let abstract_value = additive_triplet(slots.get("cpa-bond-label").ok_or("Missing authored abstract equation")?)?;
+    if pictorial != abstract_value {
+        return Err("Authored pictorial and abstract CPA quantities disagree".into());
+    }
+    Ok(pictorial)
+}
+
+fn native_action(command: &str, params: Value) -> EngineAction {
+    EngineAction { command: command.into(), params }
+}
+
+fn replace_template_param(template: &mut [EngineAction], index: usize, key: &str, value: Value) -> Result<(), String> {
+    let params = template.get_mut(index).and_then(|action| action.params.as_object_mut()).ok_or("Supported CPA topology disappeared")?;
+    params.insert(key.into(), value);
+    Ok(())
+}
+
+fn counter_rect(index: u32) -> [f64; 4] {
+    // Two rows of five cells, inside the original 132 x 132 point outer frame.
+    let x = 232.0 + (f64::from(index % 5) + 0.5) * 26.4;
+    let y = 480.0 + (f64::from(index / 5) + 0.5) * 66.0;
+    [x - 9.0, y - 9.0, x + 9.0, y + 9.0]
+}
+
+fn counter_swatch(index: u32, values: NumberTriplet) -> &'static str {
+    if index < values.left {
+        "C=15 M=100 Y=100 K=0"
+    } else if index < values.total {
+        "C=75 M=5 Y=100 K=0"
+    } else {
+        "[Paper]"
+    }
+}
+
+fn bound_counting_template(template: &[EngineAction], values: NumberTriplet) -> Result<Vec<EngineAction>, String> {
+    let mut actions = template.to_vec();
+    for (index, column) in [(142, 1), (145, 2)] {
+        let x = 232.0 + f64::from(column) * 26.4;
+        replace_template_param(&mut actions, index, "a", json!([x, 480.0]))?;
+        replace_template_param(&mut actions, index, "b", json!([x, 612.0]))?;
+    }
+    for (counter, (frame, fill)) in [0u32, 1, 2].into_iter().zip([(148, 149), (151, 152), (154, 155)]) {
+        replace_template_param(&mut actions, frame, "rect", json!(counter_rect(counter)))?;
+        replace_template_param(&mut actions, fill, "swatch", json!(counter_swatch(counter, values)))?;
+    }
+    // Append after all original commands: no authored index, text-slot target,
+    // original group member or result reference changes its meaning.
+    let mut members = vec![json!("$161.id")];
+    for column in [3, 4] {
+        let index = actions.len();
+        let x = 232.0 + f64::from(column) * 26.4;
+        members.push(json!(format!("${index}.id")));
+        actions.push(native_action("line.create", json!({"spread":0,"a":[x,480.0],"b":[x,612.0]})));
+        actions.push(native_action(
+            "object.stroke",
+            json!({"ids":[format!("${index}.id")],"swatch":"C=100 M=90 Y=10 K=0","tint":1.0,"weight":0.7,"cap":"round","join":"round"}),
+        ));
+        actions.push(native_action("object.label", json!({"ids":[format!("${index}.id")],"label":format!("part.cpa.tf.v{column}")})));
+    }
+    for counter in 3u32..10 {
+        let index = actions.len();
+        members.push(json!(format!("${index}.id")));
+        actions.push(native_action("frame.create", json!({"spread":0,"rect":counter_rect(counter),"content":"unassigned","shape":"ellipse"})));
+        actions.push(native_action("object.fill", json!({"ids":[format!("${index}.id")],"swatch":counter_swatch(counter, values),"tint":1.0})));
+        actions.push(native_action("object.label", json!({"ids":[format!("${index}.id")],"label":format!("part.cpa.tf.token-{}",counter + 1)})));
+    }
+    let group = actions.len();
+    actions.push(native_action("object.group", json!({"ids":members})));
+    actions.push(native_action("object.label", json!({"ids":[format!("${group}.id")],"label":"group.cpa.pictorial-tenframe.bound"})));
+    if template.len().checked_add(CAMBRIDGE_EXTRA_ACTIONS) != Some(actions.len()) {
+        return Err("Bound CPA command capacity changed unexpectedly".into());
+    }
+    Ok(actions)
 }
 
 fn profile(skill: &SkillSnapshot) -> Result<&DesignProfile, String> {
@@ -93,13 +329,28 @@ fn scope_image_sources(profile: &DesignProfile, scope: BatchScope, mode: OutputM
     Ok(sources)
 }
 
+#[cfg(test)]
 pub(crate) fn schema(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode) -> Result<Value, String> {
+    schema_inner(skill, scope, mode, false)
+}
+
+pub(crate) fn schema_for_brief(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, brief: &str) -> Result<Value, String> {
+    schema_inner(skill, scope, mode, detect_curriculum_subject(brief) == CurriculumSubject::Mathematics)
+}
+
+fn schema_inner(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, allow_counting: bool) -> Result<Value, String> {
     let profile = profile(skill)?;
     let end = scope_end(scope)?;
     let image_sources = scope_image_sources(profile, scope, mode)?;
     let families: Vec<_> = profile
         .page_families
         .iter()
+        .filter(|family| {
+            skill
+                .templates
+                .get(&family.template)
+                .is_some_and(|template| !counting_family(family, template) || (allow_counting && bindable_counting_family(family, template)))
+        })
         .map(|family| {
             let properties: Map<String, Value> = family
                 .text_slots
@@ -126,6 +377,9 @@ pub(crate) fn schema(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode)
             }})
         })
         .collect();
+    if families.is_empty() {
+        return Err("No native template family is supported for this brief; use structured adaptive activities".into());
+    }
     Ok(json!({"type":"object","additionalProperties":false,"required":["title","pages"],"properties":{
         "title":{"type":"string","minLength":1,"maxLength":256},
         "pages":{"type":"array","minItems":scope.count,"maxItems":scope.count,
@@ -134,9 +388,46 @@ pub(crate) fn schema(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode)
     }}))
 }
 
+#[cfg(test)]
 pub(crate) fn system(skill: &SkillSnapshot) -> Result<String, String> {
-    let profile = profile(skill)?;
-    let rules = serde_json::to_string(profile).map_err(|e| e.to_string())?;
+    system_inner(skill, false)
+}
+
+pub(crate) fn system_for_brief(skill: &SkillSnapshot, brief: &str) -> Result<String, String> {
+    system_inner(skill, detect_curriculum_subject(brief) == CurriculumSubject::Mathematics)
+}
+
+fn system_inner(skill: &SkillSnapshot, allow_counting: bool) -> Result<String, String> {
+    let mut profile = profile(skill)?.clone();
+    profile.page_families.retain(|family| {
+        skill
+            .templates
+            .get(&family.template)
+            .is_some_and(|template| !counting_family(family, template) || (allow_counting && bindable_counting_family(family, template)))
+    });
+    if profile.page_families.is_empty() {
+        return Err("No native template family is supported for this brief; use structured adaptive activities".into());
+    }
+    let bound_counting = profile.page_families.iter().any(|family| {
+        skill.templates.get(&family.template).is_some_and(|template| counting_family(family, template) && bindable_counting_family(family, template))
+    });
+    if bound_counting {
+        for family in &mut profile.page_families {
+            if family.id == CAMBRIDGE_ID {
+                for slot in &mut family.image_slots {
+                    if slot.id == "cpa-concrete" {
+                        slot.purpose = "Concrete representation of the validated authored CPA quantities. Describe the requested subject, material, and style without numeric or spelled-out counts; the host supplies the exact grouping.".into();
+                    }
+                }
+            }
+        }
+    }
+    let binding_policy = if bound_counting {
+        "For cambridge-cpa-grammar, both cpa-pictorial-label and cpa-bond-label must each contain the same explicit addition equation left + right = total, using nonnegative integers with total at most 10. ASCII and Arabic digits are accepted. Preserve authored quantities; never infer them from sample counters. Native binding reconstructs a two-row, five-column diagram only for this recognized template. For cpa-concrete illustrations, describe the requested subject, material and style without any numeric or spelled-out quantities; the host supplies the authored grouping. Raster object counts remain unverified until human visual review."
+    } else {
+        ""
+    };
+    let rules = serde_json::to_string(&profile).map_err(|e| e.to_string())?;
     if rules.len() > 32 * 1024 {
         return Err("Template style rules exceed the bounded context limit".into());
     }
@@ -150,6 +441,7 @@ pub(crate) fn system(skill: &SkillSnapshot) -> Result<String, String> {
          Fill every declared text slot exactly once, using its purpose and max_chars Unicode copy-length target; count spaces and combining vowel marks. Supply nonempty complete content \
          that fits, with no extra slot IDs. Adapt 100% of text slots—including headers, tags, cards, speech bubbles, diagrams, and tasks—to the user's exact subject and requested language. Never leave placeholder words from an unrelated topic. \
          Keep each field focused on its declared purpose, rather than placing a full bilingual page script into one rule box. Preserve meaningful supplied wording and requested vocalization; do not cut a sentence or omit required content to satisfy a character estimate. Native composition decides actual fit without shrinking the authored typography. \
+         {binding_policy} \
          Native typography, geometry and formatting are already fixed by the approved templates. \
          Adapt educational language, topic, sequence and difficulty to the brief and age range. Do not invent facts or claim live external research, reference coverage, publisher affiliation, endorsement, or standards certification. \
          Illustrations are allowed only in the selected family's image slots and only when the requested mode permits them. \
@@ -579,7 +871,11 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
     let declared_families: Vec<&str> = profile
         .page_families
         .iter()
-        .filter(|family| skill.templates.get(&family.template).is_some_and(|template| !has_unbound_counting_frame(template)))
+        .filter(|family| {
+            skill.templates.get(&family.template).is_some_and(|template| {
+                !counting_family(family, template) || (subject == CurriculumSubject::Mathematics && bindable_counting_family(family, template))
+            })
+        })
         .map(|family| family.id.as_str())
         .collect();
     if declared_families.is_empty() {
@@ -857,6 +1153,13 @@ pub(crate) fn compile_for_brief(
     brief: &str,
 ) -> Result<ProductionPlan, String> {
     let mut plan = compile(text, skill, scope, mode)?;
+    if detect_curriculum_subject(brief) != CurriculumSubject::Mathematics
+        && plan.commands.iter().any(|action| {
+            action.command == "object.label" && action.params.get("label").and_then(Value::as_str) == Some("group.cpa.pictorial-tenframe.bound")
+        })
+    {
+        return Err("The bound Cambridge counting family requires an explicit mathematics brief".into());
+    }
     crate::script_contract::validate_plan(brief, scope, &plan)?;
     crate::script_contract::anchor_images(brief, scope, &mut plan)?;
     Ok(plan)
@@ -909,13 +1212,27 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
             return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
         }
         let template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
-        if verify_math && has_unbound_counting_frame(template) {
+        let bindable = counting_family(family, template) && bindable_counting_family(family, template);
+        let quantities = if bindable {
+            Some(if verify_math {
+                number_triplet(&page.text).map_err(|error| format!("Page {} ({}): {error}", u64::from(page_number) + 1, family.id))?
+            } else {
+                // Private capacity-only worst case, never published or inferred
+                // from sample artwork. Every real page requires authored values.
+                NumberTriplet { left: 5, right: 5, total: 10 }
+            })
+        } else {
+            None
+        };
+        if verify_math && counting_family(family, template) && !bindable {
             return Err(format!(
                 "Page {} ({}): fixed counting-frame geometry and tokens are not bound to lesson quantities; use a structured activity in adaptive native planning",
                 u64::from(page_number) + 1,
                 family.id
             ));
         }
+        let bound_template = quantities.map(|values| bound_counting_template(template, values)).transpose()?;
+        let template = bound_template.as_deref().unwrap_or(template);
         let offset = plan.commands.len();
         if offset.checked_add(template.len()).is_none_or(|count| count > MAX_ACTIONS) {
             return Err("Compiled template exceeds 512 commands".into());
@@ -992,13 +1309,91 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
                 plan.commands.push(EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":direction,"align":align}}) });
             }
         }
-        append_images(&mut plan, &page, family, mode)?;
+        append_images(&mut plan, &page, family, mode, quantities, &profile.illustration)?;
     }
     crate::worker::validate_batch_plan(&plan, scope)?;
     Ok(plan)
 }
 
-fn append_images(plan: &mut ProductionPlan, page: &ContentPage, family: &PageFamily, mode: OutputMode) -> Result<(), String> {
+fn contains_image_quantity_claim(prompt: &str) -> bool {
+    let normalized = normalize_curriculum_query(prompt);
+    normalized.chars().any(|c| c.is_numeric())
+        || normalized.split(|c: char| !c.is_alphabetic()).any(|word| {
+            matches!(
+                word,
+                "zero"
+                    | "one"
+                    | "two"
+                    | "three"
+                    | "four"
+                    | "five"
+                    | "six"
+                    | "seven"
+                    | "eight"
+                    | "nine"
+                    | "ten"
+                    | "eleven"
+                    | "twelve"
+                    | "thirteen"
+                    | "fourteen"
+                    | "fifteen"
+                    | "sixteen"
+                    | "seventeen"
+                    | "eighteen"
+                    | "nineteen"
+                    | "twenty"
+                    | "hundred"
+                    | "thousand"
+                    | "pair"
+                    | "pairs"
+                    | "dozen"
+                    | "صفر"
+                    | "واحد"
+                    | "واحدة"
+                    | "واحدا"
+                    | "اثنان"
+                    | "اثنين"
+                    | "اثنتان"
+                    | "اثنتين"
+                    | "ثلاث"
+                    | "ثلاثة"
+                    | "اربع"
+                    | "أربع"
+                    | "اربعة"
+                    | "أربعة"
+                    | "خمس"
+                    | "خمسة"
+                    | "ست"
+                    | "ستة"
+                    | "سبع"
+                    | "سبعة"
+                    | "ثمان"
+                    | "ثماني"
+                    | "ثمانية"
+                    | "تسع"
+                    | "تسعة"
+                    | "عشر"
+                    | "عشرة"
+                    | "عشرين"
+                    | "مئة"
+                    | "مائة"
+                    | "الف"
+                    | "ألف"
+                    | "زوج"
+                    | "زوجان"
+                    | "زوجين"
+            )
+        })
+}
+
+fn append_images(
+    plan: &mut ProductionPlan,
+    page: &ContentPage,
+    family: &PageFamily,
+    mode: OutputMode,
+    quantities: Option<NumberTriplet>,
+    illustration_style: &[String],
+) -> Result<(), String> {
     if mode == OutputMode::NativeOnly && !page.illustrations.is_empty() {
         return Err("Native-only template content cannot request images".into());
     }
@@ -1008,12 +1403,28 @@ fn append_images(plan: &mut ProductionPlan, page: &ContentPage, family: &PageFam
         if !slots.insert(&image.slot) || !bounded_text(&image.prompt, 8192) || image.prompt.len() > 8192 || plan.images.len() >= MAX_IMAGES {
             return Err("Illustration prompt, duplicate slot or image count is invalid".into());
         }
-        plan.images.push(ImagePlacement {
-            prompt: image.prompt.clone(),
-            page: usize::try_from(page.page).map_err(|_| "Invalid image page")?,
-            rect: slot.rect,
-            label: slot.purpose.clone(),
-        });
+        let (prompt, label) = if let Some(values) = quantities.filter(|_| slot.id == "cpa-concrete") {
+            // Preserve authored subject/material/style, while refusing freeform
+            // count claims that could contradict the validated native quantities.
+            if contains_image_quantity_claim(&image.prompt) {
+                return Err("CPA concrete illustration must describe subject, material and style without numeric or spelled-out counts; the host supplies the authored quantities. Raster counts still require human visual review".into());
+            }
+            let prompt = format!(
+                "AUTHORITATIVE COUNT: exactly {} objects, arranged as {} in the first group and {} in the second group. Zero means the corresponding group is empty; when total is zero show the requested setting with no counted objects. Preserve the following requested subject, material and style: {}. No additional counted objects, text, letters, numbers, speech bubbles, or page graphics. Approved illustration style: {}",
+                values.total,
+                values.left,
+                values.right,
+                image.prompt,
+                illustration_style.join("; ")
+            );
+            (prompt, format!("CPA concrete quantities: {} + {} = {}; raster count pending human review", values.left, values.right, values.total))
+        } else {
+            (image.prompt.clone(), slot.purpose.clone())
+        };
+        if prompt.len() > 8192 {
+            return Err("Bound CPA illustration prompt exceeds its limit".into());
+        }
+        plan.images.push(ImagePlacement { prompt, page: usize::try_from(page.page).map_err(|_| "Invalid image page")?, rect: slot.rect, label });
     }
     Ok(())
 }
@@ -1118,6 +1529,195 @@ mod tests {
     fn compile_value(content: &Value, skill: &SkillSnapshot) -> Result<ProductionPlan, String> {
         compile(&content.to_string(), skill, scope(), OutputMode::NativeWithImages)
     }
+
+    fn cambridge_skill() -> SkillSnapshot {
+        let manifest: Value = serde_json::from_str(include_str!("../../../skills/kg-oxford-cambridge-style/designcraft.json")).unwrap();
+        let mut profile: DesignProfile = serde_json::from_value(manifest["design_profile"].clone()).unwrap();
+        profile.page_families.retain(|family| family.id == "cambridge-cpa-grammar");
+        let mut style = skill();
+        style.skill_id = "kg-oxford-cambridge-style".into();
+        style.templates = BTreeMap::from([(
+            "templates/cambridge-cpa-grammar.json".into(),
+            serde_json::from_str(include_str!("../../../skills/kg-oxford-cambridge-style/templates/cambridge-cpa-grammar.json")).unwrap(),
+        )]);
+        style.design_profile = Some(profile);
+        style
+    }
+
+    fn cambridge_content(style: &SkillSnapshot, equation: &str) -> Value {
+        let family = &style.design_profile.as_ref().unwrap().page_families[0];
+        let mut text = family.text_slots.iter().map(|slot| (slot.id.clone(), "Test".to_owned())).collect::<BTreeMap<_, _>>();
+        text.insert("cpa-pictorial-label".into(), format!("Pictorial Grid:\n{equation} units"));
+        text.insert("cpa-bond-label".into(), format!("Abstract:\n{equation}"));
+        json!({"title":"Bound CPA","pages":[{"page":0,"family":"cambridge-cpa-grammar","text":text,"illustrations":[]}]})
+    }
+
+    #[test]
+    fn ai23_cambridge_renamed_markers_and_unicode_negative_quantities_are_rejected() {
+        let style = cambridge_skill();
+        let scope = BatchScope { start: 0, count: 1 };
+        for sign in ["－", "﹣", "−"] {
+            let content = cambridge_content(&style, &format!("{sign}1 + 2 = 3"));
+            assert!(compile(&content.to_string(), &style, scope, OutputMode::NativeOnly).is_err());
+        }
+        for replacement in ["renamed", "part.cpa.tf.outer-renamed", ""] {
+            let mut changed = style.clone();
+            changed.templates.get_mut("templates/cambridge-cpa-grammar.json").unwrap()[138].params["label"] = json!(replacement);
+            let content = cambridge_content(&changed, "4 + 6 = 10");
+            assert!(compile(&content.to_string(), &changed, scope, OutputMode::NativeOnly).is_err());
+            assert!(requires_adaptive_math("Math", std::slice::from_ref(&changed)));
+            assert!(schema_for_brief(&changed, scope, OutputMode::NativeOnly, "Math").is_err());
+        }
+    }
+
+    #[test]
+    fn ai23_real_cambridge_binds_exact_authored_quantities_without_changing_copy() {
+        let style = cambridge_skill();
+        for (equation, left, right) in [("2 + 1 = 3", 2, 1), ("4 + 6 = 10", 4, 6), ("0 + 0 = 0", 0, 0), ("٢ + ١ = ٣", 2, 1), ("۴ + ۶ = ۱۰", 4, 6)]
+        {
+            let content = cambridge_content(&style, equation);
+            let plan = compile(&content.to_string(), &style, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
+            assert_eq!(plan.commands.len(), 228);
+            assert_eq!(plan.commands[135].params["rect"], json!([232.0, 480.0, 364.0, 612.0]));
+            assert_eq!(plan.commands[157].params["text"], content["pages"][0]["text"]["cpa-pictorial-label"]);
+            assert_eq!(plan.commands[193].params["text"], content["pages"][0]["text"]["cpa-bond-label"]);
+            let frames = [148, 151, 154, 205, 208, 211, 214, 217, 220, 223];
+            let mut counts = BTreeMap::<String, usize>::new();
+            for (index, frame) in frames.into_iter().enumerate() {
+                assert_eq!(plan.commands[frame].params["shape"], "ellipse");
+                let swatch = plan.commands[frame + 1].params["swatch"].as_str().unwrap();
+                let expected = if index < left as usize {
+                    "C=15 M=100 Y=100 K=0"
+                } else if index < (left + right) as usize {
+                    "C=75 M=5 Y=100 K=0"
+                } else {
+                    "[Paper]"
+                };
+                assert_eq!(swatch, expected);
+                *counts.entry(swatch.into()).or_default() += 1;
+                let rect = plan.commands[frame].params["rect"].as_array().unwrap();
+                assert!(rect[0].as_f64().unwrap() >= 232.0 && rect[2].as_f64().unwrap() <= 364.0);
+                assert!(rect[1].as_f64().unwrap() >= 480.0 && rect[3].as_f64().unwrap() <= 612.0);
+            }
+            assert_eq!(counts.get("C=15 M=100 Y=100 K=0").copied().unwrap_or(0), left as usize);
+            assert_eq!(counts.get("C=75 M=5 Y=100 K=0").copied().unwrap_or(0), right as usize);
+            assert_eq!(counts.get("[Paper]").copied().unwrap_or(0), (10 - left - right) as usize);
+            let verticals = plan
+                .commands
+                .iter()
+                .filter(|action| action.command == "line.create")
+                .filter(|action| action.params["a"][0] == action.params["b"][0] && action.params["a"][1] == 480.0 && action.params["b"][1] == 612.0)
+                .count();
+            assert_eq!(verticals, 4, "Five columns require four native vertical dividers");
+            assert_eq!(plan.commands[226].params["ids"][0], "$161.id");
+            assert_eq!(plan.commands[226].params["ids"].as_array().unwrap().len(), 10);
+            let mut session = designcraft_engine::Session::new();
+            session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+            session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only"})).unwrap();
+        }
+    }
+
+    #[test]
+    fn ai23_cambridge_rejects_missing_conflicting_overflowing_and_unsupported_authored_quantities() {
+        let style = cambridge_skill();
+        let scope = BatchScope { start: 0, count: 1 };
+        for equation in [
+            "No authored equation",
+            "2 + 1 = 4",
+            "8 + 3 = 11",
+            "-1 + 2 = 1",
+            "1.5 + 1.5 = 3",
+            "429496729600000000000000000 + 0 = 0",
+            "2 + 1 = 3 and 4 + 1 = 5",
+        ] {
+            let content = cambridge_content(&style, equation);
+            assert!(compile(&content.to_string(), &style, scope, OutputMode::NativeOnly).is_err(), "{equation}");
+        }
+        let mut content = cambridge_content(&style, "2 + 1 = 3");
+        content["pages"][0]["text"]["cpa-bond-label"] = json!("1 + 2 = 3");
+        assert!(compile(&content.to_string(), &style, scope, OutputMode::NativeOnly).unwrap_err().contains("disagree"));
+        content["pages"][0]["text"].as_object_mut().unwrap().remove("cpa-bond-label");
+        assert!(compile(&content.to_string(), &style, scope, OutputMode::NativeOnly).is_err());
+        let mut unknown = style.clone();
+        unknown.templates.get_mut("templates/cambridge-cpa-grammar.json").unwrap()[142].params["b"] = json!([276.0, 610.0]);
+        assert!(requires_adaptive_math("Math", &[unknown.clone()]));
+        let content = cambridge_content(&unknown, "2 + 1 = 3");
+        assert!(compile(&content.to_string(), &unknown, scope, OutputMode::NativeOnly).unwrap_err().contains("structured activity"));
+        assert!(schema_for_brief(&unknown, scope, OutputMode::NativeOnly, "Math").is_err());
+    }
+
+    #[test]
+    fn ai23_math_schema_and_blueprint_only_expose_known_bound_cambridge_for_math() {
+        let style = cambridge_skill();
+        let scope = BatchScope { start: 0, count: 1 };
+        assert!(!requires_adaptive_math("اريد منهج دولي لمادةmath", std::slice::from_ref(&style)));
+        let mut unsupported = style.clone();
+        unsupported.templates.get_mut("templates/cambridge-cpa-grammar.json").unwrap()[142].params["b"] = json!([276.0, 610.0]);
+        for brief in ["Count objects", "five-frame", "ten-frame", "العد", "أعداد", "أرقام", "إطار عشري", "إطار خماسي"]
+        {
+            assert!(requires_adaptive_math(brief, &[unsupported.clone()]), "{brief}");
+        }
+        assert!(system_for_brief(&style, "Math").unwrap().contains("same explicit addition equation"));
+        assert!(system_for_brief(&unsupported, "Math").is_err());
+        assert!(system_for_brief(&style, "English grammar").is_err());
+        assert!(system(&style).is_err());
+        let math_schema = schema_for_brief(&style, scope, OutputMode::NativeOnly, "Math").unwrap();
+        assert_eq!(math_schema["properties"]["pages"]["items"]["anyOf"][0]["properties"]["family"]["enum"][0], CAMBRIDGE_ID);
+        let blueprint = curriculum_blueprint("Math", &style, scope, 1).unwrap();
+        assert_eq!(blueprint["scoped_page_plan"][0]["recommended_family"], CAMBRIDGE_ID);
+        assert!(schema_for_brief(&style, scope, OutputMode::NativeOnly, "English grammar").is_err());
+        assert!(schema(&style, scope, OutputMode::NativeOnly).is_err());
+        assert!(curriculum_blueprint("Science", &style, scope, 1).is_err());
+        let content = cambridge_content(&style, "2 + 1 = 3");
+        assert!(compile_for_brief(&content.to_string(), &style, scope, OutputMode::NativeOnly, "English grammar").is_err());
+    }
+
+    #[test]
+    fn ai23_bound_cambridge_capacity_and_second_page_references_include_append_only_actions() {
+        let style = cambridge_skill();
+        assert_eq!(capacity(&style, OutputMode::NativeOnly).unwrap(), 2);
+        assert!(preflight(&style, BatchScope { start: 0, count: 3 }, OutputMode::NativeOnly).is_err());
+        let mut content = cambridge_content(&style, "4 + 6 = 10");
+        let mut second = content["pages"][0].clone();
+        second["page"] = json!(1);
+        content["pages"].as_array_mut().unwrap().push(second);
+        let plan = compile(&content.to_string(), &style, BatchScope { start: 0, count: 2 }, OutputMode::NativeOnly).unwrap();
+        let per_page = 199 + CAMBRIDGE_EXTRA_ACTIONS;
+        assert_eq!(plan.commands.len(), 2 * per_page);
+        assert_eq!(plan.commands[per_page + 161].params["ids"][0], format!("${}.id", per_page + 127));
+        assert_eq!(plan.commands[per_page + 226].params["ids"][0], format!("${}.id", per_page + 161));
+        let mut session = designcraft_engine::Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":2,"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only"})).unwrap();
+    }
+
+    #[test]
+    fn ai23_concrete_image_request_cannot_retain_the_stock_three_object_quantity() {
+        let style = cambridge_skill();
+        let mut content = cambridge_content(&style, "4 + 6 = 10");
+        let scope = BatchScope { start: 0, count: 1 };
+        for prompt in ["Three apples on a wooden tray.", "3 apples on a tray.", "ثلاث تفاحات على صينية."] {
+            content["pages"][0]["illustrations"] = json!([{"slot":"cpa-concrete","prompt":prompt}]);
+            assert!(
+                compile(&content.to_string(), &style, scope, OutputMode::NativeWithImages)
+                    .unwrap_err()
+                    .contains("without numeric or spelled-out counts")
+            );
+        }
+        let subject = "Fresh green apples on a wooden tray, delicate watercolor with visible paper texture";
+        content["pages"][0]["illustrations"] = json!([{"slot":"cpa-concrete","prompt":subject}]);
+        let plan = compile(&content.to_string(), &style, scope, OutputMode::NativeWithImages).unwrap();
+        assert_eq!(plan.images.len(), 1);
+        assert!(!plan.images[0].prompt.to_lowercase().contains("three"));
+        assert!(!plan.images[0].label.to_lowercase().contains("three"));
+        assert!(plan.images[0].prompt.contains("exactly 10"));
+        assert!(plan.images[0].prompt.contains("4 in the first group and 6 in the second group"));
+        assert!(plan.images[0].prompt.contains(subject));
+        assert!(plan.images[0].label.contains("raster count pending human review"));
+        assert!(plan.images[0].label.contains("4 + 6 = 10"));
+        assert!(plan.images[0].prompt.contains("Approved illustration style"));
+    }
+
     #[test]
     fn explicit_script_page_two_keeps_ownership_chart_instead_of_fallback_scope_sequence() {
         let brief = "Mathematics KG2\n### PAGE 01 — Cover\n* **English Print Copy (LTR):**\n  > My Math Book\n### PAGE 02 — This Book Belongs To & My 1–20 Bilingual Number Chart\n* **English Print Copy (LTR):**\n  > THIS MATH BOOK BELONGS TO: [Name Line] | MY NUMBER CHART 1–20\n### PAGE 03 — Teacher & Parent Guide\n* **English Print Copy (LTR):**\n  > WELCOME TO KG2 INTERNATIONAL MATH!\n### PAGE 04 — Our Math Journey\n* **English Print Copy (LTR):**\n  > Meet Noor and Leo!\n";
@@ -1563,6 +2163,12 @@ mod tests {
             .unwrap()
         })
         .collect();
+        // This identifier denotes the verified counting topology, not an
+        // arbitrary practice frame renamed to impersonate that family.
+        let cambridge = cambridge_skill();
+        let family = cambridge.design_profile.as_ref().unwrap().page_families[0].clone();
+        *style.design_profile.as_mut().unwrap().page_families.iter_mut().find(|entry| entry.id == CAMBRIDGE_ID).unwrap() = family;
+        style.templates.extend(cambridge.templates);
         let math_bp = curriculum_blueprint("اريد منهج دولي لمادةmath", &style, BatchScope { start: 0, count: 6 }, 8).unwrap();
         assert_eq!(math_bp["subject_domain"], "Mathematics (Concrete -> Pictorial -> Abstract / CPA & Sensory Numeracy / منهج الرياضيات المتدرج)");
         assert!(

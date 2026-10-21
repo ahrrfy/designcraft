@@ -276,6 +276,7 @@ impl ProductionRunner {
                 let ids = self.prepare_automatic_skills(session, &prompt)?;
                 self.snapshot.message = format!("Automatically prepared {} compatible skills locally; no provider request", ids.len());
             }
+            AiRequest::PreviewProduction(task) => self.preview_production(session, task)?,
             AiRequest::SaveSkillDraft { id, skill_md, manifest_json } => {
                 let review = self.snapshot.review.as_ref().filter(|r| r.id == id).ok_or("Inspect the skill before editing")?;
                 let mut files = self.registry.review_files(&id, &review.revision).map_err(|e| e.to_string())?;
@@ -494,6 +495,70 @@ impl ProductionRunner {
             prefs: session.prefs.clone(),
         };
         self.launch(work, Some(task), expected, pins, settings)
+    }
+
+    fn preview_production(&mut self, session: &Session, task: TaskRequest) -> Result<(), String> {
+        self.snapshot.production_preview = None;
+        if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
+            return Err("Enter valid production instructions before previewing the curriculum".into());
+        }
+        match task.target {
+            TaskTarget::NewA4 { pages } if (1..=1000).contains(&pages) => {}
+            TaskTarget::ContinueBook => {}
+            _ => return Err("Curriculum preview requires a new 1–1000-page book or an existing book to continue".into()),
+        }
+        let ids = if task.auto_select_skills {
+            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+        } else {
+            let mut ids = task.skill_ids.clone();
+            if let Some(style) = &task.settings.design_style
+                && !ids.contains(style)
+            {
+                ids.push(style.clone());
+            }
+            ids
+        };
+        if ids.len() > 8 {
+            return Err("Select at most eight skills per task".into());
+        }
+        let mut styles = Vec::new();
+        for id in ids {
+            let revision = self
+                .registry
+                .catalog("")
+                .into_iter()
+                .find(|entry| entry.skill_id == id)
+                .and_then(|entry| entry.active_revision)
+                .ok_or("Preview requires a compatible active skill revision")?;
+            let skill = self.registry.snapshot(&id, &[]).map_err(|error| error.to_string())?;
+            if skill.revision != revision {
+                return Err("Skill revision changed while preparing preview".into());
+            }
+            if skill.design_profile.is_some() {
+                styles.push(skill);
+            }
+        }
+        if styles.len() != 1 {
+            return Err("Choose one compatible design style to preview its curriculum".into());
+        }
+        let style = styles.first().ok_or("Missing preview style")?;
+        let profile = style.design_profile.as_ref().ok_or("Missing preview profile")?;
+        let (base, _) = task_document_context(session, &task.target, Some(profile), &task.prompt, &task.settings)?;
+        let total = u32::try_from(base.doc.page_count()).map_err(|_| "Preview page count exceeds its limit")?;
+        let start =
+            if matches!(task.target, TaskTarget::ContinueBook) { batch::continuation_progress(&base, Some(profile), &task.prompt)?.1 } else { 0 };
+        let remaining = total.checked_sub(start).ok_or("Invalid preview range")?;
+        let count = remaining.min(task.settings.pages_per_batch.max(1)).min(32);
+        let blueprint = crate::template_plan::curriculum_blueprint(&task.prompt, style, worker::BatchScope { start, count }, total)?;
+        let rtl = if matches!(task.target, TaskTarget::ContinueBook) {
+            session.doc().map_err(|error| error.to_string())?.doc.settings.right_to_left_binding
+        } else {
+            book_binding(&task.settings, &task.prompt)
+        };
+        self.snapshot.production_preview = Some(json!({"style":profile.name,"revision":style.revision,"total_pages":total,
+            "binding":if rtl {"RTL"} else {"LTR"},"preview_pages":count,"blueprint":blueprint}));
+        self.snapshot.message = "Local curriculum preview only; no provider request, document edit or production approval".into();
+        Ok(())
     }
 
     fn save_production_draft(&mut self, session: &Session, task: &TaskRequest) -> Result<(), String> {
@@ -1754,7 +1819,9 @@ fn validate_settings(settings: &AiSettings) -> Result<(), String> {
         return Err("Human review groups must contain 1–1000 pages, or zero for a short one-shot task".into());
     }
     validate_endpoint(&settings.text_model)?;
-    validate_endpoint(&settings.image_model)?;
+    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+        validate_endpoint(&settings.image_model)?;
+    }
     if settings.text_model.model.len() > 256 || settings.image_model.model.len() > 256 {
         return Err("Model name is too long".into());
     }
@@ -2002,6 +2069,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ai23_native_only_ignores_unused_invalid_image_endpoint_in_settings_and_batch_admission() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let settings = AiSettings {
+            output_mode: designcraft_ai_types::OutputMode::NativeOnly,
+            text_model: designcraft_ai_types::ModelSelection {
+                provider: ProviderKind::Ollama,
+                model: "ai23-no-network".into(),
+                endpoint: Some("http://127.0.0.1:9/".into()),
+            },
+            image_model: designcraft_ai_types::ModelSelection {
+                provider: ProviderKind::OpenAi,
+                model: "unused-image".into(),
+                endpoint: Some("http://untrusted-image.invalid/v1/".into()),
+            },
+            // Every request reserves at least 1024 input tokens. Admission fails
+            // before provider traffic even if the worker starts immediately.
+            budget: BudgetSpec { token_limit: 256, max_output_tokens: 1, max_requests: 1, repair_attempts: 0, ..Default::default() },
+            pages_per_batch: 1,
+            ..Default::default()
+        };
+        assert!(validate_settings(&settings).is_ok(), "Native-only settings must not validate an unused image endpoint");
+        let mut illustrated = settings.clone();
+        illustrated.output_mode = designcraft_ai_types::OutputMode::NativeWithImages;
+        assert!(validate_settings(&illustrated).is_err(), "An image-capable task must still validate that endpoint");
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        // Match the synthetic text endpoint in memory, avoiding protected-store
+        // access during admission. It cannot authorize the unrelated image URL.
+        runner.keys.push(SessionKey::new(&settings.text_model, SecretString::new("synthetic-ai23-local-key".into())).unwrap());
+        let mut session = Session::new();
+        runner
+            .start(
+                &mut session,
+                TaskRequest {
+                    prompt: "Create one editable native page.".into(),
+                    settings,
+                    skill_ids: vec![],
+                    auto_select_skills: false,
+                    target: TaskTarget::NewA4 { pages: 1 },
+                    export_directory: None,
+                },
+            )
+            .unwrap();
+        assert!(runner.pending.is_some(), "The native batch must reach worker admission without touching image credentials");
+        assert!(runner.snapshot.busy);
+        assert_eq!(runner.snapshot.batch.as_ref().unwrap().completed_pages, 0);
+        assert!(session.documents().is_empty(), "Admission must not publish an unreviewed document");
+    }
+
+    #[test]
     fn continuation_saved_draft_survives_model_validation_and_restart_without_authority() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = Session::new();
@@ -2078,6 +2196,42 @@ mod tests {
             assert_eq!(crate::template_plan::capacity(&pinned, mode).unwrap(), 2);
         }
         (directory, runner)
+    }
+
+    #[test]
+    fn ai23_local_curriculum_preview_never_launches_generation_or_edits_documents() {
+        let (_directory, mut runner) = automatic_template_batch_fixture();
+        let mut session = Session::new();
+        let mut request = TaskRequest {
+            prompt: "Create a Science book".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec!["kg-oxford-cambridge-style".into()],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 48 },
+            export_directory: None,
+        };
+        runner.preview_production(&session, request.clone()).unwrap();
+        let preview = runner.snapshot.production_preview.as_ref().unwrap();
+        assert_eq!(preview["total_pages"], 48);
+        assert!(preview["blueprint"]["subject_domain"].as_str().unwrap().contains("Science"));
+        assert!(runner.pending.is_none() && runner.batch.is_none());
+        assert!(session.documents().is_empty());
+        assert_eq!(runner.snapshot.current_usage.requests, 0);
+        session.execute("file.new", &json!({"pages":6,"facingPages":false})).unwrap();
+        for page in 0..2 {
+            session.execute("frame.create", &json!({"spread":page,"rect":[60,60,100,100]})).unwrap();
+        }
+        let before = session.doc().unwrap().doc.clone();
+        request.target = TaskTarget::ContinueBook;
+        request.settings.right_to_left_binding = Some(true);
+        runner.preview_production(&session, request.clone()).unwrap();
+        let preview = runner.snapshot.production_preview.as_ref().unwrap();
+        assert_eq!(preview["binding"], "LTR");
+        assert_eq!(preview["blueprint"]["scoped_page_plan"][0]["page"], 2);
+        assert!(std::sync::Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+        request.target = TaskTarget::NewA4 { pages: 1001 };
+        assert!(runner.preview_production(&session, request).is_err());
+        assert!(runner.snapshot.production_preview.is_none(), "Failed previews must not display stale plans");
     }
 
     fn no_provider_template_settings(requested: u32) -> AiSettings {

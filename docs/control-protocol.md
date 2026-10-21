@@ -109,3 +109,5 @@ The icon rail can reopen a collapsed dock through any root panel. Activating a
 floating panel also raises its group. These operations change only UI layout.
 
 Automatic skill preparation: `ui.menu.invoke` with `{command: ai.request, params: {method: prepare_skills, prompt: ...}}` runs the same local native-template checks used before automatic production. It makes no provider request. Machine validation is recorded separately from human approval. It cannot approve batch proofs, reveal credentials, or submit printing.
+
+Local curriculum preview: `ai.request {method: "preview_production", request: TaskRequest}` returns `production_preview` in the snapshot. It uses the selected compatible style and actual book range/binding, suggests at most 32 upcoming page families, and makes no provider request or document edit. Refresh explicitly after changing the request. A preview does not start production, grant approval, or replace human educational review.

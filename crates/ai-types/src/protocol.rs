@@ -179,6 +179,8 @@ pub enum AiRequest {
     PrepareSkills {
         prompt: String,
     },
+    /// Local planning preview only; never launches a provider or grants production authority.
+    PreviewProduction(TaskRequest),
     SaveSkillDraft {
         id: String,
         skill_md: String,
@@ -387,6 +389,8 @@ pub struct SkillReview {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AiSnapshot {
     pub available: bool,
+    #[serde(default)]
+    pub production_preview: Option<Value>,
     pub local_server: Option<LocalServerStatus>,
     pub busy: bool,
     pub stage: String,

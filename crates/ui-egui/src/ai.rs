@@ -45,6 +45,9 @@ impl OpenDocument {
 
 struct RequestEstimate {
     review_pages: u32,
+    remaining_pages: u32,
+    remaining_groups: u32,
+    book_allowance: u32,
     scripted: bool,
     image_allowance: u32,
     vision_allowance: u32,
@@ -286,6 +289,7 @@ pub struct AiUiState {
     proof_document_matches: bool,
     proof_binding: Option<bool>,
     proof_pair_view: bool,
+    proof_full_resolution: bool,
     review_input_is_human: bool,
     review_pointer_press: Option<(BatchReviewKey, egui::Id)>,
     batch_approval_gesture: Option<(BatchReviewKey, egui::Context, u64)>,
@@ -362,6 +366,7 @@ impl Default for AiUiState {
             proof_document_matches: false,
             proof_binding: None,
             proof_pair_view: true,
+            proof_full_resolution: false,
             review_input_is_human: false,
             review_pointer_press: None,
             batch_approval_gesture: None,
@@ -525,6 +530,48 @@ impl AiUiState {
         key.pages().nth(usize::try_from(index).ok()?).map(|(path, _)| path.as_str())
     }
 
+    fn can_review_pair(&self) -> bool {
+        self.proof_full_resolution
+            && self.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof")
+            && self.can_review_selected_proof()
+            && self.companion_proof_path().is_some_and(|path| {
+                self.companion_proof.as_ref().is_some_and(|proof| proof.path == path && proof.texture.is_some() && proof.error.is_empty())
+            })
+    }
+
+    fn production_task(&self) -> TaskRequest {
+        TaskRequest {
+            prompt: self.prompt.clone(),
+            settings: self.settings.clone(),
+            auto_select_skills: self.automatic_skills,
+            skill_ids: if self.automatic_skills { Vec::new() } else { self.selected_skills.iter().cloned().collect() },
+            target: if self.new_document {
+                TaskTarget::NewA4 { pages: self.pages }
+            } else if self.continue_book {
+                TaskTarget::ContinueBook
+            } else {
+                TaskTarget::CurrentDocument
+            },
+            export_directory: (!self.directory.trim().is_empty()).then(|| self.directory.clone()),
+        }
+    }
+
+    fn review_displayed_pair(&mut self) {
+        if !self.can_review_pair() {
+            return;
+        }
+        let companion = self.companion_proof_path().map(str::to_owned);
+        self.review_selected_proof();
+        if let Some(page) = self.proof_key.as_ref().and_then(|key| key.pages().find(|(path, _)| Some(path.as_str()) == companion.as_deref())) {
+            self.reviewed_proofs.insert(page.clone());
+        }
+        let next =
+            self.proof_key.as_ref().and_then(|key| key.pages().find(|page| !self.reviewed_proofs.contains(*page))).map(|(path, _)| path.clone());
+        if let Some(next) = next {
+            self.select_proof(&next);
+        }
+    }
+
     fn can_approve_batch(&self) -> bool {
         self.review_input_is_human
             && !self.snapshot.busy
@@ -675,7 +722,16 @@ impl AiUiState {
         };
         let image_allowance = review_pages.saturating_mul(sources_per_page);
         let vision_allowance = if self.settings.verify_generated_images { image_allowance } else { 0 };
-        (review_pages > 0).then_some(RequestEstimate { review_pages, scripted: scripted_pages.is_some(), image_allowance, vision_allowance })
+        let per_page = 1u32.saturating_add(sources_per_page).saturating_add(if self.settings.verify_generated_images { sources_per_page } else { 0 });
+        (review_pages > 0).then_some(RequestEstimate {
+            review_pages,
+            remaining_pages: remaining,
+            remaining_groups: remaining.div_ceil(self.settings.pages_per_batch),
+            book_allowance: remaining.saturating_mul(per_page),
+            scripted: scripted_pages.is_some(),
+            image_allowance,
+            vision_allowance,
+        })
     }
 }
 
@@ -756,6 +812,7 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
         "poll" => AiRequest::Poll,
         "cancel" => AiRequest::Cancel,
         "start" => AiRequest::Start(serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?),
+        "preview_production" => AiRequest::PreviewProduction(serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?),
         "update_settings" => AiRequest::UpdateSettings(serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?),
         "list_models" => AiRequest::ListModels { selection: serde_json::from_value(decode("selection")?).map_err(|e| e.to_string())? },
         "import_skill" => AiRequest::ImportSkill { path: field("path")? },
@@ -1649,6 +1706,14 @@ fn production(
             "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
         );
         if let Some(estimate) = s.request_estimate(documents, *activate_document) {
+            if estimate.remaining_pages > estimate.review_pages {
+                rtl::label(ui, format!("{}: {} · {} {} · {} {}", text(a, "Remaining book requests (estimate, before repairs)", "طلبات بقية الكتاب (تقدير قبل الإصلاحات)"),
+                    estimate.book_allowance, estimate.remaining_pages, text(a, "pages", "صفحة"), estimate.remaining_groups, text(a, "review groups", "مجموعات مراجعة")));
+                if s.settings.budget.max_requests < estimate.book_allowance && ui.add_enabled(estimate.book_allowance <= MAX_REQUEST_ALLOWANCE,
+                    egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for remaining book", "ضبط حصة الطلبات لبقية الكتاب")))).clicked() {
+                    s.settings.budget.max_requests = estimate.book_allowance;
+                }
+            }
             rtl::label(
                 ui,
                 format!(
@@ -1736,20 +1801,26 @@ fn production(
             rtl::label(ui, reason);
         }
         if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked() {
-            requests.push(AiRequest::Start(TaskRequest {
-                prompt: s.prompt.clone(),
-                settings: s.settings.clone(),
-                auto_select_skills: s.automatic_skills,
-                skill_ids: if s.automatic_skills { Vec::new() } else { s.selected_skills.iter().cloned().collect() },
-                target: if s.new_document {
-                    TaskTarget::NewA4 { pages: s.pages }
-                } else if s.continue_book {
-                    TaskTarget::ContinueBook
-                } else {
-                    TaskTarget::CurrentDocument
-                },
-                export_directory: (!s.directory.trim().is_empty()).then(|| s.directory.clone()),
-            }));
+            requests.push(AiRequest::Start(s.production_task()));
+        }
+        if (s.new_document || s.continue_book) && ui.add_enabled(available && !s.prompt.trim().is_empty(),
+            egui::Button::new(rtl::widget(ui,text(a,"Preview curriculum locally (no API request)","معاينة خطة المنهج محلياً (دون طلب API)")))).clicked() {
+            requests.push(AiRequest::PreviewProduction(s.production_task()));
+        }
+        if let Some(preview)=&s.snapshot.production_preview {
+            egui::CollapsingHeader::new(rtl::widget(ui,text(a,"Last local curriculum preview","آخر معاينة محلية لخطة المنهج"))).default_open(true).show(ui,|ui| {
+                rtl::label(ui,format!("{} · {} · {} · {} {}",preview["blueprint"]["subject_domain"].as_str().unwrap_or(""),
+                    preview["style"].as_str().unwrap_or(""),preview["binding"].as_str().unwrap_or(""),preview["total_pages"],text(a,"pages","صفحة")));
+                label(ui,a,"Suggested family sequence only; refresh after changing the request. Educator review is required.",
+                    "تسلسل عائلات مقترح؛ أعد المعاينة بعد تغيير الطلب. يلزم فحص تربوي بشري.");
+                egui::ScrollArea::vertical().id_salt("ai_curriculum_summary").max_height(100.0).show(ui,|ui| {
+                    for page in preview["blueprint"]["scoped_page_plan"].as_array().into_iter().flatten().take(32) {
+                        if let Some(number)=page["page"].as_u64() {
+                            rtl::label(ui,format!("{} {}: {}",text(a,"Page","الصفحة"),number.saturating_add(1),page["recommended_family"].as_str().unwrap_or("")));
+                        }
+                    }
+                });
+            });
         }
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).show(ui, |ui| {
             budgets(ui, s, a);
@@ -1865,6 +1936,7 @@ fn proof_image(
 
 fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
     let can_review = s.can_review_selected_proof();
+    let pair_visible = s.companion_proof_path().is_some();
     let can_approve = s.can_approve_batch();
     let pages: Vec<_> = s.proof_key.as_ref().map_or_else(Vec::new, |key| key.pages().collect());
     let page_count = pages.len();
@@ -1873,6 +1945,8 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
     let selected_reviewed = selected.and_then(|index| pages.get(index)).is_some_and(|page| s.reviewed_proofs.contains(*page));
     let mut select_page = None;
     let mut confirm_page = false;
+    let mut confirm_pair = false;
+    let can_review_pair = s.can_review_pair();
     let Some(batch) = &s.snapshot.batch else {
         return;
     };
@@ -1892,6 +1966,18 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
         ),
     );
     if let Some(current) = batch.batches.iter().find(|report| report.batch == batch.current_batch) {
+        egui::ScrollArea::horizontal().id_salt("ai_review_page_strip").max_height(30.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (index, page) in pages.iter().enumerate() {
+                    let number = u64::from(current.page_start).saturating_add(index as u64).saturating_add(1);
+                    let title =
+                        format!("{} {number}{}", text(a, "Review page", "مراجعة الصفحة"), if s.reviewed_proofs.contains(*page) { " ✓" } else { "" });
+                    if ui.selectable_label(selected == Some(index), rtl::widget(ui, title)).clicked() {
+                        select_page = Some(page.0.clone());
+                    }
+                }
+            });
+        });
         let pair = selected
             .and_then(|index| current.page_start.checked_add(u32::try_from(index).ok()?))
             .filter(|_| s.settings.facing_pages && s.proof_pair_view)
@@ -1905,77 +1991,105 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             ui.allocate_ui_with_layout(egui::vec2(image_width, height), egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.set_width(image_width);
                 ui.set_min_height(height);
-                if let Some(pair) = pair {
-                    let page_width = ((image_width - ui.spacing().item_spacing.x) * 0.5).max(40.0);
-                    ui.allocate_ui_with_layout(egui::vec2(image_width, height), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                        for page in pair {
-                            ui.push_id(("facing_proof_page", page), |ui| {
-                                ui.allocate_ui_with_layout(egui::vec2(page_width, height), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                    ui.set_width(page_width);
-                                    let page_number = page.saturating_add(1);
-                                    let proof = page
-                                        .checked_sub(current.page_start)
-                                        .and_then(|index| usize::try_from(index).ok())
-                                        .and_then(|index| pages.get(index));
-                                    if let Some(proof) = proof {
-                                        let (path, _) = proof;
-                                        let is_selected = s.proof_path.as_deref() == Some(path.as_str());
-                                        let title = format!(
-                                            "{} {}{}{}",
-                                            text(a, "Page", "الصفحة"),
-                                            page_number,
-                                            if is_selected { text(a, " · Selected", " · محددة") } else { "" },
-                                            if s.reviewed_proofs.contains(*proof) {
-                                                text(a, " · Reviewed", " · تمت المراجعة")
-                                            } else {
-                                                ""
-                                            }
+                egui::ScrollArea::both().id_salt("ai_proof_zoom_canvas").auto_shrink([false, false]).max_width(image_width).max_height(height).show(
+                    ui,
+                    |ui| {
+                        if let Some(pair) = pair {
+                            let page_width = if s.proof_full_resolution {
+                                s.proof_texture.as_ref().map_or(image_width, |texture| texture.size_vec2().x)
+                            } else {
+                                ((image_width - ui.spacing().item_spacing.x) * 0.5).max(40.0)
+                            };
+                            ui.allocate_ui_with_layout(egui::vec2(image_width, height), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                                for page in pair {
+                                    ui.push_id(("facing_proof_page", page), |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(page_width, height),
+                                            egui::Layout::top_down(egui::Align::Center),
+                                            |ui| {
+                                                ui.set_width(page_width);
+                                                let page_number = page.saturating_add(1);
+                                                let proof = page
+                                                    .checked_sub(current.page_start)
+                                                    .and_then(|index| usize::try_from(index).ok())
+                                                    .and_then(|index| pages.get(index));
+                                                if let Some(proof) = proof {
+                                                    let (path, _) = proof;
+                                                    let is_selected = s.proof_path.as_deref() == Some(path.as_str());
+                                                    let title = format!(
+                                                        "{} {}{}{}",
+                                                        text(a, "Page", "الصفحة"),
+                                                        page_number,
+                                                        if is_selected { text(a, " · Selected", " · محددة") } else { "" },
+                                                        if s.reviewed_proofs.contains(*proof) {
+                                                            text(a, " · Reviewed", " · تمت المراجعة")
+                                                        } else {
+                                                            ""
+                                                        }
+                                                    );
+                                                    if ui.selectable_label(is_selected, rtl::widget(ui, title)).clicked() {
+                                                        select_page = Some(path.clone());
+                                                    }
+                                                    let (texture, error) = if is_selected {
+                                                        (s.proof_texture.as_ref(), s.proof_error.as_str())
+                                                    } else if let Some(companion) = &s.companion_proof
+                                                        && companion.path.as_str() == path.as_str()
+                                                    {
+                                                        (companion.texture.as_ref(), companion.error.as_str())
+                                                    } else {
+                                                        (None, "")
+                                                    };
+                                                    let alt =
+                                                        format!("{} {} {}", text(a, "Page", "الصفحة"), page_number, text(a, "proof", "للمراجعة"));
+                                                    let size = if s.proof_full_resolution {
+                                                        texture.map_or(egui::vec2(page_width, height), |texture| texture.size_vec2())
+                                                    } else {
+                                                        egui::vec2(page_width, height - 48.0)
+                                                    };
+                                                    if proof_image(ui, a, texture, error, &alt, size).is_some_and(|response| response.clicked()) {
+                                                        select_page = Some(path.clone());
+                                                    }
+                                                } else if page < batch.total_pages {
+                                                    rtl::label(ui, format!("{} {}", text(a, "Page", "الصفحة"), page_number));
+                                                    label(ui, a, "Outside this review group", "خارج مجموعة المراجعة الحالية");
+                                                } else {
+                                                    label(ui, a, "End of book", "نهاية الكتاب");
+                                                }
+                                            },
                                         );
-                                        if ui.selectable_label(is_selected, rtl::widget(ui, title)).clicked() {
-                                            select_page = Some(path.clone());
-                                        }
-                                        let (texture, error) = if is_selected {
-                                            (s.proof_texture.as_ref(), s.proof_error.as_str())
-                                        } else if let Some(companion) = &s.companion_proof
-                                            && companion.path.as_str() == path.as_str()
-                                        {
-                                            (companion.texture.as_ref(), companion.error.as_str())
-                                        } else {
-                                            (None, "")
-                                        };
-                                        let alt = format!("{} {} {}", text(a, "Page", "الصفحة"), page_number, text(a, "proof", "للمراجعة"));
-                                        if proof_image(ui, a, texture, error, &alt, egui::vec2(page_width, height - 48.0))
-                                            .is_some_and(|response| response.clicked())
-                                        {
-                                            select_page = Some(path.clone());
-                                        }
-                                    } else if page < batch.total_pages {
-                                        rtl::label(ui, format!("{} {}", text(a, "Page", "الصفحة"), page_number));
-                                        label(ui, a, "Outside this review group", "خارج مجموعة المراجعة الحالية");
-                                    } else {
-                                        label(ui, a, "End of book", "نهاية الكتاب");
-                                    }
-                                });
+                                    });
+                                }
                             });
+                        } else {
+                            let _ = proof_image(
+                                ui,
+                                a,
+                                s.proof_texture.as_ref(),
+                                &s.proof_error,
+                                text(a, "Selected page proof", "معاينة الصفحة المحددة"),
+                                if s.proof_full_resolution {
+                                    s.proof_texture.as_ref().map_or(egui::vec2(image_width, height), |texture| texture.size_vec2())
+                                } else {
+                                    egui::vec2(image_width, height)
+                                },
+                            );
                         }
-                    });
-                } else {
-                    let _ = proof_image(
-                        ui,
-                        a,
-                        s.proof_texture.as_ref(),
-                        &s.proof_error,
-                        text(a, "Selected page proof", "معاينة الصفحة المحددة"),
-                        egui::vec2(image_width, height),
-                    );
-                }
+                    },
+                );
             });
             ui.allocate_ui_with_layout(egui::vec2(action_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(action_width);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 rtl::label(ui, format!("{} {} / {}", text(a, "Pages reviewed:", "الصفحات المراجعة:"), reviewed_count, page_count));
                 if s.settings.facing_pages {
-                    ui.checkbox(&mut s.proof_pair_view, rtl::widget(ui, text(a, "Show facing pair", "عرض الصفحتين المتقابلتين")));
+                    if ui.checkbox(&mut s.proof_pair_view, rtl::widget(ui, text(a, "Show facing pair", "عرض الصفحتين المتقابلتين"))).changed()
+                    {
+                        s.review_pointer_press = None;
+                    }
+                    if ui.checkbox(&mut s.proof_full_resolution, rtl::widget(ui, text(a, "100% image preview", "معاينة الصورة بحجم 100%"))).changed()
+                    {
+                        s.review_pointer_press = None;
+                    }
                 }
                 if let Some(index) = selected {
                     rtl::label(
@@ -2001,7 +2115,11 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                         }
                     });
                     egui::ComboBox::from_id_salt("ai_proof_page")
-                        .selected_text(format!("{} {}", text(a, "Page", "الصفحة"), index.saturating_add(1)))
+                        .selected_text(format!(
+                            "{} {}",
+                            text(a, "Page", "الصفحة"),
+                            u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)
+                        ))
                         .show_ui(ui, |ui| {
                             for (page_index, page) in pages.iter().enumerate() {
                                 let (path, _) = page;
@@ -2009,7 +2127,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                                 let title = format!(
                                     "{} {}{}",
                                     text(a, "Page", "الصفحة"),
-                                    page_index.saturating_add(1),
+                                    u64::from(current.page_start).saturating_add(page_index as u64).saturating_add(1),
                                     if reviewed { text(a, " · Reviewed", " · تمت المراجعة") } else { "" }
                                 );
                                 if ui.selectable_label(page_index == index, rtl::widget(ui, title)).clicked() {
@@ -2019,6 +2137,24 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                         });
                 }
                 if batch.status == "awaiting_human_proof" {
+                    if pair_visible {
+                        ui.push_id(("ai_review_pair", s.proof_path.as_deref()), |ui| {
+                            let response = ui.add_enabled(
+                                can_review_pair,
+                                egui::Button::new(rtl::widget(
+                                    ui,
+                                    text(a, "I reviewed both displayed pages; next preview", "راجعت الصفحتين المعروضتين؛ المعاينة التالية"),
+                                ))
+                                .wrap(),
+                            );
+                            confirm_pair = AiUiState::fresh_review_gesture(
+                                s.review_input_is_human,
+                                s.proof_key.as_ref(),
+                                &mut s.review_pointer_press,
+                                &response,
+                            );
+                        });
+                    }
                     let review_label = if selected_reviewed {
                         text(a, "Reviewed", "تمت المراجعة")
                     } else {
@@ -2102,6 +2238,10 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
     });
     if confirm_page {
         s.review_selected_proof();
+        ui.ctx().request_repaint();
+    }
+    if confirm_pair {
+        s.review_displayed_pair();
         ui.ctx().request_repaint();
     }
     if let Some(path) = select_page
@@ -2740,6 +2880,94 @@ mod tests {
     use designcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use serde_json::json;
+
+    #[test]
+    fn ai23_remaining_book_allowance_is_explicit_and_does_not_change_review_size() {
+        let mut state = AiUiState { prompt: "Create a science book".into(), pages: 48, ..Default::default() };
+        state.settings.text_model.model = "fixture".into();
+        state.settings.pages_per_batch = 2;
+        state.settings.output_mode = OutputMode::NativeWithImages;
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1200.0, 1600.0))
+            .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 4);
+        panel.get_by_label("Set request allowance for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().settings.budget.max_requests, 96);
+        assert_eq!(panel.state().settings.pages_per_batch, 2);
+        assert_eq!(panel.state().pages, 48);
+    }
+
+    #[test]
+    fn ai23_curriculum_preview_uses_the_injected_host_without_starting_production() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services {
+                ai: Some(Box::new(move |_, _| {
+                    seen.set(seen.get() + 1);
+                    AiSnapshot { available: true, message: "local preview".into(), ..Default::default() }
+                })),
+                ..Default::default()
+            },
+        );
+        let request = TaskRequest {
+            prompt: "Science book".into(),
+            settings: AiSettings::default(),
+            target: TaskTarget::NewA4 { pages: 48 },
+            skill_ids: vec![],
+            auto_select_skills: true,
+            export_directory: None,
+        };
+        let result = request_command(&mut app, &json!({"method":"preview_production","request":request}));
+        assert!(result.is_ok(), "Local curriculum preview should be available: {result:?}");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn ai23_proof_page_strip_navigates_without_reviewing_or_approving() {
+        let fixture = ProofFixture::new();
+        let calls = fixture.calls.clone();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        panel.get_by_label("Review page 2").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.proof_path.as_deref(), Some("page-2.png"));
+        assert!(panel.state().ui.ai.reviewed_proofs.is_empty());
+        assert_eq!(calls.get(), 0);
+        assert!(panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn ai23_spread_confirmation_requires_both_current_previews_and_separate_approval() {
+        let mut fixture = ProofFixture::new();
+        let batch = fixture.checkpoint.batch.as_mut().unwrap();
+        batch.total_pages = 6;
+        batch.pages_per_batch = 3;
+        batch.completed_pages = 3;
+        let report = &mut batch.batches[0];
+        report.page_count = 3;
+        report.proof_paths.push("page-3.png".into());
+        report.proof_sha256.push("4".repeat(64));
+        fixture.app.ui.ai.accept(fixture.checkpoint.clone());
+        fixture.app.ui.ai.settings.facing_pages = true;
+        let calls = fixture.calls.clone();
+        let mut panel = fixture.panel();
+        panel.run_steps(3);
+        panel.get_by_label("Next").click();
+        panel.run_steps(3);
+        assert!(panel.get_by_label("I reviewed both displayed pages; next preview").accesskit_node().is_disabled());
+        panel.get_by_label("100% image preview").click();
+        panel.run_steps(3);
+        panel.get_by_label("I reviewed both displayed pages; next preview").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().ui.ai.reviewed_proofs.len(), 2);
+        assert_eq!(panel.state().ui.ai.proof_path.as_deref(), Some("page-1.png"));
+        assert_eq!(calls.get(), 0, "spread review never launches the next group");
+        assert!(panel.get_by_label("Approve and generate next review group").accesskit_node().is_disabled());
+    }
 
     #[test]
     fn ai20_ui_completed_discovery_stays_selectable_for_its_provider_and_endpoint() {

@@ -240,7 +240,11 @@ impl ProductionRunner {
         job.snapshot.status = "running".into();
         job.snapshot.retryable = false;
         self.persist_batch(&job.snapshot)?;
-        self.prepare_credentials(&[settings.text_model.clone(), settings.image_model.clone()])?;
+        let mut selections = vec![settings.text_model.clone()];
+        if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+            selections.push(settings.image_model.clone());
+        }
+        self.prepare_credentials(&selections)?;
         let keys = self.worker_keys();
         let ledger = job.ledger.as_ref().ok_or("Batch admission ledger is unavailable")?.clone();
         job.before = ledger.summary();
