@@ -1,5 +1,19 @@
 # DesignCraft roadmap
 
+- AI23 (2026-10-21): Complete the governed handoff against verified current source: retain bounded group image context and print admission, bind supported CPA ten-frames to authored quantities, compare adjacent native layouts and template families across parts, and add local curriculum previews, explicit whole-book request allowances and guarded spread review navigation. Preserve separate human group approval. See `docs/production-governed-handoff-ai23.ar.md`.
+
+- AI22 (2026-10-21): Exclude Gemini thought images from final placement outputs while preserving measured usage and genuine multi-image guards. Recover tiny same-column header-stack overlaps in verified free space; keep body content, existing artwork and human review protected. See `docs/production-gemini-images-ai22.ar.md`.
+
+- AI21 (2026-10-21): Fit tiny native text overflows without shrinking copy or fonts: co-grow eligible new rectangular backgrounds, recover safe footer height, retain fixed/inherited artwork and exact source command indices. Send resolved print fonts before layout planning and retain one bounded private rejected response for offline diagnosis. See `docs/production-native-fit-ai21.ar.md`.
+
+- AI20 (2026-10-21): Preserve actual opened-book trim and bounded continuation context across new groups and retries; keep discovered models selectable, estimate natural-language review requests, expose truthful binding controls, and separate skill/document export destinations. Align recommended template families with strict math guards and absolute page-one openers; preserve LTR numeric expressions. Integrate upstream 0.10.0 without replacing local AI features. See `docs/production-workflow-ai20.ar.md`.
+
+- AI19 (2026-10-21): Make book continuation explicit in the composer, recover bounded private production instructions without resuming authority, retain failed live groups for explicit retries with their original cumulative ledger, and navigate directly back to the exact proof document. Validate native result references and resolve safe text positions before purchasing artwork. See `docs/production-continuation-ai19.ar.md`.
+
+- AI18 (2026-10-20): Harden script-driven production with numbered-page copy contracts, deterministic five/ten-frame activities, bounded native overset recovery, requested print geometry/font binding and resolution-aware Gemini images. Separate bounded print rasters from model JSON, retain full image pixels and use checksummed binary caching. Reuse validated local plans/artwork, expose live usage and full diagnostics, and keep proof navigation/review actions beside images. Facing-page books use automatic language binding, occasional paired editorial context and atomic native publication; optional billed illustration inspection remains advisory. See `docs/production-hardening-ai18.ar.md` for acceptance evidence and remaining print limits.
+
+- AI17 (2026-10-20): Validate template text with native composition instead of a copy-length estimate, retain authored typography and complete wording, and report exact invalid slots. Validate all text parts and project the complete image budget before purchasing artwork for a review group; preserve atomic publication and human checkpoints. Operational and design-quality follow-ups are documented in `docs/production-reliability-review.ar.md`.
+
 - AI16 (2026-10-20): Keep the requested review group independent of bounded native/provider execution chunks, publish each group atomically with one undo, and require proof of every page before continuing. Full UTF-8 briefs up to 1 MiB share one admission limit; current-document work uses the selected open file's geometry and exposes its target in the production panel.
 - AI16 review follow-up (2026-10-20): Partition generic book reviews before provider calls as well as template-backed reviews; retain pinned guidance, cumulative budgets and atomic proof publication for large groups without a selected template.
 

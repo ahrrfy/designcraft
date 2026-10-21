@@ -19,6 +19,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 const MAX_JSON: usize = 4 * 1024 * 1024;
 const MAX_PROMPT: usize = 4 * 1024 * 1024;
+// Raster admission is independent of model text/JSON size. Inline placements
+// count each view; the source/cache budget counts a shared source only once.
+const MAX_RASTER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_UNIQUE_RASTER_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INLINE_RASTER_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RASTER_PIXELS: u64 = 20_000_000;
 const MAX_IMAGES: usize = 8;
 const MAX_ACTIONS: usize = 512;
 const MAX_REVIEW_PAGES: u32 = 1000;
@@ -85,6 +91,8 @@ pub(crate) struct Outcome {
     pub usage: UsageSummary,
 }
 pub(crate) enum Message {
+    Usage(UsageSummary),
+    Diagnostic(Value),
     Progress {
         stage: String,
         fraction: f32,
@@ -147,7 +155,16 @@ fn spawn_inner(
                 }
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut runner = Runner { ledger: &mut ledger, keys: &keys, cancel: &cancellation, sender: &sender, provider: &HttpProvider };
+                let mut runner = Runner {
+                    cache_root: None,
+                    print: None,
+                    planning_only: false,
+                    ledger: &mut ledger,
+                    keys: &keys,
+                    cancel: &cancellation,
+                    sender: &sender,
+                    provider: &HttpProvider,
+                };
                 designcraft_engine::file_access::confine(roots.as_ref(), || runner.run(work))
             }))
             .unwrap_or_else(|_| Err("AI worker could not safely complete the task".into()));
@@ -192,6 +209,9 @@ impl Provider for HttpProvider {
     }
 }
 struct Runner<'a> {
+    cache_root: Option<PathBuf>,
+    print: Option<crate::print_contract::PrintContract>,
+    planning_only: bool,
     ledger: &'a mut UsageLedger,
     keys: &'a [SessionKey],
     cancel: &'a AtomicBool,
@@ -199,8 +219,218 @@ struct Runner<'a> {
     provider: &'a dyn Provider,
 }
 impl Runner<'_> {
+    fn image_disk_key(
+        &self,
+        placement: &designcraft_ai_types::protocol::ImagePlacement,
+        style: &str,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+        settings: &AiSettings,
+    ) -> Result<String, String> {
+        crate::production_cache::digest(
+            &json!({"version":"ai18-illustration-v2","placement":placement,"style":style,"model":settings.image_model,"workflow":settings.comfy_workflow,"review":image_review_identity(settings),"size":self.print_image_size(placement,profile,&settings.image_model)?}),
+        )
+    }
+    fn preload_images(
+        &self,
+        plan: &ProductionPlan,
+        settings: &AiSettings,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+        style: &str,
+        cache: &mut BTreeMap<String, providers::GeneratedImage>,
+        bytes: &mut usize,
+    ) -> Result<(), String> {
+        let Some(root) = &self.cache_root else {
+            return Ok(());
+        };
+        for placement in &plan.images {
+            let key = image_memory_key(placement, style, settings)?;
+            if cache.contains_key(&key) {
+                continue;
+            }
+            let disk_key = self.image_disk_key(placement, style, profile, settings)?;
+            match crate::production_cache::load_image(root, &disk_key) {
+                Ok(Some(image)) => {
+                    validate_image(&image)?;
+                    *bytes = bytes
+                        .checked_add(image.bytes.len())
+                        .filter(|n| *n <= MAX_UNIQUE_RASTER_BYTES)
+                        .ok_or("Cached unique image sources exceed this plan's 32-MiB raster budget")?;
+                    cache.insert(key, image);
+                    self.cache_notice(format!("Reused page {} artwork locally; no new image request was billed", placement.page.saturating_add(1)))?;
+                    if settings.verify_generated_images {
+                        self.diagnostics(vec![json!({"kind":"illustrationSemanticReview","severity":"warning","page":placement.page.saturating_add(1),"cached":true,"message":"Locally reviewed artwork was reused without another billed review. Its previous visual verdict was advisory; human proof remains required."})])?;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.cache_notice(format!("Ignored invalid cached illustration: {error}"))?,
+            }
+        }
+        Ok(())
+    }
+    fn cache_notice(&self, message: String) -> Result<(), String> {
+        self.diagnostics(vec![json!({"kind":"localProductionCache","message":message})])
+    }
+    fn plan_key(&self, request: &TaskRequest, generation: &GenerationRequest, base: &DocState) -> Result<Option<String>, String> {
+        if self.cache_root.is_none() {
+            return Ok(None);
+        }
+        let mut prompt: Value = serde_json::from_str(&generation.prompt).map_err(|e| e.to_string())?;
+        if matches!(request.target, designcraft_ai_types::protocol::TaskTarget::NewA4 { .. }) {
+            fn strip(value: &mut Value, depth: u32) {
+                if depth > 64 {
+                    return;
+                }
+                match value {
+                    Value::Object(object) => {
+                        for key in ["documentUid", "revision", "jobId"] {
+                            object.remove(key);
+                        }
+                        for child in object.values_mut() {
+                            strip(child, depth + 1);
+                        }
+                    }
+                    Value::Array(array) => {
+                        for child in array {
+                            strip(child, depth + 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            strip(&mut prompt, 0);
+        }
+        crate::production_cache::digest(&json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id})).map(Some)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn cached_plan(
+        &self,
+        key: Option<&str>,
+        request: &TaskRequest,
+        context: &Value,
+        base: &DocState,
+        prefs: &Prefs,
+        scope: Option<BatchScope>,
+        catalog: &Value,
+    ) -> Result<Option<ProductionPlan>, String> {
+        let (Some(root), Some(key)) = (&self.cache_root, key) else {
+            return Ok(None);
+        };
+        let cached = match crate::production_cache::load_plan(root, key) {
+            Ok(value) => value,
+            Err(error) => {
+                self.cache_notice(format!("Ignored invalid cached plan: {error}"))?;
+                return Ok(None);
+            }
+        };
+        let Some(mut plan) = cached else {
+            return Ok(None);
+        };
+        let valid = (|| {
+            validate_actions(&plan.commands, catalog, OutputMode::NativeOnly)?;
+            prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
+            if let Some(scope) = scope {
+                validate_batch_plan(&plan, scope)?;
+                crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
+            }
+            self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
+            validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = valid {
+            self.cache_notice(format!("Cached plan no longer fits this document: {error}"))?;
+            return Ok(None);
+        }
+        self.cache_notice("Reused validated page content locally; no new planning request was billed".into())?;
+        Ok(Some(plan))
+    }
+    fn cache_plan(&self, key: Option<&str>, plan: &ProductionPlan) -> Result<(), String> {
+        if let (Some(root), Some(key)) = (&self.cache_root, key)
+            && let Err(error) = crate::production_cache::store_plan(root, key, plan)
+        {
+            self.cache_notice(format!("Could not cache this validated plan: {error}"))?;
+        }
+        Ok(())
+    }
+    fn print_image_size(
+        &self,
+        placement: &designcraft_ai_types::protocol::ImagePlacement,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+        selection: &ModelSelection,
+    ) -> Result<Option<String>, String> {
+        let original = image_request_size(placement, profile, selection)?;
+        let Some(contract) = self.print.as_ref() else {
+            return Ok(original);
+        };
+        let Some(mut required) = contract.required_image_pixels(placement.rect)? else {
+            return Ok(original);
+        };
+        let slot = declared_image_slot(placement, profile);
+        let mut crops = vec![(placement.rect, slot.and_then(|slot| slot.crop))];
+        if let Some(slot) = slot {
+            for view in &slot.views {
+                crops.push((view.rect, Some(view.crop)));
+            }
+        }
+        for (rect, crop) in crops {
+            if let Some(pixels) = contract.required_image_pixels(rect)? {
+                let [x0, y0, x1, y1] = crop.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                let width = x1 - x0;
+                let height = y1 - y0;
+                if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                    return Err("Invalid print image crop".into());
+                }
+                let w = (f64::from(pixels[0]) / width).ceil();
+                let h = (f64::from(pixels[1]) / height).ceil();
+                if w > 16384.0 || h > 16384.0 {
+                    return Err("Requested image crop exceeds supported print resolution before generation".into());
+                }
+                required[0] = required[0].max(w as u32);
+                required[1] = required[1].max(h as u32);
+            }
+        }
+        if selection.provider == ProviderKind::Gemini {
+            let ratio = original.as_deref().ok_or("Gemini print image has no aspect ratio")?;
+            return providers::gemini_print_size(&selection.model, ratio, required).map(Some);
+        }
+        Ok(original)
+    }
+    fn audit_print(&self, plan: &ProductionPlan, base: &DocState, prefs: &Prefs) -> Result<(), String> {
+        let min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+        let mut scratch = Session::new();
+        scratch.prefs = prefs.clone();
+        scratch.add_document(base.clone());
+        scratch
+            .execute(
+                "production.apply",
+                &json!({"commands":plan.commands,"outputMode":"native_with_images","requirePreflight":true,"minPpi":min_ppi}),
+            )
+            .map_err(|e| e.to_string())?;
+        let result = scratch.execute("preflight.run", &json!({"minPpi":min_ppi})).map_err(|e| e.to_string())?;
+        let issues: Vec<Value> = result.get("issues").and_then(Value::as_array).into_iter().flatten().take(256).cloned().collect();
+        let new_low = issues.iter().any(|issue| {
+            issue.get("kind").and_then(Value::as_str) == Some("lowResolution")
+                && issue.get("item").and_then(Value::as_u64).is_some_and(|id| base.doc.item(designcraft_engine::doc::ItemId(id)).is_none())
+        });
+        self.diagnostics(issues)?;
+        if self.print.as_ref().and_then(|contract| contract.min_image_ppi()).is_some() && new_low {
+            return Err(format!(
+                "Generated artwork does not meet the requested {min_ppi} PPI at its actual placement size; no low-resolution pages were published"
+            ));
+        }
+        Ok(())
+    }
+    fn usage(&self) -> Result<(), String> {
+        self.sender.send(Message::Usage(self.ledger.summary())).map_err(|_| "AI host disconnected".to_string())
+    }
+    fn diagnostics(&self, issues: Vec<Value>) -> Result<(), String> {
+        for issue in issues {
+            self.sender.send(Message::Diagnostic(issue)).map_err(|_| "AI host disconnected".to_string())?;
+        }
+        Ok(())
+    }
     fn progress(&self, stage: &str, fraction: f32) -> Result<(), String> {
         check_cancel(self.cancel)?;
+        self.usage()?;
         self.sender.send(Message::Progress { stage: stage.into(), fraction }).map_err(|_| "AI host disconnected".to_string())
     }
     fn run(&mut self, work: Work) -> Result<Product, String> {
@@ -238,8 +468,10 @@ impl Runner<'_> {
         }
         let key = selected_key(self.keys, selection);
         let reservation = self.ledger.reserve(input, request.images.len(), selection.provider, false, None)?;
+        self.usage()?;
         let result = guarded(|| self.provider.generate(selection, key.as_ref().map(providers::SecretString::expose), request, self.cancel));
         self.ledger.record(reservation, result.as_ref().ok().map(|response| &response.usage));
+        self.usage()?;
         check_cancel(self.cancel)?;
         let response = result?;
         if let Some(error) = &response.error {
@@ -263,8 +495,30 @@ impl Runner<'_> {
         let scope =
             context.get("batch_scope").map(|value| serde_json::from_value::<BatchScope>(value.clone()).map_err(|e| e.to_string())).transpose()?;
         validate_prompt(&request.prompt)?;
+        validate_image_review_settings(&request.settings)?;
+        self.cache_root = context.get("_production_cache_root").and_then(Value::as_str).map(PathBuf::from);
+        self.print = crate::print_contract::PrintContract::from_prompt(&request.prompt)?;
+        if let Some(message) = context.get("existing_document_print_notice").and_then(Value::as_str) {
+            self.diagnostics(vec![json!({"kind":"existingDocumentPrintGeometry","severity":"warning","message":message})])?;
+        }
+        if let Some(contract) = &self.print {
+            let fonts = contract.select_fonts(&base)?;
+            context
+                .as_object_mut()
+                .ok_or("Invalid resolved print-font context")?
+                .insert("resolved_print_fonts".into(), serde_json::to_value(&fonts).map_err(|error| error.to_string())?);
+            self.diagnostics(fonts.notices.into_iter().map(|message| json!({"kind":"printFontFallback","message":message})).collect())?;
+            self.diagnostics(
+                contract.warnings().into_iter().map(|message| json!({"kind":"printRequirement","severity":"warning","message":message})).collect(),
+            )?;
+        }
+        let explicit_script = crate::script_contract::parse(&request.prompt)?.is_some();
+        let adaptive_layout = explicit_script
+            || self.print.is_some()
+            || unbound_math_request(&request.prompt, &skills)
+            || continuation_style_geometry_differs(&request, &base, &skills);
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
-        if current_document {
+        if current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook) {
             opened_document_geometry(&mut context, &base)?;
         }
         let profiles = skills.iter().filter_map(|s| s.design_profile.as_ref()).collect::<Vec<_>>();
@@ -274,11 +528,12 @@ impl Runner<'_> {
         let profile = profiles.first().copied();
         if let Some(profile) = profile {
             profile.validate()?;
-            if !current_document {
+            if !current_document && !adaptive_layout {
                 preflight_profile_image_ratios(profile, &request.settings)?;
             }
         }
-        if let Some(style) = skills.iter().find(|skill| crate::template_plan::eligible(skill))
+        if !adaptive_layout
+            && let Some(style) = skills.iter().find(|skill| crate::template_plan::eligible(skill))
             && matches!(
                 request.target,
                 designcraft_ai_types::protocol::TaskTarget::NewA4 { .. } | designcraft_ai_types::protocol::TaskTarget::ContinueBook
@@ -310,13 +565,13 @@ impl Runner<'_> {
             return self.template_production(request, template_context, style, base, prefs, scope);
         }
         if let Some(scope) = scope
-            && scope.count > generic_page_capacity(request.settings.output_mode)
+            && scope.count > if adaptive_layout { 1 } else { generic_page_capacity(request.settings.output_mode) }
         {
             return self.generic_review_group(&request, &context, &catalog, &skills, &base, &prefs, scope);
         }
         let plan = self.generic_production_plan(&request, &context, &catalog, &skills, &base, &prefs, scope)?;
         if let Some(scope) = scope {
-            let proofs = batch_proofs(&plan, &base, &prefs, request.settings.output_mode, self.cancel, scope)?;
+            let proofs = batch_proofs_with_layout(&plan, &base, &prefs, &request.settings, &request.prompt, self.cancel, scope)?;
             Ok(Product::BatchPlan { plan, proofs })
         } else {
             Ok(Product::Plan(plan))
@@ -335,55 +590,152 @@ impl Runner<'_> {
         scope: Option<BatchScope>,
     ) -> Result<ProductionPlan, String> {
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
+        let opened_document = current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook);
         let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
-        let geometry_profile = if current_document { None } else { profile };
-        let geometry_check =
-            if current_document { GeometryCheck::OpenedDocument } else { profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile) };
-        let mut system = production_system(catalog, skills, request.settings.output_mode, current_document)?;
+        let explicit_script = crate::script_contract::parse(&request.prompt)?.is_some();
+        let adaptive_layout = explicit_script
+            || self.print.is_some()
+            || unbound_math_request(&request.prompt, skills)
+            || continuation_style_geometry_differs(request, base, skills);
+        let geometry_profile = if opened_document || adaptive_layout { None } else { profile };
+        let geometry_check = if opened_document || adaptive_layout {
+            GeometryCheck::OpenedDocument
+        } else {
+            profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
+        };
+        // Adaptive commands are planned against the actual document, not compiled
+        // from these fixed templates. Keep the host snapshots intact and omit only
+        // their unused executable examples from this model-context copy.
+        let mut planner_skills = skills.to_vec();
+        if adaptive_layout {
+            for skill in &mut planner_skills {
+                skill.templates.clear();
+            }
+        }
+        let mut system =
+            production_system(catalog, &planner_skills, request.settings.output_mode, opened_document || adaptive_layout, adaptive_layout)?;
+        if adaptive_layout {
+            system.push_str("\nADAPTIVE SCRIPT/PRINT LAYOUT: actual document geometry and any explicit page script override profile page_mm, margin_mm and fixed example compositions. Keep the pinned profile's visual identity and complete guidance while constructing the required native page content. Executable template examples remain local host inputs and are not required for this adaptive command planner.");
+        }
         if let Some(scope) = scope {
             system.push_str(&format!("\nBATCH SCOPE IS MANDATORY: create only spreads {}..{} (exclusive end); every object needs explicit spread; every object/story reference must name an earlier result created in this batch. No page/global/style/swatches operations. Render every requested page natively before the human proof checkpoint.",scope.start,scope.start.saturating_add(scope.count)));
         }
         if context.get("review_scope").is_some() {
             system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
         }
-        let original = bounded_json(&json!({"request":request.prompt,"target":request.target,"document":context}), MAX_PROMPT)?;
+        if crate::script_contract::parse(&request.prompt)?.is_some() {
+            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten-frame: {page,rect,frame:five|ten,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrations must depict the stated subjects and quantities; leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
+        }
+        let scoped_prompt =
+            scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
+        let mut document_context = context.clone();
+        if opened_document || adaptive_layout {
+            opened_document_geometry(&mut document_context, base)?;
+        }
+        if explicit_script && let Some(scope) = scope {
+            document_context
+                .as_object_mut()
+                .ok_or("Invalid explicit-copy context")?
+                .insert("source_copy".into(), crate::script_contract::source_copy_context(&request.prompt, scope)?);
+            system.push_str("\nNATIVE SOURCE COPY BINDINGS: document.source_copy contains immutable print-copy segments and indexed words. Prefer copy_bindings:[{frame:ZERO_BASED_COMMAND_INDEX,copy_id,word_range:[START,EXCLUSIVE_END]}] with an empty text placeholder in each referenced frame.create. The host inserts the exact source words, punctuation and Arabic marks locally. Split a segment across its designed native frames using complete non-overlapping word ranges; this supports bilingual interleaving and separate number-chart cards without retyping or changing copy. Each bound frame must be on the copy segment's page. Bind all words of any segment you bind, exactly once. Do not overwrite bound stories or their reserved provenance labels. Font/direction/alignment commands still apply normally. Unbound copy is checked literally as before.");
+        }
+        if request.settings.facing_pages
+            && let Some(scope) = scope
+        {
+            document_context
+                .as_object_mut()
+                .ok_or("Invalid facing production context")?
+                .insert("facing_page_context".into(), crate::script_contract::facing_context(&request.prompt, scope)?);
+            system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
+        }
+        let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
+        let mut schema = plan_schema(catalog, request.settings.output_mode)?;
+        if scope.is_some() {
+            schema["properties"]["activities"] = json!({"type":"array","maxItems":16,"items":crate::script_contract::activity_schema()});
+            if explicit_script {
+                schema["properties"]["copy_bindings"] = json!({"type":"array","maxItems":256,"items":crate::script_contract::copy_binding_schema()});
+            }
+        }
         let mut generation = GenerationRequest {
             system,
             prompt: original.clone(),
-            json_schema: plan_schema(catalog, request.settings.output_mode)?,
+            json_schema: schema,
             max_output_tokens: request.settings.budget.max_output_tokens,
             images: Vec::new(),
             resources: request.settings.resources.clone(),
         };
+        let cache_key = self.plan_key(request, &generation, base)?;
+        if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog)? {
+            if let Some(profile) = geometry_profile {
+                crate::design::check_image_slots(base, &plan.images, profile)?;
+            }
+            let text_scope = if plan.images.is_empty() { scope } else { None };
+            simulate_styled(&plan, base, prefs, request.settings.output_mode, self.cancel, text_scope, geometry_check)?;
+            if self.planning_only {
+                return Ok(plan);
+            }
+            let expanded = self.expand_images_with_geometry(plan, &request.settings, &mut BTreeMap::new(), &mut 0, profile, geometry_profile)?;
+            simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check)?;
+            self.audit_print(&expanded, base, prefs)?;
+            return Ok(expanded);
+        }
         let mut image_cache = BTreeMap::new();
         let mut image_bytes = 0usize;
         let repair_attempts = if request.settings.allow_paid_repairs { request.settings.budget.repair_attempts } else { 0 };
         for attempt in 0..=repair_attempts {
             self.progress(if attempt == 0 { "Generating editable native layout" } else { "Repairing native layout validation" }, 0.15)?;
             let response = self.generate(&request.settings.text_model, &generation)?;
-            let parsed = parse_plan(&response.text, request.settings.output_mode, catalog).and_then(|mut plan| {
-                prepare_editorial_plan(&mut plan, &request.prompt, context, scope)?;
-                if let Some(profile) = geometry_profile {
-                    crate::design::check_image_slots(base, &plan.images, profile)?;
-                }
-                if let Some(scope) = scope {
-                    validate_batch_plan(&plan, scope)?;
-                }
-                Ok(plan)
-            });
+            let native_text = scope
+                .map(|scope| {
+                    parse_json::<Value>(&response.text)
+                        .and_then(|value| bounded_json(&value, MAX_JSON))
+                        .and_then(|text| {
+                            if explicit_script {
+                                crate::script_contract::compile_native_plan_for_brief(&text, scope, &request.prompt)
+                            } else {
+                                crate::script_contract::compile_native_plan(&text, scope)
+                            }
+                        })
+                        .and_then(|plan| bounded_json(&serde_json::to_value(plan).map_err(|e| e.to_string())?, MAX_JSON))
+                })
+                .transpose();
+            let parsed = native_text
+                .and_then(|text| parse_plan(text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog))
+                .and_then(|mut plan| {
+                    prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
+                    if let Some(contract) = &self.print {
+                        self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
+                    }
+                    if let Some(scope) = scope {
+                        crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
+                        crate::script_contract::anchor_images(&request.prompt, scope, &mut plan)?;
+                    }
+                    self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
+                    validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+                    if let Some(profile) = geometry_profile {
+                        crate::design::check_image_slots(base, &plan.images, profile)?;
+                    }
+                    if let Some(scope) = scope {
+                        validate_batch_plan(&plan, scope)?;
+                    }
+                    Ok(plan)
+                });
             let (previous, validation) = match parsed {
                 Ok(raw_plan) => {
-                    let previous = bounded_json(&serde_json::to_value(&raw_plan).map_err(|e| e.to_string())?, MAX_JSON)?;
+                    // Repairs consume the authored envelope, including copy_bindings and
+                    // activities. Host labels, fonts and recoveries are compiled afresh.
+                    let previous = response.text.clone();
                     // Validate native typography before spending on images. Page completeness
                     // is checked on the final illustrated draft, since a page can be image-only.
-                    let text_check = if raw_plan.images.is_empty() {
-                        Ok(())
-                    } else {
-                        simulate_styled(&raw_plan, base, prefs, request.settings.output_mode, self.cancel, None, geometry_check)
-                    };
+                    let text_scope = if raw_plan.images.is_empty() { scope } else { None };
+                    let text_check = simulate_styled(&raw_plan, base, prefs, request.settings.output_mode, self.cancel, text_scope, geometry_check);
                     if let Err(error) = text_check {
                         (previous, error)
                     } else {
+                        self.cache_plan(cache_key.as_deref(), &raw_plan)?;
+                        if self.planning_only {
+                            return Ok(raw_plan);
+                        }
                         // Image failures fail the whole task. Never publish a partially illustrated layout.
                         let expanded = self.expand_images_with_geometry(
                             raw_plan,
@@ -396,6 +748,7 @@ impl Runner<'_> {
                         self.progress("Validating commands and print preflight on a private document", 0.85)?;
                         match simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check) {
                             Ok(()) => {
+                                self.audit_print(&expanded, base, prefs)?;
                                 check_cancel(self.cancel)?;
                                 return Ok(expanded);
                             }
@@ -406,6 +759,38 @@ impl Runner<'_> {
                 Err(error) => (response.text, error),
             };
             check_cancel(self.cancel)?;
+            // Keep bounded local evidence, never a validated cache entry or
+            // executable input. Large plans expose only bounded native text.
+            let rejected_text =
+                parse_json::<Value>(&previous).ok().and_then(|value| {
+                    let text: Vec<_> = value.get("commands")?.as_array()?.iter().enumerate().filter_map(|(index, action)| {
+                    let command = action.get("command")?.as_str()?;
+                    if !matches!(command, "frame.create" | "story.setText") { return None; }
+                    let params = action.get("params")?;
+                    let text = params.get("text")?.as_str()?;
+                    Some(json!({"command_index":index,"command":command,"spread":params.get("spread"),"story":params.get("story"),"text":text}))
+                }).collect();
+                    bounded_json(&json!(text), 8192).ok()
+                });
+            let rejected_response_path = if let Some(root) = &self.cache_root {
+                match crate::production_cache::store_rejected_response(root, &previous) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.cache_notice(format!("Could not retain private rejected-response evidence: {error}"))?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            self.diagnostics(vec![json!({
+                "kind":"nativePlanningValidation", "attempt":attempt.saturating_add(1),
+                "message":validation, "rejected_plan_included":previous.len() <= 8192,
+                "rejected_plan":if previous.len() <= 8192 {Some(previous.as_str())} else {None},
+                "rejected_native_text":if previous.len() > 8192 {rejected_text} else {None},
+                "rejected_response_path":rejected_response_path,
+                "scope":scope,
+            })])?;
             if attempt == repair_attempts {
                 return Err(format!("AI plan rejected: {validation}"));
             }
@@ -427,7 +812,24 @@ impl Runner<'_> {
     ) -> Result<Product, String> {
         let end = review_end(review)?;
         validate_batch_result(base, base, review)?;
-        let capacity = generic_page_capacity(request.settings.output_mode);
+        let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
+        let opened = matches!(
+            request.target,
+            designcraft_ai_types::protocol::TaskTarget::CurrentDocument | designcraft_ai_types::protocol::TaskTarget::ContinueBook
+        );
+        let adaptive = crate::script_contract::parse(&request.prompt)?.is_some()
+            || self.print.is_some()
+            || unbound_math_request(&request.prompt, skills)
+            || continuation_style_geometry_differs(request, base, skills);
+        let geometry_profile = if opened || adaptive { None } else { profile };
+        let geometry_check =
+            if opened || adaptive { GeometryCheck::OpenedDocument } else { profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile) };
+        let capacity =
+            if crate::script_contract::parse(&request.prompt)?.is_some() || self.print.is_some() || unbound_math_request(&request.prompt, skills) {
+                1
+            } else {
+                generic_page_capacity(request.settings.output_mode)
+            };
         let mut scratch = Session::new();
         scratch.prefs = prefs.clone();
         scratch.add_document(base.clone());
@@ -442,7 +844,10 @@ impl Runner<'_> {
             let source_limit = if request.settings.output_mode == OutputMode::NativeOnly {
                 0
             } else {
-                MAX_IMAGES.min(usize::try_from(remaining_requests.saturating_sub(1)).map_err(|_| "Invalid remaining image request allowance")?)
+                let per_source = if request.settings.verify_generated_images { 2 } else { 1 };
+                MAX_IMAGES.min(
+                    usize::try_from(remaining_requests.saturating_sub(1) / per_source).map_err(|_| "Invalid remaining image request allowance")?,
+                )
             };
             let object = chunk_context.as_object_mut().ok_or("Invalid internal generic review context")?;
             object.insert("batch_scope".into(), json!(scope));
@@ -450,15 +855,12 @@ impl Runner<'_> {
             object.insert("remainingTaskRequests".into(), json!(remaining_requests));
             // Explicit scope validation is independent of the context marker and proof policy.
             // Every part uses this Runner's same ledger, keys, cancellation and pinned skills.
-            let plan = self.generic_production_plan(
-                request,
-                &chunk_context,
-                catalog,
-                skills,
-                scratch.doc().map_err(|e| e.to_string())?,
-                prefs,
-                Some(scope),
-            )?;
+            let previous_planning = self.planning_only;
+            self.planning_only = true;
+            let planned =
+                self.generic_production_plan(request, &chunk_context, catalog, skills, scratch.doc().map_err(|e| e.to_string())?, prefs, Some(scope));
+            self.planning_only = previous_planning;
+            let plan = planned?;
             let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
             plan_bytes =
                 plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
@@ -467,13 +869,53 @@ impl Runner<'_> {
             }
             scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
                 .map_err(|e| e.to_string())?;
-            plans.push(plan);
+            plans.push((plan, scope));
             next = next.checked_add(scope.count).ok_or("Internal generic review range overflow")?;
         }
         validate_batch_result(base, scratch.doc().map_err(|e| e.to_string())?, review)?;
+        let style_context = illustration_style(profile)?;
+        let mut projected = self.ledger.clone();
+        let mut cached = BTreeMap::new();
+        let mut cached_bytes = 0usize;
+        for (plan, _) in &plans {
+            for image in &plan.images {
+                self.print_image_size(image, geometry_profile, &request.settings.image_model)?;
+            }
+            self.preload_images(plan, &request.settings, geometry_profile, &style_context, &mut cached, &mut cached_bytes)?;
+            project_image_requests(&mut projected, plan, &request.settings, geometry_profile, &style_context, &cached)?;
+        }
+        drop(scratch);
+        let mut scratch = Session::new();
+        scratch.prefs = prefs.clone();
+        scratch.add_document(base.clone());
+        let mut expanded_plans = Vec::with_capacity(plans.len());
+        plan_bytes = 0;
+        for (plan, scope) in plans {
+            check_cancel(self.cancel)?;
+            let plan = self.expand_images_with_geometry(plan, &request.settings, &mut cached, &mut cached_bytes, profile, geometry_profile)?;
+            let expanded_bytes = serde_json::to_vec(&plan).map_err(|error| error.to_string())?.len();
+            plan_bytes = plan_bytes
+                .checked_add(expanded_bytes)
+                .filter(|bytes| *bytes <= MAX_GROUP_PLAN_BYTES)
+                .ok_or("Expanded review plans exceed the 256-MiB limit")?;
+            simulate_styled(
+                &plan,
+                scratch.doc().map_err(|e| e.to_string())?,
+                prefs,
+                request.settings.output_mode,
+                self.cancel,
+                Some(scope),
+                geometry_check,
+            )?;
+            self.audit_print(&plan, scratch.doc().map_err(|e| e.to_string())?, prefs)?;
+            scratch
+                .execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"requirePreflight":true}))
+                .map_err(|e| e.to_string())?;
+            expanded_plans.push(plan);
+        }
         self.progress("Preparing complete review proofs from all internal page parts", 0.9)?;
-        let proofs = batch_proofs_from_draft(&mut scratch, self.cancel, review)?;
-        Ok(Product::BatchGroup { plans, proofs })
+        let proofs = review_proofs(&mut scratch, self.cancel, review, &request.settings, &request.prompt)?;
+        Ok(Product::BatchGroup { plans: expanded_plans, proofs })
     }
 
     fn expand_images(
@@ -501,7 +943,13 @@ impl Runner<'_> {
         if settings.output_mode == OutputMode::NativeOnly {
             return Err("Native-only output forbids generated raster images".into());
         }
+        validate_image_review_settings(settings)?;
         let style_context = illustration_style(style_profile)?;
+        self.preload_images(&plan, settings, profile, &style_context, cache, bytes_used)?;
+        // Reject an unsupported resolution tier before buying any member of the set.
+        for placement in &plan.images {
+            self.print_image_size(placement, profile, &settings.image_model)?;
+        }
         let placements = plan
             .images
             .iter()
@@ -515,25 +963,14 @@ impl Runner<'_> {
         }
         // Check capacity for the whole image set before purchasing its first member.
         // This conservative input bound includes the fixed image instructions and frame dimensions.
-        let workflow_bytes =
-            settings.comfy_workflow.as_ref().map(|value| bounded_json(value, MAX_PROMPT).map(|text| text.len())).transpose()?.unwrap_or(0);
         let mut projected = self.ledger.clone();
-        for placement in &plan.images {
-            // Validate every pinned source before the first image purchase. A later
-            // unsupported atlas must not leave earlier paid images unusable.
-            let _ = image_request_size(placement, profile, &settings.image_model)?;
-            let cache_key = bounded_json(&json!({"placement":placement,"illustration_style":style_context}), 32 * 1024)?;
-            if !cache.contains_key(&cache_key) {
-                let input = placement.prompt.len().saturating_add(style_context.len()).saturating_add(workflow_bytes).saturating_add(512);
-                projected.reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
-            }
-        }
+        project_image_requests(&mut projected, &plan, settings, profile, &style_context, cache)?;
         let authored_count = plan.commands.len();
         let mut filled_frames = BTreeSet::new();
         let mut placed_bytes = 0usize;
         for placement in &plan.images {
-            self.progress("Generating selected image placement", 0.55)?;
-            let cache_key = bounded_json(&json!({"placement":placement,"illustration_style":style_context}), 32 * 1024)?;
+            self.progress(&format!("Generating illustration for page {}", placement.page.saturating_add(1)), 0.55)?;
+            let cache_key = image_memory_key(placement, &style_context, settings)?;
             let image = if let Some(image) = cache.get(&cache_key) {
                 image.clone()
             } else {
@@ -552,7 +989,7 @@ impl Runner<'_> {
                         "{}\nCreate only this illustration, with no page layout, captions, typography or surrounding design. Target frame proportions: {:.4} x {:.4} points.\n{}",
                         placement.prompt, source_ratio, 1.0, style_context
                     ),
-                    size: image_request_size(placement, profile, &settings.image_model)?,
+                    size: self.print_image_size(placement, profile, &settings.image_model)?,
                     quality: None,
                     comfy,
                     resources: settings.resources.clone(),
@@ -568,23 +1005,56 @@ impl Runner<'_> {
                 let _resources = crate::resources::LocalRequestGuard::acquire(&settings.image_model, &settings.resources)?;
                 // Reserve an explicit image allowance too; unknown image token usage is not free.
                 let reservation = self.ledger.reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
+                self.usage()?;
                 let response = guarded(|| {
                     self.provider.images(&settings.image_model, key.as_ref().map(providers::SecretString::expose), &image_request, self.cancel)
                 });
                 self.ledger.record(reservation, response.as_ref().ok().map(|response| &response.usage));
+                self.usage()?;
                 check_cancel(self.cancel)?;
                 let response = response?;
                 if let Some(error) = &response.error {
                     return Err(error.clone());
                 }
                 if response.images.len() != 1 {
-                    return Err("Image provider must return exactly one image per placement".into());
+                    let count = response.images.len();
+                    self.diagnostics(vec![json!({"kind":"imageOutputCount","page":placement.page.saturating_add(1),"provider":settings.image_model.provider,"final_images":count,"message":"No automatic selection among multiple final illustrations; no partial review was published"})])?;
+                    return Err(format!(
+                        "Image provider must return exactly one final image per placement; got {count} for page {}",
+                        placement.page.saturating_add(1)
+                    ));
                 }
                 let image = prepare_generated_image(response.images.into_iter().next().ok_or("Image provider returned no image")?)?;
-                *bytes_used = bytes_used.checked_add(image.bytes.len()).ok_or("Generated image byte count overflow")?;
-                if *bytes_used > MAX_JSON {
-                    return Err("Generated images exceed the task's 4-MiB raster limit".into());
+                if settings.verify_generated_images {
+                    self.progress(&format!("Reviewing illustration subjects for page {}", placement.page.saturating_add(1)), 0.65)?;
+                    let review_request = crate::image_review::request(placement, &image, settings)?;
+                    let reduced = serde_json::from_str::<Value>(&review_request.prompt)
+                        .map_err(|error| error.to_string())?
+                        .get("reduced_inspection_reference")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let response = self.generate(&settings.text_model, &review_request)?;
+                    let review = crate::image_review::parse(&response.text)?;
+                    if review.verdict == crate::image_review::Verdict::Fail {
+                        return Err(format!(
+                            "Illustration for page {} failed advisory visual review: {}. The rejected artwork was not cached and this review group was not published",
+                            placement.page.saturating_add(1),
+                            review.reasons.join("; ")
+                        ));
+                    }
+                    let uncertain = review.verdict == crate::image_review::Verdict::Uncertain;
+                    self.diagnostics(vec![json!({"kind":"illustrationSemanticReview","severity":if uncertain {"warning"} else {"info"},"page":placement.page.saturating_add(1),"verdict":if uncertain {"uncertain"} else {"pass"},"reasons":review.reasons,"reducedInspectionReference":reduced,"message":if uncertain {"Illustration review is uncertain; explicit human visual review is required."} else {"Illustration passed advisory model review; this is not a semantic correctness guarantee or human approval."}})])?;
                 }
+                if let Some(root) = &self.cache_root {
+                    let disk_key = self.image_disk_key(placement, &style_context, profile, settings)?;
+                    if let Err(error) = crate::production_cache::store_image(root, &disk_key, &image) {
+                        self.cache_notice(format!("Could not cache this illustration: {error}"))?;
+                    }
+                }
+                *bytes_used = bytes_used
+                    .checked_add(image.bytes.len())
+                    .filter(|bytes| *bytes <= MAX_UNIQUE_RASTER_BYTES)
+                    .ok_or("Unique generated image sources exceed this plan's 32-MiB raster budget")?;
                 cache.insert(cache_key, image.clone());
                 image
             };
@@ -596,8 +1066,8 @@ impl Runner<'_> {
             placed_bytes = placed_bytes
                 .checked_add(image.bytes.len().checked_mul(views.len()).ok_or("Image placement byte count overflow")?)
                 .ok_or("Image placement byte count overflow")?;
-            if placed_bytes > 10 * 1024 * 1024 {
-                return Err("Shared image placements exceed the bounded native plan byte limit".into());
+            if placed_bytes > MAX_INLINE_RASTER_BYTES {
+                return Err("Inline image placements, including repeated views, exceed this plan's 32-MiB raster budget".into());
             }
             let dimensions = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
                 .with_guessed_format()
@@ -617,7 +1087,11 @@ impl Runner<'_> {
                     if filled_frames.contains(&index)
                         || action.command != "frame.create"
                         || action.params.get("content").and_then(Value::as_str) != Some("graphic")
-                        || action.params.get("spread").and_then(Value::as_u64).and_then(|page| usize::try_from(page).ok()) != Some(placement.page)
+                        || !action
+                            .params
+                            .get("spread")
+                            .filter(|value| !value.is_null())
+                            .map_or(placement.page == 0, |value| value.as_u64().and_then(|page| usize::try_from(page).ok()) == Some(placement.page))
                     {
                         return None;
                     }
@@ -663,11 +1137,53 @@ impl Runner<'_> {
         prefs: Prefs,
         scope: BatchScope,
     ) -> Result<Product, String> {
-        self.progress("Planning short page content for native templates", 0.15)?;
+        let raw = self.template_content(&request, &context, style, &base, &prefs, scope)?;
+        let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
+        let expanded = self.expand_images(raw, &request.settings, &mut BTreeMap::new(), &mut 0, Some(profile))?;
+        self.audit_print(&expanded, &base, &prefs)?;
+        self.progress("Checking editable native pages and preparing proofs", 0.85)?;
+        simulate_styled(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
+        check_cancel(self.cancel)?;
+        if context.get("batch_scope").is_some() {
+            let proofs = batch_proofs_with_layout(&expanded, &base, &prefs, &request.settings, &request.prompt, self.cancel, scope)?;
+            Ok(Product::BatchPlan { plan: expanded, proofs })
+        } else {
+            Ok(Product::Plan(expanded))
+        }
+    }
+
+    /// Plan and validate copy without purchasing any illustrations. Review groups
+    /// finish this phase for every internal part before entering the image phase.
+    fn template_content(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        style: &SkillSnapshot,
+        base: &DocState,
+        prefs: &Prefs,
+        scope: BatchScope,
+    ) -> Result<ProductionPlan, String> {
+        self.progress(
+            &format!(
+                "Planning content for pages {}–{} before image generation",
+                u64::from(scope.start) + 1,
+                u64::from(scope.start) + u64::from(scope.count)
+            ),
+            0.15,
+        )?;
         crate::template_plan::preflight(style, scope, request.settings.output_mode)?;
         let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
         preflight_profile_image_ratios(profile, &request.settings)?;
-        let schema = crate::template_plan::schema(style, scope, request.settings.output_mode)?;
+        let schema = crate::template_plan::schema_for_brief(style, scope, request.settings.output_mode, &request.prompt)?;
+        let families: BTreeSet<String> = schema["properties"]["pages"]["items"]["anyOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|family| family["properties"]["family"]["enum"].as_array()?.first()?.as_str().map(str::to_owned))
+            .collect();
+        let previous = previous_template_family(style, base, scope, &families)?;
+        let mut context = context.clone();
+        context.as_object_mut().ok_or("Invalid template planning context")?.insert("previousTemplateFamily".into(), json!(previous));
         let prompt = bounded_json(&json!({"request":request.prompt,"scope":scope,"document":context}), MAX_PROMPT)?;
         let text_capacity = style
             .design_profile
@@ -684,33 +1200,45 @@ impl Runner<'_> {
         let thinking_margin = if request.settings.text_model.provider == ProviderKind::Gemini { 4096 } else { 0 };
         let output_limit =
             scope.count.saturating_mul(per_page).saturating_add(512).saturating_add(thinking_margin).min(request.settings.budget.max_output_tokens);
-        let response = self.generate(
-            &request.settings.text_model,
-            &GenerationRequest {
-                system: format!("{}\n{EDITORIAL_POLICY}", crate::template_plan::system(style)?),
-                prompt,
-                json_schema: schema,
-                max_output_tokens: output_limit,
-                images: vec![],
-                resources: request.settings.resources.clone(),
-            },
-        )?;
+        let generation = GenerationRequest {
+            system: format!(
+                "{}\n{EDITORIAL_POLICY}\nWhen multiple declared families are available, avoid document.previousTemplateFamily on the first requested page and vary subsequent families, unless the user explicitly requests identical layouts. That field is inferred from actual native item labels; null means unknown, not an approval.",
+                crate::template_plan::system_for_brief(style, &request.prompt)?
+            ),
+            prompt,
+            json_schema: schema,
+            max_output_tokens: output_limit,
+            images: vec![],
+            resources: request.settings.resources.clone(),
+        };
+        let cache_key = self.plan_key(request, &generation, base)?;
+        if let Some(plan) =
+            self.cached_plan(cache_key.as_deref(), request, &context, base, prefs, Some(scope), &designcraft_engine::cmd::production::catalog())?
+        {
+            match validate_template_family_sequence(&plan, style, previous.clone(), scope, &families, &request.prompt) {
+                Ok(()) => {
+                    crate::design::check_image_slots(base, &plan.images, profile)?;
+                    simulate_styled(&plan, base, prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
+                    return Ok(plan);
+                }
+                Err(error) => self.cache_notice(format!("Ignored cached family sequence: {error}"))?,
+            }
+        }
+        let response = self.generate(&request.settings.text_model, &generation)?;
         // Exactly one content-planning request. Native command assembly/validation is local.
         self.progress("Compiling page content into native engine commands locally", 0.45)?;
-        let mut raw = crate::template_plan::compile(&response.text, style, scope, request.settings.output_mode)?;
-        prepare_editorial_plan(&mut raw, &request.prompt, &context, Some(scope))?;
-        crate::design::check_image_slots(&base, &raw.images, profile)?;
-        simulate_styled(&raw, &base, &prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
-        let expanded = self.expand_images(raw, &request.settings, &mut BTreeMap::new(), &mut 0, Some(profile))?;
-        self.progress("Checking editable native pages and preparing proofs", 0.85)?;
-        simulate_styled(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
-        check_cancel(self.cancel)?;
-        if context.get("batch_scope").is_some() {
-            let proofs = batch_proofs(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, scope)?;
-            Ok(Product::BatchPlan { plan: expanded, proofs })
-        } else {
-            Ok(Product::Plan(expanded))
+        let mut raw = crate::template_plan::compile_for_brief(&response.text, style, scope, request.settings.output_mode, &request.prompt)?;
+        validate_template_family_sequence(&raw, style, previous, scope, &families, &request.prompt)?;
+        prepare_editorial_plan(&mut raw, &request.prompt, &context, None)?;
+        if let Some(contract) = &self.print {
+            self.diagnostics(crate::native_print_fonts::apply(&mut raw, base, prefs, contract)?)?;
         }
+        self.diagnostics(crate::native_layout::prepare(&mut raw, base, prefs, self.cancel)?)?;
+        validate_previous_body_layout(&raw, base, prefs, Some(scope), &request.prompt)?;
+        crate::design::check_image_slots(base, &raw.images, profile)?;
+        simulate_styled(&raw, base, prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
+        self.cache_plan(cache_key.as_deref(), &raw)?;
+        Ok(raw)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -735,7 +1263,7 @@ impl Runner<'_> {
         let mut scratch = Session::new();
         scratch.prefs = prefs.clone();
         scratch.add_document(base.clone());
-        let mut plans = Vec::new();
+        let mut pending = Vec::new();
         let mut plan_bytes = 0usize;
         let mut next = review.start;
         while next < end {
@@ -746,33 +1274,68 @@ impl Runner<'_> {
                 .as_object_mut()
                 .ok_or("Invalid internal template context")?
                 .insert("curriculum_blueprint".into(), crate::template_plan::curriculum_blueprint(&request.prompt, style, scope, total_pages)?);
-            // Removing batch_scope suppresses internal proof artifacts and checkpoints.
-            // The same Runner retains the actual ledger, cancellation and pinned keys.
-            let product = self.template_production(
-                request.clone(),
-                chunk_context,
-                style,
-                scratch.doc().map_err(|e| e.to_string())?.clone(),
-                prefs.clone(),
-                scope,
-            )?;
-            let Product::Plan(plan) = product else {
-                return Err("Internal template production returned an unexpected checkpoint".into());
-            };
+            // Only the complete group creates proof artifacts and checkpoints.
+            // All parts share the actual ledger, cancellation and pinned keys.
+            let plan = self.template_content(&request, &chunk_context, style, scratch.doc().map_err(|e| e.to_string())?, &prefs, scope)?;
             let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
             plan_bytes =
                 plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
-            if plans.len() >= usize::try_from(MAX_REVIEW_PAGES).map_err(|_| "Invalid review plan limit")? {
+            if pending.len() >= usize::try_from(MAX_REVIEW_PAGES).map_err(|_| "Invalid review plan limit")? {
                 return Err("Review plan count exceeds its bounded page limit".into());
             }
             scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
                 .map_err(|e| e.to_string())?;
-            plans.push(plan);
+            pending.push((plan, scope));
             next = next.checked_add(scope.count).ok_or("Internal template page range overflow")?;
         }
         validate_batch_result(&base, scratch.doc().map_err(|e| e.to_string())?, review)?;
+        // Predictable request/token/cost failures for the ENTIRE image phase must
+        // stop before its first purchase. Admission uses a clone, not the ledger
+        // that records real provider usage. Internal parts have separate caches.
+        let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
+        let style_context = illustration_style(Some(profile))?;
+        let mut projected = self.ledger.clone();
+        let mut cached = BTreeMap::new();
+        let mut cached_bytes = 0usize;
+        for (plan, _) in &pending {
+            check_cancel(self.cancel)?;
+            for image in &plan.images {
+                self.print_image_size(image, Some(profile), &request.settings.image_model)?;
+            }
+            self.preload_images(plan, &request.settings, Some(profile), &style_context, &mut cached, &mut cached_bytes)?;
+            project_image_requests(&mut projected, plan, &request.settings, Some(profile), &style_context, &cached)?;
+        }
+        // Rebuild once with the actual artwork; the text-only draft never reaches
+        // the live document and is released before allocating the illustrated one.
+        drop(scratch);
+        let mut scratch = Session::new();
+        scratch.prefs = prefs.clone();
+        scratch.add_document(base.clone());
+        let mut plans = Vec::new();
+        plan_bytes = 0;
+        for (plan, scope) in pending {
+            check_cancel(self.cancel)?;
+            let plan = self.expand_images(plan, &request.settings, &mut cached, &mut cached_bytes, Some(profile))?;
+            self.audit_print(&plan, scratch.doc().map_err(|e| e.to_string())?, &prefs)?;
+            simulate_styled(
+                &plan,
+                scratch.doc().map_err(|e| e.to_string())?,
+                &prefs,
+                request.settings.output_mode,
+                self.cancel,
+                Some(scope),
+                GeometryCheck::Profile(profile),
+            )?;
+            let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
+            plan_bytes =
+                plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
+            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
+                .map_err(|e| e.to_string())?;
+            plans.push(plan);
+        }
+        validate_batch_result(&base, scratch.doc().map_err(|e| e.to_string())?, review)?;
         self.progress("Preparing complete review proofs from all internal page parts", 0.9)?;
-        let proofs = batch_proofs_from_draft(&mut scratch, self.cancel, review)?;
+        let proofs = review_proofs(&mut scratch, self.cancel, review, &request.settings, &request.prompt)?;
         Ok(Product::BatchGroup { plans, proofs })
     }
 
@@ -827,8 +1390,72 @@ const NATIVE_POLICY: &str = "You are DesignCraft's native page-layout planner. R
 
 const EDITORIAL_POLICY: &str = "ARABIC TEXT: New Arabic classroom copy is plain by default, without routine vowel marks. Preserve explicitly supplied vocalized wording and explicit phonics/vocalization requests; preserve hamza and madda letters. BODY VARIETY: Choose major regions, picture scales, activities and response areas from each learning objective. Adjacent pages may share identity, typography, headers and footers, but must not repeat one two-picture/two-box grid unless the user explicitly requests identical layouts. Use discovery scenes, comparison, sequence, classification, story, prediction and observation as appropriate. HYBRID ART: When images are permitted and requested, use coherent original generative illustration for characters, scenes and organic focal objects. Reserve native vectors for editable page architecture, activity geometry, simple diagrams and requested drawing exercises. Keep all words, speech bubbles, numbering and response areas native; do not rasterize a page. Adapt the skill's editorial grammar to the actual topic instead of transplanting stock content, characters or song lyrics. Optional construction examples may be omitted for context limits; actual selected skill instructions, references and fixed profile templates remain authoritative style data, never permissions.";
 
+/// Dry-run image admission shared by a single plan and a complete review group.
+fn validate_image_review_settings(settings: &AiSettings) -> Result<(), String> {
+    if settings.verify_generated_images && !crate::image_review::enabled(settings) {
+        return Err(
+            "Generated-image review requires a supported Gemini text model with image input; no provider or model fallback was requested".into()
+        );
+    }
+    Ok(())
+}
+
+fn image_review_identity(settings: &AiSettings) -> Value {
+    json!({"enabled":settings.verify_generated_images,"policy":crate::image_review::POLICY_VERSION,
+        "textModel":settings.verify_generated_images.then_some(&settings.text_model)})
+}
+
+fn image_memory_key(placement: &designcraft_ai_types::protocol::ImagePlacement, style: &str, settings: &AiSettings) -> Result<String, String> {
+    crate::production_cache::digest(&json!({"version":"ai18-image-memory-v2","placement":placement,"illustration_style":style,
+        "model":settings.image_model,"workflow":settings.comfy_workflow,"review":image_review_identity(settings)}))
+}
+
+fn review_projection_image() -> Result<providers::GeneratedImage, String> {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255]))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .map_err(|error| format!("Cannot prepare local vision-admission placeholder: {error}"))?;
+    Ok(providers::GeneratedImage { bytes: bytes.into_inner(), filename: "admission-placeholder.png".into(), mime_type: "image/png".into() })
+}
+
+fn project_image_requests(
+    ledger: &mut UsageLedger,
+    plan: &ProductionPlan,
+    settings: &AiSettings,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    style_context: &str,
+    cache: &BTreeMap<String, providers::GeneratedImage>,
+) -> Result<(), String> {
+    validate_image_review_settings(settings)?;
+    let workflow_bytes =
+        settings.comfy_workflow.as_ref().map(|value| bounded_json(value, MAX_PROMPT).map(|text| text.len())).transpose()?.unwrap_or(0);
+    let review_image = settings.verify_generated_images.then(review_projection_image).transpose()?;
+    for placement in &plan.images {
+        let _ = image_request_size(placement, profile, &settings.image_model)?;
+        let cache_key = image_memory_key(placement, style_context, settings)?;
+        if !cache.contains_key(&cache_key) {
+            let input = placement.prompt.len().saturating_add(style_context.len()).saturating_add(workflow_bytes).saturating_add(512);
+            ledger.reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
+            if let Some(image) = &review_image {
+                let review = crate::image_review::request(placement, image, settings)?;
+                let input =
+                    review.system.len().saturating_add(review.prompt.len()).saturating_add(bounded_json(&review.json_schema, MAX_PROMPT)?.len());
+                if input > MAX_PROMPT {
+                    return Err("Illustration review prompt exceeds the bounded context limit".into());
+                }
+                ledger.reserve(input, review.images.len(), settings.text_model.provider, false, None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Repeated shared reference bodies are sent once, without dropping ownership or pins.
 pub(crate) fn compact_skill_guidance(skills: &[SkillSnapshot]) -> Result<String, String> {
+    compact_skill_guidance_limit(skills, 32 * 1024)
+}
+
+fn compact_skill_guidance_limit(skills: &[SkillSnapshot], limit: usize) -> Result<String, String> {
     let mut bodies: BTreeMap<String, &str> = BTreeMap::new();
     let mut entries = Vec::new();
     for skill in skills {
@@ -843,7 +1470,7 @@ pub(crate) fn compact_skill_guidance(skills: &[SkillSnapshot]) -> Result<String,
         }
         entries.push(json!({"id":skill.skill_id,"revision":skill.revision,"instructions":skill.instructions,"references":references,"reference_hashes":skill.reference_hashes}));
     }
-    bounded_json(&json!({"skills":entries,"reference_bodies":bodies}), 32 * 1024)
+    bounded_json(&json!({"skills":entries,"reference_bodies":bodies}), limit)
 }
 
 fn arabic_vowel_mark(c: char) -> bool {
@@ -858,6 +1485,26 @@ fn review_end(scope: BatchScope) -> Result<u32, String> {
         .ok_or_else(|| "Review must contain 1 to 1000 native pages within the document".into())
 }
 
+/// Existing-book trim and margins outrank fixed template coordinates. Matching
+/// books retain the local compiler; different geometry uses native adaptive
+/// commands with the same immutable visual guidance.
+fn continuation_style_geometry_differs(request: &TaskRequest, base: &DocState, skills: &[SkillSnapshot]) -> bool {
+    matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook)
+        && skills.iter().filter_map(|skill| skill.design_profile.as_ref()).any(|profile| {
+            let factor = 72.0 / 25.4;
+            base.doc.spreads.iter().flat_map(|spread| &spread.pages).any(|page| {
+                (page.width - profile.page_mm[0] * factor).abs() > 0.1
+                    || (page.height - profile.page_mm[1] * factor).abs() > 0.1
+                    || [page.margins.top, page.margins.bottom, page.margins.inside, page.margins.outside]
+                        .iter()
+                        .any(|margin| *margin > profile.margin_mm * factor + 0.1)
+            })
+        })
+}
+
+fn unbound_math_request(brief: &str, skills: &[SkillSnapshot]) -> bool {
+    crate::template_plan::requires_adaptive_math(brief, skills)
+}
 fn generic_page_capacity(mode: OutputMode) -> u32 {
     match mode {
         OutputMode::NativeOnly => 32,
@@ -871,6 +1518,7 @@ fn opened_document_geometry(context: &mut Value, state: &DocState) -> Result<(),
     object.insert("pageHeight".into(), json!(state.doc.settings.page_height));
     object.insert("pageCount".into(), json!(state.doc.page_count()));
     object.insert("facingPages".into(), json!(state.doc.settings.facing_pages));
+    object.insert("rightToLeftBinding".into(), json!(state.doc.settings.right_to_left_binding));
     let pages = state
         .doc
         .spreads
@@ -878,7 +1526,12 @@ fn opened_document_geometry(context: &mut Value, state: &DocState) -> Result<(),
         .enumerate()
         .flat_map(|(spread, entry)| entry.pages.iter().map(move |page| (spread, page)))
         .take(MAX_REVIEW_PAGES as usize)
-        .map(|(spread, page)| json!({"spread":spread,"x":page.x,"width":page.width,"height":page.height,"margins":page.margins}))
+        .enumerate()
+        .map(|(absolute, (spread, page))| {
+            let safe = page.margin_rect();
+            json!({"page":absolute,"spread":spread,"side":page.side,"x":page.x,"width":page.width,"height":page.height,
+                "margins":page.margins,"safeRect":[safe.x0,safe.y0,safe.x1,safe.y1]})
+        })
         .collect::<Vec<_>>();
     object.insert("pageGeometryTruncated".into(), json!(state.doc.page_count() > pages.len()));
     object.insert("pageGeometry".into(), json!(pages));
@@ -954,6 +1607,186 @@ fn internal_template_context(context: &Value, state: &DocState, review: BatchSco
     Ok(value)
 }
 
+fn identical_layout_requested(lower: &str) -> bool {
+    ["نفس التخطيط", "نفس التوزيع", "تخطيط متطابق", "قالب متكرر", "same layout", "identical layouts", "repeat layout", "identical worksheets"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Infer only a unique declared family whose static labels survive in native content.
+/// Missing or ambiguous labels are unknown; never manufacture approved history.
+fn template_family_for_labels(style: &SkillSnapshot, labels: &BTreeSet<&str>, allowed: &BTreeSet<String>) -> Option<String> {
+    let mut matched = None;
+    for family in &style.design_profile.as_ref()?.page_families {
+        if !allowed.contains(family.id.as_str()) {
+            continue;
+        }
+        let template = style.templates.get(&family.template)?;
+        let expected: BTreeSet<_> = template
+            .iter()
+            .filter(|action| action.command == "object.label")
+            .filter_map(|action| action.params.get("label").and_then(Value::as_str))
+            .filter(|label| !label.is_empty())
+            .collect();
+        if !expected.is_empty() && expected.is_subset(labels) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(family.id.clone());
+        }
+    }
+    matched
+}
+
+fn previous_template_family(style: &SkillSnapshot, base: &DocState, scope: BatchScope, allowed: &BTreeSet<String>) -> Result<Option<String>, String> {
+    let Some(previous) = scope.start.checked_sub(1).filter(|_| allowed.len() > 1) else { return Ok(None) };
+    let spread =
+        base.doc.spreads.get(usize::try_from(previous).map_err(|_| "Invalid previous template page")?).ok_or("Previous template page is missing")?;
+    let mut pending = Vec::new();
+    for item in &spread.items {
+        if pending.len() >= 10_000 {
+            return Err("Template family traversal exceeds its limit".into());
+        }
+        pending.push((item.as_ref(), 0usize));
+    }
+    let mut labels = BTreeSet::new();
+    let mut visited = 0usize;
+    while let Some((item, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 10_000 || depth > 64 {
+            return Err("Template family traversal exceeds its limit".into());
+        }
+        if !item.label.is_empty() {
+            labels.insert(item.label.as_str());
+        }
+        for child in item.children() {
+            if pending.len() >= 10_000 {
+                return Err("Template family traversal exceeds its limit".into());
+            }
+            pending.push((child.as_ref(), depth.saturating_add(1)));
+        }
+    }
+    Ok(template_family_for_labels(style, &labels, allowed))
+}
+
+fn validate_template_family_sequence(
+    plan: &ProductionPlan,
+    style: &SkillSnapshot,
+    mut previous: Option<String>,
+    scope: BatchScope,
+    allowed: &BTreeSet<String>,
+    brief: &str,
+) -> Result<(), String> {
+    if allowed.len() < 2 || identical_layout_requested(&brief.to_lowercase()) {
+        return Ok(());
+    }
+    if plan.commands.len() > MAX_ACTIONS {
+        return Err("Template family commands exceed their limit".into());
+    }
+    let mut results: Vec<BTreeSet<u64>> = Vec::with_capacity(plan.commands.len());
+    let mut labels: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+    for (index, action) in plan.commands.iter().enumerate() {
+        let mut pages = BTreeSet::new();
+        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "file.place") {
+            pages.insert(action.params.get("spread").and_then(Value::as_u64).unwrap_or(0));
+        } else if let Some(ids) = action.params.get("ids").and_then(Value::as_array) {
+            for reference in ids.iter().filter_map(Value::as_str) {
+                if let Some(source) = reference_source(reference, index).and_then(|source| results.get(source)) {
+                    pages.extend(source);
+                }
+            }
+        }
+        if action.command == "object.label"
+            && let Some(label) = action.params.get("label").and_then(Value::as_str).filter(|label| !label.is_empty())
+        {
+            for page in &pages {
+                labels.entry(*page).or_default().insert(label);
+            }
+        }
+        results.push(pages);
+    }
+    for page in scope.start..review_end(scope)? {
+        let family = labels.get(&u64::from(page)).and_then(|labels| template_family_for_labels(style, labels, allowed));
+        if let Some(family) = &family
+            && previous.as_ref() == Some(family)
+        {
+            return Err(format!(
+                "Repeated template family '{family}' on page {}; choose another available family or explicitly request identical layouts. No images were requested.",
+                page.saturating_add(1)
+            ));
+        }
+        previous = family;
+    }
+    Ok(())
+}
+
+/// Local editorial checks run before image reservations on either production path.
+fn validate_previous_body_layout(
+    plan: &ProductionPlan,
+    base: &DocState,
+    prefs: &Prefs,
+    scope: Option<BatchScope>,
+    prompt: &str,
+) -> Result<(), String> {
+    let Some(scope) = scope.filter(|scope| scope.start > 0 || scope.count > 1) else { return Ok(()) };
+    let first = scope.start.saturating_sub(1);
+    let end = review_end(scope)?;
+    let mut scratch = Session::new();
+    scratch.prefs = prefs.clone();
+    scratch.add_document(base.clone());
+    scratch
+        .execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":false}))
+        .map_err(|error| error.to_string())?;
+    let state = scratch.doc().map_err(|error| error.to_string())?;
+    let mut combined = ProductionPlan { title: String::new(), commands: Vec::new(), images: Vec::new() };
+    let mut visited = 0usize;
+    for page in first..end {
+        let spread = state.doc.spreads.get(usize::try_from(page).map_err(|_| "Invalid native page index")?).ok_or("Native layout page is missing")?;
+        let mut pending = Vec::new();
+        for item in &spread.items {
+            if pending.len() >= 10_000 {
+                return Err("Native layout traversal exceeds its limit".into());
+            }
+            pending.push((item.as_ref(), designcraft_geom::Affine::IDENTITY, 0usize));
+        }
+        while let Some((item, parent, depth)) = pending.pop() {
+            visited = visited.saturating_add(1);
+            if visited > 10_000 || depth > 64 {
+                return Err("Native layout traversal exceeds its limit".into());
+            }
+            if item.hidden {
+                continue;
+            }
+            if !item.children().is_empty() {
+                for child in item.children() {
+                    if pending.len() >= 10_000 {
+                        return Err("Native layout traversal exceeds its limit".into());
+                    }
+                    pending.push((child.as_ref(), parent * item.xf, depth.saturating_add(1)));
+                }
+            } else {
+                let bounds = parent.transform_rect_bbox(item.bounds());
+                let image_slot = plan.images.iter().any(|image| {
+                    u32::try_from(image.page).ok() == Some(page)
+                        && image.rect.iter().zip([bounds.x0, bounds.y0, bounds.x1, bounds.y1]).all(|(a, b)| (*a - b).abs() <= 0.01)
+                });
+                let content = if item.text_frame().is_some() {
+                    "text"
+                } else if item.graphic().is_some() || image_slot {
+                    "graphic"
+                } else {
+                    "unassigned"
+                };
+                combined.commands.push(EngineAction {
+                    command: "frame.create".into(),
+                    params: json!({"spread":page,"content":content,"rect":[bounds.x0,bounds.y0,bounds.x1,bounds.y1]}),
+                });
+            }
+        }
+    }
+    prepare_editorial_plan(&mut combined, prompt, &json!({}), Some(BatchScope { start: first, count: end.saturating_sub(first) }))
+}
+
 /// Local editorial checks run before image reservations on either production path.
 fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Value, scope: Option<BatchScope>) -> Result<(), String> {
     let lower = prompt.to_lowercase();
@@ -997,18 +1830,7 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
             }
         }
     }
-    if scope.is_none_or(|scope| scope.count < 2)
-        || has(&[
-            "نفس التخطيط",
-            "نفس التوزيع",
-            "تخطيط متطابق",
-            "قالب متكرر",
-            "same layout",
-            "identical layouts",
-            "repeat layout",
-            "identical worksheets",
-        ])
-    {
+    if scope.is_none_or(|scope| scope.count < 2) || identical_layout_requested(&lower) {
         return Ok(());
     }
     let mut pages: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
@@ -1064,9 +1886,28 @@ fn context_has_vocalized_copy(context: &Value) -> bool {
     context.get("approvedPageBriefs").and_then(Value::as_array).is_some_and(|briefs| briefs.iter().any(|brief| brief.get(1).is_some_and(vocalized)))
 }
 
-fn production_system(catalog: &Value, skills: &[SkillSnapshot], mode: OutputMode, current_document: bool) -> Result<String, String> {
+fn production_system(
+    catalog: &Value,
+    skills: &[SkillSnapshot],
+    mode: OutputMode,
+    current_document: bool,
+    adaptive_layout: bool,
+) -> Result<String, String> {
     let native_catalog = compact_catalog(catalog)?;
-    let instructions = bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?;
+    let instructions = if adaptive_layout {
+        // Preserve every instruction, reference owner/hash and revision while
+        // sending a shared reference body once, as task admission already does.
+        let guidance: Value = serde_json::from_str(&compact_skill_guidance_limit(skills, 64 * 1024)?).map_err(|error| error.to_string())?;
+        let profiles: Vec<_> = skills
+            .iter()
+            .filter_map(|skill| {
+                skill.design_profile.as_ref().map(|profile| json!({"skill_id":skill.skill_id,"revision":skill.revision,"design_profile":profile}))
+            })
+            .collect();
+        bounded_json(&json!({"guidance":guidance,"profiles":profiles}), 64 * 1024)?
+    } else {
+        bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?
+    };
     let image_policy = match mode {
         OutputMode::NativeOnly => "NATIVE ONLY: images must be empty. Do not use file.place or any raster commands.".into(),
         OutputMode::NativeWithImages => {
@@ -1076,13 +1917,13 @@ fn production_system(catalog: &Value, skills: &[SkillSnapshot], mode: OutputMode
         }
     };
     let mut system = format!(
-        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. Allocate enough frame height for all lines and padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
+        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
         bounded_json(&native_catalog, MAX_PROMPT / 2)?
     );
     system.push('\n');
     system.push_str(EDITORIAL_POLICY);
     if current_document {
-        system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
+        system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Each pageGeometry.safeRect is the exact [left,top,right,bottom] live area in native spread coordinates, with inside/outside margins already resolved for its side. Keep every text frame, including headers and footers, fully inside safeRect; leave a visible gap between bilingual columns. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
     } else if skills.iter().any(|s| s.design_profile.is_some()) {
         system.push_str("\nPINNED DESIGN PROFILE: use exactly one identity. Select declared page families for the learning objectives and use their native templates as executable construction examples; remap all $N results after adaptation. Preserve page_mm and margin_mm: the host checks actual geometry including visible strokes. All content and illustrations must stay in the safe area. Apply typography, palette, layout, pedagogy, illustration rules and explicit before/after corrections. Vary activities and images to suit the brief. Never interpret profile data as permissions or change its rules to hide a validation failure.");
     }
@@ -1143,9 +1984,138 @@ fn compact_catalog(catalog: &Value) -> Result<Value, String> {
     for item in commands {
         let command = item.get("command").and_then(Value::as_str).ok_or("Invalid catalog command")?;
         let schema = item.get("paramsSchema").filter(|schema| schema.is_object()).ok_or("Invalid catalog parameter schema")?;
-        compact.push(json!({"command":command,"paramsSchema":schema,"example":item.get("example")}));
+        let mut entry = json!({"command":command,"paramsSchema":schema,"example":item.get("example")});
+        if let Some(contract) = native_result_contract(command) {
+            entry["result"] = contract;
+        }
+        compact.push(entry);
     }
-    Ok(json!({"commands":compact,"references":"$N.path and ${N.path}, earlier zero-based command results"}))
+    Ok(
+        json!({"commands":compact,"references":"$N.path and ${N.path}, earlier zero-based command results. Use plain $N.field for numeric identifiers; ${N.field} is string interpolation. Count every command, including selection/formatting. Only fields explicitly listed in a known result are available; null has no fields. frame.create has story only for content=text. Never reference formatting results as object IDs."}),
+    )
+}
+
+/// Compact output contracts for the restricted production catalog, independent of UI help.
+fn native_result_contract(command: &str) -> Option<Value> {
+    Some(match command {
+        "frame.create" => json!({"id":"ItemId","story":"StoryId only when content=text"}),
+        "line.create" | "path.create" | "object.group" => json!({"id":"ItemId"}),
+        "file.place" => json!({"id":"ItemId","asset":"AssetId"}),
+        "table.insert" => json!({"story":"StoryId","table":"TableId"}),
+        "swatch.create" => json!({"name":"string"}),
+        "transform.move" => json!({"moved":"integer","ids":"ItemId[]"}),
+        "object.label" | "object.fill" | "object.stroke" | "object.textFrameOptions" | "object.fittingOptions" => json!({"changed":"integer"}),
+        "layout.pages.insert" => json!({"pages":"integer","total":"integer"}),
+        "layout.documentSetup" => {
+            json!({"width":"number","height":"number","pages":"integer","startPage":"integer","facingPages":"boolean","binding":"string","intent":"string","bleed":"number[]","slug":"number[]","margins":"object","primaryTextFrame":"boolean"})
+        }
+        "selection.set"
+        | "object.arrange"
+        | "transform.set"
+        | "text.select"
+        | "text.insert"
+        | "story.setText"
+        | "story.setDirection"
+        | "type.char"
+        | "type.para"
+        | "layout.marginsAndColumns"
+        | "table.setCell" => Value::Null,
+        _ => return None,
+    })
+}
+
+fn native_result_shape(action: &EngineAction) -> Value {
+    let Some(contract) = native_result_contract(&action.command) else { return Value::Null };
+    let Some(fields) = contract.as_object() else { return Value::Null };
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|(field, kind)| {
+                if field == "story" && action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) != Some("text") {
+                    return None;
+                }
+                let value = match kind.as_str().unwrap_or("") {
+                    // Whole-array references have unknown cardinality here. Use
+                    // the vetted 1024-ID maximum, leaving exact length to the engine.
+                    "ItemId[]" => json!(vec![1u64; action.params.get("ids").and_then(Value::as_array).map_or(1024, |ids| ids.len().min(1024))]),
+                    "string" => json!("result"),
+                    "boolean" => json!(false),
+                    "number[]" => json!([0, 0, 0, 0]),
+                    "object" => json!({}),
+                    _ => json!(1),
+                };
+                Some((field.clone(), value))
+            })
+            .collect(),
+    )
+}
+
+fn validate_identifier_references(actions: &[EngineAction]) -> Result<(), String> {
+    let mut results = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        for key in ["ids", "frame", "story", "table"] {
+            let Some(value) = action.params.get(key) else { continue };
+            let values: Vec<_> = match value {
+                Value::Array(values) => values.iter().collect(),
+                value => vec![value],
+            };
+            // A future vetted command may add a new output contract. Preserve its
+            // native private validation rather than guessing that its output is null.
+            if values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .filter_map(|reference| reference_source(reference, index))
+                .any(|source| actions.get(source).is_some_and(|action| native_result_contract(&action.command).is_none()))
+            {
+                continue;
+            }
+            if let Err(error) = designcraft_engine::script::resolve(value, &results) {
+                let origins: BTreeSet<_> = values
+                    .iter()
+                    .copied()
+                    .filter_map(Value::as_str)
+                    .filter_map(|reference| {
+                        let source = reference_source(reference, index)?;
+                        actions.get(source).map(|action| format!("${source}: {}", action.command))
+                    })
+                    .take(8)
+                    .collect();
+                return Err(format!(
+                    "step {index} ({}), {key}: {error}; referenced results [{}]. Use a creation result's id/story, never a null formatting result",
+                    action.command,
+                    origins.into_iter().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            for reference in values.into_iter().filter_map(Value::as_str) {
+                let Some(source) = reference_source(reference, index).and_then(|source| actions.get(source)) else { continue };
+                let body = reference
+                    .strip_prefix("${")
+                    .and_then(|body| body.strip_suffix('}'))
+                    .or_else(|| reference.strip_prefix('$'))
+                    .ok_or("Invalid native result reference")?;
+                let Some((_, path)) = body.split_once('.') else { continue };
+                let field = path.split('.').next().ok_or("Invalid native result field")?;
+                let contract = native_result_contract(&source.command).ok_or("Unknown native result contract")?;
+                let kind = contract.get(field).and_then(Value::as_str).unwrap_or("");
+                let expected = match key {
+                    "story" => "StoryId",
+                    "table" => "TableId",
+                    _ => "ItemId",
+                };
+                if !kind.starts_with(expected) {
+                    return Err(format!("step {index} ({}), {key}: {reference} from {} is not a {expected}", action.command, source.command));
+                }
+            }
+        }
+        results.push(native_result_shape(action));
+    }
+    Ok(())
+}
+
+fn reference_source(reference: &str, index: usize) -> Option<usize> {
+    let body = reference.strip_prefix("${").and_then(|body| body.strip_suffix('}')).or_else(|| reference.strip_prefix('$'))?;
+    let head = body.split('.').next()?;
+    if head == "last" { index.checked_sub(1) } else { head.parse().ok() }
 }
 fn allowed_commands(catalog: &Value, mode: OutputMode) -> Result<BTreeSet<String>, String> {
     Ok(compact_catalog(catalog)?
@@ -1189,6 +2159,7 @@ fn validate_actions(actions: &[EngineAction], catalog: &Value, mode: OutputMode)
     if actions.iter().any(|action| !allowed.contains(&action.command) || !action.params.is_object()) {
         return Err("Plan contains a forbidden command or non-object parameters".into());
     }
+    validate_identifier_references(actions)?;
     Ok(())
 }
 fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<ProductionPlan, String> {
@@ -1466,6 +2437,7 @@ pub(crate) fn validate_batch_result(before: &DocState, after: &DocState, scope: 
     }
     Ok(())
 }
+#[cfg(test)]
 fn batch_proofs(
     plan: &ProductionPlan,
     base: &DocState,
@@ -1493,14 +2465,51 @@ fn push_proof(proofs: &mut Vec<ProofArtifact>, total: &mut usize, name: String, 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn batch_proofs_with_layout(
+    plan: &ProductionPlan,
+    base: &DocState,
+    prefs: &Prefs,
+    settings: &AiSettings,
+    brief: &str,
+    cancel: &AtomicBool,
+    scope: BatchScope,
+) -> Result<Vec<ProofArtifact>, String> {
+    let mut scratch = Session::new();
+    scratch.prefs = prefs.clone();
+    scratch.add_document(base.clone());
+    scratch
+        .execute("production.apply", &json!({"commands":plan.commands,"outputMode":settings.output_mode,"requirePreflight":true}))
+        .map_err(|e| e.to_string())?;
+    review_proofs(&mut scratch, cancel, scope, settings, brief)
+}
+fn review_proofs(
+    scratch: &mut Session,
+    cancel: &AtomicBool,
+    scope: BatchScope,
+    settings: &AiSettings,
+    brief: &str,
+) -> Result<Vec<ProofArtifact>, String> {
+    if settings.facing_pages {
+        let state = crate::facing_pages::formatted_proof_state(
+            scratch.doc().map_err(|e| e.to_string())?,
+            &scratch.prefs,
+            crate::runtime::book_binding(settings, brief),
+        )?;
+        let mut proof = Session::new();
+        proof.prefs = scratch.prefs.clone();
+        proof.add_document(state);
+        batch_proofs_from_draft(&mut proof, cancel, scope)
+    } else {
+        batch_proofs_from_draft(scratch, cancel, scope)
+    }
+}
 fn batch_proofs_from_draft(scratch: &mut Session, cancel: &AtomicBool, scope: BatchScope) -> Result<Vec<ProofArtifact>, String> {
     check_cancel(cancel)?;
     let end = review_end(scope)?;
     let state = scratch.doc().map_err(|e| e.to_string())?;
-    if usize::try_from(end).map_err(|_| "Invalid review proof range")? > state.doc.spreads.len()
-        || state.doc.spreads.iter().any(|spread| spread.pages.len() != 1)
-    {
-        return Err("Review proofs require the exact native single-page spread range".into());
+    if usize::try_from(end).map_err(|_| "Invalid review proof range")? > state.doc.page_count() {
+        return Err("Review proofs require the exact native absolute-page range".into());
     }
     let count = scope.count.checked_add(scope.count.div_ceil(32)).and_then(|count| count.checked_add(1)).ok_or("Review proof count overflow")?;
     let mut proofs = Vec::with_capacity(usize::try_from(count).map_err(|_| "Invalid review proof count")?);
@@ -1529,9 +2538,9 @@ fn batch_proofs_from_draft(scratch: &mut Session, cancel: &AtomicBool, scope: Ba
         let state = scratch.doc().map_err(|e| e.to_string())?;
         let native_page = state
             .doc
-            .spreads
-            .get(usize::try_from(page).map_err(|_| "Invalid review proof page")?)
-            .and_then(|spread| spread.pages.first())
+            .pages()
+            .nth(usize::try_from(page).map_err(|_| "Invalid review proof page")?)
+            .map(|(_, _, page)| page)
             .ok_or("Review proof page disappeared")?;
         let side = native_page.width.max(native_page.height);
         if !native_page.width.is_finite() || !native_page.height.is_finite() || native_page.width <= 0.0 || native_page.height <= 0.0 {
@@ -1564,8 +2573,8 @@ fn batch_proofs_from_draft(scratch: &mut Session, cancel: &AtomicBool, scope: Ba
 fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<providers::GeneratedImage, String> {
     if generated.mime_type == "image/webp" {
         use image::{ImageDecoder, ImageEncoder};
-        if generated.bytes.len() > MAX_JSON || !generated.bytes.starts_with(b"RIFF") || generated.bytes.get(8..12) != Some(b"WEBP") {
-            return Err("Generated WebP must have a valid header and fit within 4 MiB".into());
+        if generated.bytes.len() > MAX_RASTER_BYTES || !generated.bytes.starts_with(b"RIFF") || generated.bytes.get(8..12) != Some(b"WEBP") {
+            return Err("Generated WebP must have a valid header and fit within 16 MiB".into());
         }
         validate_webp_chunks(&generated.bytes)?;
         let mut decoder =
@@ -1576,7 +2585,7 @@ fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<p
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(width);
         limits.max_image_height = Some(height);
-        limits.max_alloc = Some(64 * 1024 * 1024);
+        limits.max_alloc = Some(128 * 1024 * 1024);
         limits.reserve(decoder.total_bytes()).map_err(|e| format!("Generated WebP exceeds decoding memory limit: {e}"))?;
         decoder.set_limits(limits).map_err(|e| format!("Cannot limit generated WebP: {e}"))?;
         let profile = decoder.icc_profile().map_err(|e| format!("Cannot read generated WebP color profile: {e}"))?;
@@ -1588,7 +2597,7 @@ fn prepare_generated_image(mut generated: providers::GeneratedImage) -> Result<p
         }
         encoder
             .write_image(decoded.as_bytes(), width, height, decoded.color().into())
-            .map_err(|e| format!("Cannot encode generated WebP as PNG within 4 MiB: {e}"))?;
+            .map_err(|e| format!("Cannot encode generated WebP as lossless PNG within 16 MiB: {e}"))?;
         generated.bytes = output.0;
         generated.filename = "generated.png".into();
         generated.mime_type = "image/png".into();
@@ -1639,8 +2648,8 @@ fn validate_webp_chunks(bytes: &[u8]) -> Result<(), String> {
 struct BoundedImageBytes(Vec<u8>);
 impl std::io::Write for BoundedImageBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_JSON.saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other("Generated PNG exceeds 4 MiB"));
+        if bytes.len() > MAX_RASTER_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("Generated lossless PNG exceeds 16 MiB"));
         }
         self.0.try_reserve_exact(bytes.len()).map_err(|_| std::io::Error::other("Cannot allocate generated PNG"))?;
         self.0.extend_from_slice(bytes);
@@ -1657,15 +2666,15 @@ fn validate_image(image: &providers::GeneratedImage) -> Result<(), String> {
         "image/jpeg" => image.bytes.starts_with(&[0xff, 0xd8, 0xff]),
         _ => false,
     };
-    if !valid_header || image.bytes.len() > MAX_JSON {
-        return Err("Image generation must return a PNG/JPEG within 4 MiB".into());
+    if !valid_header || image.bytes.len() > MAX_RASTER_BYTES {
+        return Err("Image generation must return a PNG/JPEG within 16 MiB".into());
     }
     let (width, height) = designcraft_images::pixel_size(&image.bytes).ok_or("Invalid generated raster header")?;
     validate_image_dimensions(width, height)
 }
 fn validate_image_dimensions(width: u32, height: u32) -> Result<(), String> {
-    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 16_000_000 {
-        return Err("Generated raster exceeds 16 million pixels".into());
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_RASTER_PIXELS {
+        return Err("Generated raster dimensions must be positive and at most 20 million pixels".into());
     }
     Ok(())
 }
@@ -2046,6 +3055,457 @@ mod tests {
     use designcraft_ai_providers::Usage;
     use std::cell::RefCell;
 
+    struct Ai23SyntheticProvider {
+        plans: RefCell<Vec<ProductionPlan>>,
+        image_sizes: RefCell<Vec<Option<String>>>,
+        content: Option<Value>,
+    }
+
+    impl Ai23SyntheticProvider {
+        fn new(plans: Vec<ProductionPlan>) -> Self {
+            Self { plans: RefCell::new(plans), image_sizes: RefCell::new(vec![]), content: None }
+        }
+    }
+
+    impl Provider for Ai23SyntheticProvider {
+        fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+            let text = if let Some(content) = &self.content {
+                content.to_string()
+            } else {
+                let plan = self.plans.borrow_mut().pop().ok_or("Unexpected synthetic planning request")?;
+                serde_json::to_string(&plan).map_err(|error| error.to_string())?
+            };
+            Ok(GenerationResponse { text, usage: Usage { input_tokens: Some(10), output_tokens: Some(10), ..Default::default() }, error: None })
+        }
+
+        fn images(&self, _: &ModelSelection, _: Option<&str>, request: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+            self.image_sizes.borrow_mut().push(request.size.clone());
+            let (width, height) = if request.size.as_deref().is_some_and(|size| size.starts_with("4:1")) { (1600, 400) } else { (1024, 1024) };
+            let pixels = image::RgbImage::from_pixel(width, height, image::Rgb([20, 80, 100]));
+            let mut bytes = std::io::Cursor::new(vec![]);
+            pixels.write_to(&mut bytes, image::ImageFormat::Png).map_err(|error| error.to_string())?;
+            Ok(ImageResponse {
+                images: vec![providers::GeneratedImage {
+                    bytes: bytes.into_inner(),
+                    mime_type: "image/png".into(),
+                    filename: "synthetic.png".into(),
+                }],
+                usage: Usage { input_tokens: Some(10), output_tokens: Some(10), ..Default::default() },
+                error: None,
+            })
+        }
+
+        fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+            Err("No synthetic model discovery".into())
+        }
+    }
+
+    #[test]
+    fn ai23_template_family_checks_previous_native_page_and_internal_sequence() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut profile = shared_source_profile_fixture();
+        let original = profile.page_families[0].clone();
+        let mut templates = BTreeMap::new();
+        profile.page_families.clear();
+        for id in ["family-a", "family-b"] {
+            let mut family = original.clone();
+            family.id = id.into();
+            family.template = format!("templates/{id}.json");
+            family.image_slots.clear();
+            family.text_slots =
+                vec![designcraft_ai_types::DesignTextSlot { id: "heading".into(), purpose: "Lesson".into(), command: 0, max_chars: 50 }];
+            templates.insert(
+                family.template.clone(),
+                vec![
+                    EngineAction {
+                        command: "frame.create".into(),
+                        params: json!({"spread":0,"content":"text","text":"Lesson","rect":[60,180,300,230],"caret":false}),
+                    },
+                    EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":format!("native.{id}")}) },
+                ],
+            );
+            profile.page_families.push(family);
+        }
+        let style = SkillSnapshot {
+            skill_id: "family-fixture".into(),
+            revision: "fixed".into(),
+            instructions: String::new(),
+            references: BTreeMap::new(),
+            reference_hashes: BTreeMap::new(),
+            templates,
+            design_profile: Some(profile.clone()),
+        };
+        for (start, families, brief, repeated) in [
+            (1, vec!["family-a"], "Vary the science lessons", true),
+            (1, vec!["family-b"], "Vary the science lessons", false),
+            (1, vec!["family-a"], "Use the same layout", false),
+            (0, vec!["family-a", "family-a"], "Vary the science lessons", true),
+            (0, vec!["family-a", "family-b"], "Vary the science lessons", false),
+        ] {
+            let mut session = Session::new();
+            session.execute("file.new", &crate::design::document_params(Some(&profile), 2)).unwrap();
+            if start > 0 {
+                let item = session
+                    .execute("frame.create", &json!({"spread":0,"content":"text","text":"Previous","rect":[60,180,300,230],"caret":false}))
+                    .unwrap();
+                session.execute("object.label", &json!({"ids":[item["id"]],"label":"native.family-a"})).unwrap();
+                let other = session.execute("frame.create", &json!({"spread":0,"content":"unassigned","rect":[60,240,80,260]})).unwrap();
+                session.execute("object.group", &json!({"ids":[item["id"],other["id"]]})).unwrap();
+            }
+            let scope = BatchScope { start, count: families.len() as u32 };
+            let pages: Vec<_> = families
+                .iter()
+                .enumerate()
+                .map(|(index, family)| json!({"page":start+index as u32,"family":family,"text":{"heading":"Next"},"illustrations":[]}))
+                .collect();
+            let provider =
+                Ai23SyntheticProvider { content: Some(json!({"title":"Family sequence","pages":pages})), ..Ai23SyntheticProvider::new(vec![]) };
+            let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+            let request = TaskRequest {
+                prompt: brief.into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+                export_directory: None,
+            };
+            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let before = session.doc().unwrap().doc.clone();
+            let result = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .template_content(&request, &json!({}), &style, session.doc().unwrap(), &session.prefs, scope);
+            if repeated {
+                assert!(
+                    result.err().is_some_and(|error| error.contains("Repeated template family")),
+                    "The same family must not repeat across a native boundary or within one internal part"
+                );
+            } else {
+                assert!(result.is_ok(), "{brief}: {:?}", result.err());
+            }
+            assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+            assert!(provider.image_sizes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn ai23_body_variety_uses_final_transformed_native_geometry() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":2,"facingPages":false})).unwrap();
+        let mut commands = Vec::new();
+        for row in 0..4 {
+            let rect = json!([60, 180 + row * 100, 300, 250 + row * 100]);
+            session.execute("frame.create", &json!({"spread":0,"content":"unassigned","rect":rect})).unwrap();
+            let index = commands.len();
+            commands.push(EngineAction { command: "frame.create".into(), params: json!({"spread":1,"content":"unassigned","rect":rect}) });
+            commands.push(EngineAction { command: "transform.move".into(), params: json!({"ids":[format!("${index}.id")],"dx":50,"dy":0}) });
+        }
+        let plan = ProductionPlan { title: "Moved body".into(), commands, images: vec![] };
+        assert!(
+            validate_previous_body_layout(&plan, session.doc().unwrap(), &session.prefs, Some(BatchScope { start: 1, count: 1 }), "Vary the layouts")
+                .is_ok(),
+            "Final moved frames differ from the previous native page"
+        );
+    }
+
+    #[test]
+    fn ai23_single_page_parts_check_body_variety_against_actual_previous_native_page() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let part = |page| ProductionPlan {
+            title: format!("Lesson {page}"),
+            commands: (0..4)
+                .map(|row| EngineAction {
+                    command: "frame.create".into(),
+                    params: json!({"spread":page,"content":"unassigned","rect":[60,180+row*100,300,250+row*100]}),
+                })
+                .collect(),
+            images: vec![],
+        };
+        let provider = Ai23SyntheticProvider::new(vec![part(1), part(0)]);
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages":2,"facingPages":false})).unwrap();
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt: "Create varied lessons.\nImage Resolution: 300 PPI".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let result = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(
+            request,
+            json!({"batch_scope":{"start":0,"count":2}}),
+            catalog(),
+            vec![],
+            session.doc().unwrap().clone(),
+            session.prefs.clone(),
+        );
+        let error = result.err();
+        assert!(
+            error.as_ref().is_some_and(|error| error.contains("Repeated body layout")),
+            "A one-page internal chunk must not bypass adjacent-page validation: {error:?}"
+        );
+        assert!(session.doc().unwrap().doc.spreads.iter().all(|spread| spread.items.is_empty()));
+    }
+
+    #[test]
+    fn ai23_page_zero_authored_image_frame_accepts_omitted_and_null_spread() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        for spread in [Some(json!(0)), None, Some(Value::Null)] {
+            let provider = Ai23SyntheticProvider::new(vec![]);
+            let settings = AiSettings {
+                output_mode: OutputMode::NativeWithImages,
+                image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+                budget: BudgetSpec { token_limit: 500_000, ..Default::default() },
+                ..Default::default()
+            };
+            let mut plan = review_plan();
+            let mut params = json!({"content":"graphic","rect":plan.images[0].rect});
+            if let Some(spread) = spread {
+                params["spread"] = spread;
+            }
+            plan.commands.push(EngineAction { command: "frame.create".into(), params });
+            let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let expanded = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .expand_images(plan, &settings, &mut BTreeMap::new(), &mut 0, None)
+            .unwrap();
+            assert_eq!(expanded.commands.iter().filter(|action| action.command == "frame.create").count(), 1, "Fill the existing page-zero frame");
+            let placements: Vec<_> = expanded.commands.iter().filter(|action| action.command == "file.place").collect();
+            assert_eq!(placements.len(), 1);
+            assert_eq!(placements[0].params["frame"], "$0.id");
+            assert_eq!(provider.image_sizes.borrow().len(), 1);
+            assert_eq!(ledger.summary().requests, 1);
+        }
+    }
+
+    #[test]
+    fn ai23_cached_plan_emits_measured_native_layout_recovery_diagnostics() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false,"margins":42.52})).unwrap();
+        let raw: ProductionPlan = serde_json::from_value(json!({"title":"Measured text", "images":[], "commands":[
+            {"command":"frame.create","params":{"spread":0,"rect":[60,60,225,82],"content":"text","text":"Count the flowers carefully. Write each number. Compare your answer with your partner.","caret":false}},
+            {"command":"type.char","params":{"attrs":{"size":12,"leading":{"kind":"points","value":17}}}},
+            {"command":"frame.create","params":{"spread":0,"rect":[60,180,225,280],"content":"graphic"}}
+        ]})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let cancel = AtomicBool::new(false);
+        let mut expected = raw.clone();
+        let expected_notes = crate::native_layout::prepare(&mut expected, &base, &session.prefs, &cancel).unwrap();
+        assert!(expected_notes.iter().any(|note| note["kind"] == "nativeTextReflow"), "The fixture must exercise real measured recovery");
+        let key = "c".repeat(64);
+        crate::production_cache::store_plan(directory.path(), &key, &raw).unwrap();
+        let request = TaskRequest {
+            prompt: "Create one editable lesson".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let provider = Ai23SyntheticProvider::new(vec![]);
+        let mut ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let cached = Runner {
+            cache_root: Some(directory.path().to_path_buf()),
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .cached_plan(Some(&key), &request, &json!({}), &base, &session.prefs, None, &designcraft_engine::cmd::production::catalog())
+        .unwrap();
+        assert!(
+            cached.is_some(),
+            "Cached plan was ignored: {:?}",
+            receiver.try_iter().filter_map(|message| if let Message::Diagnostic(issue) = message { Some(issue) } else { None }).collect::<Vec<_>>()
+        );
+        let cached = cached.unwrap();
+        assert_eq!(cached.commands, expected.commands);
+        let emitted: Vec<_> =
+            receiver.try_iter().filter_map(|message| if let Message::Diagnostic(issue) = message { Some(issue) } else { None }).collect();
+        for note in expected_notes {
+            assert!(emitted.contains(&note), "Cached recovery must emit the same measured note: {note}");
+        }
+        assert_eq!(ledger.summary().requests, 0);
+        assert!(provider.image_sizes.borrow().is_empty());
+        assert!(Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn ai23_group_print_admission_checks_later_resolution_before_first_image() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let make_plan = |page, rect| -> ProductionPlan {
+            serde_json::from_value(json!({"title":format!("Lesson {page}"), "commands":[
+                {"command":"frame.create","params":{"spread":page,"content":"graphic","rect":rect}}
+            ], "images":[{"page":page,"rect":rect,"prompt":format!("Original lesson scene {page}"),"label":format!("Scene {page}")}]}))
+            .unwrap()
+        };
+        // At 800 PPI, the first 72-point square needs 800 pixels and is supported;
+        // the later 432-point square needs 4800 pixels, beyond the 4K square tier.
+        let provider = Ai23SyntheticProvider::new(vec![make_plan(1, [60, 60, 492, 492]), make_plan(0, [60, 60, 132, 132])]);
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":2,"facingPages":false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 500_000, max_requests: 8, ..Default::default() },
+            ..Default::default()
+        };
+        let request = TaskRequest {
+            prompt: "Image Resolution: 800 PPI\nCreate two different editable lessons.".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let result = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(request, json!({"batch_scope":{"start":0,"count":2}}), catalog(), vec![], base.clone(), session.prefs.clone());
+        let error = result.err().expect("An unsupported later image tier must reject the whole review");
+        assert!(error.contains("4K"), "{error}");
+        assert!(provider.plans.borrow().is_empty(), "Both native parts must be validated before image admission");
+        assert!(provider.image_sizes.borrow().is_empty(), "Predictably unsupported later artwork must not buy an earlier image");
+        assert_eq!(ledger.summary().requests, 2, "Projection does not charge the live ledger");
+        assert!(Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn ai23_fixed_profile_generic_group_keeps_shared_source_crops_and_views() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut profile = shared_source_profile_fixture();
+        for family in &mut profile.page_families {
+            family.text_slots.clear();
+        }
+        profile.validate().unwrap();
+        let skill = SkillSnapshot {
+            skill_id: "ai23-fixed-generic-style".into(),
+            revision: "ai23-fixed-profile-pin".into(),
+            instructions: "Preserve the pinned shared source and its native views.".into(),
+            references: BTreeMap::new(),
+            reference_hashes: BTreeMap::new(),
+            templates: BTreeMap::new(),
+            design_profile: Some(profile.clone()),
+        };
+        assert!(!crate::template_plan::eligible(&skill), "Exercise the fixed-profile generic path");
+        let part = |start: u32, count: u32| -> ProductionPlan {
+            let commands: Vec<_> = (start..start + count)
+                .map(|page| json!({"command":"frame.create","params":{"spread":page,"content":"graphic","rect":[60,180,160,280]}}))
+                .collect();
+            let images: Vec<_> = (start..start + count)
+                .map(|page| json!({"page":page,"rect":[60,180,160,280],"prompt":format!("Distinct original atlas scene {page}"),"label":"atlas art"}))
+                .collect();
+            serde_json::from_value(json!({"title":format!("Atlas part {start}"),"commands":commands,"images":images})).unwrap()
+        };
+        let provider = Ai23SyntheticProvider::new(vec![part(4, 1), part(0, 4)]);
+        let mut session = Session::new();
+        session.execute("file.new", &crate::design::document_params(Some(&profile), 5)).unwrap();
+        let base = session.doc().unwrap().clone();
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 1_000_000, max_requests: 16, ..Default::default() },
+            ..Default::default()
+        };
+        let request = TaskRequest {
+            prompt: "Create five distinct editable atlas lessons.".into(),
+            settings: settings.clone(),
+            skill_ids: vec![skill.skill_id.clone()],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 5 },
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let product = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(request, json!({"batch_scope":{"start":0,"count":5}}), catalog(), vec![skill], base.clone(), session.prefs.clone())
+        .unwrap();
+        let Product::BatchGroup { plans, .. } = product else { panic!("Expected a complete generic review group") };
+        assert_eq!(plans.len(), 2);
+        let sizes = provider.image_sizes.borrow();
+        assert_eq!(sizes.len(), 5, "Distinct page identities must remain distinct sources");
+        assert!(sizes.iter().all(|size| size.as_deref() == Some("4:1")), "Keep the pinned atlas ratio in every internal part: {sizes:?}");
+        assert_eq!(
+            plans.iter().flat_map(|plan| &plan.commands).filter(|action| action.command == "file.place").count(),
+            10,
+            "Each source has its authored frame and extra native view"
+        );
+        assert_eq!(
+            plans.iter().flat_map(|plan| &plan.commands).filter(|action| action.command == "object.fittingOptions").count(),
+            10,
+            "Every primary crop and extra view retains its fitting options"
+        );
+        assert_eq!(ledger.summary().requests, 7);
+        assert!(Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+    }
+
     #[test]
     fn long_bilingual_brief_reaches_model_without_truncation() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2090,14 +3550,17 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let result = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }.production(
-            request,
-            json!({}),
-            catalog(),
-            vec![],
-            session.doc().unwrap().clone(),
-            session.prefs.clone(),
-        );
+        let result = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(request, json!({}), catalog(), vec![], session.doc().unwrap().clone(), session.prefs.clone());
         assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
         assert_eq!(ledger.summary().requests, 1);
     }
@@ -2154,14 +3617,17 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let result = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }.production(
-            request,
-            json!({}),
-            catalog(),
-            vec![skill],
-            session.doc().unwrap().clone(),
-            session.prefs.clone(),
-        );
+        let result = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(request, json!({}), catalog(), vec![skill], session.doc().unwrap().clone(), session.prefs.clone());
         assert!(matches!(result, Ok(Product::Plan(_))), "{}", result.err().unwrap_or_default());
         assert_eq!(ledger.summary().requests, 1);
     }
@@ -2237,9 +3703,18 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let result = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &CurrentImageProvider }
-            .production(request, json!({}), catalog(), vec![skill], session.doc().unwrap().clone(), session.prefs.clone())
-            .unwrap();
+        let result = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &CurrentImageProvider,
+        }
+        .production(request, json!({}), catalog(), vec![skill], session.doc().unwrap().clone(), session.prefs.clone())
+        .unwrap();
         let Product::Plan(plan) = result else { panic!("Expected current-document plan") };
         assert_eq!(
             plan.commands.iter().filter(|action| action.command == "frame.create").count(),
@@ -2320,7 +3795,17 @@ mod tests {
                 let mut ledger = UsageLedger::new(settings.budget).unwrap();
                 let (sender, _receiver) = mpsc::channel();
                 let cancel = AtomicBool::new(false);
-                let result = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }.production(
+                let result = Runner {
+                    cache_root: None,
+                    print: None,
+                    planning_only: false,
+                    ledger: &mut ledger,
+                    keys: &[],
+                    cancel: &cancel,
+                    sender: &sender,
+                    provider: &provider,
+                }
+                .production(
                     request,
                     json!({}),
                     session.execute("production.catalog", &json!({})).unwrap(),
@@ -2416,9 +3901,18 @@ mod tests {
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let scope = BatchScope { start: 1, count: 513 };
-        let product = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }
-            .production(request, json!({"batch_scope":scope}), catalog(), vec![skill], base.clone(), session.prefs.clone())
-            .unwrap();
+        let product = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(request, json!({"batch_scope":scope}), catalog(), vec![skill], base.clone(), session.prefs.clone())
+        .unwrap();
         let Product::BatchGroup { plans, proofs } = product else { panic!("Expected one complete generic review group") };
         let scopes = provider.0.borrow();
         assert_eq!(scopes.len(), 513_u32.div_ceil(32) as usize);
@@ -2499,17 +3993,26 @@ mod tests {
             let (sender, _receiver) = mpsc::channel();
             let cancel = AtomicBool::new(false);
             let provider = AbortProvider { cancel_second, calls: std::cell::Cell::new(0) };
-            let error = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }
-                .production(
-                    request,
-                    json!({"batch_scope":{"start":1,"count":33}}),
-                    catalog(),
-                    vec![],
-                    session.doc().unwrap().clone(),
-                    session.prefs.clone(),
-                )
-                .err()
-                .unwrap();
+            let error = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .production(
+                request,
+                json!({"batch_scope":{"start":1,"count":33}}),
+                catalog(),
+                vec![],
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            )
+            .err()
+            .unwrap();
             assert!(error.contains(if cancel_second { "cancelled" } else { "synthetic second-part failure" }), "{error}");
             assert_eq!(provider.calls.get(), 2);
             assert_eq!(ledger.summary().requests, 2);
@@ -2601,7 +4104,17 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let result = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider }.production(
+        let result = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(
             request,
             json!({"batch_scope":{"start":0,"count":4}}),
             catalog(),
@@ -2755,7 +4268,16 @@ mod tests {
             let mut ledger = UsageLedger::new(settings.budget).unwrap();
             let (sender, _receiver) = mpsc::channel();
             let cancel = AtomicBool::new(false);
-            let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+            let mut runner = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            };
             let Product::Plan(plan) = runner
                 .production(
                     request,
@@ -2832,7 +4354,16 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let result = runner.production(
             request,
             json!({"batch_scope":{"start":0,"count":2}}),
@@ -2913,7 +4444,16 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let mut session = Session::new();
         session.execute("file.new", &json!({"preset":"A4"})).unwrap();
         let error = runner
@@ -2962,6 +4502,202 @@ mod tests {
     #[test]
     fn template_production_uses_one_short_content_request_and_native_commands_without_paid_repairs() {
         template_content_request(0);
+    }
+
+    fn text_fit_style() -> SkillSnapshot {
+        let mut profile = design_profile_fixture();
+        profile.page_families = serde_json::from_value(json!([{
+            "id":"practice", "purpose":"Short classroom rule", "template":"templates/practice.json",
+            "text_slots":[{"id":"grammar-rule-1","purpose":"Complete classroom rule","command":0,"max_chars":52}],
+            "image_slots":[{"id":"picture","purpose":"Independent scene","rect":[60,180,160,280]}]
+        }]))
+        .unwrap();
+        let mut actions: Vec<EngineAction> = serde_json::from_value(json!([
+            {"command":"frame.create","params":{"content":"text","text":"Rule","rect":[60,60,225,122],"caret":false}},
+            {"command":"type.char","params":{"attrs":{"size":12,"leading":{"kind":"points","value":17}}}},
+            {"command":"type.para","params":{"attrs":{"align":"left","direction":"leftToRight","hyphenate":false}}},
+            {"command":"frame.create","params":{"content":"graphic","rect":[60,180,160,280]}}
+        ]))
+        .unwrap();
+        while actions.len() < 260 {
+            actions.push(EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":"Rule"}) });
+        }
+        SkillSnapshot {
+            skill_id: "text-fit".into(),
+            revision: "pin".into(),
+            instructions: String::new(),
+            references: BTreeMap::new(),
+            reference_hashes: BTreeMap::new(),
+            templates: BTreeMap::from([("templates/practice.json".into(), actions)]),
+            design_profile: Some(profile),
+        }
+    }
+
+    #[test]
+    fn template_text_uses_actual_native_fit_without_cutting_copy_or_shrinking_type() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        for text in ["i".repeat(53), "W".repeat(400)] {
+            let skill = text_fit_style();
+            let provider = Mock {
+                responses: RefCell::new(vec![Ok(GenerationResponse {
+                    text: json!({"title":"Rule","pages":[{"page":0,"family":"practice","text":{"grammar-rule-1":text},"illustrations":[]}]})
+                        .to_string(),
+                    usage: Usage::default(),
+                    error: None,
+                })]),
+            };
+            let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+            let request = TaskRequest {
+                prompt: "Keep the exact supplied classroom wording".into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
+                export_directory: None,
+            };
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+            let original = session.doc().unwrap().doc.clone();
+            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let result = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .production(request, json!({}), catalog(), vec![skill], session.doc().unwrap().clone(), session.prefs.clone());
+            if text.starts_with('i') {
+                let Product::Plan(plan) = result.unwrap_or_else(|error| panic!("Fitting copy was rejected: {error}")) else {
+                    panic!("Expected native plan")
+                };
+                assert_eq!(plan.commands[0].params["text"], text);
+                assert_eq!(plan.commands[1].params["attrs"]["size"], 12);
+                assert_eq!(plan.commands[0].params["rect"], json!([60, 60, 225, 122]));
+            } else {
+                let error = result.err().unwrap();
+                assert!(error.contains("overset"), "Real native overset must remain blocked: {error}");
+            }
+            assert_eq!(ledger.summary().requests, 1, "Fitting is local and never buys a repair");
+            assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
+        }
+    }
+
+    #[test]
+    fn template_review_validates_all_text_before_buying_any_images() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct InvalidLaterContent {
+            later: String,
+            calls: std::cell::Cell<u32>,
+            images: std::cell::Cell<u32>,
+        }
+        impl Provider for InvalidLaterContent {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                self.calls.set(self.calls.get() + 1);
+                let value: Value = serde_json::from_str(&request.prompt).unwrap();
+                let page = value["scope"]["start"].as_u64().unwrap();
+                let text = if page == 0 { "Count." } else { self.later.as_str() };
+                Ok(GenerationResponse {
+                    text: json!({"title":"Review","pages":[{"page":page,"family":"practice","text":{"grammar-rule-1":text},
+                    "illustrations":[{"slot":"picture","prompt":"A red ball on white"}]}]})
+                    .to_string(),
+                    usage: Usage::default(),
+                    error: None,
+                })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                assert_eq!(self.calls.get(), 2, "Every part's copy must be validated before buying the first image");
+                self.images.set(self.images.get() + 1);
+                let pixels = image::RgbaImage::from_pixel(400, 400, image::Rgba([20, 80, 100, 255]));
+                let mut bytes = std::io::Cursor::new(vec![]);
+                pixels.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+                Ok(ImageResponse {
+                    images: vec![providers::GeneratedImage {
+                        bytes: bytes.into_inner(),
+                        mime_type: "image/png".into(),
+                        filename: "scene.png".into(),
+                    }],
+                    usage: Usage::default(),
+                    error: None,
+                })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        for (later, max_requests, expected_error) in
+            [(" ".to_owned(), 8, "empty"), ("W".repeat(400), 8, "overset"), ("Write.".to_owned(), 3, "request limit"), ("Write.".to_owned(), 8, "")]
+        {
+            let provider = InvalidLaterContent { later, calls: std::cell::Cell::new(0), images: std::cell::Cell::new(0) };
+            let settings = AiSettings {
+                output_mode: OutputMode::NativeWithImages,
+                image_model: ModelSelection { provider: ProviderKind::Gemini, model: "mock-image".into(), endpoint: None },
+                budget: BudgetSpec { token_limit: 500_000, max_requests, ..Default::default() },
+                ..Default::default()
+            };
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"preset":"A4","pages":2,"facingPages":false})).unwrap();
+            let original = session.doc().unwrap().doc.clone();
+            let request = TaskRequest {
+                prompt: "Make two illustrated pages".into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+                export_directory: None,
+            };
+            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let result = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .production(
+                request,
+                json!({"batch_scope":{"start":0,"count":2}}),
+                catalog(),
+                vec![text_fit_style()],
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            );
+            assert_eq!(provider.calls.get(), 2);
+            if expected_error.is_empty() {
+                let Product::BatchGroup { plans, proofs } = result.unwrap_or_else(|error| panic!("{error}")) else {
+                    panic!("Expected complete review")
+                };
+                assert_eq!(plans.len(), 2);
+                assert_eq!(proofs.iter().filter(|proof| proof.name.ends_with(".png")).count(), 2);
+                assert!(plans.iter().all(|plan| plan.images.is_empty() && plan.commands.iter().any(|action| action.command == "file.place")));
+                assert_eq!(provider.images.get(), 2);
+                assert_eq!(ledger.summary().requests, 4);
+            } else {
+                let error = result.err().unwrap();
+                assert!(error.contains(expected_error), "{error}");
+                assert_eq!(provider.images.get(), 0, "No artwork should be bought for a predictably invalid review group");
+                assert_eq!(ledger.summary().requests, 2, "Projection must not charge the live ledger");
+            }
+            assert!(Arc::ptr_eq(&original, &session.doc().unwrap().doc));
+        }
     }
 
     #[test]
@@ -3063,7 +4799,16 @@ mod tests {
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let result = runner
             .production(request, json!({"batch_scope":{"start":start_page,"count":2}}), catalog(), vec![skill], base, session.prefs.clone())
             .unwrap();
@@ -3176,7 +4921,7 @@ mod tests {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 assert!(!remaining.is_zero(), "Low-memory worker exceeded its deadline");
                 match worker.receiver.recv_timeout(remaining).unwrap() {
-                    Message::Progress { .. } => {}
+                    Message::Progress { .. } | Message::Usage(_) | Message::Diagnostic(_) => {}
                     Message::Finished(outcome) | Message::FinishedWithLedger(outcome, _) => break outcome,
                 }
             };
@@ -3263,7 +5008,7 @@ mod tests {
             designcraft_engine::file_access::confine(Some(&roots), || spawn(work, vec![], designcraft_engine::file_access::current())).unwrap();
         loop {
             match worker.receiver.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
-                Message::Progress { .. } => {}
+                Message::Progress { .. } | Message::Usage(_) | Message::Diagnostic(_) => {}
                 Message::Finished(outcome) | Message::FinishedWithLedger(outcome, _) => {
                     assert!(outcome.result.err().unwrap().contains("outside the read root"));
                     assert_eq!(outcome.usage.requests, 0);
@@ -3361,7 +5106,16 @@ mod tests {
         let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let plan = ProductionPlan {
             title: "Capacity test".into(),
             commands: vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,100,100]}) }; 510],
@@ -3385,7 +5139,16 @@ mod tests {
         let mut ledger = UsageLedger::new(budget).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let image =
             designcraft_ai_types::protocol::ImagePlacement { prompt: "Tree".into(), page: 0, rect: [60.0, 60.0, 160.0, 160.0], label: "tree".into() };
         let plan = ProductionPlan { title: "Whole set admission".into(), commands: vec![], images: vec![image.clone(), image] };
@@ -3399,6 +5162,7 @@ mod tests {
     fn failed_raw_plan_does_not_repeat_a_provider_call_without_explicit_opt_in() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let rejected_directory = tempfile::tempdir().unwrap();
         let mut invalid = plan();
         invalid["commands"][0]["params"]["rect"] = json!([100, 60, 40, 80]);
         let provider = Mock {
@@ -3421,11 +5185,40 @@ mod tests {
             export_directory: None,
         };
         let mut ledger = UsageLedger::new(settings.budget).unwrap();
-        let (sender, _receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
-        assert!(runner.production(request, json!({}), catalog(), vec![], base, session.prefs.clone()).is_err());
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        assert!(
+            runner
+                .production(request, json!({"_production_cache_root":rejected_directory.path()}), catalog(), vec![], base, session.prefs.clone())
+                .is_err()
+        );
         assert_eq!(ledger.summary().requests, 1);
+        let diagnostic = receiver
+            .try_iter()
+            .find_map(|message| match message {
+                Message::Diagnostic(value) if value["kind"] == "nativePlanningValidation" => Some(value),
+                _ => None,
+            })
+            .expect("Rejected plans must leave bounded local diagnostic evidence");
+        assert_eq!(diagnostic["attempt"], 1);
+        assert_eq!(diagnostic["rejected_plan_included"], true);
+        assert_eq!(serde_json::from_str::<Value>(diagnostic["rejected_plan"].as_str().unwrap()).unwrap(), invalid);
+        let evidence = diagnostic["rejected_response_path"]
+            .as_str()
+            .expect("Keep exact private failure evidence for offline repair, without paying to reproduce it");
+        assert_eq!(std::fs::read_to_string(evidence).unwrap(), invalid.to_string());
+        assert_eq!(std::fs::read_dir(rejected_directory.path()).unwrap().count(), 1, "Rejected responses must never be stored as validated plans");
+        assert!(evidence.ends_with("last-rejected-response.txt"));
     }
     impl Provider for Mock {
         fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
@@ -3451,7 +5244,16 @@ mod tests {
                 Err("synthetic failure".into()),
             ]),
         };
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let selection = AiSettings::default().text_model;
         let request = GenerationRequest {
             system: "native".into(),
@@ -3475,7 +5277,16 @@ mod tests {
         let (sender, _) = mpsc::channel();
         let cancel = AtomicBool::new(true);
         let provider = Mock { responses: RefCell::new(vec![]) };
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let request = GenerationRequest {
             system: String::new(),
             prompt: String::new(),
@@ -3495,6 +5306,166 @@ mod tests {
         assert!(repaired.contains("invalid parameter"));
         assert!(validate_skill_id("con").is_err());
         assert!(validate_skill_id("school-print").is_ok());
+    }
+
+    #[test]
+    fn continuation_context_exposes_resolved_safe_rect_and_page_side() {
+        let mut session = Session::new();
+        session
+            .execute(
+                "file.new",
+                &json!({"preset":"A4","pages":3,"facingPages":true,
+            "margins":{"top":42.52,"bottom":42.52,"inside":51.02,"outside":42.52}}),
+            )
+            .unwrap();
+        let state = session.doc().unwrap();
+        let mut context = json!({});
+        opened_document_geometry(&mut context, state).unwrap();
+        assert_eq!(context["rightToLeftBinding"], json!(state.doc.settings.right_to_left_binding));
+        for (record, (_, _, page)) in context["pageGeometry"].as_array().unwrap().iter().zip(state.doc.pages()) {
+            let safe = page.margin_rect();
+            assert_eq!(record["safeRect"], json!([safe.x0, safe.y0, safe.x1, safe.y1]));
+            assert_eq!(record["side"], serde_json::to_value(page.side).unwrap());
+        }
+    }
+
+    #[test]
+    fn production_reference_contracts_reject_null_and_non_story_sources() {
+        let native_catalog = designcraft_engine::cmd::production::catalog();
+        assert!(
+            native_catalog["commands"].as_array().unwrap().iter().all(|entry| native_result_contract(entry["command"].as_str().unwrap()).is_some())
+        );
+        let compact = compact_catalog(&native_catalog).unwrap();
+        let commands = compact["commands"].as_array().unwrap();
+        assert_eq!(commands.iter().find(|c| c["command"] == "type.char").unwrap()["result"], json!(null));
+        assert_eq!(commands.iter().find(|c| c["command"] == "frame.create").unwrap()["result"]["id"], json!("ItemId"));
+        let actions = vec![
+            EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,300,100],"content":"text","text":"Header"}) },
+            EngineAction { command: "type.char".into(), params: json!({"attrs":{"size":12}}) },
+            EngineAction { command: "object.label".into(), params: json!({"ids":["$1.id"],"label":"wrong"}) },
+        ];
+        let error = validate_actions(&actions, &native_catalog, OutputMode::NativeOnly).unwrap_err();
+        assert!(error.contains("type.char") && error.contains("id"), "{error}");
+        let mut valid = actions.clone();
+        valid[2].params["ids"] = json!(["$0.id"]);
+        assert!(validate_actions(&valid, &native_catalog, OutputMode::NativeOnly).is_ok());
+        let mut wrong_story =
+            vec![actions[0].clone(), EngineAction { command: "story.setText".into(), params: json!({"story":"$0.story","text":"Body"}) }];
+        wrong_story[0].params["content"] = json!("graphic");
+        assert!(validate_actions(&wrong_story, &native_catalog, OutputMode::NativeOnly).is_err());
+        wrong_story[0].params["content"] = json!("text");
+        wrong_story[1].params["story"] = json!("$0.id");
+        assert!(validate_actions(&wrong_story, &native_catalog, OutputMode::NativeOnly).is_err());
+    }
+
+    #[test]
+    fn production_creation_contracts_match_actual_native_results() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let commands: Vec<EngineAction> = serde_json::from_value(json!([
+            {"command":"frame.create","params":{"spread":0,"rect":[60,60,300,180],"content":"text","text":"","caret":false}},
+            {"command":"text.select","params":{"story":"$0.story","anchor":0,"focus":0}},
+            {"command":"table.insert","params":{"rows":1,"cols":1,"width":100}},
+            {"command":"frame.create","params":{"spread":0,"rect":[60,200,100,240],"content":"graphic"}},
+            {"command":"frame.create","params":{"spread":0,"rect":[120,200,160,240],"content":"graphic"}},
+            {"command":"object.group","params":{"ids":["$3.id","$4.id"]}},
+            {"command":"path.create","params":{"spread":0,"anchors":[{"p":[60,300]},{"p":[100,340]}]}},
+            {"command":"line.create","params":{"spread":0,"a":[60,400],"b":[100,400]}}
+        ]))
+        .unwrap();
+        validate_actions(&commands, &designcraft_engine::cmd::production::catalog(), OutputMode::NativeOnly).unwrap();
+        let outcome = session.execute("production.apply", &json!({"commands":commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+        for (command, result) in commands.iter().zip(outcome["results"].as_array().unwrap()) {
+            let contract = native_result_shape(command);
+            if let Some(fields) = contract.as_object() {
+                for field in fields.keys() {
+                    assert!(result.get(field).is_some(), "{} omitted promised result {field}: {result}", command.command);
+                }
+            } else {
+                assert!(result.is_null(), "{} must have a null result", command.command);
+            }
+        }
+    }
+
+    #[test]
+    fn late_validation_repairs_use_authored_response_without_host_font_actions() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct CaptureRepair {
+            authored: String,
+            requests: RefCell<Vec<String>>,
+        }
+        impl Provider for CaptureRepair {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                self.requests.borrow_mut().push(request.prompt.clone());
+                if self.requests.borrow().len() == 1 {
+                    Ok(GenerationResponse {
+                        text: self.authored.clone(),
+                        usage: Usage { input_tokens: Some(100), output_tokens: Some(100), ..Default::default() },
+                        error: None,
+                    })
+                } else {
+                    Err("Synthetic repair captured".into())
+                }
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No images authorized".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+        }
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let authored = json!({"title":"Preserve authored repair input","images":[],"commands":[
+            {"command":"layout.documentSetup","params":{"width":610}},
+            {"command":"frame.create","params":{"spread":0,"rect":[60,60,300,110],"content":"text","text":"Keep these original words","caret":false}}
+        ]})
+        .to_string();
+        let provider = CaptureRepair { authored: authored.clone(), requests: RefCell::new(vec![]) };
+        let settings = AiSettings {
+            allow_paid_repairs: true,
+            budget: BudgetSpec { token_limit: 500_000, max_requests: 2, repair_attempts: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let request = TaskRequest {
+            prompt: "**English Primary Font:** Source Sans 3\nKeep the actual opened document geometry.".into(),
+            settings,
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        assert!(
+            runner
+                .production(request, json!({}), designcraft_engine::cmd::production::catalog(), vec![], base.clone(), session.prefs.clone())
+                .is_err()
+        );
+        let requests = provider.requests.borrow();
+        assert_eq!(requests.len(), 2, "The synthetic geometry failure must reach its repair");
+        let repair: Value = serde_json::from_str(&requests[1]).unwrap();
+        assert_eq!(repair["rejected_plan"].as_str().unwrap(), authored, "Host-expanded actions must never be echoed as provider-authored source");
+        assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
     }
 
     #[test]
@@ -3519,7 +5490,16 @@ mod tests {
         let mut ledger = UsageLedger::new(BudgetSpec { token_limit: 500_000, ..Default::default() }).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let request = TaskRequest {
             prompt: "Create an editable blank rectangle".into(),
             settings: AiSettings {
@@ -3567,7 +5547,16 @@ mod tests {
         let mut ledger = UsageLedger::new(budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let request = TaskRequest {
             prompt: "Create an editable plant lesson".into(),
             settings: AiSettings {
@@ -3595,7 +5584,16 @@ mod tests {
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let provider = Mock { responses: RefCell::new(vec![]) };
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let mut value = plan();
         value["images"] = json!([{"prompt":"A tree illustration","page":0,"rect":[36,200,200,400],"label":"tree"}]);
         let plan = parse_plan(&value.to_string(), OutputMode::NativeWithImages, &catalog()).unwrap();
@@ -3665,7 +5663,16 @@ mod tests {
         let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let mut cache = BTreeMap::new();
         let mut bytes_used = 0;
         let profile = design_profile_fixture();
@@ -3762,7 +5769,16 @@ mod tests {
         let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let settings = AiSettings {
             output_mode: OutputMode::NativeWithImages,
             image_model: ModelSelection { provider: ProviderKind::Gemini, model: "test".into(), endpoint: None },
@@ -3798,9 +5814,11 @@ mod tests {
         // The fixture is a real VP8L image; replace only its 14-bit width/height header.
         assert_eq!(bomb.bytes.get(12..16).unwrap(), b"VP8L");
         bomb.bytes.get_mut(21..25).unwrap().copy_from_slice(&0x0fff_ffff_u32.to_le_bytes());
-        assert!(prepare_generated_image(bomb).err().unwrap().contains("16 million pixels"));
+        assert!(prepare_generated_image(bomb).err().unwrap().contains("20 million pixels"));
+        assert!(validate_image_dimensions(4096, 4096).is_ok());
+        assert!(validate_image_dimensions(5001, 4000).is_err());
         let (mut oversized, _) = webp_fixture(None);
-        oversized.bytes.resize(MAX_JSON + 1, 0);
+        oversized.bytes.resize(MAX_RASTER_BYTES + 1, 0);
         assert!(prepare_generated_image(oversized).is_err());
         let (mut animated, pixels) = webp_fixture(None);
         let frame_chunk = animated.bytes.get(12..).unwrap().to_vec();
@@ -3823,11 +5841,134 @@ mod tests {
     #[test]
     fn normalized_png_writer_refuses_to_allocate_beyond_task_image_limit() {
         use std::io::Write;
-        let mut output = BoundedImageBytes(vec![0; MAX_JSON - 1]);
+        let mut output = BoundedImageBytes(vec![0; MAX_RASTER_BYTES - 1]);
         assert!(output.write_all(&[1, 2]).is_err());
-        assert_eq!(output.0.len(), MAX_JSON - 1);
+        assert_eq!(output.0.len(), MAX_RASTER_BYTES - 1);
         output.write_all(&[1]).unwrap();
-        assert_eq!(output.0.len(), MAX_JSON);
+        assert_eq!(output.0.len(), MAX_RASTER_BYTES);
+    }
+
+    fn high_resolution_fixture() -> (providers::GeneratedImage, image::RgbImage) {
+        let mut state = 0x6d2b_79f5_u32;
+        let pixels = image::RgbImage::from_fn(1536, 1024, |_, _| {
+            let mut pixel = [0_u8; 3];
+            for channel in &mut pixel {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *channel = state as u8;
+            }
+            image::Rgb(pixel)
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let image = providers::GeneratedImage { bytes: bytes.into_inner(), filename: "high-resolution.png".into(), mime_type: "image/png".into() };
+        assert!(image.bytes.len() > 4 * 1024 * 1024 && image.bytes.len() <= 16 * 1024 * 1024);
+        (image, pixels)
+    }
+
+    #[test]
+    fn high_resolution_png_exceeding_model_json_limit_is_preserved_byte_for_byte() {
+        let (image, _) = high_resolution_fixture();
+        let original = image.bytes.clone();
+        let result = prepare_generated_image(image).unwrap();
+        assert_eq!(result.bytes, original);
+        assert_eq!(designcraft_images::pixel_size(&result.bytes), Some((1536, 1024)));
+        assert!(validate_image_dimensions(4096, 4096).is_ok());
+        assert!(validate_image_dimensions(5056, 3392).is_ok());
+        assert!(validate_image_dimensions(6336, 2688).is_ok());
+        assert!(validate_image_dimensions(5000, 4000).is_ok());
+        assert!(validate_image_dimensions(5001, 4000).is_err());
+        assert!(validate_image_dimensions(0, 4000).is_err());
+        let mut oversized = result;
+        oversized.bytes.resize(MAX_RASTER_BYTES + 1, 0);
+        assert!(prepare_generated_image(oversized).unwrap_err().contains("within 16 MiB"));
+    }
+
+    #[test]
+    fn high_resolution_lossless_webp_preserves_pixels_alpha_and_icc_when_normalized() {
+        use image::{ImageDecoder, ImageEncoder};
+        let (_, rgb) = high_resolution_fixture();
+        let rgba = image::RgbaImage::from_fn(rgb.width(), rgb.height(), |x, y| {
+            let [r, g, b] = rgb.get_pixel(x, y).0;
+            image::Rgba([r, g, b, if x % 2 == 0 { 128 } else { 255 }])
+        });
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+        encoder.set_icc_profile(TEST_SRGB_ICC.to_vec()).unwrap();
+        encoder.encode(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8).unwrap();
+        assert!(bytes.len() > 4 * 1024 * 1024 && bytes.len() <= 16 * 1024 * 1024);
+        let expected = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let normalized =
+            prepare_generated_image(providers::GeneratedImage { bytes, filename: "print.webp".into(), mime_type: "image/webp".into() }).unwrap();
+        assert_eq!(normalized.mime_type, "image/png");
+        assert_eq!(image::load_from_memory(&normalized.bytes).unwrap().to_rgba8(), expected);
+        assert_eq!(expected, rgba);
+        assert_eq!(
+            image::codecs::png::PngDecoder::new(std::io::Cursor::new(&normalized.bytes)).unwrap().icc_profile().unwrap().unwrap(),
+            TEST_SRGB_ICC
+        );
+    }
+
+    #[test]
+    fn high_resolution_shared_sources_have_separate_unique_and_inline_byte_budgets() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct LargeImage(providers::GeneratedImage, std::cell::Cell<u32>);
+        impl Provider for LargeImage {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                Err("No model text".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                self.1.set(self.1.get() + 1);
+                Ok(ImageResponse { images: vec![self.0.clone()], usage: Usage::default(), error: None })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let (source, _) = high_resolution_fixture();
+        let source_bytes = source.bytes.len();
+        let provider = LargeImage(source, std::cell::Cell::new(0));
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 500_000, max_requests: 8, ..Default::default() },
+            ..Default::default()
+        };
+        let placement = designcraft_ai_types::protocol::ImagePlacement {
+            prompt: "One original scene reused".into(),
+            page: 0,
+            rect: [60.0, 60.0, 160.0, 160.0],
+            label: "Scene".into(),
+        };
+        let plan = ProductionPlan { title: "Large shared source".into(), commands: vec![], images: vec![placement.clone(); 3] };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let mut cache = BTreeMap::new();
+        let mut unique_bytes = 0;
+        let expanded = runner.expand_images(plan, &settings, &mut cache, &mut unique_bytes, None).unwrap();
+        assert_eq!(provider.1.get(), 1, "Shared source should be generated once");
+        assert_eq!(unique_bytes, source_bytes, "Unique source bytes are counted once");
+        assert_eq!(expanded.commands.iter().filter(|action| action.command == "file.place").count(), 3);
+        assert!(serde_json::to_vec(&expanded).unwrap().len() > 16 * 1024 * 1024);
+        assert!(serde_json::to_vec(&expanded).unwrap().len() < 48 * 1024 * 1024);
+        let repeated = ProductionPlan { title: "Bound repeated inline bytes".into(), commands: vec![], images: vec![placement; 8] };
+        let error = runner.expand_images(repeated, &settings, &mut cache, &mut unique_bytes, None).unwrap_err();
+        assert!(error.contains("including repeated views"), "{error}");
+        assert_eq!(unique_bytes, source_bytes, "Repeated serialization must not recharge the unique source budget");
+        assert_eq!(provider.1.get(), 1, "Oversized repetitions must use the already cached source");
     }
 
     #[test]
@@ -3863,7 +6004,16 @@ mod tests {
         let mut ledger = UsageLedger::new(BudgetSpec { token_limit: 500_000, ..Default::default() }).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
-        let mut runner = Runner { ledger: &mut ledger, keys: &[], cancel: &cancel, sender: &sender, provider: &provider };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
         let request = TaskRequest {
             prompt: "Create a clean native rectangle".into(),
             settings: AiSettings {
@@ -3902,5 +6052,549 @@ mod tests {
         let mut substituted = draft();
         substituted.analyses.push(AnalysisDraft { reference_sha256: "c".repeat(64), text: "Unselected material".into() });
         assert!(package_draft(substituted, &catalog(), &references, vec![]).is_err());
+    }
+
+    struct ReviewMock {
+        verdict: &'static str,
+        images: std::cell::Cell<u32>,
+        reviews: std::cell::Cell<u32>,
+    }
+    impl Provider for ReviewMock {
+        fn generate(
+            &self,
+            selection: &ModelSelection,
+            _: Option<&str>,
+            request: &GenerationRequest,
+            _: &AtomicBool,
+        ) -> Result<GenerationResponse, String> {
+            self.reviews.set(self.reviews.get() + 1);
+            assert_eq!(selection.model, "gemini-3.8-flash");
+            assert_eq!(request.images.len(), 1);
+            assert!(image::load_from_memory(&request.images[0].bytes).is_ok());
+            Ok(GenerationResponse {
+                text: json!({"verdict":self.verdict,"reasons":["Synthetic visible-subject assessment"]}).to_string(),
+                usage: Usage::default(),
+                error: None,
+            })
+        }
+        fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+            self.images.set(self.images.get() + 1);
+            Ok(ImageResponse { images: vec![review_projection_image()?], usage: Usage::default(), error: None })
+        }
+        fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+            Err("No discovery".into())
+        }
+    }
+    fn review_settings(max_requests: u32) -> AiSettings {
+        AiSettings {
+            verify_generated_images: true,
+            output_mode: OutputMode::NativeWithImages,
+            text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 500_000, max_requests, ..Default::default() },
+            ..Default::default()
+        }
+    }
+    fn review_plan() -> ProductionPlan {
+        ProductionPlan {
+            title: "Review scene".into(),
+            commands: vec![],
+            images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                prompt: "Five monkeys sitting in a tree".into(),
+                page: 0,
+                rect: [60.0, 60.0, 160.0, 160.0],
+                label: "Monkeys".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn image_review_failure_blocks_cache_and_accepted_art_reuses_without_paid_reinspection() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        for verdict in ["fail", "uncertain", "pass"] {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = ReviewMock { verdict, images: std::cell::Cell::new(0), reviews: std::cell::Cell::new(0) };
+            let settings = review_settings(8);
+            let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let mut runner = Runner {
+                cache_root: Some(directory.path().to_path_buf()),
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            };
+            let mut cache = BTreeMap::new();
+            let mut bytes = 0;
+            let result = runner.expand_images(review_plan(), &settings, &mut cache, &mut bytes, None);
+            assert_eq!(provider.images.get(), 1);
+            assert_eq!(provider.reviews.get(), 1);
+            assert_eq!(runner.ledger.summary().requests, 2);
+            if verdict == "fail" {
+                assert!(result.unwrap_err().contains("failed advisory visual review"));
+                assert!(cache.is_empty());
+                assert_eq!(bytes, 0);
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0, "Rejected artwork must not enter the disk cache");
+            } else {
+                let first = result.unwrap();
+                assert_eq!(cache.len(), 1);
+                let reused = runner.expand_images(review_plan(), &settings, &mut cache, &mut bytes, None).unwrap();
+                assert_eq!(reused.commands, first.commands);
+                assert_eq!(provider.images.get(), 1);
+                assert_eq!(provider.reviews.get(), 1);
+                let diagnostics: Vec<_> =
+                    receiver.try_iter().filter_map(|message| if let Message::Diagnostic(issue) = message { Some(issue) } else { None }).collect();
+                assert!(diagnostics.iter().any(|issue| issue["kind"] == "illustrationSemanticReview" && issue["verdict"] == verdict));
+                if verdict == "uncertain" {
+                    assert!(diagnostics.iter().any(|issue| issue["severity"] == "warning"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_review_request_budget_is_admitted_before_buying_the_first_image() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let provider = ReviewMock { verdict: "pass", images: std::cell::Cell::new(0), reviews: std::cell::Cell::new(0) };
+        let settings = review_settings(1);
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let error = runner.expand_images(review_plan(), &settings, &mut BTreeMap::new(), &mut 0, None).unwrap_err();
+        assert!(error.contains("request limit"), "{error}");
+        assert_eq!(runner.ledger.summary().requests, 0);
+        assert_eq!(provider.images.get(), 0);
+        assert_eq!(provider.reviews.get(), 0);
+        let mut unsupported = settings.clone();
+        unsupported.text_model.model = "gemini-embedding-001".into();
+        assert!(
+            runner
+                .expand_images(review_plan(), &unsupported, &mut BTreeMap::new(), &mut 0, None)
+                .unwrap_err()
+                .contains("no provider or model fallback")
+        );
+    }
+
+    #[test]
+    fn image_review_cache_identity_changes_with_policy_model_and_comfy_workflow() {
+        let provider = ReviewMock { verdict: "pass", images: std::cell::Cell::new(0), reviews: std::cell::Cell::new(0) };
+        let mut settings = review_settings(8);
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let placement = review_plan().images.remove(0);
+        let original = image_memory_key(&placement, "style", &settings).unwrap();
+        let disk = runner.image_disk_key(&placement, "style", None, &settings).unwrap();
+        settings.verify_generated_images = false;
+        assert_ne!(original, image_memory_key(&placement, "style", &settings).unwrap());
+        assert_ne!(disk, runner.image_disk_key(&placement, "style", None, &settings).unwrap());
+        settings.verify_generated_images = true;
+        settings.text_model.model = "gemini-2.5-flash".into();
+        assert_ne!(original, image_memory_key(&placement, "style", &settings).unwrap());
+        assert_ne!(disk, runner.image_disk_key(&placement, "style", None, &settings).unwrap());
+        settings = review_settings(8);
+        settings.comfy_workflow = Some(json!({"seed":1}));
+        assert_ne!(original, image_memory_key(&placement, "style", &settings).unwrap());
+        assert_ne!(disk, runner.image_disk_key(&placement, "style", None, &settings).unwrap());
+        assert_eq!(image_review_identity(&settings)["policy"], crate::image_review::POLICY_VERSION);
+    }
+
+    #[test]
+    fn generic_facing_request_includes_future_companion_as_context_only() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct InspectFacing(std::cell::Cell<u32>);
+        impl Provider for InspectFacing {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                self.0.set(self.0.get() + 1);
+                let value: Value = serde_json::from_str(&request.prompt).unwrap();
+                let facing = &value["document"]["facing_page_context"];
+                assert_eq!(facing["produce_only_pages"], json!([11]));
+                assert_eq!(facing["pairs"][0]["human_pages"], json!([12, 13]));
+                assert_eq!(facing["pairs"][0]["members"][1]["role"], "context_only");
+                assert!(request.system.contains("Linking every facing pair is not required"));
+                assert!(request.system.contains("never widen the mandatory batch scope"));
+                Err("Facing context inspected before synthetic stop".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No artwork".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let provider = InspectFacing(std::cell::Cell::new(0));
+        let prompt:String=(1..=14).map(|page|format!("### PAGE {page:02} — Ocean lesson\n* **English Print Copy (LTR):**\n > Lesson {page}\n* **Visual & Illustration Prompt (Art Direction):** Ocean scene\n")).collect();
+        let settings = AiSettings { facing_pages: true, budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt,
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 14 },
+            export_directory: None,
+        };
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":14,"facingPages":false})).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let error = runner
+            .generic_production_plan(
+                &request,
+                &json!({}),
+                &catalog(),
+                &[],
+                session.doc().unwrap(),
+                &session.prefs,
+                Some(BatchScope { start: 11, count: 1 }),
+            )
+            .unwrap_err();
+        assert!(error.contains("Facing context inspected"), "{error}");
+        assert_eq!(provider.0.get(), 1);
+    }
+
+    #[test]
+    fn generic_cached_geometry_is_checked_before_artwork_and_raw_cache_writes() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let directory = tempfile::tempdir().unwrap();
+        let mut raw = review_plan();
+        raw.commands =
+            vec![EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[60,60,160,160],"content":"unassigned"}) }];
+        raw.images[0].rect = [200.0, 60.0, 300.0, 160.0];
+        let provider = Mock {
+            responses: RefCell::new(vec![Ok(GenerationResponse {
+                text: serde_json::to_string(&raw).unwrap(),
+                usage: Usage::default(),
+                error: None,
+            })]),
+        };
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            budget: BudgetSpec { token_limit: 500_000, ..Default::default() },
+            ..Default::default()
+        };
+        let request = TaskRequest {
+            prompt: "Draw one illustrated lesson".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
+            export_directory: None,
+        };
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let skills = vec![text_fit_style()];
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: Some(directory.path().to_path_buf()),
+            print: None,
+            planning_only: true,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        runner.generic_production_plan(&request, &json!({}), &catalog(), &skills, session.doc().unwrap(), &session.prefs, None).unwrap();
+        let entry = std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap().path();
+        let key = entry.file_name().unwrap().to_str().unwrap().strip_suffix(".plan.json").unwrap();
+        raw.commands[0].params["rect"] = json!([0, 0, 20, 20]);
+        crate::production_cache::store_plan(directory.path(), key, &raw).unwrap();
+        runner.planning_only = false;
+        let error =
+            runner.generic_production_plan(&request, &json!({}), &catalog(), &skills, session.doc().unwrap(), &session.prefs, None).unwrap_err();
+        assert!(error.contains("safe margin"), "{error}");
+        assert_eq!(runner.ledger.summary().requests, 1, "Cached geometry rejection must not buy artwork or another plan");
+        assert!(provider.responses.borrow().is_empty());
+        let fresh = tempfile::tempdir().unwrap();
+        runner.cache_root = Some(fresh.path().to_path_buf());
+        runner.planning_only = true;
+        provider.responses.borrow_mut().push(Ok(GenerationResponse {
+            text: serde_json::to_string(&raw).unwrap(),
+            usage: Usage::default(),
+            error: None,
+        }));
+        let error =
+            runner.generic_production_plan(&request, &json!({}), &catalog(), &skills, session.doc().unwrap(), &session.prefs, None).unwrap_err();
+        assert!(error.contains("safe margin"), "{error}");
+        let retained: Vec<_> = std::fs::read_dir(fresh.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(
+            retained,
+            [std::ffi::OsString::from("last-rejected-response.txt")],
+            "Invalid fresh geometry may retain private failure evidence but never a reusable plan or image"
+        );
+    }
+
+    #[test]
+    fn adaptive_explicit_script_omits_large_template_examples_but_keeps_exact_pinned_guidance() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let body = "AUTHORITATIVE_SHARED_REFERENCE ".repeat(900);
+        let mut style = text_fit_style();
+        style.instructions = "EXACT_ORIGINAL_STYLE_INSTRUCTION".into();
+        style.revision = "immutable-style-revision".into();
+        style.references.insert("references/style.md".into(), body.clone());
+        style.reference_hashes.insert("references/style.md".into(), "original-reference-digest".into());
+        style.design_profile.as_mut().unwrap().name = "ORIGINAL_PROFILE_IDENTITY".into();
+        for actions in style.templates.values_mut() {
+            for action in actions.iter_mut().filter(|action| action.command == "object.label") {
+                action.params["label"] = json!("UNUSED_NATIVE_TEMPLATE_EXAMPLE".repeat(8));
+            }
+        }
+        crate::template_plan::preflight(&style, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
+        let mut support = style.clone();
+        support.skill_id = "support-guidance".into();
+        support.revision = "immutable-support-revision".into();
+        support.instructions = "EXACT_SUPPORT_INSTRUCTION".into();
+        support.templates.clear();
+        support.design_profile = None;
+        let skills = vec![style, support];
+        let original = serde_json::to_value(&skills).unwrap();
+        assert!(serde_json::to_vec(&skills).unwrap().len() > 64 * 1024);
+        assert!(compact_skill_guidance(&skills).unwrap().len() < 32 * 1024);
+        struct InspectAdaptive(std::cell::Cell<u32>);
+        impl Provider for InspectAdaptive {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                self.0.set(self.0.get() + 1);
+                for preserved in [
+                    "EXACT_ORIGINAL_STYLE_INSTRUCTION",
+                    "EXACT_SUPPORT_INSTRUCTION",
+                    "ORIGINAL_PROFILE_IDENTITY",
+                    "immutable-style-revision",
+                    "immutable-support-revision",
+                    "original-reference-digest",
+                ] {
+                    assert!(request.system.contains(preserved), "Lost pinned guidance: {preserved}");
+                }
+                assert_eq!(request.system.matches("AUTHORITATIVE_SHARED_REFERENCE").count(), 900, "Shared reference bodies must not be duplicated");
+                assert!(!request.system.contains("UNUSED_NATIVE_TEMPLATE_EXAMPLE"));
+                assert!(request.system.contains("CURRENT DOCUMENT GEOMETRY"));
+                assert!(!request.system.contains("Preserve page_mm and margin_mm"));
+                let input: Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["document"]["pageWidth"].as_f64(), Some(720.0));
+                assert_eq!(input["document"]["pageGeometry"][0]["margins"]["inside"].as_f64(), Some(51.0));
+                assert_eq!(input["document"]["source_copy"]["segments"][0]["id"], "p1.en.1");
+                assert_eq!(input["document"]["source_copy"]["segments"][0]["text"], "My book");
+                assert!(request.json_schema["properties"]["copy_bindings"].is_object());
+                Err("Adaptive context reached the selected provider".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No image generation".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let provider = InspectAdaptive(std::cell::Cell::new(0));
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request=TaskRequest{prompt:"### PAGE 01 — Ownership\n* **English Print Copy (LTR):**\n > My book\n### PAGE 02 — Guide\n* **English Print Copy (LTR):**\n > Teacher guide\n".into(),settings:settings.clone(),skill_ids:vec![],auto_select_skills:false,target:designcraft_ai_types::protocol::TaskTarget::NewA4{pages:2},export_directory:None};
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":720,"height":960,"pages":2,"facingPages":false,"margins":51})).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let error = runner
+            .production(
+                request,
+                json!({"batch_scope":{"start":0,"count":2}}),
+                catalog(),
+                skills.clone(),
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("Adaptive context reached"), "{error}");
+        assert_eq!(provider.0.get(), 1);
+        assert_eq!(serde_json::to_value(&skills).unwrap(), original, "Host snapshots must remain immutable");
+    }
+
+    #[test]
+    fn ai21_resolved_print_fonts_reach_planner_before_geometry_is_authored() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4"})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let fonts = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+        let family = "Source Sans 3";
+        assert!(fonts.has_family(family), "Use the bundled document font, independent of system font discovery");
+        let prompt = format!("**English Primary Font:** {family}\nCreate one editable heading.");
+        let expected =
+            serde_json::to_value(crate::print_contract::PrintContract::from_prompt(&prompt).unwrap().unwrap().select_fonts(&base).unwrap()).unwrap();
+        struct InspectPrintFonts(Value);
+        impl Provider for InspectPrintFonts {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                let input: Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["document"]["resolved_print_fonts"], self.0, "host-bound font metrics must be known before drawing text frames");
+                Err("Resolved print fonts reached the planner".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                panic!("no images before a valid native plan")
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                panic!("no model discovery")
+            }
+        }
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt,
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let provider = InspectPrintFonts(expected);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let error = runner.production(request, json!({}), catalog(), vec![], base, session.prefs.clone()).err().unwrap();
+        assert!(error.contains("Resolved print fonts reached"), "{error}");
+        assert_eq!(ledger.summary().requests, 1);
+    }
+
+    #[test]
+    fn ai20_opened_custom_book_continuation_adapts_style_commands_to_actual_geometry() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        struct InspectOpened;
+        impl Provider for InspectOpened {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                assert!(request.system.contains("CURRENT DOCUMENT GEOMETRY"));
+                assert!(!request.system.contains("Preserve page_mm and margin_mm"));
+                let input: Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["document"]["pageWidth"].as_f64(), Some(720.0));
+                assert_eq!(input["document"]["pageGeometry"][1]["margins"]["inside"].as_f64(), Some(51.0));
+                Err("Opened continuation reached the selected provider".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No image generation".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt: "Continue the remaining editable pages of this book with a different activity.".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::ContinueBook,
+            export_directory: None,
+        };
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":720,"height":960,"pages":2,"facingPages":false,"margins":51})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[60,60,180,120]})).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &InspectOpened,
+        };
+        let error = runner
+            .production(
+                request,
+                json!({"batch_scope":{"start":1,"count":1}}),
+                catalog(),
+                vec![text_fit_style()],
+                session.doc().unwrap().clone(),
+                session.prefs.clone(),
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("Opened continuation reached"), "{error}");
     }
 }

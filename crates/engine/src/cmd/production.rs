@@ -2,13 +2,20 @@
 //! successful draft is published. Neither provider output nor a caller's allowlist grants IO.
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 use super::{CommandSpec, always, bad, cmd, has_doc};
 use crate::{HistoryEntry, Result, Session};
 
 const ID: &str = "production.apply";
 const MAX_ACTIONS: usize = 512;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BYTES: usize = 48 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENCODED_IMAGE_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+const MAX_IMAGE_PIXELS: u64 = 20_000_000;
+const MAX_UNIQUE_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_UNIQUE_IMAGE_PIXELS: u64 = 40_000_000;
 const GROUP_ID: &str = "production.applyGroup";
 const MAX_GROUPS: usize = 1000;
 const MAX_GROUP_BYTES: usize = 512 * 1024 * 1024;
@@ -495,7 +502,17 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
             return Err(bad(ID, format!("{key}: document changed while generation was pending")));
         }
     }
-    let vetted = schemas();
+    let mut vetted = schemas();
+    // Providers cannot author file.place. Keep their public catalog stable,
+    // while validated host-generated inline assets receive the print allowance.
+    let image_schema = vetted.iter_mut().find(|(id, _, _)| *id == "file.place").ok_or_else(|| bad(ID, "missing inline image schema"))?;
+    let encoded_limit = image_schema
+        .1
+        .get_mut("properties")
+        .and_then(|properties| properties.get_mut("base64"))
+        .and_then(|base64| base64.get_mut("maxLength"))
+        .ok_or_else(|| bad(ID, "missing inline image byte limit"))?;
+    *encoded_limit = json!(MAX_ENCODED_IMAGE_BYTES);
     // Reject every command and malformed envelope before executing the first draft action.
     for action in actions {
         let a = action.as_object().ok_or_else(|| bad(ID, "each action must be an object"))?;
@@ -521,6 +538,8 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
     // A draft needs no per-action history or journal retention.
     work.in_undo_step = true;
     let mut results = Vec::with_capacity(actions.len());
+    let mut image_sources = BTreeSet::new();
+    let mut image_bytes = 0usize;
     let mut image_pixels = 0u64;
     let mut table_cells = 0u64;
     for (i, action) in actions.iter().enumerate() {
@@ -542,9 +561,16 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
             }
         }
         if id == "file.place" {
-            image_pixels = image_pixels.saturating_add(check_image(&resolved)?);
-            if image_pixels > 32_000_000 {
-                return Err(bad(ID, "plan exceeds 32 million placed image pixels"));
+            let raster = check_image(&resolved)?;
+            if image_sources.insert(raster.sha256) {
+                image_bytes = image_bytes
+                    .checked_add(raster.bytes)
+                    .filter(|bytes| *bytes <= MAX_UNIQUE_IMAGE_BYTES)
+                    .ok_or_else(|| bad(ID, "plan exceeds 32 MiB of unique raster bytes"))?;
+                image_pixels = image_pixels
+                    .checked_add(raster.pixels)
+                    .filter(|pixels| *pixels <= MAX_UNIQUE_IMAGE_PIXELS)
+                    .ok_or_else(|| bad(ID, "plan exceeds 40 million unique image pixels"))?;
             }
         }
         if id == "table.insert" {
@@ -752,13 +778,25 @@ fn check_text_layout(original: &Session, draft: &Session) -> Result<()> {
     Ok(())
 }
 
-fn check_image(p: &Value) -> Result<u64> {
+struct CheckedRaster {
+    sha256: [u8; 32],
+    bytes: usize,
+    pixels: u64,
+}
+
+fn check_image(p: &Value) -> Result<CheckedRaster> {
     if p.get("frame").is_none() && !["x", "y", "width"].iter().all(|key| p.get(key).is_some()) {
         return Err(bad(ID, "image placement needs an explicit frame or x, y and width; loading the place cursor is not permitted"));
     }
     let encoded = p.get("base64").and_then(Value::as_str).ok_or_else(|| bad(ID, "inline image required"))?;
+    if encoded.len() > MAX_ENCODED_IMAGE_BYTES {
+        return Err(bad(ID, "inline image exceeds the 16 MiB encoded raster allowance"));
+    }
     let name = p.get("name").and_then(Value::as_str).ok_or_else(|| bad(ID, "image name required"))?.to_ascii_lowercase();
     let bytes = super::base64_decode(encoded);
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(bad(ID, "inline image exceeds 16 MiB of raster bytes"));
+    }
     let png = bytes.starts_with(b"\x89PNG\r\n\x1a\n") && name.ends_with(".png");
     let jpeg = bytes.starts_with(&[0xff, 0xd8, 0xff]) && (name.ends_with(".jpg") || name.ends_with(".jpeg"));
     if !png && !jpeg {
@@ -766,10 +804,11 @@ fn check_image(p: &Value) -> Result<u64> {
     }
     // Header inspection does not decode pixel data. Refuse PNG/JPEG decompression bombs first.
     let (w, h) = designcraft_images::pixel_size(&bytes).ok_or_else(|| bad(ID, "invalid raster image header"))?;
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > 16_000_000 {
-        return Err(bad(ID, "image dimensions exceed 16 million pixels"));
+    let pixels = u64::from(w) * u64::from(h);
+    if w == 0 || h == 0 || pixels > MAX_IMAGE_PIXELS {
+        return Err(bad(ID, "image dimensions exceed 20 million pixels"));
     }
-    Ok(u64::from(w) * u64::from(h))
+    Ok(CheckedRaster { sha256: Sha256::digest(&bytes).into(), bytes: bytes.len(), pixels })
 }
 
 /// Validate and simulate a complete production against the current document without editing it.
@@ -808,7 +847,9 @@ fn publish_draft(s: &mut Session, mut finished: crate::DocState, label: &str) ->
 pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<Value> {
     let params = p.as_object().ok_or_else(|| bad(GROUP_ID, "parameters must be an object"))?;
     for key in params.keys() {
-        if !["chunks", "outputMode", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi"].contains(&key.as_str()) {
+        if !["chunks", "outputMode", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi", "documentSetup"]
+            .contains(&key.as_str())
+        {
             return Err(bad(GROUP_ID, format!("unknown parameter `{key}`")));
         }
     }
@@ -824,6 +865,24 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
     {
         return Err(bad(GROUP_ID, "label must contain 1 to 256 bytes"));
     }
+    // This host envelope is deliberately absent from the provider command schemas. A review
+    // group may change pagination/binding atomically, but cannot smuggle size/page-count or
+    // unrelated Document Setup changes through the host.
+    let document_setup = if let Some(value) = p.get("documentSetup") {
+        let setup = value.as_object().ok_or_else(|| bad(GROUP_ID, "documentSetup must be an object"))?;
+        for (key, value) in setup {
+            match key.as_str() {
+                "facingPages" if value.as_bool().is_some() => {}
+                "binding" if matches!(value.as_str(), Some("leftToRight" | "rightToLeft")) => {}
+                "facingPages" => return Err(bad(GROUP_ID, "documentSetup.facingPages must be a boolean")),
+                "binding" => return Err(bad(GROUP_ID, "documentSetup.binding must be leftToRight or rightToLeft")),
+                _ => return Err(bad(GROUP_ID, format!("documentSetup: unknown parameter `{key}`"))),
+            }
+        }
+        Some(value)
+    } else {
+        None
+    };
     let original = s.doc()?;
     if original.interaction.is_some() || original.preview_stash.is_some() || s.tool.composing() {
         return Err(bad(GROUP_ID, "finish the current interaction or preview first"));
@@ -835,12 +894,22 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
             return Err(bad(GROUP_ID, format!("{key}: document changed while generation was pending")));
         }
     }
+    let original_page_count = original.doc.page_count();
     let mut work = Session::new();
     work.cache = s.cache.clone();
     work.prefs = s.prefs.clone();
     work.docs.push(original.clone());
     work.active = Some(0);
     work.in_undo_step = true;
+    if let Some(setup) = document_setup {
+        if cancelled() {
+            return Err(bad(GROUP_ID, "production cancelled"));
+        }
+        work.execute("layout.documentSetup", setup)?;
+        if work.doc()?.doc.page_count() != original_page_count {
+            return Err(bad(GROUP_ID, "documentSetup cannot add or remove existing document pages"));
+        }
+    }
     let mut results = Vec::with_capacity(chunks.len());
     let mut steps = 0usize;
     for (index, chunk) in chunks.iter().enumerate() {
@@ -879,7 +948,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "production.catalog","AI Production Commands",[],None,"{} → vetted commands with paramsSchema and examples",always,|_,_| Ok(catalog())),
         cmd!(query "production.validate","Validate AI Production",[],None,"{commands: [{command, params}], outputMode, allowedCommands?, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool (default false; refuse error-level issues before publication), minPpi?: 150 (1 to 2400)} → {valid, steps, results}",has_doc,|s,p| validate_actions(s,p)),
         cmd!(noundo "production.apply","Apply AI Production",[],None,"{commands: [{command, params}], outputMode, allowedCommands?, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool (default false; refuse error-level issues before publication), minPpi?: 150 (1 to 2400)} → {applied, steps, results}",has_doc,|s,p| apply_actions(s,p,|| false)),
-        cmd!(noundo "production.applyGroup","Apply AI Production Group",[],None,"{chunks: [{commands: [{command, params}], label?}] (1 to 1000 chunks, at most 512 commands each; references reset per chunk), outputMode, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool, minPpi?: 150 (1 to 2400)} → {applied, groups, steps, results: [chunk results], label, documentUid, revision}",has_doc,|s,p| apply_action_groups(s,p,|| false)),
+        cmd!(noundo "production.applyGroup","Apply AI Production Group",[],None,"{chunks: [{commands: [{command, params}], label?}] (1 to 1000 chunks, at most 512 commands each; references reset per chunk), outputMode, label?, expectedDocumentUid?, expectedRevision?, requirePreflight?: bool, minPpi?: 150 (1 to 2400), documentSetup?: {facingPages?: bool, binding?: leftToRight|rightToLeft} (host only; applied privately before chunks without changing page count)} → {applied, groups, steps, results: [chunk results], label, documentUid, revision}",has_doc,|s,p| apply_action_groups(s,p,|| false)),
     ]
 }
 
@@ -957,6 +1026,113 @@ mod tests {
         assert_eq!(after.history.undo.len(), before.history.undo.len());
         assert_eq!(after.history.redo.len(), before.history.redo.len());
         assert_eq!(format!("{:?}", after.selection), format!("{:?}", before.selection));
+        assert_eq!(s.journal.len(), journal);
+    }
+
+    fn grouped_facing_setup() -> Value {
+        json!({"outputMode":"native_only","documentSetup":{"facingPages":true,"binding":"rightToLeft"},"label":"Facing review group","chunks":[
+            {"commands":[
+                {"command":"frame.create","params":{"spread":1,"rect":[420,30,520,130]}},
+                {"command":"object.label","params":{"ids":["$0.id"],"label":"Absolute page two"}}
+            ]},
+            {"commands":[
+                {"command":"frame.create","params":{"spread":1,"rect":[20,30,120,130]}},
+                {"command":"object.label","params":{"ids":["$0.id"],"label":"Absolute page three"}}
+            ]}
+        ]})
+    }
+
+    #[test]
+    fn grouped_document_setup_and_mapped_chunks_publish_atomically_with_one_undo() {
+        let mut s = session();
+        s.execute("file.new", &json!({"width":400,"height":600,"pages":6,"facingPages":false})).unwrap();
+        let cover = s.execute("frame.create", &json!({"spread":0,"rect":[20,30,120,130]})).unwrap();
+        s.execute("object.label", &json!({"ids":[cover["id"]],"label":"Existing cover"})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let page_ids: Vec<_> = before.doc.pages().map(|(_, _, page)| page.id).collect();
+        let mut parameters = grouped_facing_setup();
+        // The host can validate identical mapped chunks against a private formatted state
+        // before any setup or new artwork reaches the live document.
+        let mut preview = Session::new();
+        preview.add_document(before.clone());
+        preview.execute("layout.documentSetup", &parameters["documentSetup"]).unwrap();
+        let mut preview_parameters = parameters.clone();
+        preview_parameters.as_object_mut().unwrap().remove("documentSetup");
+        preview.execute("production.applyGroup", &preview_parameters).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        parameters["expectedDocumentUid"] = json!(before.uid);
+        parameters["expectedRevision"] = json!(before.revision);
+        let result = s.execute("production.applyGroup", &parameters).unwrap();
+        assert_eq!((result["groups"].as_u64(), result["steps"].as_u64()), (Some(2), Some(4)));
+        let after = s.doc().unwrap();
+        assert!(after.doc.settings.facing_pages && after.doc.settings.right_to_left_binding);
+        assert_eq!((after.doc.page_count(), after.doc.spreads.len()), (6, 4));
+        assert_eq!(after.doc.pages().map(|(_, _, page)| page.id).collect::<Vec<_>>(), page_ids);
+        assert_eq!(
+            after.doc.item(crate::doc::ItemId(cover["id"].as_u64().unwrap())),
+            before.doc.item(crate::doc::ItemId(cover["id"].as_u64().unwrap()))
+        );
+        assert_eq!(after.doc.spreads, preview.doc().unwrap().doc.spreads);
+        assert_eq!(after.history.undo.len(), before.history.undo.len() + 1);
+        assert_eq!(after.history.undo.last().unwrap().label, "Facing review group");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        assert!(!s.doc().unwrap().doc.settings.facing_pages);
+        assert_eq!(s.doc().unwrap().doc.spreads.len(), 6);
+        assert_eq!(s.doc().unwrap().doc.spreads.iter().map(|spread| spread.items.len()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn grouped_document_setup_rejects_other_fields_or_types_without_live_changes() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        for setup in [
+            json!(null),
+            json!([]),
+            json!(true),
+            json!({"pages":2}),
+            json!({"width":400}),
+            json!({"facingPages":"true"}),
+            json!({"facingPages":null}),
+            json!({"binding":"vertical"}),
+            json!({"binding":true}),
+            json!({"binding":f64::NAN}),
+        ] {
+            let mut parameters = grouped_facing_setup();
+            parameters["documentSetup"] = setup;
+            let error = s.execute("production.applyGroup", &parameters).unwrap_err();
+            assert!(error.to_string().contains("documentSetup"), "{error}");
+            let after = s.doc().unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &after.doc));
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.history.undo.len(), after.history.undo.len());
+            assert_eq!(s.journal.len(), journal);
+        }
+    }
+
+    #[test]
+    fn grouped_document_setup_later_failure_and_stale_pins_leave_original_state_untouched() {
+        let mut s = session();
+        s.execute("file.new", &json!({"width":400,"height":600,"pages":6,"facingPages":false})).unwrap();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        let mut parameters = grouped_facing_setup();
+        parameters["chunks"][1]["commands"][1]["params"]["ids"] = json!(["$0.missing"]);
+        let error = s.execute("production.applyGroup", &parameters).unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+        for key in ["expectedDocumentUid", "expectedRevision"] {
+            let mut parameters = grouped_facing_setup();
+            parameters[key] = json!(if key == "expectedDocumentUid" { before.uid + 1 } else { before.revision + 1 });
+            assert!(s.execute("production.applyGroup", &parameters).unwrap_err().to_string().contains(key));
+            let after = s.doc().unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &after.doc));
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.history.undo.len(), after.history.undo.len());
+            assert_eq!(before.history.redo.len(), after.history.redo.len());
+            assert_eq!(before.selection, after.selection);
+        }
         assert_eq!(s.journal.len(), journal);
     }
 
@@ -1145,6 +1321,118 @@ mod tests {
         let p = json!({"outputMode":"native_with_images","commands":[{"command":"file.place","params":{"name":"illustration.png","base64":png,"x":36,"y":36,"width":100}}]});
         assert!(s.execute("production.apply", &p).is_ok());
         assert_eq!(s.doc().unwrap().history.undo.len(), 1);
+    }
+
+    // A complete grayscale PNG with stored DEFLATE blocks. The ancillary chunk
+    // models a large encoded provider asset without allocating a full RGBA raster.
+    fn inline_raster_png(width: u32, height: u32, padding: usize, marker: u8) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], bytes: &[u8]) {
+            let mut table = [0u32; 256];
+            for (index, entry) in table.iter_mut().enumerate() {
+                let mut crc = index as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 { crc >> 1 } else { (crc >> 1) ^ 0xedb8_8320 };
+                }
+                *entry = crc;
+            }
+            let mut crc = u32::MAX;
+            for &byte in kind.iter().chain(bytes) {
+                crc = (crc >> 8) ^ table[((crc ^ u32::from(byte)) & 255) as usize];
+            }
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(&(!crc).to_be_bytes());
+        }
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[1, 0, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &header);
+        let raw_bytes = (width as usize).div_ceil(8).checked_add(1).unwrap().checked_mul(height as usize).unwrap();
+        let mut remaining = raw_bytes;
+        let mut compressed = vec![0x78, 0x01];
+        while remaining > 0 {
+            let size = remaining.min(u16::MAX as usize) as u16;
+            remaining -= usize::from(size);
+            compressed.push(u8::from(remaining == 0));
+            compressed.extend_from_slice(&size.to_le_bytes());
+            compressed.extend_from_slice(&(!size).to_le_bytes());
+            compressed.resize(compressed.len() + usize::from(size), 0);
+        }
+        compressed.extend_from_slice(&((((raw_bytes % 65_521) as u32) << 16) | 1).to_be_bytes());
+        chunk(&mut png, b"IDAT", &compressed);
+        chunk(&mut png, b"raSt", &vec![marker; padding]);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    fn inline_raster_action(bytes: &[u8], x: u32) -> Value {
+        json!({"command":"file.place","params":{"name":"generated.png","base64":super::super::base64_encode(bytes),"x":x,"y":36,"width":100}})
+    }
+
+    #[test]
+    fn inline_raster_large_4k_shared_views_embed_exact_bytes_and_roundtrip_with_one_undo() {
+        let bytes = inline_raster_png(4096, 4096, 5 * 1024 * 1024, 7);
+        assert!(bytes.len() > 6 * 1024 * 1024 && bytes.len() < 16 * 1024 * 1024);
+        assert_eq!(designcraft_images::pixel_size(&bytes), Some((4096, 4096)));
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let commands: Vec<_> = [36, 150, 264].into_iter().map(|x| inline_raster_action(&bytes, x)).collect();
+        s.execute("production.apply", &json!({"outputMode":"native_with_images","commands":commands})).unwrap();
+        let state = s.doc().unwrap();
+        assert_eq!(state.history.undo.len(), before.history.undo.len() + 1);
+        assert_eq!(state.doc.assets.len(), 1, "Shared views must retain one source asset");
+        let asset = state.doc.assets.values().next().unwrap();
+        assert_eq!(asset.data.as_slice(), bytes);
+        assert_eq!(asset.pixels, Some((4096, 4096)));
+        assert!(asset.link.is_none(), "The generated image must remain embedded");
+        let saved = designcraft_format::save(&state.doc).unwrap();
+        let reopened = designcraft_format::load(&saved).unwrap();
+        assert_eq!(reopened.assets.len(), 1);
+        let asset = reopened.assets.values().next().unwrap();
+        assert_eq!(asset.data.as_slice(), bytes);
+        assert!(asset.link.is_none());
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn inline_raster_limits_and_unknown_paths_reject_atomically() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        let journal = s.journal.len();
+        let tiny = inline_raster_png(1, 1, 0, 0);
+        let mut path = inline_raster_action(&tiny, 36);
+        path["params"]["path"] = json!("private.png");
+        let oversized = inline_raster_png(1, 1, 16 * 1024 * 1024, 0);
+        let too_many_pixels = inline_raster_png(5000, 4001, 0, 0);
+        for rejected in [path, inline_raster_action(&oversized, 36), inline_raster_action(&too_many_pixels, 36)] {
+            let p = json!({"outputMode":"native_with_images","commands":[
+                {"command":"frame.create","params":{"rect":[36,36,72,72]}},rejected
+            ]});
+            assert!(s.execute("production.apply", &p).is_err());
+            let after = s.doc().unwrap();
+            assert!(Arc::ptr_eq(&before.doc, &after.doc));
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.history.undo.len(), before.history.undo.len());
+            assert_eq!(s.journal.len(), journal);
+        }
+    }
+
+    #[test]
+    fn inline_raster_unique_source_aggregate_limits_reject_atomically() {
+        let mut s = session();
+        let before = s.doc().unwrap().clone();
+        for (width, height, padding, expected) in [(4096, 4096, 1, "40 million"), (1, 1, 11 * 1024 * 1024, "32 MiB")] {
+            let commands: Vec<_> = (0..3).map(|marker| inline_raster_action(&inline_raster_png(width, height, padding, marker), 36)).collect();
+            let error = s.execute("production.apply", &json!({"outputMode":"native_with_images","commands":commands})).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(Arc::ptr_eq(&before.doc, &s.doc().unwrap().doc));
+            assert_eq!(s.doc().unwrap().revision, before.revision);
+            assert_eq!(s.doc().unwrap().history.undo.len(), before.history.undo.len());
+        }
     }
     #[test]
     fn restricted_graphic_fitting_preserves_frame_and_rejects_hostile_parameters() {

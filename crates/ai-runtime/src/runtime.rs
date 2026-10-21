@@ -4,9 +4,9 @@ use designcraft_ai_providers::{SecretString, validate_endpoint};
 use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry, SkillSnapshot};
 use designcraft_ai_types::protocol::*;
 use designcraft_ai_types::{EngineAction, ProviderKind};
-use designcraft_engine::{Session, file_access};
+use designcraft_engine::{DocState, Prefs, Session, file_access};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, mpsc::TryRecvError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +24,7 @@ struct Pending {
     started: Instant,
     task: Option<TaskRequest>,
     expected: Option<(u64, u64)>,
+    expected_prefs: Option<Prefs>,
     skills: Vec<(String, String)>,
     settings: AiSettings,
 }
@@ -47,6 +48,7 @@ pub struct ProductionRunner {
     sample: Option<SampleEvidence>,
     sequence: u64,
     print_attempts: BTreeSet<String>,
+    print_contracts: BTreeMap<u64, crate::print_contract::PrintContract>,
     local_server: crate::localserver::LocalOllama,
 }
 
@@ -85,11 +87,37 @@ impl ProductionRunner {
             .map_err(|e| format!("Print attempt history: {e}"))?
             .unwrap_or_default();
         let recovered_batch = batch::recover_snapshot(&profile_access, &root)?;
+        let (production_draft, draft_warning) = match read_json(&profile_access, &root.join("production-draft.json"), 2 * 1024 * 1024)
+            .and_then(|value| value.map(serde_json::from_value::<ProductionDraft>).transpose().map_err(|e| e.to_string()))
+            .and_then(|draft| {
+                if let Some(draft) = &draft {
+                    validate_production_draft(draft)?;
+                }
+                Ok(draft)
+            }) {
+            Ok(mut draft) => {
+                if let Some(draft) = &mut draft {
+                    // UIDs are process-local. A saved path helps the human choose a book;
+                    // neither it nor this draft authorizes publication or paid requests.
+                    draft.document_uid = None;
+                }
+                (draft, String::new())
+            }
+            Err(error) => (None, format!("Saved production instructions could not be restored: {error}")),
+        };
         let mut host = Self {
             root,
             profile_access,
             registry,
-            snapshot: AiSnapshot { available: true, settings, reports, batch: recovered_batch, ..Default::default() },
+            snapshot: AiSnapshot {
+                available: true,
+                settings,
+                reports,
+                production_draft,
+                message: draft_warning,
+                batch: recovered_batch,
+                ..Default::default()
+            },
             keys: Vec::new(),
             vault,
             pending: None,
@@ -97,6 +125,7 @@ impl ProductionRunner {
             sample: None,
             sequence: 0,
             print_attempts,
+            print_contracts: BTreeMap::new(),
             local_server: Default::default(),
         };
         host.refresh_catalog();
@@ -112,8 +141,13 @@ impl ProductionRunner {
             job.worker.cancel.store(true, Ordering::Relaxed);
         }
         self.poll(session);
+        if let Err(error) = self.refresh_unchanged_proof(session) {
+            self.snapshot.message = format!("Unchanged proof could not be refreshed: {error}");
+        }
         self.refresh_local_server();
+        let failed_job = self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed") && self.pending.is_none();
         if self.batch.is_some()
+            && !failed_job
             && !matches!(request, AiRequest::Poll | AiRequest::Cancel | AiRequest::ApproveBatch { .. } | AiRequest::InspectSkill { .. })
         {
             self.snapshot.message = "Finish reviewing or cancel the current production batch before another operation".into();
@@ -144,6 +178,7 @@ impl ProductionRunner {
                 self.snapshot.message = "Cancellation requested; a request already sent may still be billed".into();
             }
             AiRequest::ApproveBatch { job_id, checkpoint } => self.approve_batch(session, &job_id, checkpoint)?,
+            AiRequest::RetryBatch { job_id } => self.retry_batch(session, &job_id)?,
             AiRequest::UpdateSettings(settings) => {
                 validate_settings(&settings)?;
                 write_json(&self.profile_access, &self.root.join("settings.json"), &settings)?;
@@ -241,6 +276,7 @@ impl ProductionRunner {
                 let ids = self.prepare_automatic_skills(session, &prompt)?;
                 self.snapshot.message = format!("Automatically prepared {} compatible skills locally; no provider request", ids.len());
             }
+            AiRequest::PreviewProduction(task) => self.preview_production(session, task)?,
             AiRequest::SaveSkillDraft { id, skill_md, manifest_json } => {
                 let review = self.snapshot.review.as_ref().filter(|r| r.id == id).ok_or("Inspect the skill before editing")?;
                 let mut files = self.registry.review_files(&id, &review.revision).map_err(|e| e.to_string())?;
@@ -309,12 +345,26 @@ impl ProductionRunner {
             }
             AiRequest::ExportDocument { path, pdf } => {
                 file_access::check_write(&path)?;
+                let contract = self.print_contracts.get(&session.doc().map_err(|e| e.to_string())?.uid).cloned();
                 if pdf {
-                    ensure_preflight(session)?;
+                    ensure_preflight_at(session, contract.as_ref().and_then(|c| c.min_image_ppi()).unwrap_or(150.0))?;
                 }
-                let params = if pdf { json!({"path":path,"spreads":false,"bleed":false,"marks":false}) } else { json!({"path":path}) };
+                let params = if pdf {
+                    match &contract {
+                        Some(contract) => contract.pdf_export_params(Some(&path))?,
+                        None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
+                    }
+                } else {
+                    json!({"path":path})
+                };
                 session.execute(if pdf { "file.exportPdf" } else { "file.saveAs" }, &params).map_err(|e| e.to_string())?;
                 self.snapshot.message = format!("Exported {path}");
+                if pdf
+                    && let Some(contract) = contract
+                    && let Err(warning) = contract.validate_final_export()
+                {
+                    self.snapshot.message.push_str(&format!(". Review PDF saved; {warning}"));
+                }
             }
             AiRequest::ExportIdml { path } => {
                 file_access::check_write(&path)?;
@@ -342,15 +392,23 @@ impl ProductionRunner {
         Ok(())
     }
 
-    fn start(&mut self, session: &mut Session, task: TaskRequest) -> Result<(), String> {
+    fn start(&mut self, session: &mut Session, mut task: TaskRequest) -> Result<(), String> {
+        if matches!(task.target, TaskTarget::ContinueBook) {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            task.settings.facing_pages |= current.doc.settings.facing_pages;
+            if current.doc.settings.facing_pages {
+                task.settings.right_to_left_binding = Some(current.doc.settings.right_to_left_binding);
+            }
+        }
         if let Some(directory) = &task.export_directory {
             file_access::check_write(directory)?;
         }
         validate_settings(&task.settings)?;
-        require_text_model(&task.settings)?;
         if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
             return Err(format!("Enter a nonempty brief of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
         }
+        self.save_production_draft(session, &task)?;
+        require_text_model(&task.settings)?;
         let expected = match task.target {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
             TaskTarget::ContinueBook => {
@@ -404,16 +462,27 @@ impl ProductionRunner {
             return Err("Choose one design style per task to avoid conflicting identities".into());
         }
         let profile = snapshots.iter().find_map(|s| s.design_profile.as_ref());
-        let (base, context) = task_document_context(session, &task.target, profile)?;
-        if let TaskTarget::ContinueBook = task.target {
-            batch::continuation_progress(&base, profile)?;
+        let (base, mut context) = task_document_context(session, &task.target, profile, &task.prompt, &task.settings)?;
+        enrich_production_context(&mut context, &self.root, &base, &task)?;
+        let print_contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
+        if print_contract.is_some() && self.print_contracts.len() >= 1024 {
+            return Err("Too many document print contracts in this application session; save open work and restart before creating another".into());
         }
-        if !matches!(task.target, TaskTarget::CurrentDocument)
+        if let TaskTarget::ContinueBook = task.target {
+            batch::continuation_progress(&base, profile, &task.prompt)?;
+        }
+        if matches!(task.target, TaskTarget::NewA4 { .. })
+            && print_contract.is_none()
             && let Some(profile) = profile
         {
             crate::design::check_geometry(Some(&base), &base, profile)?;
         }
         let settings = task.settings.clone();
+        if self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed") {
+            // An explicit new Produce may replace a failed task; Retry instead keeps
+            // its original pinned skills and cumulative ledger.
+            self.cancel_batch();
+        }
         if matches!(task.target, TaskTarget::ContinueBook) || matches!(task.target, TaskTarget::NewA4 { .. } if settings.pages_per_batch > 0) {
             return self.start_batches(session, task, snapshots, base, context);
         }
@@ -426,6 +495,108 @@ impl ProductionRunner {
             prefs: session.prefs.clone(),
         };
         self.launch(work, Some(task), expected, pins, settings)
+    }
+
+    fn preview_production(&mut self, session: &Session, task: TaskRequest) -> Result<(), String> {
+        self.snapshot.production_preview = None;
+        if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
+            return Err("Enter valid production instructions before previewing the curriculum".into());
+        }
+        match task.target {
+            TaskTarget::NewA4 { pages } if (1..=1000).contains(&pages) => {}
+            TaskTarget::ContinueBook => {}
+            _ => return Err("Curriculum preview requires a new 1–1000-page book or an existing book to continue".into()),
+        }
+        let ids = if task.auto_select_skills {
+            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+        } else {
+            let mut ids = task.skill_ids.clone();
+            if let Some(style) = &task.settings.design_style
+                && !ids.contains(style)
+            {
+                ids.push(style.clone());
+            }
+            ids
+        };
+        if ids.len() > 8 {
+            return Err("Select at most eight skills per task".into());
+        }
+        let mut styles = Vec::new();
+        for id in ids {
+            let revision = self
+                .registry
+                .catalog("")
+                .into_iter()
+                .find(|entry| entry.skill_id == id)
+                .and_then(|entry| entry.active_revision)
+                .ok_or("Preview requires a compatible active skill revision")?;
+            let skill = self.registry.snapshot(&id, &[]).map_err(|error| error.to_string())?;
+            if skill.revision != revision {
+                return Err("Skill revision changed while preparing preview".into());
+            }
+            if skill.design_profile.is_some() {
+                styles.push(skill);
+            }
+        }
+        if styles.len() != 1 {
+            return Err("Choose one compatible design style to preview its curriculum".into());
+        }
+        let style = styles.first().ok_or("Missing preview style")?;
+        let profile = style.design_profile.as_ref().ok_or("Missing preview profile")?;
+        let (base, _) = task_document_context(session, &task.target, Some(profile), &task.prompt, &task.settings)?;
+        let total = u32::try_from(base.doc.page_count()).map_err(|_| "Preview page count exceeds its limit")?;
+        let start =
+            if matches!(task.target, TaskTarget::ContinueBook) { batch::continuation_progress(&base, Some(profile), &task.prompt)?.1 } else { 0 };
+        let remaining = total.checked_sub(start).ok_or("Invalid preview range")?;
+        let count = remaining.min(task.settings.pages_per_batch.max(1)).min(32);
+        let blueprint = crate::template_plan::curriculum_blueprint(&task.prompt, style, worker::BatchScope { start, count }, total)?;
+        let rtl = if matches!(task.target, TaskTarget::ContinueBook) {
+            session.doc().map_err(|error| error.to_string())?.doc.settings.right_to_left_binding
+        } else {
+            book_binding(&task.settings, &task.prompt)
+        };
+        self.snapshot.production_preview = Some(json!({"style":profile.name,"revision":style.revision,"total_pages":total,
+            "binding":if rtl {"RTL"} else {"LTR"},"preview_pages":count,"blueprint":blueprint}));
+        self.snapshot.message = "Local curriculum preview only; no provider request, document edit or production approval".into();
+        Ok(())
+    }
+
+    fn save_production_draft(&mut self, session: &Session, task: &TaskRequest) -> Result<(), String> {
+        let current = if matches!(task.target, TaskTarget::NewA4 { .. }) { None } else { Some(session.doc().map_err(|e| e.to_string())?) };
+        self.sequence = self.sequence.saturating_add(1);
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis();
+        let draft = ProductionDraft {
+            id: format!("draft-{stamp}-{}-{}", std::process::id(), self.sequence),
+            request: task.clone(),
+            document_uid: current.map(|doc| doc.uid),
+            document_path: current.and_then(|doc| doc.path.clone()),
+            document_title: current.map(|doc| doc.title()).unwrap_or_default(),
+        };
+        validate_production_draft(&draft)?;
+        self.persist_production_draft(&draft)?;
+        self.snapshot.production_draft = Some(draft);
+        Ok(())
+    }
+
+    fn persist_production_draft(&self, draft: &ProductionDraft) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(draft).map_err(|e| e.to_string())?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err("Saved production instructions exceed their 2 MiB storage limit".into());
+        }
+        write_profile(&self.profile_access, &self.root.join("production-draft.json"), &bytes)
+    }
+
+    fn bind_production_draft(&mut self, session: &Session, id: &str) -> Result<(), String> {
+        let Some(mut draft) = self.snapshot.production_draft.clone() else { return Ok(()) };
+        let current = session.doc().map_err(|e| e.to_string())?;
+        draft.id = id.into();
+        draft.document_uid = Some(current.uid);
+        draft.document_path = current.path.clone();
+        draft.document_title = current.title();
+        draft.request.target = TaskTarget::ContinueBook;
+        self.persist_production_draft(&draft)?;
+        self.snapshot.production_draft = Some(draft);
+        Ok(())
     }
 
     fn start_skill(
@@ -486,9 +657,15 @@ impl ProductionRunner {
         self.prepare_credentials(&selections)?;
         let keys = self.worker_keys();
         let roots = file_access::current();
+        let expected_prefs = match &work {
+            worker::Work::Production { prefs, .. } => Some(prefs.clone()),
+            _ => None,
+        };
         let worker = worker::spawn(work, keys, roots.clone())?;
-        self.pending = Some(Pending { roots, worker, id, started: Instant::now(), task, expected, skills, settings });
+        self.pending = Some(Pending { roots, worker, id, started: Instant::now(), task, expected, expected_prefs, skills, settings });
         self.snapshot.busy = true;
+        self.snapshot.current_usage = Default::default();
+        self.snapshot.current_issues.clear();
         self.snapshot.progress = 0.0;
         self.snapshot.stage = "generating".into();
         self.snapshot.message = "AI task started".into();
@@ -569,6 +746,27 @@ impl ProductionRunner {
                     self.snapshot.stage = stage;
                     self.snapshot.progress = fraction.clamp(0.0, 1.0);
                 }
+                Ok(worker::Message::Usage(usage)) => {
+                    self.snapshot.current_usage = usage.clone();
+                    if let Some(job) = self.batch.as_mut() {
+                        job.snapshot.cumulative_usage = usage.clone();
+                    }
+                    if let Some(batch) = self.snapshot.batch.as_mut() {
+                        batch.cumulative_usage = usage;
+                    }
+                }
+                Ok(worker::Message::Diagnostic(issue)) => {
+                    // A long review group may repair many pages. Retain the
+                    // latest bounded planning evidence without growing each
+                    // poll/history response by a plan for every attempt.
+                    if issue.get("kind").and_then(Value::as_str) == Some("nativePlanningValidation")
+                        && let Some(previous) = self.snapshot.current_issues.iter_mut().find(|old| old.get("kind") == issue.get("kind"))
+                    {
+                        *previous = issue;
+                    } else if self.snapshot.current_issues.len() < 1024 {
+                        self.snapshot.current_issues.push(issue);
+                    }
+                }
                 Ok(worker::Message::Finished(outcome)) => {
                     completed = Some(outcome);
                     break;
@@ -618,7 +816,7 @@ impl ProductionRunner {
             usage: outcome.usage,
             elapsed_ms: pending.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             actions: 0,
-            issues: Vec::new(),
+            issues: self.snapshot.current_issues.clone(),
             artifacts: Vec::new(),
             message: String::new(),
         };
@@ -626,7 +824,17 @@ impl ProductionRunner {
             Err("AI task cancelled; document changes were not published".into())
         } else {
             file_access::confine(pending.roots.as_ref(), || {
-                outcome.result.and_then(|product| self.publish(session, &pending.task, pending.expected, product, &mut report))
+                let product = outcome.result?;
+                if let Some(expected) = &pending.expected_prefs
+                    && serde_json::to_value(expected).map_err(|e| e.to_string())?
+                        != serde_json::to_value(&session.prefs).map_err(|e| e.to_string())?
+                {
+                    return Err(
+                        "Application preferences changed during generation; result was not published. Run the task again with current preferences"
+                            .into(),
+                    );
+                }
+                self.publish(session, &pending.task, pending.expected, product, &mut report)
             })
         };
         match result {
@@ -725,7 +933,7 @@ impl ProductionRunner {
                 std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
                 let trace = runs.join(format!("{}.json", report.id));
                 let page_params = match task.target {
-                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params(&report.skills, pages)?),
+                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params_for_brief(&report.skills, pages, &task.prompt)?),
                     _ => None,
                 };
                 let context = match task.target {
@@ -740,31 +948,62 @@ impl ProductionRunner {
                 report.artifacts.push(trace.to_string_lossy().into_owned());
                 let previous_active = session.active_index();
                 let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
-                if let Some(params) = page_params {
-                    session.execute("file.new", &params).map_err(|e| e.to_string())?;
-                }
-                let current = session.doc().map_err(|e| e.to_string())?;
-                let params = json!({"commands":plan.commands,"outputMode":task.settings.output_mode,"label":plan.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true});
-                if let Err(error) = session.execute("production.apply", &params) {
-                    if new_document {
-                        session.execute("file.close", &json!({})).map_err(|e| format!("{error}; could not close the failed new document: {e}"))?;
-                        if let Some(index) = previous_active {
-                            session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
-                        }
+                let min_ppi =
+                    crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+                let mut created = false;
+                let published = (|| {
+                    if let Some(params) = page_params {
+                        session.execute("file.new", &params).map_err(|e| e.to_string())?;
+                        created = true;
+                        initialize_print_document(session, &task.prompt)?;
+                        initialize_facing_document(session, &task.settings, &task.prompt)?;
+                        // Creation settings form the empty document's baseline.
+                        // Only the production edit belongs in the user's undo history.
+                        let baseline = session.doc_mut().map_err(|e| e.to_string())?;
+                        baseline.history.undo.clear();
+                        baseline.history.redo.clear();
                     }
-                    return Err(error.to_string());
+                    let current = session.doc().map_err(|e| e.to_string())?;
+                    let mapped = if new_document && task.settings.facing_pages { Some(crate::facing_pages::map_plan(&plan, current)?) } else { None };
+                    let applied = mapped.as_ref().unwrap_or(&plan);
+                    let params = json!({"commands":applied.commands,"outputMode":task.settings.output_mode,"label":applied.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true,"minPpi":min_ppi});
+                    session.execute("production.apply", &params).map_err(|e| e.to_string())?;
+                    Ok::<_, String>((applied.commands.len(), applied.title.clone()))
+                })();
+                let (actions, title) = match published {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if created {
+                            session
+                                .execute("file.close", &json!({}))
+                                .map_err(|e| format!("{error}; could not close the failed new document: {e}"))?;
+                            if let Some(index) = previous_active {
+                                session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
+                report.actions = actions;
+                report.title = title;
+                if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+                    self.print_contracts.insert(session.doc().map_err(|e| e.to_string())?.uid, contract);
                 }
-                report.actions = plan.commands.len();
-                report.title = plan.title;
-                let preflight = ensure_preflight(session)?;
-                report.issues = preflight.get("issues").and_then(Value::as_array).cloned().unwrap_or_default();
+                let preflight = ensure_preflight_at(session, min_ppi)?;
+                report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
                 if let Some(directory) = &task.export_directory {
                     file_access::check_write(directory)?;
                     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
                     for (extension, command) in [("designcraft", "file.saveAs"), ("pdf", "file.exportPdf")] {
                         let path = Path::new(directory).join(format!("production-{}.{}", report.id, extension));
-                        let args =
-                            if extension == "pdf" { json!({"path":path,"spreads":false,"bleed":false,"marks":false}) } else { json!({"path":path}) };
+                        let args = if extension == "pdf" {
+                            match crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+                                Some(contract) => contract.pdf_export_params(Some(path.to_str().ok_or("PDF export path is not valid Unicode")?))?,
+                                None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
+                            }
+                        } else {
+                            json!({"path":path})
+                        };
                         session.execute(command, &args).map_err(|e| e.to_string())?;
                         report.artifacts.push(path.to_string_lossy().into_owned());
                     }
@@ -779,7 +1018,11 @@ impl ProductionRunner {
         choose_compatible_skills(prompt, self.registry.catalog(""), &supported_commands())
     }
 
+    #[cfg(test)]
     fn pinned_document_params(&self, pins: &[(String, String)], pages: u32) -> Result<Value, String> {
+        self.pinned_document_params_for_brief(pins, pages, "")
+    }
+    fn pinned_document_params_for_brief(&self, pins: &[(String, String)], pages: u32, brief: &str) -> Result<Value, String> {
         let mut profile = None;
         for (id, revision) in pins {
             let record = self.registry.revision(id, revision).map_err(|e| e.to_string())?;
@@ -791,7 +1034,7 @@ impl ProductionRunner {
                 profile = Some(selected);
             }
         }
-        Ok(crate::design::document_params(profile, pages))
+        production_document_params(profile, pages, brief)
     }
 
     fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
@@ -1576,13 +1819,31 @@ fn validate_settings(settings: &AiSettings) -> Result<(), String> {
         return Err("Human review groups must contain 1–1000 pages, or zero for a short one-shot task".into());
     }
     validate_endpoint(&settings.text_model)?;
-    validate_endpoint(&settings.image_model)?;
+    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+        validate_endpoint(&settings.image_model)?;
+    }
     if settings.text_model.model.len() > 256 || settings.image_model.model.len() > 256 {
         return Err("Model name is too long".into());
     }
     UsageLedger::new(settings.budget.clone())?;
     if let Some(rates) = &settings.image_rates {
         crate::ledger::validate_rates(rates)?;
+    }
+    Ok(())
+}
+fn validate_production_draft(draft: &ProductionDraft) -> Result<(), String> {
+    validate_settings(&draft.request.settings)?;
+    if draft.id.len() > 256
+        || draft.request.prompt.trim().is_empty()
+        || draft.request.prompt.len() > MAX_BRIEF_BYTES
+        || draft.document_title.len() > 4096
+        || draft.document_path.as_ref().is_some_and(|path| path.len() > 32_768)
+        || draft.request.export_directory.as_ref().is_some_and(|path| path.len() > 32_768)
+        || draft.request.skill_ids.len() > 8
+        || draft.request.skill_ids.iter().any(|id| id.len() > 256)
+        || matches!(draft.request.target, TaskTarget::NewA4 { pages } if !(1..=1000).contains(&pages))
+    {
+        return Err("Saved production instructions contain invalid or oversized fields".into());
     }
     Ok(())
 }
@@ -1599,19 +1860,65 @@ fn task_document_context(
     session: &Session,
     target: &TaskTarget,
     profile: Option<&designcraft_ai_types::DesignProfile>,
+    brief: &str,
+    settings: &AiSettings,
 ) -> Result<(designcraft_engine::DocState, Value), String> {
     match target {
-        TaskTarget::CurrentDocument | TaskTarget::ContinueBook => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
+        TaskTarget::CurrentDocument => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
+        TaskTarget::ContinueBook => {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            let facing = if settings.facing_pages && !current.doc.settings.facing_pages {
+                Some(crate::facing_pages::formatted_proof_state(current, &session.prefs, book_binding(settings, brief))?)
+            } else {
+                None
+            };
+            let state = crate::facing_pages::canonicalize(facing.as_ref().unwrap_or(current), &session.prefs)?;
+            let mut scratch = Session::new();
+            scratch.prefs = session.prefs.clone();
+            scratch.add_document(state.clone());
+            Ok((state, compact_context(&scratch)?))
+        }
         TaskTarget::NewA4 { pages } => {
             if let Some(profile) = profile {
                 profile.validate()?;
             }
             let mut scratch = Session::new();
-            scratch.execute("file.new", &crate::design::document_params(profile, *pages)).map_err(|e| e.to_string())?;
+            scratch.execute("file.new", &production_document_params(profile, *pages, brief)?).map_err(|e| e.to_string())?;
+            initialize_print_document(&mut scratch, brief)?;
+            if settings.facing_pages {
+                initialize_facing_document(&mut scratch, settings, brief)?;
+                let state = crate::facing_pages::canonicalize(scratch.doc().map_err(|e| e.to_string())?, &scratch.prefs)?;
+                scratch.add_document(state);
+            }
             let context = compact_context(&scratch)?;
             Ok((scratch.doc().map_err(|e| e.to_string())?.clone(), context))
         }
     }
+}
+fn production_document_params(profile: Option<&designcraft_ai_types::DesignProfile>, pages: u32, brief: &str) -> Result<Value, String> {
+    match crate::print_contract::PrintContract::from_prompt(brief)? {
+        Some(contract) => contract.document_params(profile, pages),
+        None => Ok(crate::design::document_params(profile, pages)),
+    }
+}
+fn initialize_print_document(session: &mut Session, brief: &str) -> Result<(), String> {
+    if let Some(contract) = crate::print_contract::PrintContract::from_prompt(brief)? {
+        for action in contract.initial_actions() {
+            session.execute(&action.command, &action.params).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+pub(crate) fn book_binding(settings: &AiSettings, brief: &str) -> bool {
+    settings.right_to_left_binding.unwrap_or_else(|| crate::facing_pages::auto_direction(brief) == "rightToLeft")
+}
+fn initialize_facing_document(session: &mut Session, settings: &AiSettings, brief: &str) -> Result<(), String> {
+    if settings.facing_pages {
+        session
+            .execute("layout.documentSetup", &json!({"facingPages":true,"binding":if book_binding(settings,brief){"rightToLeft"}else{"leftToRight"}}))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 #[cfg(test)]
 fn new_a4(pages: u32) -> Value {
@@ -1625,7 +1932,10 @@ fn print_params(printer: Option<String>, grayscale: bool, duplex: String) -> Val
     params
 }
 fn ensure_preflight(session: &mut Session) -> Result<Value, String> {
-    let report = session.execute("preflight.run", &json!({"minPpi":150})).map_err(|e| e.to_string())?;
+    ensure_preflight_at(session, 150.0)
+}
+fn ensure_preflight_at(session: &mut Session, min_ppi: f64) -> Result<Value, String> {
+    let report = session.execute("preflight.run", &json!({"minPpi":min_ppi})).map_err(|e| e.to_string())?;
     if report.get("errors").and_then(Value::as_u64).is_none_or(|n| n > 0) {
         return Err(format!("Preflight errors require correction before output: {report}"));
     }
@@ -1639,6 +1949,31 @@ fn ensure_publication_idle(session: &Session) -> Result<(), String> {
     }
     Ok(())
 }
+/// Task environment is rebuilt for every explicit start, retry and approved
+/// group. It is host data, never authority recovered from a model response.
+fn enrich_production_context(context: &mut Value, root: &Path, base: &DocState, task: &TaskRequest) -> Result<(), String> {
+    let context = context.as_object_mut().ok_or("Invalid native production context")?;
+    context.insert("_production_cache_root".into(), json!(root.join("production-cache-v1")));
+    if task.settings.facing_pages {
+        context.insert("facing_editorial_direction".into(), json!({
+            "enabled":true,"rightToLeft":book_binding(&task.settings,&task.prompt),
+            "instruction":"Plan occasional visually connected facing pairs, like an educational magazine: shared thematic scene, aligned sections, related activities and a continuous restrained identity. Use chapter openers and selected learning sequences, not one repeated spread everywhere. Preserve each page's supplied lesson and printable copy. Keep critical text/answer areas clear of the binding gutter; headers/folios follow left/right positions. Coordinate with the adjacent supplied PAGE block; both pages retain independently editable native elements. Cover page 1 stands alone; reader pairs are pages 2–3, 4–5 and so on."
+        }));
+    }
+    if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+        context.insert("production_print_contract".into(), serde_json::to_value(&contract).map_err(|e| e.to_string())?);
+        if !matches!(task.target, TaskTarget::NewA4 { .. })
+            && let Err(message) = contract.validate_existing(base)
+        {
+            context.insert(
+                "existing_document_print_notice".into(),
+                json!(format!("Preserve the opened document's actual geometry; requested final print settings differ: {message}")),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn compact_context(session: &Session) -> Result<Value, String> {
     let state = session.doc().map_err(|e| e.to_string())?;
     let doc = &state.doc;
@@ -1733,6 +2068,85 @@ fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8
 mod tests {
     use super::*;
 
+    #[test]
+    fn ai23_native_only_ignores_unused_invalid_image_endpoint_in_settings_and_batch_admission() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let settings = AiSettings {
+            output_mode: designcraft_ai_types::OutputMode::NativeOnly,
+            text_model: designcraft_ai_types::ModelSelection {
+                provider: ProviderKind::Ollama,
+                model: "ai23-no-network".into(),
+                endpoint: Some("http://127.0.0.1:9/".into()),
+            },
+            image_model: designcraft_ai_types::ModelSelection {
+                provider: ProviderKind::OpenAi,
+                model: "unused-image".into(),
+                endpoint: Some("http://untrusted-image.invalid/v1/".into()),
+            },
+            // Every request reserves at least 1024 input tokens. Admission fails
+            // before provider traffic even if the worker starts immediately.
+            budget: BudgetSpec { token_limit: 256, max_output_tokens: 1, max_requests: 1, repair_attempts: 0, ..Default::default() },
+            pages_per_batch: 1,
+            ..Default::default()
+        };
+        assert!(validate_settings(&settings).is_ok(), "Native-only settings must not validate an unused image endpoint");
+        let mut illustrated = settings.clone();
+        illustrated.output_mode = designcraft_ai_types::OutputMode::NativeWithImages;
+        assert!(validate_settings(&illustrated).is_err(), "An image-capable task must still validate that endpoint");
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        // Match the synthetic text endpoint in memory, avoiding protected-store
+        // access during admission. It cannot authorize the unrelated image URL.
+        runner.keys.push(SessionKey::new(&settings.text_model, SecretString::new("synthetic-ai23-local-key".into())).unwrap());
+        let mut session = Session::new();
+        runner
+            .start(
+                &mut session,
+                TaskRequest {
+                    prompt: "Create one editable native page.".into(),
+                    settings,
+                    skill_ids: vec![],
+                    auto_select_skills: false,
+                    target: TaskTarget::NewA4 { pages: 1 },
+                    export_directory: None,
+                },
+            )
+            .unwrap();
+        assert!(runner.pending.is_some(), "The native batch must reach worker admission without touching image credentials");
+        assert!(runner.snapshot.busy);
+        assert_eq!(runner.snapshot.batch.as_ref().unwrap().completed_pages, 0);
+        assert!(session.documents().is_empty(), "Admission must not publish an unreviewed document");
+    }
+
+    #[test]
+    fn continuation_saved_draft_survives_model_validation_and_restart_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(4)).unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let request = TaskRequest {
+            prompt: "Keep the exact bilingual book instructions العربية without losing this draft".into(),
+            target: TaskTarget::ContinueBook,
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            export_directory: None,
+        };
+        let state = runner.handle(&mut session, AiRequest::Start(request.clone()));
+        assert!(!state.busy, "Missing model must not launch a provider");
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["production_draft"]["request"]["prompt"], request.prompt);
+        assert!(dir.path().join("production-draft.json").is_file());
+        drop(runner);
+        let mut reopened = ProductionRunner::open(dir.path()).unwrap();
+        let state = reopened.handle(&mut session, AiRequest::Poll);
+        let value = serde_json::to_value(state).unwrap();
+        assert_eq!(value["production_draft"]["request"]["prompt"], request.prompt);
+        assert!(value["production_draft"]["document_uid"].is_null(), "A process-local UID is never resumed from disk");
+        assert!(reopened.pending.is_none() && reopened.batch.is_none());
+    }
+
     // Context bounding is a pure transformation of a pinned snapshot. Load the
     // verified draft data without activating/rendering a bilingual sample: font
     // availability and system-font initialization order belong to sample tests.
@@ -1782,6 +2196,42 @@ mod tests {
             assert_eq!(crate::template_plan::capacity(&pinned, mode).unwrap(), 2);
         }
         (directory, runner)
+    }
+
+    #[test]
+    fn ai23_local_curriculum_preview_never_launches_generation_or_edits_documents() {
+        let (_directory, mut runner) = automatic_template_batch_fixture();
+        let mut session = Session::new();
+        let mut request = TaskRequest {
+            prompt: "Create a Science book".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec!["kg-oxford-cambridge-style".into()],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 48 },
+            export_directory: None,
+        };
+        runner.preview_production(&session, request.clone()).unwrap();
+        let preview = runner.snapshot.production_preview.as_ref().unwrap();
+        assert_eq!(preview["total_pages"], 48);
+        assert!(preview["blueprint"]["subject_domain"].as_str().unwrap().contains("Science"));
+        assert!(runner.pending.is_none() && runner.batch.is_none());
+        assert!(session.documents().is_empty());
+        assert_eq!(runner.snapshot.current_usage.requests, 0);
+        session.execute("file.new", &json!({"pages":6,"facingPages":false})).unwrap();
+        for page in 0..2 {
+            session.execute("frame.create", &json!({"spread":page,"rect":[60,60,100,100]})).unwrap();
+        }
+        let before = session.doc().unwrap().doc.clone();
+        request.target = TaskTarget::ContinueBook;
+        request.settings.right_to_left_binding = Some(true);
+        runner.preview_production(&session, request.clone()).unwrap();
+        let preview = runner.snapshot.production_preview.as_ref().unwrap();
+        assert_eq!(preview["binding"], "LTR");
+        assert_eq!(preview["blueprint"]["scoped_page_plan"][0]["page"], 2);
+        assert!(std::sync::Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+        request.target = TaskTarget::NewA4 { pages: 1001 };
+        assert!(runner.preview_production(&session, request).is_err());
+        assert!(runner.snapshot.production_preview.is_none(), "Failed previews must not display stale plans");
     }
 
     fn no_provider_template_settings(requested: u32) -> AiSettings {
@@ -1962,7 +2412,7 @@ mod tests {
         session.execute("file.new", &new_a4(1)).unwrap();
         let original = session.doc().unwrap().clone();
         let target = TaskTarget::NewA4 { pages: 2 };
-        let (base, context) = task_document_context(&session, &target, Some(&profile)).unwrap();
+        let (base, context) = task_document_context(&session, &target, Some(&profile), "", &AiSettings::default()).unwrap();
         assert!(!context.is_null());
         let page = &base.doc.spreads[0].pages[0];
         assert!((page.width - 240.0 * 72.0 / 25.4).abs() < 0.001);
@@ -3143,6 +3593,112 @@ mod tests {
         assert!(session.documents().is_empty(), "review samples must not alter open documents");
     }
     #[test]
+    fn running_usage_and_full_diagnostics_are_visible_before_worker_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            id: "live-progress".into(),
+            started: Instant::now(),
+            expected: None,
+            expected_prefs: None,
+            task: None,
+            skills: vec![],
+            settings: Default::default(),
+        });
+        runner.snapshot.busy = true;
+        sender
+            .send(worker::Message::Usage(UsageSummary {
+                requests: 2,
+                input_tokens: 123,
+                output_tokens: 45,
+                estimated_cost_usd: Some(0.01),
+                ..Default::default()
+            }))
+            .unwrap();
+        sender.send(worker::Message::Diagnostic(json!({"kind":"printRequirement","message":"full detailed cause\npossible remedy"}))).unwrap();
+        for attempt in 1..=3 {
+            sender
+                .send(worker::Message::Diagnostic(json!({"kind":"nativePlanningValidation","attempt":attempt,"message":"bounded evidence"})))
+                .unwrap();
+        }
+        let snapshot = runner.handle(&mut session, AiRequest::Poll);
+        assert!(snapshot.busy);
+        assert_eq!(snapshot.current_usage.requests, 2);
+        assert_eq!(snapshot.current_usage.input_tokens, 123);
+        assert_eq!(snapshot.current_issues[0]["message"], "full detailed cause\npossible remedy");
+        assert_eq!(snapshot.current_issues.len(), 2, "Repeated planning attempts must not multiply large history/poll payloads");
+        assert_eq!(snapshot.current_issues[1]["attempt"], 3);
+        assert!(snapshot.reports.is_empty());
+        assert!(session.documents().is_empty());
+        assert!(runner.pending.is_some());
+    }
+
+    #[test]
+    fn facing_nonbatch_mapping_failure_restores_original_active_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        session.execute("frame.create", &json!({"rect":[40,40,100,100]})).unwrap();
+        let original = session.doc().unwrap().clone();
+        let task = TaskRequest {
+            prompt: "Create a facing-page booklet".into(),
+            settings: AiSettings { facing_pages: true, pages_per_batch: 0, ..Default::default() },
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 2 },
+            export_directory: None,
+        };
+        // A missing absolute spread is valid in ordinary nonbatch engine actions,
+        // but cannot be mapped safely into a facing-page book.
+        let plan = ProductionPlan {
+            title: "Invalid mapping".into(),
+            commands: vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[50,50,100,100]}) }],
+            images: vec![],
+        };
+        let mut report = TaskReport {
+            id: "facing-rollback".into(),
+            status: String::new(),
+            title: String::new(),
+            provider: ProviderKind::Ollama,
+            model: String::new(),
+            settings: None,
+            skills: vec![],
+            usage: Default::default(),
+            elapsed_ms: 0,
+            actions: 0,
+            issues: vec![],
+            artifacts: vec![],
+            message: String::new(),
+            design_style: None,
+        };
+        let error = runner.publish(&mut session, &Some(task.clone()), None, worker::Product::Plan(plan), &mut report).unwrap_err();
+        assert!(error.contains("spread"), "{error}");
+        assert_eq!(session.documents().len(), 1);
+        assert_eq!(session.active_index(), Some(0));
+        assert_eq!(session.doc().unwrap().uid, original.uid);
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.doc().unwrap().doc));
+        assert_eq!(session.doc().unwrap().history.undo.len(), original.history.undo.len());
+        let valid = ProductionPlan {
+            title: "Valid facing publication".into(),
+            commands: vec![EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[50,50,100,100]}) }],
+            images: vec![],
+        };
+        runner.publish(&mut session, &Some(task), None, worker::Product::Plan(valid), &mut report).unwrap();
+        assert_eq!(session.documents().len(), 2);
+        assert!(session.doc().unwrap().doc.settings.facing_pages);
+        assert_eq!(session.doc().unwrap().history.undo.len(), 1);
+        session.execute("edit.undo", &json!({})).unwrap();
+        assert!(session.doc().unwrap().doc.spreads.iter().all(|spread| spread.items.is_empty()));
+        assert!(session.doc().unwrap().doc.settings.facing_pages);
+        assert!(std::sync::Arc::ptr_eq(&original.doc, &session.documents()[0].doc));
+    }
+
+    #[test]
     fn stale_result_cannot_touch_another_document() {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -3184,6 +3740,65 @@ mod tests {
         assert_eq!(session.doc().unwrap().doc.spreads[0].items.len(), 1);
     }
     #[test]
+    fn nonbatch_production_rejects_changed_preferences_before_any_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.prefs.typographers_quotes = false;
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let before = session.doc().unwrap().clone();
+        let original_prefs = session.prefs.clone();
+        let supplied = "\"Preserve this exact copy\"";
+        let plan = ProductionPlan {
+            title: "Pinned nonbatch preferences".into(),
+            commands: vec![
+                EngineAction { command: "frame.create".into(), params: json!({"rect":[50,50,300,180],"content":"text"}) },
+                EngineAction { command: "text.insert".into(), params: json!({"text":supplied}) },
+            ],
+            images: vec![],
+        };
+        let mut private = Session::new();
+        private.prefs = original_prefs.clone();
+        private.add_document(before.clone());
+        private.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        assert!(private.doc().unwrap().doc.stories.values().any(|story| story.text == supplied));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let settings = AiSettings { pages_per_batch: 0, ..Default::default() };
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            id: "nonbatch-prefs".into(),
+            started: Instant::now(),
+            task: Some(TaskRequest {
+                prompt: supplied.into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: TaskTarget::CurrentDocument,
+                export_directory: None,
+            }),
+            expected: Some((before.uid, before.revision)),
+            expected_prefs: Some(original_prefs),
+            skills: vec![],
+            settings,
+        });
+        runner.snapshot.busy = true;
+        session.prefs.typographers_quotes = true;
+        assert_eq!(session.doc().unwrap().revision, before.revision, "Preference changes do not invalidate the document revision pin");
+        sender.send(worker::Message::Finished(worker::Outcome { result: Ok(worker::Product::Plan(plan)), usage: Default::default() })).unwrap();
+        let rejected = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(rejected.stage, "failed");
+        assert!(rejected.message.contains("preferences changed"), "{}", rejected.message);
+        assert!(runner.pending.is_none());
+        assert!(std::sync::Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        assert_eq!(before.history.undo.len(), session.doc().unwrap().history.undo.len());
+        assert_eq!(before.is_dirty(), session.doc().unwrap().is_dirty());
+        assert_eq!(before.revision, session.doc().unwrap().revision);
+        assert!(rejected.reports.last().unwrap().artifacts.is_empty());
+        assert!(!runner.root.join("runs").exists(), "Preference drift must be refused before any trace or live publication");
+    }
+
+    #[test]
     fn cancel_wins_over_already_queued_completion() {
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -3210,6 +3825,7 @@ mod tests {
             id: "cancel-test".into(),
             started: Instant::now(),
             expected: Some((session.doc().unwrap().uid, session.doc().unwrap().revision)),
+            expected_prefs: Some(session.prefs.clone()),
             task: Some(task),
             skills: Vec::new(),
             settings: Default::default(),

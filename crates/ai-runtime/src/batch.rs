@@ -9,13 +9,14 @@ const MAX_PROOF_FILE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PAGE_PROOF_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROOF_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 
+#[derive(Clone)]
 pub(super) struct BatchJob {
     task: TaskRequest,
     skills: Vec<SkillSnapshot>,
     roots: Option<Arc<file_access::AutomationRoots>>,
     ledger: Option<UsageLedger>,
     before: UsageSummary,
-    snapshot: BatchSnapshot,
+    pub(super) snapshot: BatchSnapshot,
     prefs: Prefs,
     // Font reload replaces the composition cache without changing the document
     // allocation. Proof authority therefore pins it independently of doc edits.
@@ -23,6 +24,7 @@ pub(super) struct BatchJob {
     // Keeps the original allocation alive: selection/view revisions alone are
     // not document edits, and an address cannot be recycled while pinned here.
     publication_base: Option<DocState>,
+    retry_sequence: u32,
 }
 impl BatchJob {
     pub(super) fn snapshot_elapsed(&self) -> u64 {
@@ -33,6 +35,7 @@ impl BatchJob {
 pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRoots>, root: &Path) -> Result<Option<BatchSnapshot>, String> {
     let Some(value) = read_json(access, &root.join("batch-checkpoint.json"), 8 * 1024 * 1024)? else { return Ok(None) };
     let mut snapshot: BatchSnapshot = serde_json::from_value(value).map_err(|e| format!("Batch checkpoint: {e}"))?;
+    snapshot.retryable = false;
     if snapshot.batches.len() > 1000 {
         return Err("Batch checkpoint exceeds its batch limit".into());
     }
@@ -59,11 +62,17 @@ pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRo
 
 /// A continuation starts only from a deliberately selected current book. Never
 /// infer permission or a page offset from stale, editable checkpoint metadata.
-pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraft_ai_types::DesignProfile>) -> Result<(u32, u32), String> {
+pub(super) fn continuation_progress(
+    base: &DocState,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    brief: &str,
+) -> Result<(u32, u32), String> {
     if let Some(profile) = profile {
         profile.validate()?;
     }
-    let page_mm = profile.map_or([210.0, 297.0], |p| p.page_mm);
+    // A style supplies an identity, not permission to resize the opened book.
+    // Only an explicit trim in the user's brief can require another size.
+    let requested_trim = crate::print_contract::PrintContract::from_prompt(brief)?.and_then(|contract| contract.page_mm);
     let pages = u32::try_from(base.doc.spreads.len()).map_err(|_| "Invalid existing book page count")?;
     if !(1..=1000).contains(&pages)
         || base.doc.spreads.iter().any(|spread| {
@@ -71,12 +80,19 @@ pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraf
                 || spread.pages.iter().any(|page| {
                     !page.width.is_finite()
                         || !page.height.is_finite()
-                        || (page.width - page_mm[0] * 72.0 / 25.4).abs() > 0.1
-                        || (page.height - page_mm[1] * 72.0 / 25.4).abs() > 0.1
+                        || page.width <= 0.0
+                        || page.height <= 0.0
+                        || page.width > 15552.0
+                        || page.height > 15552.0
+                        || requested_trim
+                            .is_some_and(|[w, h]| (page.width - w * 72.0 / 25.4).abs() > 0.1 || (page.height - h * 72.0 / 25.4).abs() > 0.1)
                 })
         })
     {
-        return Err("Continue book requires 1–1000 single pages matching the selected profile (A4 by default)".into());
+        return Err(
+            "Continue book requires 1–1000 valid pages matching any explicit Trim Size in your brief; select another book or correct that size"
+                .into(),
+        );
     }
     let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
     if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
@@ -86,18 +102,47 @@ pub(super) fn continuation_progress(base: &DocState, profile: Option<&designcraf
 }
 
 impl ProductionRunner {
+    pub(super) fn refresh_unchanged_proof(&mut self, session: &Session) -> Result<(), String> {
+        let Some(job) = self.batch.as_ref().filter(|job| job.snapshot.status == "awaiting_human_proof" && self.pending.is_none()) else {
+            return Ok(());
+        };
+        let Some(current) = session.active() else { return Ok(()) };
+        if Some(current.uid) != job.snapshot.document_uid
+            || Some(current.revision) == job.snapshot.document_revision
+            || !job.publication_base.as_ref().is_some_and(|published| {
+                Arc::ptr_eq(&published.doc, &current.doc)
+                    && published.active_layer == current.active_layer
+                    && published.editing_parents == current.editing_parents
+            })
+            || !Arc::ptr_eq(&job.publication_cache, &session.cache)
+            || serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&session.prefs).map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        // Native selection/navigation may bump the session revision. Rebind only
+        // the exact still-pinned document allocation; changed content never passes.
+        let mut snapshot = job.snapshot.clone();
+        snapshot.document_revision = Some(current.revision);
+        self.persist_batch(&snapshot)?;
+        if let Some(job) = &mut self.batch {
+            job.snapshot = snapshot.clone();
+        }
+        self.snapshot.batch = Some(snapshot);
+        Ok(())
+    }
+
     pub(super) fn start_batches(
         &mut self,
         session: &mut Session,
         task: TaskRequest,
         skills: Vec<SkillSnapshot>,
         mut base: DocState,
-        context: Value,
+        mut context: Value,
     ) -> Result<(), String> {
         let (pages, completed, existing) = match task.target {
             TaskTarget::NewA4 { pages } => (pages, 0, None),
             TaskTarget::ContinueBook => {
-                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()))?;
+                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()), &task.prompt)?;
                 (pages, completed, Some((base.uid, base.revision)))
             }
             TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
@@ -134,13 +179,51 @@ impl ProductionRunner {
             snapshot,
             prefs: session.prefs.clone(),
             publication_cache: session.cache.clone(),
-            publication_base: existing.map(|_| base.clone()),
+            publication_base: if existing.is_some() { Some(session.doc().map_err(|e| e.to_string())?.clone()) } else { None },
+            retry_sequence: 0,
         };
+        if completed > 0 {
+            let mut projected = Session::new();
+            projected.prefs = session.prefs.clone();
+            projected.add_document(base.clone());
+            context = batch_context(&projected, &job, &self.root)?;
+        }
+        if let Some(mut draft) = self.snapshot.production_draft.clone() {
+            draft.id = job.snapshot.job_id.clone();
+            self.persist_production_draft(&draft)?;
+            self.snapshot.production_draft = Some(draft);
+        }
         base.selection = Default::default();
         self.launch_batch(job, base, context)
     }
 
-    fn launch_batch(&mut self, mut job: BatchJob, base: DocState, mut context: Value) -> Result<(), String> {
+    fn launch_batch(&mut self, job: BatchJob, base: DocState, context: Value) -> Result<(), String> {
+        let backup = job.clone();
+        if let Err(error) = self.launch_batch_inner(job, base, context) {
+            let mut failed = self.batch.take().unwrap_or(backup);
+            failed.snapshot.status = "failed".into();
+            if !failed.snapshot.batches.last().is_some_and(|batch| batch.page_start == failed.snapshot.completed_pages && batch.status == "failed") {
+                failed.snapshot.batches.push(BatchReport {
+                    batch: failed.snapshot.current_batch,
+                    page_start: failed.snapshot.completed_pages,
+                    page_count: scope(&failed.snapshot).map(|scope| scope.count).unwrap_or(0),
+                    status: "failed".into(),
+                    ..Default::default()
+                });
+            }
+            failed.snapshot.retryable = retry_candidate(&failed);
+            self.snapshot.batch = Some(failed.snapshot.clone());
+            let persisted = self.persist_batch(&failed.snapshot);
+            self.batch = Some(failed);
+            return Err(match persisted {
+                Ok(()) => error,
+                Err(write_error) => format!("{error}; could not persist failed checkpoint: {write_error}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn launch_batch_inner(&mut self, mut job: BatchJob, base: DocState, mut context: Value) -> Result<(), String> {
         if self.pending.is_some() {
             return Err("A provider request is already active".into());
         }
@@ -155,10 +238,15 @@ impl ProductionRunner {
         let settings = job.task.settings.clone();
         // Durable intent precedes the network request; recovery still cannot resume it.
         job.snapshot.status = "running".into();
+        job.snapshot.retryable = false;
         self.persist_batch(&job.snapshot)?;
-        self.prepare_credentials(&[settings.text_model.clone(), settings.image_model.clone()])?;
+        let mut selections = vec![settings.text_model.clone()];
+        if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+            selections.push(settings.image_model.clone());
+        }
+        self.prepare_credentials(&selections)?;
         let keys = self.worker_keys();
-        let ledger = job.ledger.take().ok_or("Batch admission ledger is unavailable")?;
+        let ledger = job.ledger.as_ref().ok_or("Batch admission ledger is unavailable")?.clone();
         job.before = ledger.summary();
         let task = job.task.clone();
         let pins = job.skills.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
@@ -170,13 +258,34 @@ impl ProductionRunner {
             base,
             prefs: job.prefs.clone(),
         };
-        let worker = worker::spawn_with_ledger(work, keys, job.roots.clone(), ledger)?;
-        let id = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
+        let worker = match worker::spawn_with_ledger(work, keys, job.roots.clone(), ledger) {
+            Ok(worker) => worker,
+            Err(error) => {
+                job.snapshot.status = "failed".into();
+                job.snapshot.retryable = retry_candidate(&job);
+                self.snapshot.batch = Some(job.snapshot.clone());
+                self.batch = Some(job);
+                return Err(error);
+            }
+        };
+        job.ledger = None;
+        let id = batch_report_id(&job);
         let expected = job.snapshot.document_uid.zip(job.snapshot.document_revision);
-        self.pending =
-            Some(Pending { roots: job.roots.clone(), worker, id, started: Instant::now(), task: Some(task), expected, skills: pins, settings });
+        self.pending = Some(Pending {
+            roots: job.roots.clone(),
+            worker,
+            id,
+            started: Instant::now(),
+            task: Some(task),
+            expected,
+            expected_prefs: None,
+            skills: pins,
+            settings,
+        });
         job.snapshot.status = "running".into();
         self.snapshot.busy = true;
+        self.snapshot.current_usage = job.before.clone();
+        self.snapshot.current_issues.clear();
         self.snapshot.stage = "generating_batch".into();
         self.snapshot.progress = job.snapshot.completed_pages as f32 / job.snapshot.total_pages as f32;
         self.snapshot.message =
@@ -184,6 +293,54 @@ impl ProductionRunner {
         self.snapshot.batch = Some(job.snapshot.clone());
         self.batch = Some(job);
         Ok(())
+    }
+
+    pub(super) fn retry_batch(&mut self, session: &mut Session, id: &str) -> Result<(), String> {
+        let job = self.batch.as_ref().ok_or("This task is no longer live; select its book and explicitly Continue with a new task")?;
+        if job.snapshot.job_id != id || !retry_candidate(job) || self.pending.is_some() {
+            return Err("Only an unpublished failed group with its original admission ledger can be retried".into());
+        }
+        ensure_publication_idle(session)?;
+        let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
+        let (base, mut context) = if let Some(uid) = job.snapshot.document_uid {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            if current.uid != uid {
+                return Err("Select this failed task's book before Retry; another open document will not be modified".into());
+            }
+            let (base, context) = task_document_context(session, &TaskTarget::ContinueBook, profile, &job.task.prompt, &job.task.settings)?;
+            let (total, completed) = continuation_progress(&base, profile, &job.task.prompt)?;
+            if total != job.snapshot.total_pages || completed != job.snapshot.completed_pages {
+                return Err("The target pages or book page count changed; prepare a fresh continuation instead of overwriting content".into());
+            }
+            (base, context)
+        } else {
+            if !matches!(job.task.target, TaskTarget::NewA4 { .. }) || job.snapshot.completed_pages != 0 {
+                return Err("The failed task has no matching book authority".into());
+            }
+            task_document_context(session, &job.task.target, profile, &job.task.prompt, &job.task.settings)?
+        };
+        if job.snapshot.completed_pages > 0 {
+            let mut projected = Session::new();
+            projected.prefs = session.prefs.clone();
+            projected.add_document(base.clone());
+            context = batch_context(&projected, job, &self.root)?;
+        } else {
+            enrich_production_context(&mut context, &self.root, &base, &job.task)?;
+        }
+        let mut job = self.batch.take().ok_or("The failed task disappeared")?;
+        job.retry_sequence = job.retry_sequence.checked_add(1).ok_or("Too many retries for this task")?;
+        if job.snapshot.document_uid.is_some() {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            job.snapshot.document_revision = Some(current.revision);
+            job.publication_base = Some(current.clone());
+        }
+        job.publication_cache = session.cache.clone();
+        job.prefs = session.prefs.clone();
+        // Failed attempts stay in history; proof lookup must see only the new attempt.
+        if job.snapshot.batches.last().is_some_and(|batch| batch.status == "failed" && batch.page_start == job.snapshot.completed_pages) {
+            job.snapshot.batches.pop();
+        }
+        self.launch_batch(job, base, context)
     }
 
     pub(super) fn approve_batch(&mut self, session: &mut Session, id: &str, checkpoint: u32) -> Result<(), String> {
@@ -241,8 +398,8 @@ impl ProductionRunner {
         if let Some(last) = job.snapshot.batches.last_mut() {
             last.status = "approved".into();
         }
-        let approved_id = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
-        if let Some(report) = self.snapshot.reports.iter_mut().find(|report| report.id == approved_id) {
+        let approved_id = batch_report_id(&job);
+        if let Some(report) = self.snapshot.reports.iter_mut().rev().find(|report| report.id == approved_id) {
             report.status = "approved".into();
             report.message = "Human approved the exact native/PDF/PNG proof checkpoint".into();
         }
@@ -268,9 +425,12 @@ impl ProductionRunner {
             }
             return exported.map(|_| ());
         }
-        let mut base = session.doc().map_err(|e| e.to_string())?.clone();
+        let mut base = crate::facing_pages::canonicalize(session.doc().map_err(|e| e.to_string())?, &session.prefs)?;
         base.selection = Default::default();
-        let context = batch_context(session, &job)?;
+        let mut projected = Session::new();
+        projected.prefs = session.prefs.clone();
+        projected.add_document(base.clone());
+        let context = batch_context(&projected, &job, &self.root)?;
         job.snapshot.current_batch = job.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
         // Consumes this exact approval before any next request is launched.
         job.snapshot.status = "running".into();
@@ -289,6 +449,7 @@ impl ProductionRunner {
 
     pub(super) fn cancel_batch(&mut self) {
         let Some(mut job) = self.batch.take() else { return };
+        job.snapshot.retryable = false;
         if let Some(pending) = &self.pending {
             pending.worker.cancel.store(true, Ordering::Relaxed);
             job.snapshot.status = "cancelling".into();
@@ -306,8 +467,10 @@ impl ProductionRunner {
     pub(super) fn lose_batch_worker(&mut self) {
         if let Some(mut job) = self.batch.take() {
             job.snapshot.status = "failed".into();
+            job.snapshot.retryable = retry_candidate(&job);
             self.snapshot.batch = Some(job.snapshot.clone());
             let _ = self.persist_batch(&job.snapshot);
+            self.batch = Some(job);
         }
     }
 
@@ -338,7 +501,7 @@ impl ProductionRunner {
             usage: usage.clone(),
             elapsed_ms: elapsed,
             actions: 0,
-            issues: vec![],
+            issues: self.snapshot.current_issues.clone(),
             artifacts: vec![],
             message: String::new(),
         };
@@ -378,6 +541,9 @@ impl ProductionRunner {
                 report.status = "awaiting_human_proof".into();
                 report.message =
                     "Batch published with native/PDF/PNG proofs. Human approval is required before any subsequent provider request".into();
+                if let Err(error) = self.bind_production_draft(session, &job.snapshot.job_id) {
+                    report.message.push_str(&format!("; saved continuation instructions could not be updated: {error}"));
+                }
             }
             Err(error) => {
                 job.snapshot.status = if cancelled { "cancelled" } else { "failed" }.into();
@@ -387,6 +553,7 @@ impl ProductionRunner {
             }
         }
         job.snapshot.batches.push(batch_report);
+        job.snapshot.retryable = retry_candidate(&job);
         self.snapshot.stage = job.snapshot.status.clone();
         self.snapshot.message = report.message.clone();
         self.snapshot.progress = job.snapshot.completed_pages as f32 / job.snapshot.total_pages as f32;
@@ -404,13 +571,13 @@ impl ProductionRunner {
             self.snapshot.message = format!("Batch evidence could not be persisted; continuation is disabled: {error}");
             self.snapshot.batch = Some(job.snapshot.clone());
         }
-        if job.snapshot.status == "awaiting_human_proof" {
+        if matches!(job.snapshot.status.as_str(), "awaiting_human_proof" | "failed") {
             self.batch = Some(job);
         }
     }
 
     fn publish_batch(
-        &self,
+        &mut self,
         session: &mut Session,
         job: &mut BatchJob,
         plans: &[ProductionPlan],
@@ -482,7 +649,16 @@ impl ProductionRunner {
         let previous = session.active_index();
         if first {
             let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
-            session.execute("file.new", &crate::design::document_params(profile, job.snapshot.total_pages)).map_err(|e| e.to_string())?;
+            session
+                .execute("file.new", &production_document_params(profile, job.snapshot.total_pages, &job.task.prompt)?)
+                .map_err(|e| e.to_string())?;
+            initialize_print_document(session, &job.task.prompt)?;
+            // Print preferences define the new document's creation baseline. Facing setup
+            // and reviewed artwork are published together by applyGroup below, so undoing
+            // this batch restores its complete pre-publication state in one step.
+            let created = session.doc_mut().map_err(|e| e.to_string())?;
+            created.history.undo.clear();
+            created.history.redo.clear();
         }
         let result = (|| {
             let current = session.doc().map_err(|e| e.to_string())?;
@@ -498,10 +674,37 @@ impl ProductionRunner {
             }
             let mut base = current.clone();
             base.selection = Default::default();
-            worker::simulate_group_scoped(plans, &base, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), scope)?;
+            let change_layout = job.task.settings.facing_pages && !base.doc.settings.facing_pages;
+            let facing = if change_layout {
+                Some(crate::facing_pages::formatted_proof_state(&base, &job.prefs, book_binding(&job.task.settings, &job.task.prompt))?)
+            } else {
+                None
+            };
+            let projected_base = facing.as_ref().unwrap_or(&base);
+            let canonical = crate::facing_pages::canonicalize(projected_base, &job.prefs)?;
+            worker::simulate_group_scoped(plans, &canonical, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), scope)?;
+            let mapped: Vec<_> = plans.iter().map(|plan| crate::facing_pages::map_plan(plan, projected_base)).collect::<Result<_, _>>()?;
+            let min_ppi =
+                crate::print_contract::PrintContract::from_prompt(&job.task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+            let chunks = mapped.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect::<Vec<_>>();
+            let mut projected = Session::new();
+            projected.prefs = job.prefs.clone();
+            projected.add_document(base.clone());
+            let mut group_params = json!({"chunks":chunks,"outputMode":job.task.settings.output_mode,"requirePreflight":true,"minPpi":min_ppi});
+            if change_layout {
+                group_params["documentSetup"] =
+                    json!({"facingPages":true,"binding":if book_binding(&job.task.settings,&job.task.prompt){"rightToLeft"}else{"leftToRight"}});
+            }
+            projected.execute("production.applyGroup", &group_params).map_err(|e| e.to_string())?;
+            crate::facing_pages::validate_mapped_result(projected_base, projected.doc().map_err(|e| e.to_string())?, scope)?;
             let uid = current.uid;
             let revision = current.revision;
-            let directory = self.root.join("runs").join(&job.snapshot.job_id).join(format!("batch-{}", job.snapshot.current_batch));
+            let directory_name = if job.retry_sequence == 0 {
+                format!("batch-{}", job.snapshot.current_batch)
+            } else {
+                format!("batch-{}-retry-{}", job.snapshot.current_batch, job.retry_sequence)
+            };
+            let directory = self.root.join("runs").join(&job.snapshot.job_id).join(directory_name);
             self.profile_access.check(&directory, file_access::Access::Write)?;
             std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
             for proof in proofs {
@@ -516,13 +719,20 @@ impl ProductionRunner {
                 &trace,
                 &json!({"jobId":job.snapshot.job_id,"batch":job.snapshot.current_batch,"scope":scope,"settings":job.task.settings,"skills":report.skills,"designStyle":report.design_style,"usage":report.usage,"elapsedMs":report.elapsed_ms,"plans":plans,"plan":(plans.len()==1).then_some(first_plan),"proofs":batch_report.proof_paths,"sha256":batch_report.proof_sha256}),
             )?;
-            let chunks = plans.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect::<Vec<_>>();
             let label = format!("{} · batch {}", limited_text(&first_plan.title, 200), job.snapshot.current_batch);
-            session.execute("production.applyGroup",&json!({"chunks":chunks,"outputMode":job.task.settings.output_mode,"label":label,"expectedDocumentUid":uid,"expectedRevision":revision,"requirePreflight":true,"minPpi":150})).map_err(|e|e.to_string())?;
+            group_params["label"] = json!(label);
+            group_params["expectedDocumentUid"] = json!(uid);
+            group_params["expectedRevision"] = json!(revision);
+            session.execute("production.applyGroup", &group_params).map_err(|e| e.to_string())?;
             let state = session.doc().map_err(|e| e.to_string())?;
             job.snapshot.document_uid = Some(state.uid);
             job.snapshot.document_revision = Some(state.revision);
             job.publication_base = Some(state.clone());
+            if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&job.task.prompt)? {
+                self.print_contracts.insert(state.uid, contract);
+            }
+            let preflight = session.execute("preflight.run", &json!({"minPpi":min_ppi})).map_err(|e| e.to_string())?;
+            report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
             report.title = first_plan.title.clone();
             batch_report.title = first_plan.title.clone();
             report.actions = actions;
@@ -548,9 +758,28 @@ impl ProductionRunner {
         let source = Path::new(directory).join(format!("reviewed-{job_id}.designcraft"));
         let pdf = Path::new(directory).join(format!("reviewed-{job_id}.pdf"));
         session.execute("file.saveAs", &json!({"path":source})).map_err(|e| e.to_string())?;
-        session.execute("file.exportPdf", &json!({"path":pdf,"spreads":false,"bleed":false,"marks":false})).map_err(|e| e.to_string())?;
+        let contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
+        let params = match &contract {
+            Some(contract) => contract.pdf_export_params(Some(pdf.to_str().ok_or("PDF export path is not valid Unicode")?))?,
+            None => json!({"path":pdf,"spreads":false,"bleed":false,"marks":false}),
+        };
+        session.execute("file.exportPdf", &params).map_err(|e| e.to_string())?;
         Ok(vec![source.to_string_lossy().into_owned(), pdf.to_string_lossy().into_owned()])
     }
+}
+fn batch_report_id(job: &BatchJob) -> String {
+    let base = format!("{}-batch-{}", job.snapshot.job_id, job.snapshot.current_batch);
+    if job.retry_sequence == 0 { base } else { format!("{base}-retry-{}", job.retry_sequence) }
+}
+fn retry_candidate(job: &BatchJob) -> bool {
+    job.snapshot.status == "failed"
+        && job.ledger.is_some()
+        && job.snapshot.completed_pages < job.snapshot.total_pages
+        && job
+            .snapshot
+            .batches
+            .last()
+            .is_some_and(|batch| batch.status == "failed" && batch.page_start == job.snapshot.completed_pages && batch.page_count > 0)
 }
 fn scope(snapshot: &BatchSnapshot) -> Result<worker::BatchScope, String> {
     let count = snapshot.total_pages.checked_sub(snapshot.completed_pages).ok_or("Invalid completed page count")?.min(snapshot.pages_per_batch);
@@ -564,13 +793,22 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 /// Keep book-wide page coverage and recent approved content; never repeatedly resend page one.
-fn batch_context(session: &Session, job: &BatchJob) -> Result<Value, String> {
+fn batch_context(session: &Session, job: &BatchJob, root: &Path) -> Result<Value, String> {
     let state = session.doc().map_err(|e| e.to_string())?;
     let completed = usize::try_from(job.snapshot.completed_pages).map_err(|_| "Invalid approved page count")?;
-    let last = job.snapshot.batches.last().ok_or("Approved batch context is unavailable")?;
-    let start = usize::try_from(last.page_start).map_err(|_| "Invalid preceding batch page")?;
-    let count = usize::try_from(last.page_count).map_err(|_| "Invalid preceding batch size")?;
-    let end = start.checked_add(count).ok_or("Preceding batch range overflow")?;
+    let preceding = job.snapshot.batches.iter().rev().find(|batch| {
+        batch.status == "approved"
+            && batch.page_count > 0
+            && batch.page_start.checked_add(batch.page_count).is_some_and(|end| end <= job.snapshot.completed_pages)
+    });
+    let end = completed;
+    let start = if let Some(batch) = preceding {
+        usize::try_from(batch.page_start).map_err(|_| "Invalid preceding batch page")?
+    } else {
+        // A fresh continuation observes the existing prefix without inventing
+        // historical human approvals or reading a failed unpublished suffix.
+        completed.saturating_sub(usize::try_from(job.snapshot.pages_per_batch.clamp(1, 32)).map_err(|_| "Invalid review size")?)
+    };
     let per_page = (12_000 / completed.max(1)).clamp(8, 160);
     let mut briefs = Vec::new();
     for page in 0..completed.min(1000) {
@@ -603,17 +841,28 @@ fn batch_context(session: &Session, job: &BatchJob) -> Result<Value, String> {
             break;
         }
     }
-    let ranges: Vec<_> = job
+    let mut ranges: Vec<_> = job
         .snapshot
         .batches
         .iter()
+        .filter(|batch| {
+            batch.status == "approved"
+                && batch.page_count > 0
+                && batch.page_start.checked_add(batch.page_count).is_some_and(|end| end <= job.snapshot.completed_pages)
+        })
         .rev()
         .take(64)
-        .rev()
         .map(|batch| json!([batch.batch, batch.page_start, batch.page_count, limited_text(&batch.title, 80)]))
         .collect();
+    ranges.reverse();
     let title = limited_text(&job.task.prompt, 256);
-    let context = json!({"documentUid":state.uid,"revision":state.revision,"pageCount":state.doc.page_count(),"pageWidth":state.doc.settings.page_width,"pageHeight":state.doc.settings.page_height,"units":"points; each native spread is one A4 page","approvedPageCount":job.snapshot.completed_pages,"approvedPageBriefs":briefs,"recentApprovedBatchRanges":ranges,"earlierBatchRangesOmitted":job.snapshot.batches.len()>64,"recentApprovedObjects":objects,"recentObjectsTruncated":truncated,"bookRequestSummary":title,"continuityInstruction":"Continue the original book after the approved pages. Page briefs are bounded observations of existing editable content, not a new curriculum or a claim of educational certification. Do not repeat the beginning or regenerate approved pages."});
+    let mut context = compact_context(session)?;
+    let object = context.as_object_mut().ok_or("Invalid native book context")?;
+    object.remove("objects");
+    object.remove("objectsTruncated");
+    let continuity = json!({"units":"points; each canonical native spread is one actual document page","approvedPageCount":job.snapshot.completed_pages,"approvedPageBriefs":briefs,"recentApprovedBatchRanges":ranges,"earlierBatchRangesOmitted":job.snapshot.batches.len()>64,"recentApprovedObjects":objects,"recentObjectsTruncated":truncated,"bookRequestSummary":title,"continuityInstruction":"Continue the selected original book after its existing completed prefix. Page briefs are bounded observations of editable content, not invented historical approval or educational certification. Do not repeat the beginning or regenerate earlier pages."});
+    object.extend(continuity.as_object().ok_or("Invalid book continuity data")?.clone());
+    enrich_production_context(&mut context, root, state, &job.task)?;
     if serde_json::to_vec(&context).map_err(|e| e.to_string())?.len() > 48 * 1024 {
         return Err("Approved book continuity context exceeds its bounded size".into());
     }
@@ -656,24 +905,25 @@ mod tests {
         }
     }
     #[test]
-    fn continuation_refuses_blank_books_filled_books_holes_and_non_a4_pages() {
+    fn continuation_refuses_blank_books_filled_books_and_holes_but_preserves_custom_trim() {
         let mut session = Session::new();
         session.execute("file.new", &new_a4(4)).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None, "").is_err());
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert_eq!(continuation_progress(session.doc().unwrap(), None).unwrap(), (4, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), None, "").unwrap(), (4, 1));
         session.execute("frame.create", &json!({"spread":2,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None, "").is_err());
         session.execute("frame.create", &json!({"spread":1,"rect":[50,50,100,100]})).unwrap();
         session.execute("frame.create", &json!({"spread":3,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert!(continuation_progress(session.doc().unwrap(), None, "").is_err());
         session.execute("file.new", &json!({"width":400,"height":600,"pages":2,"facingPages":false})).unwrap();
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
+        assert_eq!(continuation_progress(session.doc().unwrap(), None, "").unwrap(), (2, 1));
+        assert!(continuation_progress(session.doc().unwrap(), None, "Trim Size: A4").is_err());
     }
 
     #[test]
-    fn continuation_matches_selected_non_a4_geometry_without_weakening_the_default() {
+    fn continuation_preserves_actual_trim_when_style_or_default_sizes_differ() {
         let directory = tempfile::tempdir().unwrap();
         let runner = ProductionRunner::open(directory.path()).unwrap();
         let mut profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
@@ -682,10 +932,47 @@ mod tests {
         let mut session = Session::new();
         session.execute("file.new", &crate::design::document_params(Some(&profile), 3)).unwrap();
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
-        assert!(continuation_progress(session.doc().unwrap(), None).is_err());
-        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile)).unwrap(), (3, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), None, "").unwrap(), (3, 1));
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
         profile.page_mm = [250.0, 350.0];
-        assert!(continuation_progress(session.doc().unwrap(), Some(&profile)).is_err());
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
+        assert!(continuation_progress(session.doc().unwrap(), Some(&profile), "Trim Size: 250 x 350 mm").is_err());
+    }
+
+    #[test]
+    fn ai20_continuation_preserves_opened_custom_trim_instead_of_forcing_a_style_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = ProductionRunner::open(directory.path()).unwrap();
+        let profile = runner.snapshot.skills.iter().find_map(|card| card.design_profile.clone()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":195.0*72.0/25.4,"height":265.0*72.0/25.4,"pages":3,"facingPages":false})).unwrap();
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn ai20_continuation_accepts_matching_explicit_trim_and_rejects_a_conflicting_brief_before_http() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        for (trim, allowed) in [("195 x 265 mm", true), ("210 x 297 mm", false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(directory.path()).unwrap();
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"width":195.0*72.0/25.4,"height":265.0*72.0/25.4,"pages":3,"facingPages":false})).unwrap();
+            session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+            let before = session.doc().unwrap().doc.clone();
+            let mut request = task("http://127.0.0.1:9/".into(), 1);
+            request.target = TaskTarget::ContinueBook;
+            request.prompt = format!("Trim Size: {trim}\nContinue the remaining blank pages with editable native artwork.");
+            let started = runner.handle(&mut session, AiRequest::Start(request));
+            assert_eq!(started.busy, allowed, "{}", started.message);
+            if allowed {
+                wait(&mut runner, &mut session);
+            } else {
+                assert!(runner.pending.is_none());
+            }
+            assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+        }
     }
     fn wait(runner: &mut ProductionRunner, session: &mut Session) -> AiSnapshot {
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -744,18 +1031,288 @@ mod tests {
             prefs: session.prefs.clone(),
             publication_cache: session.cache.clone(),
             publication_base: session.active().cloned(),
+            retry_sequence: 0,
         });
         ("fixture-book".into(), 1)
     }
 
     #[test]
+    fn continuation_failed_worker_retains_budget_and_book_for_explicit_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let before = runner.batch.as_ref().unwrap().ledger.as_ref().unwrap().summary();
+        runner.lose_batch_worker();
+        assert_eq!(runner.snapshot.batch.as_ref().unwrap().status, "failed");
+        assert!(runner.batch.is_some(), "A failed live job needs an explicit retry path without resetting its ledger");
+        let retained = runner.batch.as_ref().unwrap();
+        assert_eq!(retained.snapshot.completed_pages, 1);
+        assert_eq!(retained.ledger.as_ref().unwrap().summary().requests, before.requests);
+        assert!(runner.pending.is_none(), "Failure retention cannot auto-launch another request");
+    }
+
+    #[test]
+    fn continuation_view_only_changes_do_not_invalidate_unchanged_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let before = session.doc().unwrap().clone();
+        session.execute("select.firstAbove", &json!({})).unwrap();
+        let current = session.doc().unwrap();
+        assert!(Arc::ptr_eq(&before.doc, &current.doc));
+        assert_ne!(before.revision, current.revision);
+        let revision = current.revision;
+        let result = runner.handle(&mut session, AiRequest::Poll);
+        let batch = result.batch.unwrap();
+        assert_eq!(batch.document_revision, Some(revision), "An unchanged native allocation must remain reviewable after selection/navigation");
+        assert_eq!(batch.status, "awaiting_human_proof");
+        assert_eq!(batch.cumulative_usage.requests, 1);
+        assert!(runner.pending.is_none(), "Refreshing unchanged proof authority must not request production");
+    }
+
+    #[test]
+    fn continuation_proof_repin_refuses_content_font_cache_and_preference_changes() {
+        for change in ["content", "cache", "preferences"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(dir.path()).unwrap();
+            let mut session = Session::new();
+            waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            let original = runner.snapshot.batch.as_ref().unwrap().document_revision;
+            match change {
+                "content" => {
+                    session.execute("frame.create", &json!({"spread":0,"rect":[200,60,300,150],"content":"unassigned"})).unwrap();
+                }
+                "cache" => session.cache = Arc::new(designcraft_engine::compose::Cache::new()),
+                _ => session.prefs.typographers_quotes = !session.prefs.typographers_quotes,
+            }
+            session.execute("select.firstAbove", &json!({})).unwrap();
+            let result = runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(result.batch.unwrap().document_revision, original, "{change} must invalidate unchanged-proof rebinding");
+            assert!(runner.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn public_poll_publishes_new_rtl_facing_book_with_one_undo_and_human_proofs() {
+        synthetic_facing_publication(false, false);
+    }
+
+    #[test]
+    fn public_poll_continues_single_page_book_as_rtl_facing_without_changing_prefix() {
+        synthetic_facing_publication(true, false);
+    }
+
+    #[test]
+    fn public_poll_keeps_new_print_baseline_in_creation_not_a_second_undo() {
+        synthetic_facing_publication(false, true);
+    }
+
+    fn synthetic_facing_publication(continuing: bool, baseline: bool) {
+        use base64::Engine as _;
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(if continuing { 6 } else { 1 })).unwrap();
+        let prefix = if continuing { 2 } else { 1 };
+        for page in 0..prefix {
+            let created = session.execute("frame.create", &json!({"spread":page,"rect":[60,60,160,160]})).unwrap();
+            session.execute("object.label", &json!({"ids":[created["id"]],"label":format!("Preserved prefix {}",page+1)})).unwrap();
+        }
+        let before = session.doc().unwrap().clone();
+        let previous_index = session.active_index().unwrap();
+        let document_count = session.documents().len();
+        let mut request = task("http://127.0.0.1:9/".into(), 1);
+        request.prompt = "Content Copy Language: Arabic\nSix-page editable book with independently reviewed native pages.".into();
+        if baseline {
+            request.prompt.push_str("\nGrid System: 8 mm baseline grid.");
+        }
+        request.settings.facing_pages = true;
+        request.settings.right_to_left_binding = Some(true);
+        request.settings.pages_per_batch = if continuing { 2 } else { 3 };
+        request.target = if continuing { TaskTarget::ContinueBook } else { TaskTarget::NewA4 { pages: 6 } };
+        let start = if continuing { 2 } else { 0 };
+        let count = request.settings.pages_per_batch;
+        let (canonical, _) = task_document_context(&session, &request.target, None, &request.prompt, &request.settings).unwrap();
+        assert_eq!(canonical.doc.spreads.len(), 6);
+        assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc), "Private planning cannot reformat the live book");
+        let plans: Vec<_> = (start..start + count)
+            .map(|page| ProductionPlan {
+                title: format!("Absolute page {}", page + 1),
+                commands: vec![
+                    EngineAction { command: "frame.create".into(), params: json!({"spread":page,"rect":[60,180,160,280]}) },
+                    EngineAction { command: "object.label".into(), params: json!({"ids":["$0.id"],"label":format!("Reviewed page {}",page+1)}) },
+                ],
+                images: vec![],
+            })
+            .collect();
+        let mut proof_session = Session::new();
+        proof_session.prefs = session.prefs.clone();
+        proof_session.add_document(canonical);
+        let chunks: Vec<_> = plans.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect();
+        proof_session.execute("production.applyGroup", &json!({"chunks":chunks,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        let formatted = crate::facing_pages::formatted_proof_state(proof_session.doc().unwrap(), &proof_session.prefs, true).unwrap();
+        proof_session.add_document(formatted);
+        let mut proofs = vec![worker::ProofArtifact {
+            name: "document.designcraft".into(),
+            bytes: designcraft_format::save(&proof_session.doc().unwrap().doc).unwrap(),
+        }];
+        let pdf = proof_session
+            .execute("file.exportPdf", &json!({"pages":(start+1..=start+count).collect::<Vec<_>>(),"spreads":false,"bleed":false,"marks":false}))
+            .unwrap();
+        proofs.push(worker::ProofArtifact {
+            name: "proof.pdf".into(),
+            bytes: base64::engine::general_purpose::STANDARD.decode(pdf["base64"].as_str().unwrap()).unwrap(),
+        });
+        let mut renderer = designcraft_render::Renderer::new();
+        for page in start..start + count {
+            let image = renderer
+                .render_page(&proof_session.doc().unwrap().doc, &proof_session.cache, page as usize, 0.25, false, &Default::default())
+                .unwrap();
+            proofs.push(worker::ProofArtifact { name: format!("page-{}.png", page + 1), bytes: image.to_png() });
+        }
+        let ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
+        let snapshot = BatchSnapshot {
+            job_id: if continuing { "synthetic-facing-continue" } else { "synthetic-facing-new" }.into(),
+            total_pages: 6,
+            pages_per_batch: count,
+            current_batch: 1,
+            total_batches: (6 - start).div_ceil(count),
+            completed_pages: start,
+            status: "running".into(),
+            document_uid: continuing.then_some(before.uid),
+            document_revision: continuing.then_some(before.revision),
+            ..Default::default()
+        };
+        runner.batch = Some(BatchJob {
+            task: request.clone(),
+            skills: vec![],
+            roots: None,
+            ledger: None,
+            before: Default::default(),
+            snapshot: snapshot.clone(),
+            prefs: session.prefs.clone(),
+            publication_cache: session.cache.clone(),
+            publication_base: continuing.then_some(before.clone()),
+            retry_sequence: 0,
+        });
+        runner.snapshot.batch = Some(snapshot.clone());
+        runner.snapshot.busy = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(worker::Message::FinishedWithLedger(
+                worker::Outcome { result: Ok(worker::Product::BatchGroup { plans, proofs }), usage: Default::default() },
+                ledger,
+            ))
+            .unwrap();
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: Arc::new(AtomicBool::new(false)) },
+            id: format!("{}-batch-1", snapshot.job_id),
+            started: Instant::now(),
+            task: Some(request.clone()),
+            expected: continuing.then_some((before.uid, before.revision)),
+            expected_prefs: None,
+            skills: vec![],
+            settings: request.settings,
+        });
+        let completed = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(completed.stage, "awaiting_human_proof", "{}", completed.message);
+        assert!(!completed.busy);
+        assert!(runner.pending.is_none());
+        assert!(runner.batch.is_some(), "Human proof authority must remain unconsumed");
+        let checkpoint = completed.batch.as_ref().unwrap();
+        assert_eq!((checkpoint.completed_pages, checkpoint.checkpoint), (start + count, 1));
+        assert_eq!(checkpoint.cumulative_usage.requests, 0, "Synthetic completion must not call any provider");
+        let published = session.doc().unwrap().clone();
+        assert!(published.doc.settings.facing_pages && published.doc.settings.right_to_left_binding);
+        if baseline {
+            assert!((published.doc.settings.baseline_grid.increment - 8.0 * 72.0 / 25.4).abs() < 0.001);
+        }
+        assert_eq!((published.doc.page_count(), published.doc.spreads.len()), (6, 4));
+        let local = crate::facing_pages::canonicalize(&published, &session.prefs).unwrap();
+        for page in 0..6 {
+            let spread = &local.doc.spreads[page];
+            if (start..start + count).contains(&(page as u32)) {
+                assert_eq!(spread.items.len(), 1);
+                assert_eq!(spread.items[0].label, format!("Reviewed page {}", page + 1));
+                assert_eq!(spread.items[0].bounds().x0, 60.0);
+                assert_eq!(spread.items[0].bounds().y0, 180.0);
+            } else if continuing && page < prefix {
+                assert_eq!(spread.items, before.doc.spreads[page].items, "Prefix artwork must remain exactly editable and unchanged");
+                assert_eq!(spread.pages[0].id, before.doc.spreads[page].pages[0].id);
+            } else {
+                assert!(spread.items.is_empty(), "Future absolute pages must stay blank");
+            }
+        }
+        assert_eq!(
+            published.history.undo.len(),
+            if continuing { before.history.undo.len() + 1 } else { 1 },
+            "One reviewed batch must produce one undo entry"
+        );
+        if !continuing {
+            assert_eq!(session.documents().len(), document_count + 1);
+            assert!(Arc::ptr_eq(&session.documents()[previous_index].doc, &before.doc), "Creating a book must preserve the former document");
+        }
+        let evidence = &checkpoint.batches[0];
+        assert_eq!(evidence.status, "awaiting_human_proof");
+        assert_eq!(evidence.proof_paths.len(), (count + 2) as usize);
+        for path in &evidence.proof_paths {
+            let bytes = std::fs::read(path).unwrap();
+            match Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap() {
+                "designcraft" => {
+                    let proof = designcraft_format::load(&bytes).unwrap();
+                    assert!(proof.settings.facing_pages && proof.settings.right_to_left_binding);
+                    assert_eq!((proof.page_count(), proof.spreads.len()), (6, 4));
+                }
+                "pdf" => assert!(bytes.starts_with(b"%PDF-")),
+                "png" => {
+                    let image = image::load_from_memory(&bytes).unwrap();
+                    assert!(image.width() < image.height(), "Each PNG must show one absolute portrait page, not a facing spread");
+                }
+                other => panic!("Unexpected proof format {other}"),
+            }
+        }
+        let mut undo = Session::new();
+        undo.add_document(published);
+        undo.execute("edit.undo", &json!({})).unwrap();
+        if continuing {
+            assert!(Arc::ptr_eq(&undo.doc().unwrap().doc, &before.doc));
+            assert!(!undo.doc().unwrap().doc.settings.facing_pages, "One undo must restore single-page topology as well as artwork");
+        } else {
+            assert!(undo.doc().unwrap().doc.spreads.iter().all(|spread| spread.items.is_empty()));
+            if baseline {
+                assert!((undo.doc().unwrap().doc.settings.baseline_grid.increment - 8.0 * 72.0 / 25.4).abs() < 0.001);
+            }
+        }
+        for _ in 0..3 {
+            let unchanged = runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(unchanged.stage, "awaiting_human_proof");
+            assert_eq!(unchanged.batch.unwrap().checkpoint, 1);
+            assert!(runner.pending.is_none(), "Polling cannot send another request before human approval");
+        }
+    }
+
+    #[test]
     fn explicit_approval_is_the_only_path_between_real_http_batches() {
-        reviewed_http_batches(0);
+        reviewed_http_batches(0, false);
     }
 
     #[test]
     fn continuing_an_existing_book_preserves_its_prefix_and_human_http_checkpoints() {
-        reviewed_http_batches(2);
+        reviewed_http_batches(2, false);
+    }
+
+    #[test]
+    fn continuation_retry_keeps_failed_usage_prefix_and_human_checkpoints() {
+        reviewed_http_batches(2, true);
+    }
+
+    #[test]
+    fn continuation_retry_before_first_publication_creates_only_its_new_book() {
+        reviewed_http_batches(0, true);
     }
 
     #[test]
@@ -916,7 +1473,7 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
-    fn reviewed_http_batches(initial_completed: u32) {
+    fn reviewed_http_batches(initial_completed: u32, fail_first: bool) {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -962,11 +1519,14 @@ mod tests {
                     }
                 }
                 let request_index = server_calls.fetch_add(1, Ordering::Relaxed);
-                if request_index > 1 {
+                if request_index > 1 + u32::from(fail_first) {
                     return Err("Unexpected unapproved provider request".into());
                 }
-                let page = initial_completed + request_index;
-                let plan = json!({"title":"Reviewed native book","commands":[{"command":"frame.create","params":{"spread":page,"rect":[50,60,200,180],"content":"unassigned"}},{"command":"object.label","params":{"ids":["$0.id"],"label":format!("page-{}",page+1)}}],"images":[]});
+                let page = initial_completed + request_index.saturating_sub(u32::from(fail_first));
+                let mut plan = json!({"title":"Reviewed native book","commands":[{"command":"frame.create","params":{"spread":page,"rect":[50,60,200,180],"content":"unassigned"}},{"command":"object.label","params":{"ids":["$0.id"],"label":format!("page-{}",page+1)}}],"images":[]});
+                if fail_first && request_index == 0 {
+                    plan["commands"][0]["command"] = json!("unsupported.fixture.command");
+                }
                 let reply =
                     json!({"done":true,"message":{"content":plan.to_string()},"prompt_eval_count":120,"eval_count":30,"prompt_eval_cached_count":10})
                         .to_string();
@@ -1001,11 +1561,29 @@ mod tests {
             assert_ne!(session.doc().unwrap().revision, original.revision);
             assert!(Arc::ptr_eq(&session.doc().unwrap().doc, &original.doc), "Selection changed without editing document content");
         }
-        let first = wait(&mut runner, &mut session);
+        let mut first = wait(&mut runner, &mut session);
+        if fail_first {
+            assert_eq!(first.stage, "failed", "{}", first.message);
+            let failed = first.batch.as_ref().unwrap();
+            assert!(failed.retryable);
+            assert_eq!(failed.completed_pages, initial_completed);
+            assert_eq!(failed.cumulative_usage.requests, 1);
+            assert_eq!(session.doc().map(|state| state.history.undo.len()).unwrap_or(0), prior_undo);
+            let recovered = ProductionRunner::open(dir.path()).unwrap();
+            assert!(!recovered.snapshot.batch.as_ref().unwrap().retryable);
+            assert!(recovered.batch.is_none() && recovered.pending.is_none());
+            let id = failed.job_id.clone();
+            runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "Failure cannot retry automatically");
+            let started = runner.handle(&mut session, AiRequest::RetryBatch { job_id: id });
+            assert!(started.busy, "{}", started.message);
+            first = wait(&mut runner, &mut session);
+        }
+        let prior_requests = u32::from(fail_first);
         assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
         let checkpoint = first.batch.as_ref().unwrap();
         assert_eq!(checkpoint.completed_pages, initial_completed + 1);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         assert_eq!(checkpoint.batches[0].proof_paths.len(), 3);
         let approved_page = session.doc().unwrap().doc.spreads[initial_completed as usize].clone();
         assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
@@ -1013,17 +1591,17 @@ mod tests {
             runner.handle(&mut session, AiRequest::Poll);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "Polling must never prefetch the next batch");
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests, "Polling must never prefetch the next batch");
         let wrong = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint + 1 });
         assert!(!wrong.busy);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         let mut reopened = ProductionRunner::open(dir.path()).unwrap();
         assert_eq!(reopened.snapshot.batch.as_ref().unwrap().status, "interrupted");
         assert!(reopened.pending.is_none());
         assert!(reopened.batch.is_none());
         let denied = reopened.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
         assert!(!denied.busy);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         drop(reopened);
         let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
         assert!(approved.busy, "{}", approved.message);
@@ -1031,9 +1609,9 @@ mod tests {
         assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
         let final_checkpoint = second.batch.as_ref().unwrap();
         assert_eq!(final_checkpoint.completed_pages, initial_completed + 2);
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert_eq!(final_checkpoint.cumulative_usage.requests, 2);
-        assert_eq!(final_checkpoint.cumulative_usage.input_tokens, 240);
+        assert_eq!(calls.load(Ordering::Relaxed), 2 + prior_requests);
+        assert_eq!(final_checkpoint.cumulative_usage.requests, 2 + prior_requests);
+        assert_eq!(final_checkpoint.cumulative_usage.input_tokens, u64::from(2 + prior_requests) * 120);
         assert!(final_checkpoint.batches.iter().all(|batch| batch.usage.requests == 1));
         assert_eq!(session.doc().unwrap().doc.spreads[initial_completed as usize], approved_page);
         assert_eq!(session.doc().unwrap().doc.spreads[(initial_completed + 1) as usize].items[0].label, format!("page-{}", initial_completed + 2));
@@ -1048,7 +1626,7 @@ mod tests {
         for _ in 0..4 {
             runner.handle(&mut session, AiRequest::Poll);
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 2, "Final or repeated approval cannot issue another request");
+        assert_eq!(calls.load(Ordering::Relaxed), 2 + prior_requests, "Final or repeated approval cannot issue another request");
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap().unwrap();
     }
@@ -1064,7 +1642,7 @@ mod tests {
         let mut session = Session::new();
         let (job_id, checkpoint) = waiting(&mut runner, &mut session, format!("http://{}/", listener.local_addr().unwrap()));
         let before = session.doc().unwrap().doc.clone();
-        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint });
         assert!(approved.busy, "{}", approved.message);
         let result = wait(&mut runner, &mut session);
         assert_eq!(result.batch.as_ref().unwrap().status, "failed");
@@ -1072,6 +1650,13 @@ mod tests {
         assert_eq!(result.batch.as_ref().unwrap().cumulative_usage.requests, 1);
         assert_eq!(result.batch.as_ref().unwrap().batches.last().unwrap().usage.requests, 0);
         assert!(listener.accept().is_err(), "Exhausted cumulative budget must stop before HTTP");
+        assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
+        let retried = runner.handle(&mut session, AiRequest::RetryBatch { job_id });
+        assert!(retried.busy, "{}", retried.message);
+        let stopped = wait(&mut runner, &mut session);
+        assert!(stopped.message.contains("request limit"), "{}", stopped.message);
+        assert_eq!(stopped.batch.as_ref().unwrap().cumulative_usage.requests, 1, "Retry cannot reset exhausted allowances");
+        assert!(listener.accept().is_err());
         assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
     }
 
@@ -1439,7 +2024,7 @@ mod tests {
             status: "approved".into(),
             ..Default::default()
         });
-        let context = batch_context(&session, &job).unwrap();
+        let context = batch_context(&session, &job, dir.path()).unwrap();
         assert_eq!(context["approvedPageCount"], 2);
         assert_eq!(context["approvedPageBriefs"].as_array().unwrap().len(), 2);
         let recent = context["recentApprovedObjects"].to_string();
@@ -1448,5 +2033,46 @@ mod tests {
         assert!(context["recentApprovedBatchRanges"].to_string().contains("Plants"));
         assert!(serde_json::to_vec(&context).unwrap().len() < 48 * 1024);
         assert!(limited_text("حروف عربية", 7).len() <= 7);
+    }
+
+    #[test]
+    fn ai20_later_and_retry_context_keeps_environment_and_only_completed_native_observations() {
+        for prior_report in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(directory.path()).unwrap();
+            let mut session = Session::new();
+            waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            session
+                .execute(
+                    "frame.create",
+                    &json!({"spread":0,"rect":[200,60,400,120],"content":"text","text":"Existing approved roots and leaves","caret":false}),
+                )
+                .unwrap();
+            let mut job = runner.batch.take().unwrap();
+            job.task.settings.facing_pages = true;
+            job.task.prompt = "Trim Size: A4\nMargins: 15 mm\nContinue the bilingual book".into();
+            if prior_report {
+                job.snapshot.batches[0].status = "approved".into();
+            } else {
+                job.snapshot.batches.clear();
+            }
+            job.snapshot.batches.push(BatchReport {
+                batch: 2,
+                page_start: 1,
+                page_count: 1,
+                status: "failed".into(),
+                title: "UNPUBLISHED".into(),
+                ..Default::default()
+            });
+            let context = batch_context(&session, &job, directory.path()).unwrap();
+            assert!(context["fontFaces"].is_array());
+            assert!(context["swatchNames"].as_array().unwrap().iter().any(|name| name == "[Black]"));
+            assert!(context.get("_production_cache_root").is_some());
+            assert_eq!(context["facing_editorial_direction"]["enabled"], true);
+            assert!(context["production_print_contract"].is_object());
+            assert!(context["recentApprovedObjects"].to_string().contains("roots and leaves"));
+            assert!(!context["recentApprovedBatchRanges"].to_string().contains("UNPUBLISHED"));
+            assert!(serde_json::to_vec(&context).unwrap().len() < 48 * 1024);
+        }
     }
 }

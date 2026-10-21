@@ -108,12 +108,70 @@ pub struct ComfyRequest {
 pub struct ImageRequest {
     pub prompt: String,
     /// OpenAI pixel size, or a Gemini native aspect ratio (e.g. 4:1).
+    /// A Gemini ratio may include an explicit native tier: `4:1@2K`.
     /// None delegates to the selected model's default.
     pub size: Option<String>,
     pub quality: Option<String>,
     /// Required only for ComfyUI; no workflow or model is installed implicitly.
     pub comfy: Option<ComfyRequest>,
     pub resources: designcraft_ai_types::LocalResourcePolicy,
+}
+
+/// Select native source resolution without resampling. Actual returned pixels still need preflight.
+/// Dimensions and tiers: https://ai.google.dev/gemini-api/docs/generate-content/image-generation
+pub fn gemini_print_size(model: &str, ratio: &str, min_pixels: [u32; 2]) -> Result<String, String> {
+    if !gemini_has_print_tiers(model) || !gemini_print_ratio_supported(model, ratio) {
+        return Err("Selected Gemini model has no verified 2K/4K print resolution support".into());
+    }
+    let [width, height] = gemini_base_pixels(ratio).ok_or("Unsupported Gemini image aspect ratio")?;
+    let [min_width, min_height] = min_pixels;
+    if min_width == 0 || min_height == 0 {
+        return Err("Print image dimensions must be positive".into());
+    }
+    for (scale, tier) in [(1, "1K"), (2, "2K"), (4, "4K")] {
+        if width * scale >= min_width && height * scale >= min_height {
+            return Ok(format!("{ratio}@{tier}"));
+        }
+    }
+    Err(format!(
+        "Requested source image {min_width}×{min_height} pixels exceeds Gemini's documented 4K tier for {ratio}; reduce the placed size or use a higher-resolution original"
+    ))
+}
+
+fn gemini_has_print_tiers(model: &str) -> bool {
+    let model = model.strip_prefix("models/").unwrap_or(model);
+    ["gemini-3.1-flash-image", "gemini-3-pro-image", "gemini-3.1-pro-image", "gemini-nano-banana-2.1"]
+        .iter()
+        .any(|known| model == *known || model.strip_prefix(known).is_some_and(|suffix| suffix.starts_with("-preview")))
+}
+
+fn gemini_print_ratio_supported(model: &str, ratio: &str) -> bool {
+    if matches!(ratio, "1:4" | "4:1" | "1:8" | "8:1") {
+        let model = model.strip_prefix("models/").unwrap_or(model);
+        model.starts_with("gemini-3.1-flash-image") || model.starts_with("gemini-nano-banana-2.1")
+    } else {
+        gemini_base_pixels(ratio).is_some()
+    }
+}
+
+fn gemini_base_pixels(ratio: &str) -> Option<[u32; 2]> {
+    Some(match ratio {
+        "1:1" => [1024, 1024],
+        "1:4" => [512, 2048],
+        "1:8" => [384, 3072],
+        "2:3" => [848, 1264],
+        "3:2" => [1264, 848],
+        "3:4" => [896, 1200],
+        "4:1" => [2048, 512],
+        "4:3" => [1200, 896],
+        "4:5" => [928, 1152],
+        "5:4" => [1152, 928],
+        "8:1" => [3072, 384],
+        "9:16" => [768, 1376],
+        "16:9" => [1376, 768],
+        "21:9" => [1584, 672],
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug)]

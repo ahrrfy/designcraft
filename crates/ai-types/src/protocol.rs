@@ -38,8 +38,14 @@ pub struct TokenRates {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
+    /// Real book spreads; existing documents always keep their current binding.
+    pub facing_pages: bool,
+    /// None infers direction from content language; explicit preferences remain available.
+    pub right_to_left_binding: Option<bool>,
     /// Additional planning requests may be billed; opt in explicitly, including legacy settings.
     pub allow_paid_repairs: bool,
+    /// Optional billed visual inspection using the selected supported vision text model.
+    pub verify_generated_images: bool,
     /// None selects a relevant style locally; Some pins this skill's design profile at task start.
     pub design_style: Option<String>,
     pub text_model: ModelSelection,
@@ -55,7 +61,10 @@ pub struct AiSettings {
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
+            facing_pages: false,
+            right_to_left_binding: None,
             allow_paid_repairs: false,
+            verify_generated_images: false,
             design_style: None,
             text_model: ModelSelection { provider: ProviderKind::Ollama, model: String::new(), endpoint: None },
             image_model: ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: None },
@@ -73,7 +82,7 @@ impl Default for AiSettings {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskTarget {
     CurrentDocument,
-    /// Explicit new authority to fill the contiguous blank suffix of an existing A4 book.
+    /// Explicit new authority to fill the contiguous blank suffix of the selected book.
     /// Persisted checkpoints never grant this authority.
     ContinueBook,
     NewA4 {
@@ -93,6 +102,16 @@ pub struct TaskRequest {
 }
 fn auto_skills() -> bool {
     true
+}
+/// Recoverable instructions only. Reopening never restores a live worker or proof approval.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionDraft {
+    pub id: String,
+    pub request: TaskRequest,
+    pub document_uid: Option<u64>,
+    pub document_path: Option<String>,
+    pub document_title: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +140,10 @@ pub enum AiRequest {
     ApproveBatch {
         job_id: String,
         checkpoint: u32,
+    },
+    /// Retry an unpublished failed group with its original cumulative admission ledger.
+    RetryBatch {
+        job_id: String,
     },
     UpdateSettings(AiSettings),
     SetApiKey {
@@ -156,6 +179,8 @@ pub enum AiRequest {
     PrepareSkills {
         prompt: String,
     },
+    /// Local planning preview only; never launches a provider or grants production authority.
+    PreviewProduction(TaskRequest),
     SaveSkillDraft {
         id: String,
         skill_md: String,
@@ -307,6 +332,9 @@ pub struct BatchSnapshot {
     pub total_batches: u32,
     pub completed_pages: u32,
     pub status: String,
+    /// Live failed-job authority only; always false for recovered checkpoints.
+    #[serde(default)]
+    pub retryable: bool,
     pub checkpoint: u32,
     pub document_uid: Option<u64>,
     pub document_revision: Option<u64>,
@@ -361,12 +389,22 @@ pub struct SkillReview {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AiSnapshot {
     pub available: bool,
+    #[serde(default)]
+    pub production_preview: Option<Value>,
     pub local_server: Option<LocalServerStatus>,
     pub busy: bool,
     pub stage: String,
     pub progress: f32,
+    /// Current task's measured cumulative ledger, refreshed after each provider call.
+    #[serde(default)]
+    pub current_usage: UsageSummary,
+    /// Local fitting decisions and production checks; never provider credentials.
+    #[serde(default)]
+    pub current_issues: Vec<Value>,
     pub message: String,
     pub settings: AiSettings,
+    #[serde(default)]
+    pub production_draft: Option<ProductionDraft>,
     pub skills: Vec<SkillCard>,
     #[serde(default)]
     pub skill_warnings: Vec<String>,

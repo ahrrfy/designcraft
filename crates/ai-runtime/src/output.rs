@@ -12,6 +12,20 @@ impl ProductionRunner {
 
     pub(super) fn prepare_print(&mut self, session: &mut Session, printer: Option<String>, grayscale: bool, duplex: String) -> Result<(), String> {
         self.snapshot.print_proof = None;
+        if let Some(contract) = self.print_contracts.get(&session.doc().map_err(|e| e.to_string())?.uid) {
+            contract.validate_existing(session.doc().map_err(|e| e.to_string())?)?;
+            contract.validate_final_export()?;
+            let checked = ensure_preflight_at(session, contract.min_image_ppi().unwrap_or(150.0))?;
+            if checked
+                .get("issues")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|issue| issue.get("kind").and_then(Value::as_str) == Some("lowResolution"))
+            {
+                return Err("Resolve low-resolution artwork before preparing final print".into());
+            }
+        }
         let prepared = session.execute("file.preparePrint", &print_params(printer, grayscale, duplex)).map_err(|e| e.to_string())?;
         let token = prepared.get("token").and_then(Value::as_str).ok_or("Missing frozen print token")?.to_string();
         valid_token(&token)?;

@@ -38,6 +38,8 @@ pub struct DesignTextSlot {
     pub id: String,
     pub purpose: String,
     pub command: usize,
+    /// Copy-length target for the planner. Publication also requires real native
+    /// composition at the authored type size; character counts cannot prove fit.
     pub max_chars: usize,
 }
 
