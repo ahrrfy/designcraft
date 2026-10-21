@@ -20,7 +20,14 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         .map_err(|e| e.to_string())?;
     let results = result.get("results").and_then(Value::as_array).ok_or("Native layout did not return command results")?;
     let mut frames = Vec::new();
+    let mut created_frames = BTreeMap::new();
     for (index, action) in candidate.commands.iter().enumerate() {
+        if action.command == "frame.create"
+            && action.params.get("content").and_then(Value::as_str) == Some("unassigned")
+            && let Some(id) = results.get(index).and_then(|value| value.get("id")).and_then(Value::as_u64)
+        {
+            created_frames.insert(ItemId(id), index);
+        }
         if action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text") {
             let id = results.get(index).and_then(|v| v.get("id")).and_then(Value::as_u64).ok_or("Native text frame has no ID")?;
             let story = results.get(index).and_then(|v| v.get("story")).and_then(Value::as_u64).ok_or("Native text frame has no story")?;
@@ -88,83 +95,73 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         let spread = doc.spreads.get(spread_index).ok_or("Native page disappeared")?;
         let item = doc.item(id).ok_or("Native frame disappeared")?;
         let outer = doc.parent_xf(&loc);
+        let old = outer.transform_rect_bbox(item.bounds());
+        let identity = frame_identity(spread_index, index, id, old, &story.text);
         let linear = (outer * item.xf).as_coeffs();
         if (linear[0] - 1.0).abs() > 0.001 || linear[1].abs() > 0.001 || linear[2].abs() > 0.001 || (linear[3] - 1.0).abs() > 0.001 {
-            return Err(format!(
-                "Page {} frame '{}' has overset text in a transformed frame; reflow its layout before generation",
-                spread_index + 1,
-                item.label
-            ));
+            return Err(format!("{identity} has overset text in a transformed frame; reflow its layout before generation"));
         }
-        let old = outer.transform_rect_bbox(item.bounds());
         scratch.execute("object.fit", &json!({"ids":[id.0],"mode":"fitFrameToContent","axis":"height"})).map_err(|e| e.to_string())?;
         let fitted_doc = scratch.doc().map_err(|e| e.to_string())?.doc.clone();
         let fitted = fitted_doc.item(id).ok_or("Fitted text frame disappeared")?;
-        let grown = outer.transform_rect_bbox(fitted.bounds());
-        let safe = spread.pages.iter().any(|page| contains(page.margin_rect(), grown));
-        let mut pending: Vec<_> = spread.items.iter().map(|node| (node.as_ref(), Affine::IDENTITY, 0u32)).collect();
-        // Parent artwork is rendered on the document page too. Match the engine's
-        // placement/override rules before declaring a growth area to be empty.
-        for (page_index, page) in spread.pages.iter().enumerate().filter(|(_, page)| page.show_parent_items) {
-            for (parent_index, parent_page_index) in doc.shown_parent_pages(designcraft_engine::doc::SpreadRef::Doc(spread_index), page_index) {
-                let Some(parent) = doc.parents.get(parent_index) else { continue };
-                let Some(parent_page) = parent.pages.get(parent_page_index) else { continue };
-                for node in &parent.items {
-                    if page.overridden.contains(&node.id)
-                        || (parent.pages.len() > 1 && parent.page_at_x(node.bounds().center().x) != Some(parent_page_index))
-                    {
-                        continue;
-                    }
-                    if pending.len() >= 10_000 {
-                        return Err("Native fitting parent-item bound exceeded".into());
-                    }
-                    pending.push((node.as_ref(), Affine::translate((page.x - parent_page.x, 0.0)), 0u32));
-                }
-            }
+        let measured = outer.transform_rect_bbox(fitted.bounds());
+        let extra_height = measured.height() - old.height() + 0.01;
+        // Include the same rounding allowance in collision checks and the published source.
+        let grown = Rect::new(measured.x0, measured.y0, measured.x1, measured.y1 + 0.01);
+        let page = spread.page_at_x(old.center().x).ok_or("Native text frame has no owning page")?;
+        let safe = spread.pages.get(page).ok_or("Native text page disappeared")?.margin_rect();
+        let mut growth = TextPosition { index, id, spread: spread_index, page, original: old, target: grown, safe, language: 0 };
+        let mut blocked = !extra_height.is_finite() || extra_height <= 0.0;
+        // Height fitting happens after ordinary margin recovery. A new footer can
+        // retain its bottom edge by moving only the measured excess upward.
+        if !contains(safe, grown) {
+            growth.target = shift(grown, 0.0, safe.y1 - grown.y1);
+            blocked |= grown.y1 <= safe.y1
+                || loc.path.len() != 1
+                || base.doc.item(id).is_some()
+                || item.locked
+                || item.hidden
+                || item.nonprinting
+                || doc.layer(item.layer).is_some_and(|layer| layer.locked || !layer.visible || !layer.printable)
+                || !contains(safe, growth.target)
+                || position_collision(&growth, &BTreeMap::from([(id, growth.target)]), &doc, &candidate, cancel)?;
         }
-        let mut visited = 0usize;
-        let mut collision = false;
-        while let Some((node, parent, depth)) = pending.pop() {
-            visited = visited.saturating_add(1);
-            if visited > 10_000 || depth > 64 {
-                return Err("Native fitting item-tree bound exceeded".into());
-            }
-            if !node.children().is_empty() {
-                for child in node.children() {
-                    pending.push((child.as_ref(), parent * node.xf, depth.saturating_add(1)));
-                }
-                continue;
-            }
-            if node.id == id {
-                continue;
-            }
-            let bounds = parent.transform_rect_bbox(node.visible_bounds());
-            if contains(bounds, old) {
-                if !contains(bounds, grown) {
-                    collision = true;
-                    break;
-                }
-            } else if overlaps(grown, bounds) && !overlaps(old, bounds) {
-                collision = true;
-                break;
-            }
-        }
-        for image in &candidate.images {
-            if image.page == spread_index {
-                let [x0, y0, x1, y1] = image.rect;
-                let bounds = Rect::new(x0, y0, x1, y1);
-                if overlaps(grown, bounds) && !overlaps(old, bounds) {
-                    collision = true;
-                }
-            }
-        }
-        if !safe || collision || scratch.cache.get(&fitted_doc, story_id, None).is_overset() {
+        let backgrounds = if blocked { None } else { containing_background_growths(&growth, &doc, base, &created_frames, &candidate, cancel)? };
+        let Some(backgrounds) = backgrounds.filter(|_| !scratch.cache.get(&fitted_doc, story_id, None).is_overset()) else {
             return Err(format!(
-                "Page {} frame '{}' has overset text and needs {:.1} pt more height, but no safe free space remains; copy and font size were preserved. Reflow this activity before buying images",
-                spread_index + 1,
-                item.label,
-                (grown.height() - old.height()).max(0.0)
+                "{identity} has overset text and needs {:.1} pt more height, but no safe free space remains; copy and font size were preserved. Reflow this activity before buying images",
+                (measured.height() - old.height()).max(0.0)
             ));
+        };
+        let dy = growth.target.y0 - grown.y0;
+        if candidate
+            .commands
+            .len()
+            .checked_add(backgrounds.len())
+            .and_then(|length| length.checked_add(usize::from(dy != 0.0)))
+            .is_none_or(|length| length > 512)
+        {
+            return Err("Local fitting exceeds the bounded native action limit".into());
+        }
+        for background in backgrounds {
+            let current = scratch.doc().map_err(|error| error.to_string())?.doc.item(background.id).ok_or("Native background disappeared")?;
+            let height = if prefs.dimensions_include_stroke { current.visible_bounds().height() } else { current.bounds().height() } + extra_height;
+            let params = json!({"ids":[background.id.0],"height":height,"ref":0});
+            scratch.execute("transform.set", &params).map_err(|error| error.to_string())?;
+            candidate.commands.push(EngineAction {
+                command: "transform.set".into(),
+                params: json!({"ids":[format!("${}.id",background.index)],"height":height,"ref":0}),
+            });
+            notes.push(json!({"kind":"nativeBackgroundReflow","page":spread_index,"item":background.id.0,"extraHeightPt":extra_height,
+                "message":"Expanded a new rectangular text container into verified free space; preserved its padding and existing artwork"}));
+        }
+        if dy != 0.0 {
+            scratch.execute("transform.move", &json!({"ids":[id.0],"dx":0,"dy":dy})).map_err(|error| error.to_string())?;
+            candidate
+                .commands
+                .push(EngineAction { command: "transform.move".into(), params: json!({"ids":[format!("${index}.id")],"dx":0,"dy":dy}) });
+            notes.push(json!({"kind":"nativeTextTranslation","page":spread_index,"item":id.0,"dx":0,"dy":dy,
+                "message":"Moved newly fitted text upward into verified safe space; preserved copy, font sizes and explicit text insets"}));
         }
         let rect = candidate
             .commands
@@ -174,8 +171,8 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
             .ok_or("Native text frame has no source rectangle")?;
         let bottom = rect.get(3).and_then(Value::as_f64).ok_or("Invalid native frame height")?;
         let value = rect.get_mut(3).ok_or("Invalid native frame rectangle")?;
-        *value = json!(bottom + grown.height() - old.height() + 0.01);
-        notes.push(json!({"kind":"nativeTextReflow","page":spread_index,"item":id.0,"label":item.label,"extraHeightPt":grown.height()-old.height()+0.01,"message":"Expanded text frame into verified free space; preserved all text and font size"}));
+        *value = json!(bottom + extra_height);
+        notes.push(json!({"kind":"nativeTextReflow","page":spread_index,"item":id.0,"label":item.label,"extraHeightPt":extra_height,"message":"Expanded text frame into verified free space; preserved all text and font size"}));
     }
     if candidate.commands.len() > 512 {
         return Err("Local fitting exceeds the bounded native action limit".into());
@@ -189,6 +186,198 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         .map_err(|e| e.to_string())?;
     *plan = candidate;
     Ok(notes)
+}
+
+fn frame_identity(spread: usize, index: usize, id: ItemId, rect: Rect, text: &str) -> String {
+    let mut copy: String =
+        text.chars().take(80).map(|character| if character.is_whitespace() || character.is_control() { ' ' } else { character }).collect();
+    if text.chars().nth(80).is_some() {
+        copy.push('…');
+    }
+    format!(
+        "Page {} native text item {} (source ${index}, rect [{:.2}, {:.2}, {:.2}, {:.2}], copy {copy:?})",
+        spread + 1,
+        id.0,
+        rect.x0,
+        rect.y0,
+        rect.x1,
+        rect.y1
+    )
+}
+
+struct FittingObstacle {
+    id: ItemId,
+    bounds: Rect,
+    inherited: bool,
+}
+
+struct BackgroundGrowth {
+    index: usize,
+    id: ItemId,
+    original: Rect,
+    target: Rect,
+}
+
+/// Grow only containers whose authorship, geometry and complete new bottom band
+/// are proven locally. Fixed artwork and containing images retain their bounds.
+fn containing_background_growths(
+    text: &TextPosition,
+    doc: &designcraft_engine::doc::Document,
+    base: &DocState,
+    created: &BTreeMap<ItemId, usize>,
+    plan: &ProductionPlan,
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<BackgroundGrowth>>, String> {
+    let obstacles = fitting_obstacles(doc, text.spread, cancel)?;
+    let mut backgrounds = Vec::new();
+    let spread = doc.spreads.get(text.spread).ok_or("Native text page disappeared")?;
+    for obstacle in &obstacles {
+        if (!obstacle.inherited && obstacle.id == text.id) || !contains(obstacle.bounds, text.original) || contains(obstacle.bounds, text.target) {
+            continue;
+        }
+        let Some(&index) = created.get(&obstacle.id) else { return Ok(None) };
+        let Some(item) = doc.item(obstacle.id) else { return Ok(None) };
+        let Some(loc) = doc.find(obstacle.id) else { return Ok(None) };
+        let linear = (doc.parent_xf(&loc) * item.xf).as_coeffs();
+        if obstacle.inherited
+            || base.doc.item(obstacle.id).is_some()
+            || loc.path.len() != 1
+            || item.shape != designcraft_engine::doc::Shape::Rectangle
+            || !matches!(item.content, designcraft_engine::doc::Content::Unassigned)
+            || item.locked
+            || item.hidden
+            || item.nonprinting
+            || item.overrides.is_some()
+            || item.flex.is_some()
+            || item.effects.any()
+            || !item.wrap.is_default()
+            || doc.layer(item.layer).is_some_and(|layer| layer.locked || !layer.visible || !layer.printable)
+            || (linear[0] - 1.0).abs() > 0.001
+            || linear[1].abs() > 0.001
+            || linear[2].abs() > 0.001
+            || (linear[3] - 1.0).abs() > 0.001
+            || spread.page_at_x(obstacle.bounds.center().x) != Some(text.page)
+        {
+            return Ok(None);
+        }
+        let target =
+            Rect::new(obstacle.bounds.x0, obstacle.bounds.y0, obstacle.bounds.x1, obstacle.bounds.y1 + text.target.height() - text.original.height());
+        if ![target.x0, target.y0, target.x1, target.y1].iter().all(|value| value.is_finite())
+            || !contains(text.safe, target)
+            || !contains(target, text.target)
+        {
+            return Ok(None);
+        }
+        backgrounds.push(BackgroundGrowth { index, id: obstacle.id, original: obstacle.bounds, target });
+    }
+    let targets: BTreeMap<_, _> = backgrounds.iter().map(|background| (background.id, background.target)).collect();
+    // Keep the original text-growth collision rule, substituting only containers
+    // that have passed the stricter provenance and geometry checks above.
+    for obstacle in &obstacles {
+        if !obstacle.inherited && obstacle.id == text.id {
+            continue;
+        }
+        let bounds = if obstacle.inherited { obstacle.bounds } else { targets.get(&obstacle.id).copied().unwrap_or(obstacle.bounds) };
+        if if contains(bounds, text.original) {
+            !contains(bounds, text.target)
+        } else {
+            overlaps(text.target, bounds) && !overlaps(text.original, bounds)
+        } {
+            return Ok(None);
+        }
+    }
+    for image in plan.images.iter().filter(|image| image.page == text.spread) {
+        let [x0, y0, x1, y1] = image.rect;
+        if overlaps(text.target, Rect::new(x0, y0, x1, y1)) && !overlaps(text.original, Rect::new(x0, y0, x1, y1)) {
+            return Ok(None);
+        }
+    }
+    for background in &backgrounds {
+        let band = Rect::new(background.target.x0, background.original.y1, background.target.x1, background.target.y1);
+        for obstacle in &obstacles {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Local layout cancelled".into());
+            }
+            if !obstacle.inherited && obstacle.id == background.id {
+                continue;
+            }
+            let target = if !obstacle.inherited && obstacle.id == text.id {
+                text.target
+            } else if obstacle.inherited {
+                obstacle.bounds
+            } else {
+                targets.get(&obstacle.id).copied().unwrap_or(obstacle.bounds)
+            };
+            if background_growth_blocks(background, obstacle.bounds, target, band) {
+                return Ok(None);
+            }
+        }
+        for image in plan.images.iter().filter(|image| image.page == text.spread) {
+            let [x0, y0, x1, y1] = image.rect;
+            let bounds = Rect::new(x0, y0, x1, y1);
+            if background_growth_blocks(background, bounds, bounds, band) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(backgrounds))
+}
+
+fn background_growth_blocks(background: &BackgroundGrowth, old: Rect, target: Rect, band: Rect) -> bool {
+    if contains(old, background.original) {
+        !contains(target, background.target)
+    } else if contains(background.original, old) {
+        !contains(background.target, target)
+    } else {
+        overlaps(band, target)
+    }
+}
+
+fn fitting_obstacles(doc: &designcraft_engine::doc::Document, spread_index: usize, cancel: &AtomicBool) -> Result<Vec<FittingObstacle>, String> {
+    let spread = doc.spreads.get(spread_index).ok_or("Native text page disappeared")?;
+    if spread.items.len() > 10_000 {
+        return Err("Native fitting item-tree bound exceeded".into());
+    }
+    let mut pending: Vec<_> = spread.items.iter().map(|node| (node.as_ref(), Affine::IDENTITY, 0u32, false)).collect();
+    for (page_index, page) in spread.pages.iter().enumerate().filter(|(_, page)| page.show_parent_items) {
+        for (parent_index, parent_page_index) in doc.shown_parent_pages(designcraft_engine::doc::SpreadRef::Doc(spread_index), page_index) {
+            let Some(parent) = doc.parents.get(parent_index) else { continue };
+            let Some(parent_page) = parent.pages.get(parent_page_index) else { continue };
+            for node in &parent.items {
+                if page.overridden.contains(&node.id)
+                    || (parent.pages.len() > 1 && parent.page_at_x(node.bounds().center().x) != Some(parent_page_index))
+                {
+                    continue;
+                }
+                if pending.len() >= 10_000 {
+                    return Err("Native fitting parent-item bound exceeded".into());
+                }
+                pending.push((node.as_ref(), Affine::translate((page.x - parent_page.x, 0.0)), 0, true));
+            }
+        }
+    }
+    let mut obstacles = Vec::new();
+    let mut visited = 0usize;
+    while let Some((node, parent, depth, inherited)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 10_000 || depth > 64 || pending.len() > 10_000 {
+            return Err("Native fitting item-tree bound exceeded".into());
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Local layout cancelled".into());
+        }
+        if node.children().is_empty() {
+            obstacles.push(FittingObstacle { id: node.id, bounds: parent.transform_rect_bbox(node.visible_bounds()), inherited });
+        } else {
+            for child in node.children() {
+                if pending.len() >= 10_000 {
+                    return Err("Native fitting item-tree bound exceeded".into());
+                }
+                pending.push((child.as_ref(), parent * node.xf, depth.saturating_add(1), inherited));
+            }
+        }
+    }
+    Ok(obstacles)
 }
 
 #[derive(Clone)]
@@ -469,6 +658,146 @@ mod tests {
             {"command":"frame.create","params":{"spread":0,"rect":[60,180,225,280],"content":"graphic"}}
         ]})).unwrap();
         (session, plan)
+    }
+
+    fn contained_growth_fixture() -> (Session, ProductionPlan, Rect) {
+        let (session, mut plan) = fixture();
+        plan.commands.insert(2, EngineAction { command: "object.textFrameOptions".into(), params: json!({"ids":["$0.id"],"inset":[2,3,2,3]}) });
+        let mut measured = Session::new();
+        measured.prefs = session.prefs.clone();
+        measured.add_document(session.doc().unwrap().clone());
+        let applied =
+            measured.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+        let id = applied["results"][0]["id"].as_u64().unwrap();
+        measured.execute("object.fit", &json!({"ids":[id],"mode":"fitFrameToContent","axis":"height"})).unwrap();
+        let fitted = measured.doc().unwrap().doc.item(ItemId(id)).unwrap().bounds();
+        let old_bottom = fitted.y1 - 4.4;
+        plan.commands[0].params["rect"][3] = json!(old_bottom);
+        let background = Rect::new(54.0, 54.0, 231.0, old_bottom + 1.0);
+        plan.commands.insert(0, EngineAction { command: "frame.create".into(), params: json!({"spread":0,"content":"unassigned","shape":"rectangle","rect":[background.x0,background.y0,background.x1,background.y1]}) });
+        plan.commands[3].params["ids"] = json!(["$1.id"]);
+        (session, plan, background)
+    }
+
+    #[test]
+    fn ai21_new_decorative_container_grows_with_tiny_text_reflow_and_keeps_padding_and_insets() {
+        let (session, mut plan, old_background) = contained_growth_fixture();
+        let authored = plan.clone();
+        let base = session.doc().unwrap().clone();
+        let notes = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap();
+        assert!(notes.iter().any(|note| note["kind"] == "nativeBackgroundReflow"));
+        assert_eq!(plan.commands[1].params["text"], authored.commands[1].params["text"]);
+        assert_eq!(plan.commands[2].params, authored.commands[2].params, "Font size and leading must stay authored");
+        assert_eq!(plan.commands[3].params, authored.commands[3].params, "Explicit text insets must never change");
+        let mut proof = Session::new();
+        proof.prefs = session.prefs.clone();
+        proof.add_document(base.clone());
+        let result =
+            proof.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        let doc = &proof.doc().unwrap().doc;
+        let background = doc.item(ItemId(result["results"][0]["id"].as_u64().unwrap())).unwrap().bounds();
+        let text = doc.item(ItemId(result["results"][1]["id"].as_u64().unwrap())).unwrap().bounds();
+        assert!((background.y1 - text.y1 - 1.0).abs() < 0.02, "Bottom padding must survive local reflow");
+        assert!(background.y1 > old_background.y1 && background.y1 - old_background.y1 < 5.0);
+        assert_eq!((background.x0, background.y0, background.x1), (old_background.x0, old_background.y0, old_background.x1));
+        assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn ai21_container_growth_refuses_real_and_inherited_obstacles_in_its_padding_band() {
+        for inherited in [false, true] {
+            let (mut session, mut plan, background) = contained_growth_fixture();
+            let obstacle = json!({"spread":if inherited {json!({"kind":"parent","index":0})} else {json!(0)},
+                "content":"graphic","rect":[54,background.y1+1.0,59,background.y1+3.0]});
+            if inherited {
+                session.execute("frame.create", &obstacle).unwrap();
+            } else {
+                plan.commands.push(EngineAction { command: "frame.create".into(), params: obstacle });
+            }
+            let authored = serde_json::to_value(&plan).unwrap();
+            let base = session.doc().unwrap().clone();
+            assert!(prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).is_err());
+            assert_eq!(serde_json::to_value(&plan).unwrap(), authored);
+            assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+        }
+    }
+
+    #[test]
+    fn ai21_existing_inherited_graphic_and_nonrectangular_containers_remain_fixed() {
+        for kind in ["existing", "inherited", "graphic", "ellipse"] {
+            let (mut session, mut plan, _) = contained_growth_fixture();
+            if kind == "existing" || kind == "inherited" {
+                let mut background = plan.commands.remove(0).params;
+                if kind == "inherited" {
+                    background["spread"] = json!({"kind":"parent","index":0});
+                }
+                session.execute("frame.create", &background).unwrap();
+                plan.commands[2].params["ids"] = json!(["$0.id"]);
+            } else if kind == "graphic" {
+                plan.commands[0].params["content"] = json!("graphic");
+            } else {
+                plan.commands[0].params["shape"] = json!("ellipse");
+            }
+            let authored = serde_json::to_value(&plan).unwrap();
+            let base = session.doc().unwrap().clone();
+            assert!(prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).is_err(), "{kind} must not be resized by local recovery");
+            assert_eq!(serde_json::to_value(&plan).unwrap(), authored);
+            assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+        }
+    }
+
+    fn fitted_footer_fixture() -> (Session, ProductionPlan, Rect) {
+        let (session, mut plan, _) = contained_growth_fixture();
+        plan.commands.remove(0);
+        plan.commands.pop();
+        plan.commands[2].params["ids"] = json!(["$0.id"]);
+        let safe = session.doc().unwrap().doc.spreads[0].pages[0].margin_rect();
+        let old_bottom = plan.commands[0].params["rect"][3].as_f64().unwrap();
+        let dy = safe.y1 - old_bottom;
+        plan.commands[0].params["rect"][1] = json!(60.0 + dy);
+        plan.commands[0].params["rect"][3] = json!(safe.y1);
+        (session, plan, Rect::new(60.0, 60.0 + dy, 225.0, safe.y1))
+    }
+
+    #[test]
+    fn ai21_tiny_overset_footer_moves_up_with_unchanged_copy_fonts_and_explicit_insets() {
+        let (session, mut plan, original) = fitted_footer_fixture();
+        let authored = plan.clone();
+        let base = session.doc().unwrap().clone();
+        let notes = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap();
+        assert!(notes.iter().any(|note| note["kind"] == "nativeTextTranslation"));
+        assert_eq!(plan.commands[0].params["text"], authored.commands[0].params["text"]);
+        assert_eq!(plan.commands[1].params, authored.commands[1].params);
+        assert_eq!(plan.commands[2].params, authored.commands[2].params);
+        let mut proof = Session::new();
+        proof.prefs = session.prefs.clone();
+        proof.add_document(base.clone());
+        let result =
+            proof.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only","requirePreflight":true})).unwrap();
+        let doc = &proof.doc().unwrap().doc;
+        let bounds = doc.item(ItemId(result["results"][0]["id"].as_u64().unwrap())).unwrap().bounds();
+        assert!(contains(doc.spreads[0].pages[0].margin_rect(), bounds));
+        assert!((bounds.y1 - original.y1).abs() < 0.02);
+        assert!(original.y0 - bounds.y0 > 4.0 && original.y0 - bounds.y0 < 5.0);
+        assert_eq!((bounds.x0, bounds.x1), (original.x0, original.x1));
+        assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn ai21_footer_growth_refuses_upward_obstruction_and_reports_bounded_source_identity() {
+        let (session, mut plan, original) = fitted_footer_fixture();
+        plan.commands.push(EngineAction {
+            command: "frame.create".into(),
+            params: json!({"spread":0,"content":"graphic","rect":[60,original.y0-3.0,225,original.y0-1.0]}),
+        });
+        let authored = serde_json::to_value(&plan).unwrap();
+        let base = session.doc().unwrap().clone();
+        let error = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap_err();
+        assert!(error.contains("source $0") && error.contains("item ") && error.contains("rect ["), "{error}");
+        assert!(error.contains("Count the flowers") && error.contains("4.4 pt"), "{error}");
+        assert!(error.len() < 700, "Overset diagnostics must remain bounded");
+        assert_eq!(serde_json::to_value(&plan).unwrap(), authored);
+        assert!(std::sync::Arc::ptr_eq(&base.doc, &session.doc().unwrap().doc));
     }
 
     fn margin_fixture() -> (Session, ProductionPlan) {

@@ -64,6 +64,16 @@ pub(crate) fn store_plan(root: &Path, key: &str, plan: &ProductionPlan) -> Resul
     store(root, key, "plan", payload)
 }
 
+/// One bounded private diagnostic, never an executable or validated plan entry.
+/// Replacement uses the same ordinary-file, atomic-write and shared quota guards.
+pub(crate) fn store_rejected_response(root: &Path, response: &str) -> Result<Option<PathBuf>, String> {
+    if response.len() > 4 * 1024 * 1024 {
+        return Err("Rejected response exceeds its 4-MiB diagnostic limit".into());
+    }
+    let path = root.join("last-rejected-response.txt");
+    Ok(write_cache_file(root, &path, response.as_bytes())?.then_some(path))
+}
+
 pub(crate) fn load_image(root: &Path, key: &str) -> Result<Option<GeneratedImage>, String> {
     let Some(payload) = load(root, key, "image")? else { return Ok(None) };
     if payload.get("blob_sha256").is_some() {
@@ -487,6 +497,23 @@ mod tests {
         assert_eq!(std::fs::metadata(&filler).unwrap().len(), MAX_CACHE_BYTES);
         assert!(load_plan(root.path(), &key()).unwrap().is_none());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn ai21_rejected_response_is_bounded_replaced_and_never_a_validated_plan() {
+        let root = temporary_root();
+        let original = "{invalid private response}".repeat(800);
+        let path = store_rejected_response(root.path(), &original).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(load_plan(root.path(), &key()).unwrap().is_none());
+        let valid = plan();
+        store_plan(root.path(), &key(), &valid).unwrap();
+        store_rejected_response(root.path(), "نص تشخيصي جديد").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "نص تشخيصي جديد");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        assert_eq!(serde_json::to_value(load_plan(root.path(), &key()).unwrap().unwrap()).unwrap(), serde_json::to_value(valid).unwrap());
+        assert!(store_rejected_response(root.path(), &"x".repeat(4 * 1024 * 1024 + 1)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "نص تشخيصي جديد");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # DesignCraft roadmap
 
+- AI21 (2026-10-21): Fit tiny native text overflows without shrinking copy or fonts: co-grow eligible new rectangular backgrounds, recover safe footer height, retain fixed/inherited artwork and exact source command indices. Send resolved print fonts before layout planning and retain one bounded private rejected response for offline diagnosis. See `docs/production-native-fit-ai21.ar.md`.
+
 - AI20 (2026-10-21): Preserve actual opened-book trim and bounded continuation context across new groups and retries; keep discovered models selectable, estimate natural-language review requests, expose truthful binding controls, and separate skill/document export destinations. Align recommended template families with strict math guards and absolute page-one openers; preserve LTR numeric expressions. Integrate upstream 0.10.0 without replacing local AI features. See `docs/production-workflow-ai20.ar.md`.
 
 - AI19 (2026-10-21): Make book continuation explicit in the composer, recover bounded private production instructions without resuming authority, retain failed live groups for explicit retries with their original cumulative ledger, and navigate directly back to the exact proof document. Validate native result references and resolve safe text positions before purchasing artwork. See `docs/production-continuation-ai19.ar.md`.

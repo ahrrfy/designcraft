@@ -502,6 +502,10 @@ impl Runner<'_> {
         }
         if let Some(contract) = &self.print {
             let fonts = contract.select_fonts(&base)?;
+            context
+                .as_object_mut()
+                .ok_or("Invalid resolved print-font context")?
+                .insert("resolved_print_fonts".into(), serde_json::to_value(&fonts).map_err(|error| error.to_string())?);
             self.diagnostics(fonts.notices.into_iter().map(|message| json!({"kind":"printFontFallback","message":message})).collect())?;
             self.diagnostics(
                 contract.warnings().into_iter().map(|message| json!({"kind":"printRequirement","severity":"warning","message":message})).collect(),
@@ -766,11 +770,23 @@ impl Runner<'_> {
                 }).collect();
                     bounded_json(&json!(text), 8192).ok()
                 });
+            let rejected_response_path = if let Some(root) = &self.cache_root {
+                match crate::production_cache::store_rejected_response(root, &previous) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.cache_notice(format!("Could not retain private rejected-response evidence: {error}"))?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             self.diagnostics(vec![json!({
                 "kind":"nativePlanningValidation", "attempt":attempt.saturating_add(1),
                 "message":validation, "rejected_plan_included":previous.len() <= 8192,
                 "rejected_plan":if previous.len() <= 8192 {Some(previous.as_str())} else {None},
                 "rejected_native_text":if previous.len() > 8192 {rejected_text} else {None},
+                "rejected_response_path":rejected_response_path,
                 "scope":scope,
             })])?;
             if attempt == repair_attempts {
@@ -1685,7 +1701,7 @@ fn production_system(
         }
     };
     let mut system = format!(
-        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. Allocate enough frame height for all lines and padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
+        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
         bounded_json(&native_catalog, MAX_PROMPT / 2)?
     );
     system.push('\n');
@@ -4479,6 +4495,7 @@ mod tests {
     fn failed_raw_plan_does_not_repeat_a_provider_call_without_explicit_opt_in() {
         let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let rejected_directory = tempfile::tempdir().unwrap();
         let mut invalid = plan();
         invalid["commands"][0]["params"]["rect"] = json!([100, 60, 40, 80]);
         let provider = Mock {
@@ -4513,7 +4530,11 @@ mod tests {
             sender: &sender,
             provider: &provider,
         };
-        assert!(runner.production(request, json!({}), catalog(), vec![], base, session.prefs.clone()).is_err());
+        assert!(
+            runner
+                .production(request, json!({"_production_cache_root":rejected_directory.path()}), catalog(), vec![], base, session.prefs.clone())
+                .is_err()
+        );
         assert_eq!(ledger.summary().requests, 1);
         let diagnostic = receiver
             .try_iter()
@@ -4525,6 +4546,12 @@ mod tests {
         assert_eq!(diagnostic["attempt"], 1);
         assert_eq!(diagnostic["rejected_plan_included"], true);
         assert_eq!(serde_json::from_str::<Value>(diagnostic["rejected_plan"].as_str().unwrap()).unwrap(), invalid);
+        let evidence = diagnostic["rejected_response_path"]
+            .as_str()
+            .expect("Keep exact private failure evidence for offline repair, without paying to reproduce it");
+        assert_eq!(std::fs::read_to_string(evidence).unwrap(), invalid.to_string());
+        assert_eq!(std::fs::read_dir(rejected_directory.path()).unwrap().count(), 1, "Rejected responses must never be stored as validated plans");
+        assert!(evidence.ends_with("last-rejected-response.txt"));
     }
     impl Provider for Mock {
         fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
@@ -5669,7 +5696,12 @@ mod tests {
         let error =
             runner.generic_production_plan(&request, &json!({}), &catalog(), &skills, session.doc().unwrap(), &session.prefs, None).unwrap_err();
         assert!(error.contains("safe margin"), "{error}");
-        assert_eq!(std::fs::read_dir(fresh.path()).unwrap().count(), 0, "Invalid fresh geometry must never be cached, including planning-only mode");
+        let retained: Vec<_> = std::fs::read_dir(fresh.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert_eq!(
+            retained,
+            [std::ffi::OsString::from("last-rejected-response.txt")],
+            "Invalid fresh geometry may retain private failure evidence but never a reusable plan or image"
+        );
     }
 
     #[test]
@@ -5770,6 +5802,67 @@ mod tests {
         assert!(error.contains("Adaptive context reached"), "{error}");
         assert_eq!(provider.0.get(), 1);
         assert_eq!(serde_json::to_value(&skills).unwrap(), original, "Host snapshots must remain immutable");
+    }
+
+    #[test]
+    fn ai21_resolved_print_fonts_reach_planner_before_geometry_is_authored() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4"})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let fonts = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+        let family = "Source Sans 3";
+        assert!(fonts.has_family(family), "Use the bundled document font, independent of system font discovery");
+        let prompt = format!("**English Primary Font:** {family}\nCreate one editable heading.");
+        let expected =
+            serde_json::to_value(crate::print_contract::PrintContract::from_prompt(&prompt).unwrap().unwrap().select_fonts(&base).unwrap()).unwrap();
+        struct InspectPrintFonts(Value);
+        impl Provider for InspectPrintFonts {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                let input: Value = serde_json::from_str(&request.prompt).unwrap();
+                assert_eq!(input["document"]["resolved_print_fonts"], self.0, "host-bound font metrics must be known before drawing text frames");
+                Err("Resolved print fonts reached the planner".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                panic!("no images before a valid native plan")
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                panic!("no model discovery")
+            }
+        }
+        let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
+        let request = TaskRequest {
+            prompt,
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let provider = InspectPrintFonts(expected);
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let error = runner.production(request, json!({}), catalog(), vec![], base, session.prefs.clone()).err().unwrap();
+        assert!(error.contains("Resolved print fonts reached"), "{error}");
+        assert_eq!(ledger.summary().requests, 1);
     }
 
     #[test]
