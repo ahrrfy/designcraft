@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 /// listed here, and not a test file or test module, must not.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "ui-egui/src/preview_update.rs",
+        "The desktop launcher selects its manifest through the host environment; bounded manifest reads use engine::io. The update command refuses confined automation before any polling or process launch. Direct writes create only a new fixed-prefix temporary copy of the binary's embedded updater (never downloaded or command-selected code) and remove that exact owned temporary file. The external updater runs with explicit unrestricted desktop authority and preserves the existing profile and documents.",
+    ),
+    (
         "ai-runtime/src/vault.rs",
         "The native host supplies its already-validated private profile directory. Canonicalization establishes a hashed credential namespace only; this module reads no profile file contents and creates no credential files. Secret persistence uses the OS credential store, isolated by profile, provider and normalized endpoint, with no command-selected filesystem destination.",
     ),

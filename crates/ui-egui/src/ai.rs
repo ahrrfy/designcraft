@@ -269,6 +269,7 @@ impl ProofDisplay {
 #[derive(Clone)]
 pub struct AiUiState {
     pub open: bool,
+    pub(crate) preview_update: crate::preview_update::PreviewUpdate,
     pub tab: usize,
     pub snapshot: AiSnapshot,
     pub settings: AiSettings,
@@ -348,6 +349,7 @@ impl Default for AiUiState {
     fn default() -> Self {
         Self {
             open: false,
+            preview_update: crate::preview_update::PreviewUpdate::default(),
             tab: 0,
             snapshot: AiSnapshot::default(),
             settings: AiSettings::default(),
@@ -988,6 +990,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     let a = app.ui.language == "ar";
     let mut open = state.open;
     let mut requests = Vec::new();
+    let mut check_preview_update = false;
     let available = app.services.ai.is_some() && state.snapshot.available;
     let documents: Vec<_> =
         app.session.documents().iter().enumerate().map(|(index, document)| OpenDocument::from_document(index, document)).collect();
@@ -1000,6 +1003,8 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         .min_width(540.0)
         .resizable(true)
         .show(ctx, |ui| {
+            check_preview_update = state.preview_update.show(ui, a);
+            ui.separator();
             ui.horizontal(|ui| {
                 for (i, en, ar) in [
                     (0, "Production", "الإنتاج"),
@@ -1115,6 +1120,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         state.review_pointer_press = None;
     }
     app.ui.ai = state;
+    if check_preview_update && let Err(error) = app.run("app.checkPreviewUpdate", serde_json::json!({})) {
+        app.ui.ai.error = error;
+    }
     if activate_document != original_document {
         if let Some(index) = activate_document
             && let Err(error) = app.run("file.activate", serde_json::json!({"index":index}))
@@ -1630,8 +1638,9 @@ fn production(
                 s.tab = 1;
             }
         });
-        // Long pasted briefs scroll inside the composer instead of hiding the production button.
-        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(180.0).show(ui, |ui| {
+        // Keep room for the compact update row and the production action. Long
+        // briefs remain complete and scroll inside their own seven-row composer.
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(128.0).show(ui, |ui| {
             ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(text(
                 a,
                 "Describe your design, audience and desired result...",

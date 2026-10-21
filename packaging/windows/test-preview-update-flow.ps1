@@ -1,0 +1,114 @@
+$ErrorActionPreference = 'Stop'
+# Reuse the local archive, digest and protection regressions; no fixture is executable.
+. (Join-Path $PSScriptRoot 'test-preview-updater.ps1')
+. (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $manifest -LibraryOnly
+$launcher = Join-Path $PSScriptRoot 'start-native-preview.ps1'
+$updater = Join-Path $PSScriptRoot 'update-native-preview.ps1'
+$activeExe = Join-Path $source 'designcraft.exe'
+function Reset-FlowManifest {
+    JsonFile $manifest ([pscustomobject]@{
+        profile=$profile; document_path=$book; executable=$activeExe; port=65335
+        executable_sha256=$meta.binaries.'designcraft.exe'; published_source_commit=('b' * 40)
+        custom_setting=[pscustomobject]@{nested='retain-me'; values=@(1,2,3)}
+    })
+}
+Reset-FlowManifest
+Install-UpdatePointer $manifest $installed $meta $true | Out-Null
+$before = (Get-FileHash -LiteralPath $manifest).Hash
+$beforeConfig = $env:DESIGNCRAFT_CONFIG_DIR
+$beforeManifest = $env:DESIGNCRAFT_PREVIEW_MANIFEST
+$checked = & $launcher -ManifestPath $manifest -ValidateOnly
+Check ($checked.executable -eq $activeExe) 'Validation promoted the active executable.'
+Check ((Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'Validation wrote the staged manifest.'
+Check ($env:DESIGNCRAFT_CONFIG_DIR -eq $beforeConfig -and $env:DESIGNCRAFT_PREVIEW_MANIFEST -eq $beforeManifest) 'Validation mutated the environment.'
+Check (-not (Test-Path -LiteralPath (Join-Path $testRoot 'managed-updates'))) 'Validation created update storage.'
+Reject { Resolve-PreviewLaunch $manifest -AppRunning:$true }
+Check ((Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'Live launcher promoted a stage.'
+Reject { Resolve-PreviewLaunch $manifest $activeExe }
+Check ((Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'Executable override changed a staged pointer.'
+$resolved = Resolve-PreviewLaunch $manifest -AppRunning:$false
+Check ($resolved.executable -eq (Join-Path $installed 'designcraft.exe') -and $resolved.update_status -eq 'installed_for_next_launch') 'Next launch did not promote the valid stage.'
+Check ($resolved.custom_setting.nested -eq 'retain-me' -and $resolved.custom_setting.values.Count -eq 3) 'Unrelated nested settings changed.'
+try {
+    Set-PreviewLaunchEnvironment $manifest $resolved
+    Check ($env:DESIGNCRAFT_CONFIG_DIR -eq $profile -and $env:DESIGNCRAFT_PREVIEW_MANIFEST -eq $manifest) 'Launcher environment contract differs.'
+} finally {
+    $env:DESIGNCRAFT_CONFIG_DIR = $beforeConfig
+    $env:DESIGNCRAFT_PREVIEW_MANIFEST = $beforeManifest
+}
+$shortcutDir = Join-Path $testRoot 'shortcuts'
+$shortcuts = @(Install-PreviewLauncherShortcuts $manifest $shortcutDir)
+Check ($shortcuts.Count -eq 2) 'Launch/update shortcut pair is missing.'
+$shell = New-Object -ComObject WScript.Shell
+try {
+    foreach ($path in $shortcuts) {
+        Check (Test-Path -LiteralPath $path -PathType Leaf) 'Shortcut was not saved.'
+        $link = $shell.CreateShortcut($path)
+        Check ($link.Arguments.Contains('-WindowStyle Hidden') -and $link.Arguments.Contains($manifest) -and $link.TargetPath.EndsWith('powershell.exe')) 'Shortcut arguments are wrong.'
+        $expectedScript = if ($path.EndsWith('Smart Design Launcher.lnk')) { $launcher } else { $updater }
+        Check ($link.Arguments.Contains($expectedScript)) 'Shortcut target script is wrong.'
+    }
+} finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null }
+Check ((Read-UpdateJson $manifest).update_script_path -eq $updater) 'Trusted updater path was not installed.'
+
+# Exercise the actual updater entry point with local-only network/process doubles.
+# It must emit exactly one JSON line for every successful outcome.
+$metaFile = Join-Path $testRoot 'metadata.json'
+JsonFile $metaFile $meta
+$destination = Join-Path $testRoot ('managed-updates/versions/' + $sha)
+[IO.Directory]::CreateDirectory($destination) | Out-Null
+foreach ($name in @('designcraft.exe','designcraft-cli.exe','SOURCE-COMMIT.txt')) { [IO.File]::Copy((Join-Path $source $name), (Join-Path $destination $name), $true) }
+function Invoke-FlowScenario([string]$Scenario) {
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Scenario -eq 'already_staged') { throw 'A staged update must retain its ready result without a network request.' }
+        if ($Uri -like '*/releases?*') {
+            if ($Scenario -eq 'no_published_update') { return @() }
+            return [pscustomobject]@{
+                draft=$false; tag_name='v0.10.0-ai24'; published_at='2026-10-21T00:00:00Z'
+                assets=@(
+                    [pscustomobject]@{name='update.json'; size=1000; browser_download_url='https://github.com/ahrrfy/designcraft/releases/download/v0.10.0-ai24/update.json'},
+                    [pscustomobject]@{name=$meta.archive.name; size=$meta.archive.size; browser_download_url=('https://github.com/ahrrfy/designcraft/releases/download/v0.10.0-ai24/' + $meta.archive.name)}
+                )
+            }
+        }
+        if ($Uri -like '*/compare/*') { return [pscustomobject]@{status=$(if ($Scenario -eq 'older_ancestor') { 'behind' } else { 'ahead' })} }
+        if ($Uri -like '*/actions/runs/*') { return [pscustomobject]@{head_sha=$sha; head_repository=[pscustomobject]@{full_name='ahrrfy/designcraft'}; path='.github/workflows/ci.yml'; status='completed'; conclusion='success'; event='push'; head_branch='main'} }
+        throw 'Unexpected network request.'
+    }
+    function Invoke-WebRequest {
+        param([switch]$UseBasicParsing, $Uri, $OutFile, $TimeoutSec)
+        if ($Uri -notlike '*/update.json') { throw 'Unexpected archive download.' }
+        [IO.File]::Copy($metaFile, $OutFile, $true)
+    }
+    function Get-Process {
+        param($Name, $ErrorAction)
+        if ($Scenario -eq 'staged_waiting_for_app_close') { return [pscustomobject]@{Id=123} }
+    }
+    $lines = @(& $updater -ManifestPath $manifest)
+    Check ($lines.Count -eq 1 -and $lines[0] -is [string] -and $lines[0].Length -lt 40000) 'Updater did not emit exactly one bounded JSON result.'
+    $result = $lines[0] | ConvertFrom-Json
+    $expectedStatus = if ($Scenario -eq 'older_ancestor') { 'up_to_date' } elseif ($Scenario -eq 'already_staged') { 'staged_waiting_for_app_close' } else { $Scenario }
+    Check ($result.status -eq $expectedStatus -and @($result.PSObject.Properties).Count -eq 4) 'Updater result schema/status differs.'
+    if ($Scenario -eq 'no_published_update') {
+        Check ($null -eq $result.selectedCommit -and $null -eq $result.targetExe -and $null -eq $result.ciUrl) 'Missing release result must use null targets.'
+    } elseif ($Scenario -eq 'older_ancestor') {
+        Check ($result.selectedCommit -eq ('b' * 40) -and $result.targetExe -eq $activeExe -and $null -eq $result.ciUrl) 'Older published ancestor replaced the installed build.'
+        Check ((Read-UpdateJson $manifest).executable -eq $activeExe) 'Older published ancestor changed the active pointer.'
+    } else {
+        Check ($result.selectedCommit -eq $sha -and [IO.Path]::IsPathRooted($result.targetExe) -and $result.ciUrl -eq $meta.ciUrl) 'Updater result metadata differs.'
+    }
+}
+foreach ($scenario in @('no_published_update','up_to_date','older_ancestor','staged_waiting_for_app_close','installed_for_next_launch','already_staged')) {
+    Reset-FlowManifest
+    if ($scenario -eq 'up_to_date') {
+        $record = Read-UpdateJson $manifest
+        $record.published_source_commit = $sha
+        JsonFile $manifest $record
+    }
+    if ($scenario -eq 'already_staged') { Install-UpdatePointer $manifest $installed $meta $true | Out-Null }
+    Invoke-FlowScenario $scenario
+}
+Check ((Get-Content -LiteralPath $book -Raw) -eq 'Synthetic user work; never overwrite.') 'Flow changed the document.'
+Check ((Get-Content -LiteralPath (Join-Path $profile 'sentinel.txt') -Raw) -eq 'Synthetic existing settings; never overwrite.') 'Flow changed profile settings.'
+'PASS: next-launch promotion, live refusal, read-only validation/environment, nested settings, launch/update shortcut setup, all four one-line updater JSON outcomes, older ancestor and staged recheck; no binaries started or network/provider requests sent.'

@@ -16,6 +16,24 @@ $source = Join-Path $testRoot 'source'
 [IO.File]::WriteAllText((Join-Path $source 'font-licenses/LICENSE-MIT'), 'Synthetic redistribution notice without a file extension.')
 foreach ($name in @('designcraft.exe', 'designcraft-cli.exe')) { [IO.File]::WriteAllText((Join-Path $source $name), ('synthetic fixture, never executable: ' + $name)) }
 $sha = 'a' * 40
+Check ((Get-PreviewUpdateDecision ('b' * 40) $sha 'behind') -eq 'up_to_date') 'An older published ancestor was not reported as up to date.'
+Check ((Get-PreviewUpdateDecision $sha $sha 'identical') -eq 'up_to_date') 'An identical source was not up to date.'
+Check ((Get-PreviewUpdateDecision ('b' * 40) $sha 'ahead') -eq 'install') 'A forward candidate was rejected.'
+Reject { Get-PreviewUpdateDecision ('b' * 40) $sha 'diverged' }
+Reject { Get-PreviewUpdateDecision '' $sha 'ahead' }
+$ci = [pscustomobject]@{head_sha=$sha; head_repository=[pscustomobject]@{full_name='ahrrfy/designcraft'}; path='.github/workflows/ci.yml'; status='completed'; conclusion='success'; event='push'; head_branch='main'}
+Assert-PreviewCiProof $ci $sha
+foreach ($field in @('head_sha', 'path', 'status', 'conclusion', 'event', 'head_branch')) {
+    $saved = $ci.$field
+    $ci.$field = 'untrusted'
+    Reject { Assert-PreviewCiProof $ci $sha }
+    $ci.$field = $saved
+}
+$ci.head_repository.full_name = 'storytold/designcraft'
+Reject { Assert-PreviewCiProof $ci $sha }
+$ci.head_repository.full_name = 'ahrrfy/designcraft'
+$ci.event = 'workflow_dispatch'
+Assert-PreviewCiProof $ci $sha
 [IO.File]::WriteAllText((Join-Path $source 'SOURCE-COMMIT.txt'), $sha)
 $archive = Join-Path $testRoot 'fixture.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($source, $archive)
@@ -57,17 +75,37 @@ $book = Join-Path $testRoot 'user-work.designcraft'
 [IO.File]::WriteAllText($book, 'Synthetic user work; never overwrite.')
 $manifest = Join-Path $testRoot 'launcher.json'
 JsonFile $manifest ([pscustomobject]@{profile = $profile; document_path = $book; executable = 'old.exe'; published_source_commit = ('b' * 40); custom_setting = 'retain-me'})
-$before = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash
 Check ((Install-UpdatePointer $manifest $installed $meta $true) -eq 'staged_waiting_for_app_close') 'Live app was not deferred.'
-Check ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -eq $before) 'A live app changed the launcher.'
+$staged = Read-UpdateJson $manifest
+Check ($staged.update_status -eq 'staged_waiting_for_app_close' -and $staged.staged_executable -eq (Join-Path $installed 'designcraft.exe')) 'Verified staged pointer was not persisted.'
+Check ($staged.executable -eq 'old.exe' -and $staged.published_source_commit -eq ('b' * 40)) 'A live app changed the active pointer.'
+Check ($staged.staged_cli_sha256 -eq $meta.binaries.'designcraft-cli.exe') 'CLI proof was not persisted.'
+$before = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash
 [IO.File]::WriteAllText((Join-Path $installed 'designcraft-cli.exe'), 'damaged')
-Reject { Install-UpdatePointer $manifest $installed $meta $false }
+Reject { Promote-StagedUpdate $manifest }
+Check ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -eq $before) 'Invalid staged CLI modified the manifest.'
 [IO.File]::Copy((Join-Path $source 'designcraft-cli.exe'), (Join-Path $installed 'designcraft-cli.exe'), $true)
-Check ((Install-UpdatePointer $manifest $installed $meta $false) -eq 'installed_for_next_launch') 'Valid update was not installed.'
+foreach ($name in @('designcraft.exe', 'designcraft-cli.exe', 'SOURCE-COMMIT.txt')) {
+    $path = Join-Path $installed $name
+    $saved = [IO.File]::ReadAllBytes($path)
+    [IO.File]::WriteAllText($path, 'damaged')
+    Reject { Promote-StagedUpdate $manifest }
+    Check ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -eq $before) 'Corrupt stage modified the manifest.'
+    [IO.File]::WriteAllBytes($path, $saved)
+    [IO.File]::Move($path, ($path + '.missing'))
+    Reject { Promote-StagedUpdate $manifest }
+    Check ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -eq $before) 'Missing stage modified the manifest.'
+    [IO.File]::Move(($path + '.missing'), $path)
+}
+Check ((Promote-StagedUpdate $manifest -ValidateOnly) -eq 'staged_waiting_for_app_close') 'Stage validation failed.'
+Check ((Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash -eq $before) 'Stage validation modified the manifest.'
+Check ((Promote-StagedUpdate $manifest) -eq 'installed_for_next_launch') 'Valid update was not promoted.'
 $after = Read-UpdateJson $manifest
+Check ($after.executable -eq (Join-Path $installed 'designcraft.exe') -and $after.previous_executable -eq 'old.exe') 'Promotion pointer or rollback is wrong.'
+Check (@($after.PSObject.Properties.Name | Where-Object { $_ -like 'staged_*' }).Count -eq 0) 'Promotion retained stale staged fields.'
 Check ($after.profile -eq $profile -and $after.document_path -eq $book -and $after.custom_setting -eq 'retain-me') 'Existing launcher settings changed.'
 Check ((Get-Content -LiteralPath $book -Raw) -eq 'Synthetic user work; never overwrite.') 'User book changed.'
 Check ((Get-Content -LiteralPath (Join-Path $profile 'sentinel.txt') -Raw) -eq 'Synthetic existing settings; never overwrite.') 'Profile changed.'
 Check (Test-Path -LiteralPath ($manifest + '.before-update')) 'Rollback pointer is missing.'
-Write-Output 'Updater tests passed: source/size/digest/path guards, live-app deferral, damaged CLI rejection, profile/document preservation and atomic rollback.'
+Write-Output 'Updater tests passed: source/size/digest/path and exact-CI guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

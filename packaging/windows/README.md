@@ -17,16 +17,49 @@ installs side by side and retains the old version. These previews are unsigned;
 hashes and GitHub CI prove source/channel integrity, not a code-signing identity.
 Upstream releases are integrated into the fork before becoming eligible.
 
-A running app is never closed: the update is staged, and a later check changes
-only the launcher pointer after the app has closed. Existing profile, provider
+A running app is never closed: the updater atomically records its verified staged
+pointer while retaining the active executable. The next launcher invocation, after
+the app has closed, verifies both EXE and CLI SHA-256 and `SOURCE-COMMIT.txt` again,
+then atomically promotes the pointer and retains the previous executable. A corrupt
+or missing stage stops launch without modifying the manifest, profile or document.
+`-ValidateOnly` also validates pending stages but never promotes or writes anything.
+The launcher exports `DESIGNCRAFT_PREVIEW_MANIFEST` and `DESIGNCRAFT_CONFIG_DIR`, and
+records its absolute trusted sibling `update_script_path` for the update UI.
+Existing profile, provider
 vault scope and document paths remain unchanged. No generated pages, approval or
 print action is resumed. Missing metadata, unsuccessful CI, an unknown installed
-commit, network failure or a divergent/downgrade candidate stops installation.
+commit, network failure or a divergent candidate stops installation. A published
+ancestor of the installed development build reports `up_to_date` with the current
+commit and executable; an older published release is never installed.
 Published drafts are not eligible. `test-preview-updater.ps1` exercises the
 archive/source/digest guards and preservation with synthetic local files and no
 provider or network requests. A per-user scheduled task can invoke the updater;
 launch the app through the stable `start-native-preview.ps1` manifest shortcut.
 Source development and publication remain separate from user installation.
+
+Every successful updater invocation prints exactly one compressed JSON object:
+`{"status":"up_to_date","selectedCommit":"<40-character-sha>","targetExe":"<absolute-path>","ciUrl":null}`.
+Other statuses are `no_published_update` (all three targets null),
+`staged_waiting_for_app_close`, and `installed_for_next_launch`. CI URLs, when
+present, refer to the trusted fork's verified GitHub Actions run. Errors produce
+one concise stderr message and exit nonzero. No Git checkout, build, installed
+ArtCraft Launcher, provider request or open application is modified.
+
+For one-time shortcut setup, dot-source the launcher with `-LibraryOnly` and invoke
+`Install-PreviewLauncherShortcuts <absolute-manifest> <absolute-shortcut-directory>`.
+It creates `Smart Design Launcher.lnk` (open/promote) and
+`Check Smart Design Updates.lnk` (check/stage), each invoking the local script via
+hidden Windows PowerShell. The existing ArtCraft shortcuts are preserved. The
+in-app update button supplies visible asynchronous status for check/stage results.
+`Promote-StagedUpdate` and `Resolve-PreviewLaunch` are library helpers: tests invoke
+them without starting a binary. Both launcher and updater serialize normal actions
+with the same exclusive update lock.
+
+Run `powershell.exe -NoProfile -File packaging/windows/test-preview-update-flow.ps1`
+for synthetic archive and CI guards, persisted staging, all corrupt/missing stage
+files, next-launch promotion, read-only validation, nested settings and environment
+preservation, shortcut creation/inspection and every JSON success outcome. Its
+network/process doubles make no real requests and never execute fixture binaries.
 
 `installer-ui.wxs` is generated from the shared `craft-installer` crate in
 [craft-libs](https://github.com/storytold/craft-libs/tree/main/crates/installer).
