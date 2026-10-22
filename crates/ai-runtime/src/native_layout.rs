@@ -50,7 +50,7 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     }
     notes.extend(recover_text_positions(&mut candidate, &mut scratch, base, &frames, cancel)?);
     let mut seen = BTreeSet::new();
-    for (index, id, story_id) in frames {
+    for &(index, id, story_id) in &frames {
         if cancel.load(Ordering::Relaxed) {
             return Err("Local layout cancelled".into());
         }
@@ -102,29 +102,31 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         if !scratch.cache.get(&doc, story_id, None).is_overset() {
             continue;
         }
-        let loc = doc.find(id).ok_or("Native text frame location disappeared")?;
+        let target_id = doc.story(story_id).and_then(|st| st.frames.last().copied()).unwrap_or(id);
+        let (fit_index, fit_id) = frames.iter().find_map(|&(idx, fid, _)| (fid == target_id).then_some((idx, fid))).unwrap_or((index, id));
+        let loc = doc.find(fit_id).ok_or("Native text frame location disappeared")?;
         let designcraft_engine::doc::SpreadRef::Doc(spread_index) = loc.spread else {
             return Err("Cannot fit a parent-page frame in production".into());
         };
         let spread = doc.spreads.get(spread_index).ok_or("Native page disappeared")?;
-        let item = doc.item(id).ok_or("Native frame disappeared")?;
+        let item = doc.item(fit_id).ok_or("Native frame disappeared")?;
         let outer = doc.parent_xf(&loc);
         let old = outer.transform_rect_bbox(item.bounds());
-        let identity = frame_identity(spread_index, index, id, old, &story.text);
+        let identity = frame_identity(spread_index, fit_index, fit_id, old, &story.text);
         let linear = (outer * item.xf).as_coeffs();
         if (linear[0] - 1.0).abs() > 0.001 || linear[1].abs() > 0.001 || linear[2].abs() > 0.001 || (linear[3] - 1.0).abs() > 0.001 {
             return Err(format!("{identity} has overset text in a transformed frame; reflow its layout before generation"));
         }
-        scratch.execute("object.fit", &json!({"ids":[id.0],"mode":"fitFrameToContent","axis":"height"})).map_err(|e| e.to_string())?;
+        scratch.execute("object.fit", &json!({"ids":[fit_id.0],"mode":"fitFrameToContent","axis":"height"})).map_err(|e| e.to_string())?;
         let fitted_doc = scratch.doc().map_err(|e| e.to_string())?.doc.clone();
-        let fitted = fitted_doc.item(id).ok_or("Fitted text frame disappeared")?;
+        let fitted = fitted_doc.item(fit_id).ok_or("Fitted text frame disappeared")?;
         let measured = outer.transform_rect_bbox(fitted.bounds());
         let extra_height = measured.height() - old.height() + 0.01;
         // Include the same rounding allowance in collision checks and the published source.
         let grown = Rect::new(measured.x0, measured.y0, measured.x1, measured.y1 + 0.01);
         let page = spread.page_at_x(old.center().x).ok_or("Native text frame has no owning page")?;
         let safe = spread.pages.get(page).ok_or("Native text page disappeared")?.margin_rect();
-        let mut growth = TextPosition { index, id, spread: spread_index, page, original: old, target: grown, safe, language: 0 };
+        let mut growth = TextPosition { index: fit_index, id: fit_id, spread: spread_index, page, original: old, target: grown, safe, language: 0 };
         let mut blocked = !extra_height.is_finite() || extra_height <= 0.0;
         // Height fitting happens after ordinary margin recovery. A new footer can
         // retain its bottom edge by moving only the measured excess upward.
@@ -132,13 +134,13 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
             growth.target = shift(grown, 0.0, safe.y1 - grown.y1);
             blocked |= grown.y1 <= safe.y1
                 || loc.path.len() != 1
-                || base.doc.item(id).is_some()
+                || base.doc.item(fit_id).is_some()
                 || item.locked
                 || item.hidden
                 || item.nonprinting
                 || doc.layer(item.layer).is_some_and(|layer| layer.locked || !layer.visible || !layer.printable)
                 || !contains(safe, growth.target)
-                || position_collision(&growth, &BTreeMap::from([(id, growth.target)]), &doc, &candidate, cancel)?;
+                || position_collision(&growth, &BTreeMap::from([(fit_id, growth.target)]), &doc, &candidate, cancel)?;
         }
         let backgrounds = if blocked { None } else { containing_background_growths(&growth, &doc, base, &created_frames, &candidate, cancel)? };
         let Some(backgrounds) = backgrounds.filter(|_| !scratch.cache.get(&fitted_doc, story_id, None).is_overset()) else {
@@ -170,23 +172,23 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
                 "message":"Expanded a new rectangular text container into verified free space; preserved its padding and existing artwork"}));
         }
         if dy != 0.0 {
-            scratch.execute("transform.move", &json!({"ids":[id.0],"dx":0,"dy":dy})).map_err(|error| error.to_string())?;
+            scratch.execute("transform.move", &json!({"ids":[fit_id.0],"dx":0,"dy":dy})).map_err(|error| error.to_string())?;
             candidate
                 .commands
-                .push(EngineAction { command: "transform.move".into(), params: json!({"ids":[format!("${index}.id")],"dx":0,"dy":dy}) });
-            notes.push(json!({"kind":"nativeTextTranslation","page":spread_index,"item":id.0,"dx":0,"dy":dy,
+                .push(EngineAction { command: "transform.move".into(), params: json!({"ids":[format!("${fit_index}.id")],"dx":0,"dy":dy}) });
+            notes.push(json!({"kind":"nativeTextTranslation","page":spread_index,"item":fit_id.0,"dx":0,"dy":dy,
                 "message":"Moved newly fitted text upward into verified safe space; preserved copy, font sizes and explicit text insets"}));
         }
         let rect = candidate
             .commands
-            .get_mut(index)
+            .get_mut(fit_index)
             .and_then(|a| a.params.get_mut("rect"))
             .and_then(Value::as_array_mut)
             .ok_or("Native text frame has no source rectangle")?;
         let bottom = rect.get(3).and_then(Value::as_f64).ok_or("Invalid native frame height")?;
         let value = rect.get_mut(3).ok_or("Invalid native frame rectangle")?;
         *value = json!(bottom + extra_height);
-        notes.push(json!({"kind":"nativeTextReflow","page":spread_index,"item":id.0,"label":item.label,"extraHeightPt":extra_height,"message":"Expanded text frame into verified free space; preserved all text and font size"}));
+        notes.push(json!({"kind":"nativeTextReflow","page":spread_index,"item":fit_id.0,"label":item.label,"extraHeightPt":extra_height,"message":"Expanded text frame into verified free space; preserved all text and font size"}));
     }
     if candidate.commands.len() > 512 {
         return Err("Local fitting exceeds the bounded native action limit".into());
@@ -203,6 +205,48 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     Ok(notes)
 }
 
+fn normalize_effects_aliases(effects: &mut serde_json::Map<String, Value>) {
+    if !effects.contains_key("bevel")
+        && let Some(mut bevel) = effects.remove("bevelEmboss")
+    {
+        if let Some(b_obj) = bevel.as_object_mut() {
+            if !b_obj.contains_key("depth")
+                && let Some(soften) = b_obj.remove("soften")
+            {
+                b_obj.insert("depth".into(), soften);
+            } else {
+                b_obj.remove("soften");
+            }
+            b_obj.remove("altitude");
+        }
+        effects.insert("bevel".into(), bevel);
+    }
+    if let Some(df) = effects.get_mut("directionalFeather")
+        && df.is_array()
+    {
+        let widths = df.take();
+        *df = json!({"on": true, "widths": widths});
+    }
+    for key in ["innerShadow", "innerGlow"] {
+        if let Some(sub) = effects.get_mut(key).and_then(Value::as_object_mut)
+            && !sub.contains_key("choke")
+            && let Some(spread) = sub.remove("spread")
+        {
+            sub.insert("choke".into(), spread);
+        }
+    }
+}
+
+fn normalize_alt_fills_aliases(alt: &mut serde_json::Map<String, Value>) {
+    for (alias, canonical) in
+        [("everyA", "first"), ("colorA", "firstColor"), ("tintA", "firstTint"), ("everyB", "next"), ("colorB", "nextColor"), ("tintB", "nextTint")]
+    {
+        if let Some(val) = alt.remove(alias) {
+            alt.entry(canonical).or_insert(val);
+        }
+    }
+}
+
 /// Normalize common model-emitted command aliases (such as `type.set` -> `story.setText`,
 /// `style.para.*` -> `style.paragraph.*`, `style.char.*` -> `style.character.*`,
 /// `pathfinder.*` -> `object.pathfinder`, `qr.create` -> `object.qrCode`) before validation.
@@ -210,32 +254,44 @@ pub(crate) fn normalize_command_aliases(plan: &mut ProductionPlan) -> Vec<Value>
     let mut notes = Vec::new();
     for (index, action) in plan.commands.iter_mut().enumerate() {
         let original = action.command.trim();
-        let (canonical, inferred_op) = match original {
-            "type.set" | "text.set" | "story.set" => (Some("story.setText"), None),
-            "object.delete" | "item.delete" | "frame.delete" | "edit.delete" => (Some("edit.clear"), None),
-            "text.replace" | "find.replace" => (Some("find.change"), None),
-            "style.para.create" => (Some("style.paragraph.create"), None),
-            "style.para.edit" => (Some("style.paragraph.edit"), None),
-            "style.para.apply" => (Some("style.paragraph.apply"), None),
-            "style.char.create" => (Some("style.character.create"), None),
-            "style.char.edit" => (Some("style.character.edit"), None),
-            "style.char.apply" => (Some("style.character.apply"), None),
-            "pathfinder.add" => (Some("object.pathfinder"), Some("add")),
-            "pathfinder.subtract" => (Some("object.pathfinder"), Some("subtract")),
-            "pathfinder.intersect" => (Some("object.pathfinder"), Some("intersect")),
-            "pathfinder.exclude" => (Some("object.pathfinder"), Some("exclude")),
-            "pathfinder.minusBack" => (Some("object.pathfinder"), Some("minusBack")),
-            "object.compoundPath.make" | "compoundPath.make" => (Some("object.makeCompoundPath"), None),
-            "object.compoundPath.release" | "compoundPath.release" => (Some("object.releaseCompoundPath"), None),
-            "object.gradientFill" | "gradient.fill" => (Some("object.gradient"), None),
-            "qr.create" | "qrcode.create" => (Some("object.qrCode"), None),
-            "page.insert" | "pages.insert" => (Some("layout.pages.insert"), None),
-            "table.set_cell" | "table.cell" => (Some("table.setCell"), None),
-            "table.mergeCells" => (Some("table.merge"), None),
-            "table.unmergeCells" => (Some("table.unmerge"), None),
-            "table.setTableStyle" | "table.setHeaderFooterRows" => (Some("table.options"), None),
-            "object.stepAndRepeat" | "transform.stepAndRepeat" => (Some("edit.stepAndRepeat"), None),
-            _ => (None, None),
+        let has_style_name = action.params.get("name").is_some() || action.params.get("style").is_some();
+        let (canonical, inferred_op, inferred_list_type) = match original {
+            "type.set" | "text.set" | "story.set" => (Some("story.setText"), None, None),
+            "object.delete" | "item.delete" | "frame.delete" | "edit.delete" => (Some("edit.clear"), None, None),
+            "object.move" => (Some("transform.move"), None, None),
+            "object.resize" => (Some("transform.set"), None, None),
+            "object.cornerRadius" | "object.corners" => (Some("object.cornerOptions"), None, None),
+            "text.replace" | "find.replace" => (Some("find.change"), None, None),
+            "style.para.create" => (Some("style.paragraph.create"), None, None),
+            "style.para.edit" => (Some("style.paragraph.edit"), None, None),
+            "style.para.apply" => (Some("style.paragraph.apply"), None, None),
+            "style.char.create" => (Some("style.character.create"), None, None),
+            "style.char.edit" => (Some("style.character.edit"), None, None),
+            "style.char.apply" => (Some("style.character.apply"), None, None),
+            "lists.bulleted" | "list.bulleted" | "type.bulletedList" => (Some("type.para"), None, Some("bullets")),
+            "lists.numbered" | "list.numbered" | "type.numberedList" => (Some("type.para"), None, Some("numbers")),
+            "pathfinder.add" => (Some("object.pathfinder"), Some("add"), None),
+            "pathfinder.subtract" => (Some("object.pathfinder"), Some("subtract"), None),
+            "pathfinder.intersect" => (Some("object.pathfinder"), Some("intersect"), None),
+            "pathfinder.exclude" => (Some("object.pathfinder"), Some("exclude"), None),
+            "pathfinder.minusBack" => (Some("object.pathfinder"), Some("minusBack"), None),
+            "object.compoundPath.make" | "compoundPath.make" => (Some("object.makeCompoundPath"), None, None),
+            "object.compoundPath.release" | "compoundPath.release" => (Some("object.releaseCompoundPath"), None, None),
+            "object.gradientFill" | "gradient.fill" => (Some("object.gradient"), None, None),
+            "qr.create" | "qrcode.create" => (Some("object.qrCode"), None, None),
+            "page.insert" | "pages.insert" => (Some("layout.pages.insert"), None, None),
+            "table.set_cell" | "table.cell" => (Some("table.setCell"), None, None),
+            "table.insertCol" => (Some("table.insertColumn"), None, None),
+            "table.deleteCol" => (Some("table.deleteColumn"), None, None),
+            "table.rowHeight" => (Some("table.setRowHeight"), None, None),
+            "table.columnWidth" | "table.colWidth" => (Some("table.setColumnWidth"), None, None),
+            "table.mergeCells" => (Some("table.merge"), None, None),
+            "table.unmergeCells" => (Some("table.unmerge"), None, None),
+            "table.setCellStyle" => (Some("style.cell.apply"), None, None),
+            "table.setTableStyle" if has_style_name => (Some("style.table.apply"), None, None),
+            "table.setTableStyle" | "table.setHeaderFooterRows" => (Some("table.options"), None, None),
+            "object.stepAndRepeat" | "transform.stepAndRepeat" => (Some("edit.stepAndRepeat"), None, None),
+            _ => (None, None, None),
         };
         if let Some(target) = canonical {
             let requested = action.command.clone();
@@ -246,6 +302,14 @@ pub(crate) fn normalize_command_aliases(plan: &mut ProductionPlan) -> Vec<Value>
             {
                 obj.insert("op".into(), Value::String(op.into()));
             }
+            if let Some(lt) = inferred_list_type
+                && let Some(obj) = action.params.as_object_mut()
+            {
+                let attrs = obj.entry("attrs").or_insert_with(|| json!({}));
+                if let Some(attrs_obj) = attrs.as_object_mut() {
+                    attrs_obj.entry("listType").or_insert_with(|| Value::String(lt.into()));
+                }
+            }
             notes.push(json!({
                 "kind": "commandAliasNormalized",
                 "command": index,
@@ -253,6 +317,27 @@ pub(crate) fn normalize_command_aliases(plan: &mut ProductionPlan) -> Vec<Value>
                 "resolved": target,
                 "message": "Normalized command alias to canonical vetted engine command"
             }));
+        }
+        if action.command == "object.cornerOptions"
+            && let Some(obj) = action.params.as_object_mut()
+        {
+            if !obj.contains_key("size")
+                && let Some(radius) = obj.remove("radius")
+            {
+                obj.insert("size".into(), radius);
+            } else {
+                obj.remove("radius");
+            }
+            obj.entry("shape").or_insert_with(|| Value::String("rounded".into()));
+        }
+        if matches!(
+            action.command.as_str(),
+            "style.cell.apply" | "style.table.apply" | "style.object.apply" | "style.paragraph.apply" | "style.character.apply"
+        ) && let Some(obj) = action.params.as_object_mut()
+            && !obj.contains_key("name")
+            && let Some(style) = obj.remove("style")
+        {
+            obj.insert("name".into(), style);
         }
         if action.command == "story.setText"
             && let Some(obj) = action.params.as_object_mut()
@@ -266,6 +351,41 @@ pub(crate) fn normalize_command_aliases(plan: &mut ProductionPlan) -> Vec<Value>
                 && let Some(content) = obj.remove("content")
             {
                 obj.insert("text".into(), content);
+            }
+        }
+        if action.command == "object.gradient"
+            && let Some(stops) = action.params.get_mut("stops").and_then(Value::as_array_mut)
+        {
+            for stop in stops {
+                if let Some(st) = stop.as_object_mut()
+                    && let Some(pos) = st.remove("pos")
+                    && !st.contains_key("location")
+                    && let Some(v) = pos.as_f64()
+                {
+                    let loc = if v <= 1.0 { v * 100.0 } else { v };
+                    st.insert("location".into(), json!(loc));
+                }
+            }
+        }
+        if matches!(action.command.as_str(), "object.effects" | "style.object.create")
+            && let Some(effects) = action.params.get_mut("effects").and_then(Value::as_object_mut)
+        {
+            normalize_effects_aliases(effects);
+        }
+        if matches!(action.command.as_str(), "style.table.create" | "table.options")
+            && let Some(obj) = action.params.as_object_mut()
+        {
+            for repeat_key in ["repeatHeader", "repeatFooter"] {
+                if let Some(val) = obj.get_mut(repeat_key)
+                    && let Some(s) = val.as_str()
+                {
+                    *val = Value::Bool(!matches!(s, "none" | "false" | "off"));
+                }
+            }
+            for alt_key in ["altRows", "altCols"] {
+                if let Some(alt) = obj.get_mut(alt_key).and_then(Value::as_object_mut) {
+                    normalize_alt_fills_aliases(alt);
+                }
             }
         }
         for container_key in ["para", "attrs"] {
@@ -283,8 +403,7 @@ pub(crate) fn normalize_command_aliases(plan: &mut ProductionPlan) -> Vec<Value>
             }
         }
     }
-    let table_inserts: BTreeSet<usize> =
-        plan.commands.iter().enumerate().filter_map(|(i, a)| (a.command == "table.insert").then_some(i)).collect();
+    let table_inserts: BTreeSet<usize> = plan.commands.iter().enumerate().filter_map(|(i, a)| (a.command == "table.insert").then_some(i)).collect();
     for (index, action) in plan.commands.iter_mut().enumerate() {
         if let Some(table_val) = action.params.get_mut("table")
             && let Some(raw_ref) = table_val.as_str()
@@ -399,31 +518,18 @@ pub(crate) fn recover_unregistered_swatches(plan: &mut ProductionPlan, base: &Do
         }
     }
     let bare = |name: &str| name.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
-    let mut notes = Vec::new();
-    for (index, action) in plan.commands.iter_mut().enumerate() {
-        let field = match action.command.as_str() {
-            "object.fill" | "object.stroke" => action.params.get_mut("swatch"),
-            "object.dropShadow" | "object.qrCode" => action.params.get_mut("color"),
-            "type.char" => action.params.get_mut("attrs").and_then(|attrs| attrs.get_mut("fill")),
-            "style.paragraph.create" | "style.paragraph.edit" | "style.character.create" | "style.character.edit" => {
-                action.params.get_mut("chars").and_then(|chars| chars.get_mut("fill"))
-            }
-            "style.object.create" | "style.cell.create" | "table.setCell" => action.params.get_mut("fill"),
-            _ => None,
-        };
-        let Some(slot) = field else { continue };
-        let Some(requested) = slot.as_str().map(str::to_owned) else { continue };
-        if requested.is_empty() || requested.starts_with('$') || known.contains(&requested) {
-            continue;
+    let resolve_swatch = |requested: &str| -> Option<String> {
+        if requested.is_empty() || requested.starts_with('$') || known.contains(requested) {
+            return None;
         }
-        let requested_bare = bare(&requested);
-        let replacement = if let Some(exact) = base.doc.swatches.iter().find(|s| bare(&s.name) == requested_bare) {
+        let requested_bare = bare(requested);
+        if let Some(exact) = base.doc.swatches.iter().find(|s| bare(&s.name) == requested_bare) {
             Some(exact.name.clone())
         } else if requested_bare == "transparent"
             && let Some(none_swatch) = base.doc.swatches.iter().find(|s| matches!(s.value, designcraft_engine::doc::color::SwatchValue::None))
         {
             Some(none_swatch.name.clone())
-        } else if let Some(target) = parse_inline_color(&requested) {
+        } else if let Some(target) = parse_inline_color(requested) {
             let target_rgb = target.to_rgb_uncalibrated();
             base.doc
                 .swatches
@@ -441,8 +547,13 @@ pub(crate) fn recover_unregistered_swatches(plan: &mut ProductionPlan, base: &Do
                 .map(|(name, _)| name)
         } else {
             None
-        };
-        if let Some(resolved) = replacement {
+        }
+    };
+    let mut notes = Vec::new();
+    let mut check_slot = |index: usize, slot: Option<&mut Value>| {
+        let Some(slot) = slot else { return };
+        let Some(requested) = slot.as_str().map(str::to_owned) else { return };
+        if let Some(resolved) = resolve_swatch(&requested) {
             *slot = Value::String(resolved.clone());
             notes.push(json!({
                 "kind": "nativeSwatchFallback",
@@ -452,32 +563,127 @@ pub(crate) fn recover_unregistered_swatches(plan: &mut ProductionPlan, base: &Do
                 "message": "Resolved unregistered swatch reference to an existing document swatch"
             }));
         }
+    };
+    for (index, action) in plan.commands.iter_mut().enumerate() {
+        match action.command.as_str() {
+            "object.fill" | "object.stroke" => check_slot(index, action.params.get_mut("swatch")),
+            "object.dropShadow" | "object.qrCode" => check_slot(index, action.params.get_mut("color")),
+            "object.gradient" => {
+                if let Some(stops) = action.params.get_mut("stops").and_then(Value::as_array_mut) {
+                    for stop in stops {
+                        check_slot(index, stop.get_mut("swatch"));
+                    }
+                }
+            }
+            "type.char" => check_slot(index, action.params.get_mut("attrs").and_then(|attrs| attrs.get_mut("fill"))),
+            "type.para" => {
+                if let Some(attrs) = action.params.get_mut("attrs") {
+                    check_slot(index, attrs.get_mut("shadingColor"));
+                    check_slot(index, attrs.get_mut("borderColor"));
+                }
+            }
+            "style.paragraph.create" | "style.paragraph.edit" | "style.character.create" | "style.character.edit" => {
+                check_slot(index, action.params.get_mut("chars").and_then(|chars| chars.get_mut("fill")));
+                if let Some(para) = action.params.get_mut("para") {
+                    check_slot(index, para.get_mut("shadingColor"));
+                    check_slot(index, para.get_mut("borderColor"));
+                }
+            }
+            "style.object.create" => {
+                check_slot(index, action.params.get_mut("fill"));
+                check_slot(index, action.params.get_mut("dropShadow").and_then(|s| s.get_mut("color")));
+                if let Some(effects) = action.params.get_mut("effects") {
+                    for key in ["dropShadow", "innerShadow", "outerGlow", "innerGlow", "satin"] {
+                        check_slot(index, effects.get_mut(key).and_then(|e| e.get_mut("color")));
+                    }
+                    if let Some(bevel) = effects.get_mut("bevel") {
+                        check_slot(index, bevel.get_mut("highlight"));
+                        check_slot(index, bevel.get_mut("shadow"));
+                    }
+                }
+            }
+            "object.effects" => {
+                if let Some(effects) = action.params.get_mut("effects") {
+                    for key in ["dropShadow", "innerShadow", "outerGlow", "innerGlow", "satin"] {
+                        check_slot(index, effects.get_mut(key).and_then(|e| e.get_mut("color")));
+                    }
+                    if let Some(bevel) = effects.get_mut("bevel") {
+                        check_slot(index, bevel.get_mut("highlight"));
+                        check_slot(index, bevel.get_mut("shadow"));
+                    }
+                }
+            }
+            "style.cell.create" => {
+                check_slot(index, action.params.get_mut("fill"));
+                check_slot(index, action.params.get_mut("stroke").and_then(|s| s.get_mut("color")));
+            }
+            "style.table.create" | "table.options" => {
+                check_slot(index, action.params.get_mut("border").and_then(|b| b.get_mut("color")));
+                for key in ["altRows", "altCols"] {
+                    if let Some(alt) = action.params.get_mut(key) {
+                        check_slot(index, alt.get_mut("firstColor"));
+                        check_slot(index, alt.get_mut("nextColor"));
+                    }
+                }
+            }
+            "table.setCell" => check_slot(index, action.params.get_mut("fill")),
+            _ => {}
+        }
     }
     Ok(notes)
 }
 
 fn normalize_unit_interval_fields(plan: &mut ProductionPlan) -> Vec<Value> {
     let mut notes = Vec::new();
-    for (index, action) in plan.commands.iter_mut().enumerate() {
-        let key = match action.command.as_str() {
-            "object.opacity" | "object.dropShadow" | "object.effects" => "opacity",
-            "object.fill" | "object.stroke" | "table.setCell" | "style.cell.create" => "tint",
-            _ => continue,
-        };
-        let Some(slot) = action.params.get_mut(key) else { continue };
+    let mut norm_slot = |index: usize, cmd: &str, field: &str, slot: Option<&mut Value>| {
+        let Some(slot) = slot else { return };
         let Some(raw) = slot.as_f64().filter(|v| v.is_finite() && *v > 1.0 && *v <= 100.0) else {
-            continue;
+            return;
         };
         let normalized = raw / 100.0;
         *slot = json!(normalized);
         notes.push(json!({
             "kind": "unitIntervalNormalized",
             "command": index,
-            "field": format!("{}.{}", action.command, key),
+            "field": format!("{cmd}.{field}"),
             "requested": raw,
             "resolved": normalized,
             "message": "Normalized percentage unit-interval value into [0.0, 1.0]"
         }));
+    };
+    for (index, action) in plan.commands.iter_mut().enumerate() {
+        let cmd = action.command.clone();
+        match cmd.as_str() {
+            "object.opacity" | "object.dropShadow" => norm_slot(index, &cmd, "opacity", action.params.get_mut("opacity")),
+            "object.fill" | "object.stroke" | "table.setCell" => norm_slot(index, &cmd, "tint", action.params.get_mut("tint")),
+            "style.cell.create" => {
+                norm_slot(index, &cmd, "tint", action.params.get_mut("tint"));
+                norm_slot(index, &cmd, "stroke.tint", action.params.get_mut("stroke").and_then(|s| s.get_mut("tint")));
+            }
+            "style.table.create" | "table.options" => {
+                norm_slot(index, &cmd, "border.tint", action.params.get_mut("border").and_then(|b| b.get_mut("tint")));
+                for key in ["altRows", "altCols"] {
+                    if let Some(alt) = action.params.get_mut(key) {
+                        norm_slot(index, &cmd, &format!("{key}.firstTint"), alt.get_mut("firstTint"));
+                        norm_slot(index, &cmd, &format!("{key}.nextTint"), alt.get_mut("nextTint"));
+                    }
+                }
+            }
+            "object.effects" | "style.object.create" => {
+                norm_slot(index, &cmd, "opacity", action.params.get_mut("opacity"));
+                norm_slot(index, &cmd, "dropShadow.opacity", action.params.get_mut("dropShadow").and_then(|s| s.get_mut("opacity")));
+                if let Some(effects) = action.params.get_mut("effects") {
+                    for key in ["dropShadow", "innerShadow", "outerGlow", "innerGlow", "satin"] {
+                        norm_slot(index, &cmd, &format!("effects.{key}.opacity"), effects.get_mut(key).and_then(|e| e.get_mut("opacity")));
+                    }
+                    if let Some(bevel) = effects.get_mut("bevel") {
+                        norm_slot(index, &cmd, "effects.bevel.highlightOpacity", bevel.get_mut("highlightOpacity"));
+                        norm_slot(index, &cmd, "effects.bevel.shadowOpacity", bevel.get_mut("shadowOpacity"));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     notes
 }
@@ -1629,10 +1835,20 @@ mod tests {
                 {"command": "type.set", "params": {"id": "$0.story", "content": "Updated Copy"}},
                 {"command": "style.para.create", "params": {"name": "TitleStyle", "chars": {"size": 16}}},
                 {"command": "style.para.apply", "params": {"name": "TitleStyle"}},
+                {"command": "lists.bulleted", "params": {}},
                 {"command": "frame.create", "params": {"spread": 0, "rect": [60, 150, 140, 230], "shape": "ellipse", "content": "unassigned"}},
                 {"command": "frame.create", "params": {"spread": 0, "rect": [100, 150, 180, 230], "shape": "ellipse", "content": "unassigned"}},
-                {"command": "pathfinder.add", "params": {"ids": ["$4.id", "$5.id"]}},
-                {"command": "qr.create", "params": {"type": "url", "content": "https://example.com", "rect": [360, 150, 440, 230]}}
+                {"command": "pathfinder.add", "params": {"ids": ["$5.id", "$6.id"]}},
+                {"command": "object.cornerRadius", "params": {"ids": ["$7.id"], "radius": 8}},
+                {"command": "object.move", "params": {"ids": ["$7.id"], "dx": 4, "dy": 4}},
+                {"command": "object.gradientFill", "params": {"ids": ["$7.id"], "kind": "linear", "stops": [{"pos": 0.0, "color": "#1E3A8A"}, {"pos": 1.0, "color": "#3B82F6"}]}},
+                {"command": "qr.create", "params": {"type": "url", "content": "https://example.com", "rect": [360, 150, 440, 230]}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [60, 260, 520, 460], "content": "text", "text": "", "caret": true}},
+                {"command": "table.insert", "params": {"rows": 2, "cols": 2, "width": 440}},
+                {"command": "table.insertCol", "params": {"story": "$12.story", "table": "$13.id", "col": 0, "where": "right", "count": 1}},
+                {"command": "table.rowHeight", "params": {"story": "$12.story", "table": "$13.id", "row": 0, "height": 26}},
+                {"command": "table.columnWidth", "params": {"story": "$12.story", "table": "$13.id", "col": 0, "width": 120}},
+                {"command": "table.setHeaderFooterRows", "params": {"story": "$12.story", "table": "$13.id", "headerRows": 1, "repeatHeader": "everyTextColumn", "altRows": {"everyA": 1, "colorA": "Paper", "everyB": 1, "colorB": "Paper"}}}
             ]
         }))
         .unwrap();
@@ -1643,9 +1859,26 @@ mod tests {
         assert_eq!(plan.commands[1].params["text"], "Updated Copy");
         assert_eq!(plan.commands[2].command, "style.paragraph.create");
         assert_eq!(plan.commands[3].command, "style.paragraph.apply");
-        assert_eq!(plan.commands[6].command, "object.pathfinder");
-        assert_eq!(plan.commands[6].params["op"], "add");
-        assert_eq!(plan.commands[7].command, "object.qrCode");
+        assert_eq!(plan.commands[4].command, "type.para");
+        assert_eq!(plan.commands[4].params["attrs"]["listType"], "bullets");
+        assert_eq!(plan.commands[7].command, "object.pathfinder");
+        assert_eq!(plan.commands[7].params["op"], "add");
+        assert_eq!(plan.commands[8].command, "object.cornerOptions");
+        assert_eq!(plan.commands[8].params["size"], 8);
+        assert_eq!(plan.commands[8].params["shape"], "rounded");
+        assert_eq!(plan.commands[9].command, "transform.move");
+        assert_eq!(plan.commands[10].command, "object.gradient");
+        assert_eq!(plan.commands[10].params["stops"][0]["location"], 0.0);
+        assert_eq!(plan.commands[10].params["stops"][1]["location"], 100.0);
+        assert_eq!(plan.commands[11].command, "object.qrCode");
+        assert_eq!(plan.commands[14].command, "table.insertColumn");
+        assert_eq!(plan.commands[14].params["table"], "$13.table");
+        assert_eq!(plan.commands[15].command, "table.setRowHeight");
+        assert_eq!(plan.commands[16].command, "table.setColumnWidth");
+        assert_eq!(plan.commands[17].command, "table.options");
+        assert_eq!(plan.commands[17].params["repeatHeader"], true);
+        assert_eq!(plan.commands[17].params["altRows"]["first"], 1);
+        assert_eq!(plan.commands[17].params["altRows"]["firstColor"], "[Paper]");
         assert!(notes.iter().any(|n| n["kind"] == "commandAliasNormalized"));
     }
 }

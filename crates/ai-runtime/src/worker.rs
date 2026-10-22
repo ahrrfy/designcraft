@@ -744,7 +744,7 @@ impl Runner<'_> {
             system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten/twenty-frame: {page,rect,frame:five|ten|twenty,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
         }
         if current_document {
-            system.push_str("\nEXISTING DOCUMENT EDITING CONTRACT: document.objects lists the opened document's existing native items with their numeric id, spread, page, bounds, content (text|graphic|group|unassigned), shape, story (numeric StoryId for text frames), text preview, fillSwatch, fillTint, strokeSwatch, strokeWeight, locked flag, parentGroup, typography, and tables (numeric table ID, rows, cols, cells). When the user asks to modify, restyle, translate, replace, align, transform, or delete existing elements in the opened document, target those existing items directly by their numeric id (e.g. object.fill, object.stroke, object.gradientFill, object.cornerOptions, object.opacity, object.dropShadow, object.effects, object.textWrap, object.arrange, object.align, object.distribute, object.pathfinder, object.compoundPath.make, object.compoundPath.release, object.convertShape, object.fit, object.ungroup, edit.stepAndRepeat, transform.set, transform.move, transform.rotate, transform.scale, transform.shear, transform.flip, transform.clear, style.object.apply, edit.clear), target existing text stories by their numeric story ID (story.setText, story.setDirection, text.select + type.char/type.para/type.bulletedList/type.numberedList/style.paragraph.apply/style.character.apply, text.thread/text.unthread, or find.change), and target existing tables by their numeric story + table IDs (table.select, table.setCell, table.insertRow, table.insertColumn, table.deleteRow, table.deleteColumn, table.mergeCells, table.unmergeCells, table.setRowHeight, table.setColumnWidth, table.setHeaderFooterRows, table.setCellStyle, table.setTableStyle). If the user explicitly asks to add pages or adjust margins/page setup, use layout.pages.insert, layout.marginsAndColumns, or layout.documentSetup. To replace or populate an existing graphic frame with a generated illustration in NativeWithImages mode, emit an images[] entry whose page (0-based spread index) and rect match the existing graphic frame's spread and bounds; the host places the generated image directly into that frame. Only create new frames when adding new design elements or replacing deleted ones; never stack duplicate text or graphic frames on top of unchanged existing frames.");
+            system.push_str("\nEXISTING DOCUMENT EDITING CONTRACT: document.objects lists the opened document's existing native items with their numeric id, spread, page, bounds, content (text|graphic|group|unassigned), shape, story (numeric StoryId for text frames), text preview, fillSwatch, fillTint, strokeSwatch, strokeWeight, locked flag, parentGroup, typography, and tables (numeric table ID, rows, cols, cells). When the user asks to modify, restyle, translate, replace, align, transform, or delete existing elements in the opened document, target those existing items directly by their numeric id (e.g. object.fill, object.stroke, object.gradient, object.cornerOptions, object.opacity, object.dropShadow, object.feather, object.gradientFeather, object.effects, object.textWrap, object.arrange, object.align, object.distribute, object.pathfinder, object.makeCompoundPath, object.releaseCompoundPath, object.fit, object.ungroup, edit.stepAndRepeat, transform.set, transform.move, transform.rotate, transform.scale, transform.flip, style.object.apply, edit.clear), target existing text stories by their numeric story ID (story.setText, story.setDirection, text.select + type.char/type.para/style.paragraph.apply/style.character.apply, list.define, text.thread/text.unthread, or find.change), and target existing tables by their numeric story + table IDs (table.setCell, table.insertRow, table.insertColumn, table.deleteRow, table.deleteColumn, table.merge, table.unmerge, table.setRowHeight, table.setColumnWidth, table.distributeColumns, table.distributeRows, table.options, style.table.apply, style.cell.apply). If the user explicitly asks to add pages or adjust margins/page setup, use layout.pages.insert, layout.marginsAndColumns, or layout.documentSetup. To replace or populate an existing graphic frame with a generated illustration in NativeWithImages mode, emit an images[] entry whose page (0-based spread index) and rect match the existing graphic frame's spread and bounds; the host places the generated image directly into that frame. Only create new frames when adding new design elements or replacing deleted ones; never stack duplicate text or graphic frames on top of unchanged existing frames.");
         }
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
@@ -2198,7 +2198,7 @@ fn production_system(
         }
     };
     let mut system = format!(
-        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Act as the master architect of the native tool engine across any user prompt, subject, language, age stage, or publication genre, synthesizing all selected skills and context.templatePlan (including skill_tool_mastermind and curriculum_blueprint when present) into cohesive, geometrically balanced pages. Use native frame.create, path.create, line.create, object.pathfinder, object.compoundPath.make/release, object.convertShape, edit.stepAndRepeat, object.qrCode, table.insert, table.setCell, table.insertRow/insertColumn/deleteRow/deleteColumn/mergeCells/unmergeCells/setRowHeight/setColumnWidth/setHeaderFooterRows/setCellStyle/setTableStyle, object.fill, object.gradientFill, object.stroke, object.effects, object.dropShadow, object.cornerOptions, object.opacity, object.textWrap, object.fit, object.align, object.distribute, transform.move/set/rotate/scale/shear/flip/clear, story.setText, story.setDirection, type.char, type.para, type.bulletedList, type.numberedList, style.paragraph.create/apply, style.character.create/apply, style.object.create/apply, and text.thread/unthread with deliberate spatial zones and >=12pt breathing room between sibling cards. Never emit type.set; use story.setText or frame.create text. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
+        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Act as the master architect of the native tool engine across any user prompt, subject, language, age stage, or publication genre, synthesizing all selected skills and context.templatePlan (including skill_tool_mastermind and curriculum_blueprint when present) into cohesive, geometrically balanced pages. Use native frame.create, path.create, line.create, object.pathfinder, object.makeCompoundPath/releaseCompoundPath, edit.stepAndRepeat, object.qrCode, table.insert, table.setCell, table.insertRow/insertColumn/deleteRow/deleteColumn/merge/unmerge/setRowHeight/setColumnWidth/distributeColumns/distributeRows/options, object.fill, object.gradient, object.stroke, object.effects, object.dropShadow, object.feather, object.gradientFeather, object.cornerOptions, object.opacity, object.textWrap, object.fit, object.align, object.distribute, transform.move/set/rotate/scale/flip, story.setText, story.setDirection, type.char, type.para, list.define, style.paragraph.create/edit/apply, style.character.create/edit/apply, style.object.create/apply, style.table.create/apply, style.cell.create/apply, and text.thread/unthread with deliberate spatial zones and >=12pt breathing room between sibling cards. Never emit type.set; use story.setText or frame.create text. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
         bounded_json(&native_catalog, MAX_PROMPT / 2)?
     );
     system.push('\n');
@@ -2291,22 +2291,24 @@ fn native_result_contract(command: &str) -> Option<Value> {
         "edit.stepAndRepeat" => json!({"created":"integer","ids":"ItemId[]"}),
         "file.place" => json!({"id":"ItemId","asset":"AssetId"}),
         "table.insert" => json!({"story":"StoryId","table":"TableId"}),
-        "text.thread" => json!({"from":"ItemId","to":"ItemId","story":"StoryId"}),
-        "text.unthread" => json!({"unthreaded":"ItemId","newStory":"StoryId"}),
-        "style.paragraph.create"
-        | "style.character.create"
-        | "style.object.create"
-        | "style.table.create"
-        | "style.cell.create"
-        | "list.define" => json!({"name":"string"}),
+        "text.thread" => json!({"story":"StoryId","from":"ItemId","to":"ItemId","overset":"boolean","pagesAdded":"integer"}),
+        "text.unthread" => json!({"story":"StoryId","overset":"boolean"}),
+        "style.paragraph.create" | "style.character.create" | "style.object.create" | "style.table.create" | "style.cell.create" => {
+            json!({"name":"string"})
+        }
+        "list.define" => json!({"lists":"array"}),
         "swatch.create" => json!({"name":"string"}),
+        "object.gradient" => json!({"swatch":"string","kind":"string"}),
         "transform.move" => json!({"moved":"integer","ids":"ItemId[]"}),
         "edit.clear" => json!({"deleted":"integer"}),
         "find.change" => json!({"count":"integer"}),
-        "object.fit" => json!({"fitted":"integer"}),
+        "style.cell.apply" => json!({"cells":"integer"}),
+        "table.insertRow" | "table.deleteRow" => json!({"rows":"integer"}),
+        "table.insertColumn" | "table.deleteColumn" => json!({"columns":"integer"}),
+        "table.distributeRows" => json!({"rows":"integer","height":"number"}),
+        "table.options" => json!({"options":"object"}),
         "object.label"
         | "object.fill"
-        | "object.gradient"
         | "object.stroke"
         | "object.textFrameOptions"
         | "object.fittingOptions"
@@ -2324,6 +2326,7 @@ fn native_result_contract(command: &str) -> Option<Value> {
         "selection.set"
         | "object.arrange"
         | "object.ungroup"
+        | "object.fit"
         | "object.align"
         | "object.distribute"
         | "transform.set"
@@ -2342,20 +2345,13 @@ fn native_result_contract(command: &str) -> Option<Value> {
         | "style.character.apply"
         | "style.object.apply"
         | "style.table.apply"
-        | "style.cell.apply"
         | "layout.marginsAndColumns"
         | "table.setCell"
-        | "table.insertRow"
-        | "table.insertColumn"
-        | "table.deleteRow"
-        | "table.deleteColumn"
         | "table.merge"
         | "table.unmerge"
         | "table.setRowHeight"
         | "table.setColumnWidth"
-        | "table.distributeColumns"
-        | "table.distributeRows"
-        | "table.options" => Value::Null,
+        | "table.distributeColumns" => Value::Null,
         _ => return None,
     })
 }
@@ -2377,6 +2373,7 @@ fn native_result_shape(action: &EngineAction) -> Value {
                     "string" => json!("result"),
                     "boolean" => json!(false),
                     "number[]" => json!([0, 0, 0, 0]),
+                    "array" => json!([]),
                     "object" => json!({}),
                     _ => json!(1),
                 };
@@ -2389,7 +2386,7 @@ fn native_result_shape(action: &EngineAction) -> Value {
 fn validate_identifier_references(actions: &[EngineAction]) -> Result<(), String> {
     let mut results = Vec::with_capacity(actions.len());
     for (index, action) in actions.iter().enumerate() {
-        for key in ["ids", "frame", "story", "table"] {
+        for key in ["ids", "frame", "story", "table", "from", "to"] {
             let Some(value) = action.params.get(key) else { continue };
             let values: Vec<_> = match value {
                 Value::Array(values) => values.iter().collect(),
@@ -2744,7 +2741,12 @@ pub(crate) fn validate_batch_plan(plan: &ProductionPlan, scope: BatchScope) -> R
         if !batch_command(&action.command) {
             return Err(format!("Command {} cannot modify a page-isolated batch", action.command));
         }
-        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.qrCode") {
+        if action.command == "text.thread" && action.params.get("autoflow").and_then(Value::as_bool) == Some(true) {
+            return Err("Command text.thread cannot autoflow pages in a page-isolated batch".into());
+        }
+        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.qrCode")
+            || (action.command == "text.thread" && action.params.get("rect").is_some())
+        {
             let page = action.params.get("spread").and_then(Value::as_u64).ok_or("Every batch object needs an explicit native spread")?;
             if page < u64::from(scope.start) || page >= u64::from(end) {
                 return Err("Batch object targets a page outside its approved range".into());
@@ -2822,6 +2824,14 @@ pub(crate) fn validate_batch_result(before: &DocState, after: &DocState, scope: 
     normalized.assets = before.doc.assets.clone();
     normalized.next_id = before.doc.next_id;
     normalized.modified = before.doc.modified;
+    if normalized.swatches.len() >= before.doc.swatches.len()
+        && normalized.swatches[..before.doc.swatches.len()] == before.doc.swatches[..]
+        && normalized.swatches[before.doc.swatches.len()..]
+            .iter()
+            .all(|s| !s.named && s.hidden && matches!(s.value, designcraft_engine::doc::color::SwatchValue::Gradient { .. }))
+    {
+        normalized.swatches.truncate(before.doc.swatches.len());
+    }
     if &normalized != before.doc.as_ref() {
         return Err("Batch changed global styles, swatches, layers or document settings".into());
     }
@@ -7784,6 +7794,31 @@ mod tests {
             &cancel,
             None,
             GeometryCheck::OpenedDocument { allow_geometry_edits: true },
+        )
+        .unwrap();
+
+        let batch_raw = serde_json::to_string(&json!({
+            "title": "Batch Gradient and Threading",
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 72.0, 240.0, 140.0], "content": "text", "text": "Batch Story", "caret": false}},
+                {"command": "type.char", "params": {"attrs": {"fontFamily": "Tahoma", "fontStyle": "Regular", "size": 14.0, "leading": {"kind": "points", "value": 20.0}}}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [260.0, 72.0, 440.0, 140.0], "content": "text", "text": "", "caret": false}},
+                {"command": "text.thread", "params": {"from": "$0.id", "to": "$2.id"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 170.0, 240.0, 240.0], "content": "unassigned"}},
+                {"command": "object.gradient", "params": {"ids": ["$4.id"], "kind": "linear", "stops": [{"pos": 0.0, "color": "#1E3A8A"}, {"pos": 1.0, "color": "#3B82F6"}]}}
+            ],
+            "images": []
+        }))
+        .unwrap();
+        let mut batch_plan = parse_plan(&batch_raw, OutputMode::NativeOnly, &real_catalog).unwrap();
+        crate::native_layout::prepare(&mut batch_plan, session.doc().unwrap(), &session.prefs, &cancel).unwrap();
+        simulate_scoped(
+            &batch_plan,
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeOnly,
+            &cancel,
+            Some(BatchScope { start: 0, count: 1 }),
         )
         .unwrap();
     }

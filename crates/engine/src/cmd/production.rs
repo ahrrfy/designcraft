@@ -133,22 +133,53 @@ fn drop_shadow_schema() -> Value {
     )
 }
 
-fn glow_schema() -> Value {
+fn inner_shadow_schema() -> Value {
+    object(
+        &[
+            ("on", boolean()),
+            ("distance", number(0.0, 1000.0)),
+            ("angle", number(-360.0, 360.0)),
+            ("opacity", number(0.0, 1.0)),
+            ("size", number(0.0, 1000.0)),
+            ("choke", number(0.0, 100.0)),
+            ("color", string()),
+        ],
+        &[],
+    )
+}
+
+fn outer_glow_schema() -> Value {
     object(
         &[("on", boolean()), ("color", string()), ("opacity", number(0.0, 1.0)), ("size", number(0.0, 1000.0)), ("spread", number(0.0, 100.0))],
         &[],
     )
 }
 
-fn bevel_emboss_schema() -> Value {
+fn inner_glow_schema() -> Value {
+    object(
+        &[
+            ("on", boolean()),
+            ("color", string()),
+            ("opacity", number(0.0, 1.0)),
+            ("size", number(0.0, 1000.0)),
+            ("choke", number(0.0, 100.0)),
+            ("center", boolean()),
+        ],
+        &[],
+    )
+}
+
+fn bevel_schema() -> Value {
     object(
         &[
             ("on", boolean()),
             ("size", number(0.0, 1000.0)),
-            ("soften", number(0.0, 1000.0)),
+            ("depth", number(0.0, 1000.0)),
             ("angle", number(-360.0, 360.0)),
-            ("altitude", number(0.0, 90.0)),
+            ("globalLight", boolean()),
+            ("highlight", string()),
             ("highlightOpacity", number(0.0, 1.0)),
+            ("shadow", string()),
             ("shadowOpacity", number(0.0, 1.0)),
         ],
         &[],
@@ -164,9 +195,14 @@ fn satin_schema() -> Value {
             ("angle", number(-360.0, 360.0)),
             ("distance", number(0.0, 1000.0)),
             ("size", number(0.0, 1000.0)),
+            ("invert", boolean()),
         ],
         &[],
     )
+}
+
+fn directional_feather_schema() -> Value {
+    object(&[("on", boolean()), ("widths", array(number(0.0, 1000.0), 4, 4))], &[])
 }
 
 fn gradient_feather_schema() -> Value {
@@ -188,13 +224,13 @@ fn effects_schema() -> Value {
     object(
         &[
             ("dropShadow", drop_shadow_schema()),
-            ("innerShadow", drop_shadow_schema()),
-            ("outerGlow", glow_schema()),
-            ("innerGlow", glow_schema()),
-            ("bevelEmboss", bevel_emboss_schema()),
+            ("innerShadow", inner_shadow_schema()),
+            ("outerGlow", outer_glow_schema()),
+            ("innerGlow", inner_glow_schema()),
+            ("bevel", bevel_schema()),
             ("satin", satin_schema()),
             ("feather", number(0.0, 1000.0)),
-            ("directionalFeather", array(number(0.0, 1000.0), 4, 4)),
+            ("directionalFeather", directional_feather_schema()),
             ("gradientFeather", gradient_feather_schema()),
         ],
         &[],
@@ -208,12 +244,12 @@ fn cell_stroke_schema() -> Value {
 fn alt_fills_schema() -> Value {
     object(
         &[
-            ("everyA", integer(0, 100)),
-            ("colorA", string()),
-            ("tintA", number(0.0, 1.0)),
-            ("everyB", integer(0, 100)),
-            ("colorB", string()),
-            ("tintB", number(0.0, 1.0)),
+            ("first", integer(0, 100)),
+            ("firstColor", string()),
+            ("firstTint", number(0.0, 1.0)),
+            ("next", integer(0, 100)),
+            ("nextColor", string()),
+            ("nextTint", number(0.0, 1.0)),
             ("skipFirst", integer(0, 100)),
             ("skipLast", integer(0, 100)),
         ],
@@ -300,10 +336,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
         ("edit.clear", object(&[("ids", ids())], &["ids"]), json!({"ids":["$0.id"]})),
         (
             "object.pathfinder",
-            object(
-                &[("ids", ids()), ("op", choice(&["add", "subtract", "intersect", "exclude", "minusBack"]))],
-                &["op"],
-            ),
+            object(&[("ids", ids()), ("op", choice(&["add", "subtract", "intersect", "exclude", "minusBack"]))], &["op"]),
             json!({"ids":["$0.id","$1.id"],"op":"subtract"}),
         ),
         ("object.makeCompoundPath", object(&[("ids", ids())], &[]), json!({"ids":["$0.id","$1.id"]})),
@@ -357,11 +390,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
             ),
             json!({"ids":["$0.id"],"on":true,"distance":4,"angle":135,"opacity":0.25,"size":8}),
         ),
-        (
-            "object.feather",
-            object(&[("ids", ids()), ("width", number(0.0, 1000.0))], &["width"]),
-            json!({"ids":["$0.id"],"width":6}),
-        ),
+        ("object.feather", object(&[("ids", ids()), ("width", number(0.0, 1000.0))], &["width"]), json!({"ids":["$0.id"],"width":6})),
         (
             "object.gradientFeather",
             object(
@@ -370,14 +399,14 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                     ("on", boolean()),
                     ("radial", boolean()),
                     ("angle", number(-360.0, 360.0)),
-                    ("start", number(0.0, 1.0)),
-                    ("end", number(0.0, 1.0)),
+                    ("start", number(0.0, 100.0)),
+                    ("end", number(0.0, 100.0)),
                     ("from", point()),
                     ("to", point()),
                 ],
                 &[],
             ),
-            json!({"ids":["$0.id"],"on":true,"angle":90,"start":0.0,"end":1.0}),
+            json!({"ids":["$0.id"],"on":true,"angle":90,"start":10.0,"end":90.0}),
         ),
         (
             "object.effects",
@@ -390,7 +419,24 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                 &[
                     ("ids", ids()),
                     ("kind", choice(&["linear", "radial"])),
-                    ("stops", array(object(&[("pos", number(0.0, 1.0)), ("color", color_value_schema())], &["pos", "color"]), 2, 16)),
+                    (
+                        "stops",
+                        array(
+                            object(
+                                &[
+                                    ("location", number(0.0, 100.0)),
+                                    ("pos", number(0.0, 1.0)),
+                                    ("color", color_value_schema()),
+                                    ("swatch", string()),
+                                    ("opacity", number(0.0, 100.0)),
+                                    ("midpoint", number(13.0, 87.0)),
+                                ],
+                                &[],
+                            ),
+                            2,
+                            16,
+                        ),
+                    ),
                     ("reverse", boolean()),
                     ("angle", number(-360.0, 360.0)),
                     ("from", point()),
@@ -399,7 +445,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                 ],
                 &[],
             ),
-            json!({"ids":["$0.id"],"kind":"linear","angle":45,"stops":[{"pos":0.0,"color":"#1E3A8A"},{"pos":1.0,"color":"#3B82F6"}]}),
+            json!({"ids":["$0.id"],"kind":"linear","angle":45,"stops":[{"location":0,"color":"#1E3A8A"},{"location":100,"color":"#3B82F6"}]}),
         ),
         (
             "object.textWrap",
@@ -545,13 +591,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
         (
             "text.thread",
             object(
-                &[
-                    ("from", integer(1, u64::MAX)),
-                    ("to", integer(1, u64::MAX)),
-                    ("rect", rect()),
-                    ("spread", index()),
-                    ("autoflow", boolean()),
-                ],
+                &[("from", integer(1, u64::MAX)), ("to", integer(1, u64::MAX)), ("rect", rect()), ("spread", index()), ("autoflow", boolean())],
                 &[],
             ),
             json!({"from":"$0.id","to":"$1.id"}),
@@ -587,16 +627,8 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
             ),
             json!({"find":"النص القديم","change":"النص الجديد","scope":"document"}),
         ),
-        (
-            "type.char",
-            object(&[("attrs", char_attrs_schema())], &["attrs"]),
-            json!({"attrs":{"size":14,"fontFamily":"Arial"}}),
-        ),
-        (
-            "type.para",
-            object(&[("attrs", para_attrs_schema())], &["attrs"]),
-            json!({"attrs":{"align":"right","direction":"rightToLeft"}}),
-        ),
+        ("type.char", object(&[("attrs", char_attrs_schema())], &["attrs"]), json!({"attrs":{"size":14,"fontFamily":"Arial"}})),
+        ("type.para", object(&[("attrs", para_attrs_schema())], &["attrs"]), json!({"attrs":{"align":"right","direction":"rightToLeft"}})),
         (
             "list.define",
             object(&[("name", string()), ("continueAcrossStories", boolean()), ("rename", string())], &["name"]),
@@ -639,10 +671,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
         ),
         (
             "style.character.create",
-            object(
-                &[("name", string()), ("basedOn", string()), ("chars", char_attrs_schema()), ("fromSelection", boolean())],
-                &["name"],
-            ),
+            object(&[("name", string()), ("basedOn", string()), ("chars", char_attrs_schema()), ("fromSelection", boolean())], &["name"]),
             json!({"name":"Emphasis","chars":{"fontStyle":"Bold","fill":"[Black]"}}),
         ),
         (
@@ -667,11 +696,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
             ),
             json!({"name":"Callout Card","fill":"[Paper]","dropShadow":{"on":true,"distance":4,"angle":135,"opacity":0.2,"size":8}}),
         ),
-        (
-            "style.object.apply",
-            object(&[("name", string()), ("ids", ids())], &["name"]),
-            json!({"name":"Callout Card","ids":["$0.id"]}),
-        ),
+        ("style.object.apply", object(&[("name", string()), ("ids", ids())], &["name"]), json!({"name":"Callout Card","ids":["$0.id"]})),
         (
             "style.table.create",
             object(
@@ -685,6 +710,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                     ("rightColumn", string()),
                     ("border", cell_stroke_schema()),
                     ("altRows", alt_fills_schema()),
+                    ("altCols", alt_fills_schema()),
                     ("spaceBefore", number(0.0, 1000.0)),
                     ("spaceAfter", number(0.0, 1000.0)),
                 ],
@@ -966,15 +992,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
         ),
         (
             "table.distributeRows",
-            object(
-                &[
-                    ("story", integer(1, u64::MAX)),
-                    ("table", integer(1, u64::MAX)),
-                    ("rows", array(index(), 2, 2)),
-                    ("row", index()),
-                ],
-                &[],
-            ),
+            object(&[("story", integer(1, u64::MAX)), ("table", integer(1, u64::MAX)), ("rows", array(index(), 2, 2)), ("row", index())], &[]),
             json!({"story":"$0.story","table":"$1.table","rows":[0,3]}),
         ),
         (
@@ -987,8 +1005,8 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                     ("spaceAfter", number(0.0, 1000.0)),
                     ("headerRows", integer(0, 10)),
                     ("footerRows", integer(0, 10)),
-                    ("repeatHeader", choice(&["everyTextColumn", "oncePerFrame", "oncePerPage"])),
-                    ("repeatFooter", choice(&["everyTextColumn", "oncePerFrame", "oncePerPage"])),
+                    ("repeatHeader", boolean()),
+                    ("repeatFooter", boolean()),
                     ("altRows", alt_fills_schema()),
                     ("altCols", alt_fills_schema()),
                     ("story", integer(1, u64::MAX)),
@@ -1000,7 +1018,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                 ],
                 &[],
             ),
-            json!({"story":"$0.story","table":"$1.table","direction":"rightToLeft","headerRows":1}),
+            json!({"story":"$0.story","table":"$1.table","direction":"rightToLeft","headerRows":1,"repeatHeader":true}),
         ),
         (
             "file.place",
@@ -1038,6 +1056,10 @@ fn check_effects_swatches(doc: &designcraft_doc::Document, id: &str, effects: &V
             check_known_swatch(doc, id, effect.get("color").and_then(Value::as_str))?;
         }
     }
+    if let Some(bevel) = effects.get("bevel") {
+        check_known_swatch(doc, id, bevel.get("highlight").and_then(Value::as_str))?;
+        check_known_swatch(doc, id, bevel.get("shadow").and_then(Value::as_str))?;
+    }
     Ok(())
 }
 
@@ -1045,6 +1067,13 @@ fn check_command_swatches(doc: &designcraft_doc::Document, id: &str, resolved: &
     match id {
         "object.dropShadow" | "object.qrCode" => {
             check_known_swatch(doc, id, resolved.get("color").and_then(Value::as_str))?;
+        }
+        "object.gradient" => {
+            if let Some(stops) = resolved.get("stops").and_then(Value::as_array) {
+                for stop in stops {
+                    check_known_swatch(doc, id, stop.get("swatch").and_then(Value::as_str))?;
+                }
+            }
         }
         "table.setCell" => {
             check_known_swatch(doc, id, resolved.get("fill").and_then(Value::as_str))?;
@@ -1075,8 +1104,8 @@ fn check_command_swatches(doc: &designcraft_doc::Document, id: &str, resolved: &
             }
             for key in ["altRows", "altCols"] {
                 if let Some(alt) = resolved.get(key) {
-                    check_known_swatch(doc, id, alt.get("colorA").and_then(Value::as_str))?;
-                    check_known_swatch(doc, id, alt.get("colorB").and_then(Value::as_str))?;
+                    check_known_swatch(doc, id, alt.get("firstColor").and_then(Value::as_str))?;
+                    check_known_swatch(doc, id, alt.get("nextColor").and_then(Value::as_str))?;
                 }
             }
         }
@@ -1331,11 +1360,41 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
         }
         let id = action.get("command").and_then(Value::as_str).ok_or_else(|| bad(ID, "missing command"))?;
         let raw = action.get("params").ok_or_else(|| bad(ID, "missing params"))?;
-        let resolved = crate::script::resolve(raw, &results).map_err(|e| bad(ID, format!("step {i}: {e}")))?;
+        let mut resolved = crate::script::resolve(raw, &results).map_err(|e| bad(ID, format!("step {i}: {e}")))?;
         bounded(&resolved)?;
         let schema = vetted.iter().find(|(c, _, _)| *c == id).ok_or_else(|| bad(ID, "command not vetted"))?;
         check(&schema.1, &resolved, id)?;
         check_command_swatches(&work.doc()?.doc, id, &resolved)?;
+        if id == "object.gradient"
+            && let Some(stops) = resolved.get_mut("stops").and_then(Value::as_array_mut)
+        {
+            for stop in stops {
+                if let Some(st) = stop.as_object_mut() {
+                    if !st.contains_key("location")
+                        && let Some(pos) = st.get("pos").and_then(Value::as_f64)
+                    {
+                        st.insert("location".into(), json!(pos * 100.0));
+                    }
+                    if st.get("color").is_none() && st.get("swatch").is_none() {
+                        return Err(bad(ID, "object.gradient.stops: missing `color` or `swatch`"));
+                    }
+                }
+            }
+        }
+        if id == "object.gradientFeather"
+            && let Some(obj) = resolved.as_object_mut()
+        {
+            let s_val = obj.get("start").and_then(Value::as_f64);
+            let e_val = obj.get("end").and_then(Value::as_f64);
+            if s_val.is_some_and(|v| v <= 1.0) && e_val.is_some_and(|v| v <= 1.0 && v > 0.0) {
+                if let Some(sv) = s_val {
+                    obj.insert("start".into(), json!(sv * 100.0));
+                }
+                if let Some(ev) = e_val {
+                    obj.insert("end".into(), json!(ev * 100.0));
+                }
+            }
+        }
         if id == "transform.move" && resolved.get("copy").and_then(Value::as_bool) == Some(true) {
             let targets = resolved.get("ids").and_then(Value::as_array).ok_or_else(|| bad(ID, "raster copy needs explicit targets"))?;
             let source = targets.first().and_then(Value::as_u64).filter(|_| targets.len() == 1);
@@ -2557,8 +2616,8 @@ mod tests {
             json!({"command":"style.object.apply","params":{"name":"Brand Card","ids":["$15.id"]}}),
             json!({"command":"object.gradient","params":{"ids":["$15.id"],"kind":"linear","angle":45,"stops":[{"pos":0.0,"color":"#1E3A8A"},{"pos":1.0,"color":"#D97706"}]}}),
             json!({"command":"object.feather","params":{"ids":["$15.id"],"width":4}}),
-            json!({"command":"object.gradientFeather","params":{"ids":["$15.id"],"on":true,"angle":90,"start":0.1,"end":0.9}}),
-            json!({"command":"object.effects","params":{"ids":["$15.id"],"opacity":0.9,"blend":"normal","effects":{"outerGlow":{"on":true,"color":"Brand Gold","opacity":0.3,"size":8}}}}),
+            json!({"command":"object.gradientFeather","params":{"ids":["$15.id"],"on":true,"angle":90,"start":10.0,"end":90.0}}),
+            json!({"command":"object.effects","params":{"ids":["$15.id"],"opacity":0.9,"blend":"normal","effects":{"outerGlow":{"on":true,"color":"Brand Gold","opacity":0.3,"size":8},"bevel":{"on":true,"size":4,"depth":50,"highlight":"[Paper]","shadow":"[Black]"},"directionalFeather":{"on":true,"widths":[2,2,2,2]}}}}),
             json!({"command":"transform.rotate","params":{"ids":["$15.id"],"angle":5,"ref":4}}),
             json!({"command":"transform.scale","params":{"ids":["$15.id"],"sx":1.05,"sy":1.05}}),
             json!({"command":"transform.flip","params":{"ids":["$15.id"],"axis":"horizontal"}}),
@@ -2575,7 +2634,7 @@ mod tests {
             json!({"command":"object.qrCode","params":{"type":"url","content":"https://designcraft.example","rect":[440,300,520,380],"color":"Brand Navy"}}),
             json!({"command":"frame.create","params":{"rect":[54,420,540,700],"content":"text","text":"","caret":true}}),
             json!({"command":"table.insert","params":{"rows":3,"cols":3,"headerRows":1,"width":480}}),
-            json!({"command":"style.table.create","params":{"name":"Report Grid","border":{"weight":1,"color":"Brand Navy"},"altRows":{"everyA":1,"colorA":"[Paper]","tintA":1.0,"everyB":1,"colorB":"Brand Gold","tintB":0.15}}}),
+            json!({"command":"style.table.create","params":{"name":"Report Grid","border":{"weight":1,"color":"Brand Navy"},"altRows":{"first":1,"firstColor":"[Paper]","firstTint":1.0,"next":1,"nextColor":"Brand Gold","nextTint":0.15}}}),
             json!({"command":"style.table.apply","params":{"name":"Report Grid","story":"$33.story","table":"$34.table"}}),
             json!({"command":"style.cell.create","params":{"name":"Header Cell","fill":"Brand Navy","insets":6,"vj":"center"}}),
             json!({"command":"style.cell.apply","params":{"name":"Header Cell","story":"$33.story","table":"$34.table","rows":[0,0],"cols":[0,2]}}),
@@ -2589,7 +2648,7 @@ mod tests {
             json!({"command":"table.unmerge","params":{"story":"$33.story","table":"$34.table","row":0,"col":0}}),
             json!({"command":"table.deleteRow","params":{"story":"$33.story","table":"$34.table","row":3}}),
             json!({"command":"table.deleteColumn","params":{"story":"$33.story","table":"$34.table","col":3}}),
-            json!({"command":"table.options","params":{"story":"$33.story","table":"$34.table","direction":"rightToLeft","spaceBefore":6,"spaceAfter":8}}),
+            json!({"command":"table.options","params":{"story":"$33.story","table":"$34.table","direction":"rightToLeft","repeatHeader":true,"spaceBefore":6,"spaceAfter":8}}),
         ]);
         let full_plan = json!({"outputMode":"native_only","commands":cmds});
         s.execute("production.apply", &full_plan).unwrap();
@@ -2598,8 +2657,23 @@ mod tests {
         assert!(doc.styles.paragraph.iter().any(|st| st.name == "Arabic Body"));
         assert!(doc.styles.character.iter().any(|st| st.name == "Gold Highlight"));
         assert!(doc.styles.object.iter().any(|st| st.name == "Brand Card"));
-        assert!(doc.styles.table.iter().any(|st| st.name == "Report Grid"));
+        let report_grid = doc.styles.table.iter().find(|st| st.name == "Report Grid").unwrap();
+        let alt_rows = report_grid.alt_rows.as_ref().unwrap();
+        assert_eq!(alt_rows.first, 1);
+        assert_eq!(alt_rows.next, 1);
+        assert_eq!(alt_rows.next_color, "Brand Gold");
         assert!(doc.styles.cell.iter().any(|st| st.name == "Header Cell"));
+        let grad_swatch = doc
+            .swatches
+            .iter()
+            .find_map(|sw| match &sw.value {
+                designcraft_doc::color::SwatchValue::Gradient { gradient } => Some(&gradient.stops),
+                _ => None,
+            })
+            .expect("gradient swatch should be created");
+        assert_eq!(grad_swatch.len(), 2);
+        assert!((grad_swatch[0].offset - 0.0).abs() < 1e-4);
+        assert!((grad_swatch[1].offset - 1.0).abs() < 1e-4);
 
         let before = s.doc().unwrap().doc.clone();
         // Graphic duplication via stepAndRepeat must be rejected.
