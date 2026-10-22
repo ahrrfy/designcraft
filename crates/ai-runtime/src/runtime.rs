@@ -1391,6 +1391,24 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
     if task_skill_context_bytes(&skills)? <= multi_limit {
         return Ok(skills);
     }
+    if skills.len() > 1
+        && skills.iter().all(|s| s.instructions.len() <= 32 * 1024 && s.references.values().all(|r| r.len() <= 32 * 1024))
+        && let Ok(guidance) = worker::compact_skill_guidance_limit(&skills, multi_limit)
+    {
+        let mut dedup_bytes = guidance.len();
+        let mut fits = true;
+        for profile in skills.iter().filter_map(|skill| skill.design_profile.as_ref()) {
+            let rules = serde_json::to_vec(profile).map_err(|e| e.to_string())?.len();
+            if rules > 32 * 1024 {
+                fits = false;
+                break;
+            }
+            dedup_bytes = dedup_bytes.saturating_add(rules);
+        }
+        if fits && dedup_bytes <= multi_limit {
+            return Ok(skills);
+        }
+    }
     Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into())
 }
 
@@ -2103,23 +2121,125 @@ fn compact_context(session: &Session) -> Result<Value, String> {
         }
     }
     let mut objects = Vec::new();
+    let mut objects_bytes = 0usize;
+    let mut objects_truncated = false;
     for (spread_index, spread) in doc.spreads.iter().enumerate() {
-        for item in &spread.items {
-            if objects.len() >= 200 {
+        let first_page = doc.first_page_of_spread(spread_index);
+        let mut stack: Vec<(&designcraft_engine::doc::Item, designcraft_geom::Affine, Option<u64>, usize)> =
+            spread.items.iter().rev().map(|item| (item.as_ref(), designcraft_geom::Affine::IDENTITY, None, 0usize)).collect();
+        while let Some((item, parent_xf, parent_group, depth)) = stack.pop() {
+            if objects.len() >= 200 || objects_bytes >= 24 * 1024 {
+                objects_truncated = true;
                 break;
             }
-            let bounds = item.bounds();
-            let text = item.text_frame().and_then(|t| doc.stories.get(&t.story)).map(|s| s.text.chars().take(500).collect::<String>());
-            objects.push(
-                json!({"id":item.id.0,"label":item.label,"spread":spread_index,"bounds":[bounds.x0,bounds.y0,bounds.x1,bounds.y1],"text":text}),
-            );
+            let bounds = parent_xf.transform_rect_bbox(item.bounds());
+            let page_offset = spread.page_at_x(bounds.center().x).unwrap_or(0);
+            let page = first_page.saturating_add(page_offset).saturating_add(1);
+            let content = match &item.content {
+                designcraft_engine::doc::Content::Text(_) => "text",
+                designcraft_engine::doc::Content::Graphic(_) => "graphic",
+                designcraft_engine::doc::Content::Group { .. } => "group",
+                designcraft_engine::doc::Content::Unassigned if item.object_style == doc.styles.default_graphic_frame => "graphic",
+                designcraft_engine::doc::Content::Unassigned => "unassigned",
+            };
+            let shape = match item.shape {
+                designcraft_engine::doc::Shape::Rectangle => "rectangle",
+                designcraft_engine::doc::Shape::Oval => "ellipse",
+                designcraft_engine::doc::Shape::Polygon => "polygon",
+                designcraft_engine::doc::Shape::GraphicLine => "line",
+                designcraft_engine::doc::Shape::Path => "path",
+                designcraft_engine::doc::Shape::Group => "group",
+            };
+            let story_id = item.text_frame().map(|tf| tf.story.0);
+            let story_ref = item.text_frame().and_then(|tf| doc.stories.get(&tf.story));
+            let text = story_ref.map(|s| s.text.chars().take(500).collect::<String>());
+            let typography = story_ref.and_then(|story| {
+                let para = story.paras.first()?;
+                let (paragraph, base) = doc.styles.resolve_para(para);
+                let chars = doc.styles.resolve_char(&base, story.char_format_at(0));
+                Some(json!({
+                    "fontFamily": chars.font_family.chars().take(160).collect::<String>(),
+                    "fontStyle": chars.font_style.chars().take(80).collect::<String>(),
+                    "size": chars.size,
+                    "fill": chars.fill.chars().take(160).collect::<String>(),
+                    "leading": chars.leading,
+                    "direction": paragraph.direction,
+                    "align": paragraph.align,
+                }))
+            });
+            let tables = story_ref.filter(|story| !story.tables.is_empty()).map(|story| {
+                story
+                    .tables
+                    .values()
+                    .take(8)
+                    .map(|table| {
+                        let cols = table.columns.len();
+                        let cells: Vec<Value> = table
+                            .cells
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, cell)| !cell.text.text.trim().is_empty())
+                            .take(32)
+                            .map(|(idx, cell)| {
+                                let row = idx.checked_div(cols).unwrap_or(0);
+                                let col = idx.checked_rem(cols).unwrap_or(0);
+                                json!({
+                                    "row": row,
+                                    "col": col,
+                                    "text": cell.text.text.chars().take(120).collect::<String>(),
+                                    "fill": cell.fill.chars().take(80).collect::<String>(),
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "table": table.id,
+                            "rows": table.rows.len(),
+                            "cols": cols,
+                            "cells": cells,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let entry = json!({
+                "id": item.id.0,
+                "label": item.label,
+                "spread": spread_index,
+                "page": page,
+                "bounds": [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                "content": content,
+                "shape": shape,
+                "story": story_id,
+                "text": text,
+                "fillSwatch": item.fill.swatch.chars().take(160).collect::<String>(),
+                "fillTint": item.fill.tint,
+                "strokeSwatch": item.stroke.swatch.chars().take(160).collect::<String>(),
+                "strokeWeight": item.stroke.weight,
+                "locked": item.locked,
+                "parentGroup": parent_group,
+                "typography": typography,
+                "tables": tables,
+            });
+            let entry_len = serde_json::to_vec(&entry).map(|v| v.len()).unwrap_or(512);
+            if !objects.is_empty() && objects_bytes.saturating_add(entry_len) > 24 * 1024 {
+                objects_truncated = true;
+                break;
+            }
+            objects_bytes = objects_bytes.saturating_add(entry_len);
+            objects.push(entry);
+            if depth < 8 && !item.children().is_empty() {
+                let child_xf = parent_xf * item.xf;
+                for child in item.children().iter().rev() {
+                    stack.push((child.as_ref(), child_xf, Some(item.id.0), depth + 1));
+                }
+            }
         }
-        if objects.len() >= 200 {
+        if objects_truncated || objects.len() >= 200 {
+            objects_truncated = true;
             break;
         }
     }
     Ok(
-        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
+        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects_truncated,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
     )
 }
 
@@ -4084,5 +4204,42 @@ mod tests {
             "{blueprint}"
         );
         assert_eq!(preview.production_preview.as_ref().and_then(|v| v.get("binding")).and_then(Value::as_str), Some("RTL"));
+    }
+
+    #[test]
+    fn compact_context_exposes_existing_document_stories_tables_and_group_children() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let text_frame =
+            session.execute("frame.create", &json!({"spread":0,"rect":[36.0,36.0,280.0,180.0],"content":"text","text":"Existing Heading"})).unwrap();
+        let text_id = text_frame["id"].as_u64().unwrap();
+        let story_id = text_frame["story"].as_u64().unwrap();
+        let table = session.execute("table.insert", &json!({"story":story_id,"rows":2,"cols":2})).unwrap()["table"].as_u64().unwrap();
+        session.execute("table.setCell", &json!({"table":table,"row":0,"col":0,"text":"Cell A1"})).unwrap();
+        let g1 = session.execute("frame.create", &json!({"spread":0,"rect":[300.0,36.0,420.0,140.0],"content":"graphic"})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let g2 = session.execute("frame.create", &json!({"spread":0,"rect":[430.0,36.0,520.0,140.0],"content":"unassigned"})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let group_id = session.execute("object.group", &json!({"ids":[g1,g2]})).unwrap()["id"].as_u64().unwrap();
+
+        let ctx = compact_context(&session).unwrap();
+        let objects = ctx["objects"].as_array().expect("objects array");
+        let text_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(text_id)).expect("text frame entry");
+        assert_eq!(text_entry["content"].as_str(), Some("text"));
+        assert_eq!(text_entry["shape"].as_str(), Some("rectangle"));
+        assert_eq!(text_entry["story"].as_u64(), Some(story_id));
+        assert!(text_entry["typography"]["size"].as_f64().is_some_and(|s| s > 0.0));
+        let tables = text_entry["tables"].as_array().expect("tables array");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0]["table"].as_u64(), Some(table));
+        assert_eq!(tables[0]["cells"][0]["text"].as_str(), Some("Cell A1"));
+
+        let group_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(group_id)).expect("group entry");
+        assert_eq!(group_entry["content"].as_str(), Some("group"));
+        let child_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(g1)).expect("grouped child entry");
+        assert_eq!(child_entry["parentGroup"].as_u64(), Some(group_id));
+        assert_eq!(child_entry["content"].as_str(), Some("graphic"));
     }
 }

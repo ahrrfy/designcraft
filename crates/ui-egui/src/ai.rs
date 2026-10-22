@@ -445,6 +445,9 @@ pub struct AiUiState {
     print_save_path: String,
     ollama_executable: String,
     pick_ollama: bool,
+    open_document_path: String,
+    pick_target_document: bool,
+    open_target_document_requested: bool,
 }
 impl std::fmt::Debug for AiUiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -525,6 +528,9 @@ impl Default for AiUiState {
             print_save_path: String::new(),
             ollama_executable: String::new(),
             pick_ollama: false,
+            open_document_path: String::new(),
+            pick_target_document: false,
+            open_target_document_requested: false,
         }
     }
 }
@@ -1183,6 +1189,9 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
     let snapshot = host(&mut app.session, request);
     let result = serde_json::to_value(&snapshot).map_err(|e| e.to_string());
     app.ui.ai.accept(snapshot);
+    if let Some(alert) = app.ui.ai.active_diagnostic_alert() {
+        app.ui.status = format!("⚠ {} | {}", alert.title_ar, alert.title_en);
+    }
     if let Some(request) = production_request {
         app.ui.ai.load_production_request(&request);
     }
@@ -1501,6 +1510,44 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         app.ui.ai.ollama_executable = path;
         ctx.request_repaint();
     }
+    if std::mem::take(&mut app.ui.ai.pick_target_document) {
+        if app.services.pick_open.is_some() {
+            if let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("open")) {
+                app.ui.ai.open_document_path = path.clone();
+                match open_target_document_path(app, &path) {
+                    Ok(_) => {
+                        app.ui.ai.new_document = false;
+                        app.ui.ai.continue_book = false;
+                        app.ui.ai.restored_target_unconfirmed = false;
+                        app.ui.ai.error.clear();
+                        ctx.request_repaint();
+                    }
+                    Err(error) => app.ui.ai.error = error,
+                }
+            }
+        } else if let Err(error) = app.pick_and_open("open") {
+            app.ui.ai.error = error;
+        }
+        requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
+    }
+    if std::mem::take(&mut app.ui.ai.open_target_document_requested) {
+        let path = app.ui.ai.open_document_path.trim().to_string();
+        if path.is_empty() {
+            app.ui.ai.error = text(a, "Enter a document path to open.", "أدخل مسار مستند لفتحه.").into();
+        } else {
+            match open_target_document_path(app, &path) {
+                Ok(_) => {
+                    app.ui.ai.new_document = false;
+                    app.ui.ai.continue_book = false;
+                    app.ui.ai.restored_target_unconfirmed = false;
+                    app.ui.ai.error.clear();
+                    ctx.request_repaint();
+                }
+                Err(error) => app.ui.ai.error = error,
+            }
+        }
+        requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
+    }
     if !requests.is_empty() {
         ctx.request_repaint();
     }
@@ -1513,6 +1560,49 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     load_preview(app, ctx);
     load_proof_preview(app, ctx);
     load_companion_proof(app, ctx);
+}
+
+fn open_target_document_path(app: &mut DesignApp, path: &str) -> Result<serde_json::Value, String> {
+    let lower = path.to_ascii_lowercase();
+    let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("Imported");
+    if [".docx", ".rtf", ".txt", ".md", ".xlsx"].iter().any(|ext| lower.ends_with(ext)) {
+        let created = app.run("file.new", serde_json::json!({"preset": "A4", "pages": 1, "facingPages": false, "title": stem}))?;
+        match app.open_file("file.place", serde_json::json!({"path": path, "autoflow": true})) {
+            Ok(v) => Ok(v),
+            Err(error) => {
+                if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
+                    let _ = app.run("file.close", serde_json::json!({"index": index}));
+                }
+                Err(error)
+            }
+        }
+    } else if lower.ends_with(".pdf") {
+        let bytes = if let Some(read) = app.services.read.as_mut() { read(path) } else { designcraft_engine::io::read_file(path) };
+        let bytes = match bytes {
+            Ok(b) if designcraft_render::is_pdf(&b) => b,
+            Ok(_) => return app.open_file("file.open", serde_json::json!({"path": path})),
+            Err(error) => return Err(error),
+        };
+        let pages = designcraft_render::pdf_page_count(&bytes).unwrap_or(1).clamp(1, 500);
+        let (w, h) = designcraft_render::pdf_page_size(&bytes, 0).unwrap_or((595.27559, 841.88976));
+        let created = app.run("file.new", serde_json::json!({"width": w, "height": h, "pages": pages, "facingPages": false, "title": stem}))?;
+        let mut last = serde_json::Value::Null;
+        for page in 1..=pages {
+            match app.open_file("file.place", serde_json::json!({"path": path, "pdfPage": page, "spread": page - 1, "x": 0.0, "y": 0.0, "width": w}))
+            {
+                Ok(v) => last = v,
+                Err(error) => {
+                    if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
+                        let _ = app.run("file.close", serde_json::json!({"index": index}));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(last)
+    } else {
+        app.open_file("file.open", serde_json::json!({"path": path}))
+    }
 }
 
 fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, requests: &mut Vec<AiRequest>) {
@@ -1915,27 +2005,30 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
     let border = egui::Stroke::new(2.0, egui::Color32::from_rgb(225, 65, 75));
     let title_color = egui::Color32::from_rgb(255, 110, 115);
     let accent_color = egui::Color32::from_rgb(255, 205, 120);
+    let show_ar = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
     egui::Frame::group(ui.style()).fill(fill).stroke(border).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
         ui,
         |ui| {
-            let title_text = if a { format!("⚠ {} | {}", alert.title_ar, alert.title_en) } else { format!("⚠ {}", alert.title_en) };
-            rtl::label(ui, egui::RichText::new(title_text).color(title_color).strong().size(14.0));
+            if show_ar {
+                rtl::label(ui, egui::RichText::new(format!("⚠ {}", alert.title_ar)).color(title_color).strong().size(14.0));
+            }
+            rtl::label(ui, egui::RichText::new(format!("⚠ {}", alert.title_en)).color(title_color).strong().size(13.5));
             ui.add_space(4.0);
             let cause_text =
-                if a { format!("السبب / Cause: {} — {}", alert.cause_ar, alert.cause_en) } else { format!("Cause: {}", alert.cause_en) };
+                if show_ar { format!("السبب / Cause: {} — {}", alert.cause_ar, alert.cause_en) } else { format!("Cause: {}", alert.cause_en) };
             rtl::label(ui, egui::RichText::new(cause_text).color(accent_color).strong());
-            let solution_text = if a {
+            let solution_text = if show_ar {
                 format!("الحل المقترح / Solution: {} — {}", alert.solution_ar, alert.solution_en)
             } else {
                 format!("Solution: {}", alert.solution_en)
             };
             rtl::label(ui, solution_text);
-            let detail_text = if a {
+            let detail_text = if show_ar {
                 format!("التفاصيل الفنية / Technical detail: {}", alert.raw_error)
             } else {
                 format!("Technical detail: {}", alert.raw_error)
             };
-            if a {
+            if show_ar {
                 rtl::label(ui, detail_text);
             } else {
                 ui.label(detail_text);
@@ -1947,8 +2040,8 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
                         if ui.button(rtl::widget(ui, text(a, "Enable Smart Skill Compaction", "تفعيل الدمج الذكي للمهارات"))).clicked()
                         {
                             s.automatic_skills = true;
-                            if s.selected_skills.len() > 2 {
-                                s.selected_skills.clear();
+                            while s.selected_skills.len() > 2 {
+                                s.selected_skills.pop_last();
                             }
                             s.clear_failure_alert();
                         }
@@ -1999,6 +2092,7 @@ fn production(
     activate_document: &mut Option<usize>,
     requests: &mut Vec<AiRequest>,
 ) {
+    render_diagnostic_alert_banner(ui, s, a, documents, *activate_document);
     production_recovery(ui, s, a, available, documents, activate_document, requests);
     if (s.proof_display.is_some() && s.show_saved_proof) || s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
         if s.proof_key.is_none() {
@@ -2020,7 +2114,6 @@ fn production(
         });
         return;
     }
-    render_diagnostic_alert_banner(ui, s, a, documents, *activate_document);
     ui.add_enabled_ui(!s.task_active(), |ui| {
         if let Some(document) = documents.iter().find(|document| Some(document.index) == *activate_document && document.continuable) {
             ui.horizontal_wrapped(|ui| {
@@ -2153,6 +2246,9 @@ fn production(
                 s.continue_book = true;
                 s.restored_target_unconfirmed = false;
             }
+            if button(ui, a, "Open file to edit…", "فتح ملف للتعديل…") {
+                s.pick_target_document = true;
+            }
             if s.new_document {
                 ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
             }
@@ -2182,6 +2278,21 @@ fn production(
                 if let Some(selected) = selected {
                     rtl::label(ui, format!("{} {}", selected.pages, text(a, "pages", "صفحة")));
                     rtl::label(ui, selected.page_map_line(a));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                label(
+                    ui,
+                    a,
+                    "Document file (.designcraft, .idml, .indd, .indt, .pdf, .docx, .rtf, .txt, .md, .xlsx)",
+                    "ملف المستند (.designcraft أو .idml أو .indd أو .indt أو .pdf أو .docx أو .rtf أو .txt أو .md أو .xlsx)",
+                );
+                ui.add(egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0));
+                if button(ui, a, "Open path", "فتح المسار") {
+                    s.open_target_document_requested = true;
+                }
+                if button(ui, a, "Browse…", "استعراض…") {
+                    s.pick_target_document = true;
                 }
             });
             if let Some(selected) = selected
@@ -2421,9 +2532,21 @@ fn production(
                 label(ui,a,"Suggested family sequence only; refresh after changing the request. Educator review is required.",
                     "تسلسل عائلات مقترح؛ أعد المعاينة بعد تغيير الطلب. يلزم فحص تربوي بشري.");
                 egui::ScrollArea::vertical().id_salt("ai_curriculum_summary").max_height(100.0).show(ui,|ui| {
+                    let has_ar_font = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
                     for page in preview["blueprint"]["scoped_page_plan"].as_array().into_iter().flatten().take(32) {
                         if let Some(number)=page["page"].as_u64() {
-                            rtl::label(ui,format!("{} {}: {}",text(a,"Page","الصفحة"),number.saturating_add(1),page["recommended_family"].as_str().unwrap_or("")));
+                            let archetype = if has_ar_font {
+                                page["display_archetype"].as_str().or_else(|| page["recommended_family"].as_str()).unwrap_or("")
+                            } else {
+                                page["recommended_family"].as_str().unwrap_or("")
+                            };
+                            let lesson = if has_ar_font { page["chapter_and_lesson"].as_str().unwrap_or("") } else { "" };
+                            let line = if lesson.is_empty() {
+                                format!("{} {}: {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype)
+                            } else {
+                                format!("{} {}: {} — {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype, lesson)
+                            };
+                            rtl::label(ui, line);
                         }
                     }
                 });
@@ -5284,5 +5407,66 @@ mod tests {
         panel.get_by_label("Open Keys & Providers").click();
         panel.run_steps(3);
         assert_eq!(panel.state().0.tab, 3);
+    }
+
+    #[test]
+    fn production_panel_open_file_to_edit_switches_target_to_current_document() {
+        use egui_kittest::kittest::Queryable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("existing-poster.designcraft");
+        let txt_path = dir.path().join("imported-notes.txt");
+        std::fs::write(&txt_path, "Imported heading line\nSecond body paragraph for editing.").unwrap();
+        let mut author = DesignApp::new(
+            Session::new(),
+            Services { write: Some(Box::new(|path, bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()))), ..Default::default() },
+        );
+        author.run("file.new", serde_json::json!({"preset":"A4","pages":2})).unwrap();
+        author
+            .run("frame.create", serde_json::json!({"spread":0,"rect":[72.0,72.0,320.0,160.0],"content":"text","text":"Existing Poster Heading"}))
+            .unwrap();
+        author.run("file.save", serde_json::json!({"path": file_path.to_string_lossy()})).unwrap();
+
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services {
+                read: Some(Box::new(|path| std::fs::read(path).map_err(|e| e.to_string()))),
+                pick_open: Some(Box::new(|_| None)),
+                ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })),
+                ..Default::default()
+            },
+        );
+        app.ui.ai.open = true;
+        app.ui.ai.new_document = true;
+        app.ui.ai.continue_book = true;
+        app.ui.ai.open_document_path = file_path.to_string_lossy().into_owned();
+        app.ui.ai.open_target_document_requested = true;
+
+        let mut harness =
+            egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 900.0)).build_ui_state(|ui, app: &mut DesignApp| show(app, ui.ctx()), app);
+        harness.run_steps(3);
+
+        assert!(!harness.state().ui.ai.new_document, "opening a file to edit switches target mode to CurrentDocument");
+        assert!(!harness.state().ui.ai.continue_book, "opening a file to edit clears continue_book");
+        assert!(harness.state().ui.ai.error.is_empty(), "error={}", harness.state().ui.ai.error);
+        assert_eq!(harness.state().session.active().map(|d| d.doc.page_count()), Some(2));
+        assert!(harness.query_by_label("Open path").is_some());
+        assert!(harness.query_by_label("Browse…").is_some());
+
+        // Cancelling the file picker must not flip target mode when a document is already open.
+        harness.state_mut().ui.ai.new_document = true;
+        harness.state_mut().ui.ai.pick_target_document = true;
+        harness.run_steps(3);
+        assert!(harness.state().ui.ai.new_document, "cancelled picker must preserve new_document mode");
+
+        // Opening a text file imports and autoflows it into a new editable document and switches to CurrentDocument.
+        harness.state_mut().ui.ai.continue_book = true;
+        harness.state_mut().ui.ai.open_document_path = txt_path.to_string_lossy().into_owned();
+        harness.state_mut().ui.ai.open_target_document_requested = true;
+        harness.run_steps(3);
+        assert!(!harness.state().ui.ai.new_document);
+        assert!(!harness.state().ui.ai.continue_book);
+        assert!(harness.state().ui.ai.error.is_empty(), "error={}", harness.state().ui.ai.error);
+        assert_eq!(harness.state().session.active().map(|d| d.doc.title.as_str()), Some("imported-notes"));
     }
 }

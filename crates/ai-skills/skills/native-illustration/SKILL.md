@@ -1,12 +1,12 @@
 ---
 name: native-illustration
-description: Use when illustrations, drawing, diagrams, educational figures or visual explanations need editable shapes and paths, مهارات الرسم التصميمي والرسوم التوضيحية والأشكال والمسارات القابلة للتحرير.
+description: Use when illustrations, drawing, diagrams, educational figures or visual explanations need editable shapes, Boolean pathfinder, compound paths, gradients and step-and-repeat grids, مهارات الرسم التصميمي والرسوم التوضيحية والأشكال والمسارات المركبة والتدرجات القابلة للتحرير.
 ---
 # Native illustration
 
 Translate the concept into a small visual vocabulary: silhouette, major forms, meaningful color, labels and reading order. Choose the illustration style from the brief and visual identity. Use realistic photographs when requested; use native vector drawing for diagrams, activity marks and illustrations that require individual part editing. Several figures can share a page when the teaching purpose needs comparison, grouping or a sequence.
 
-Build original illustrations with frame.create shapes, path.create anchors and their native Bézier handles, line.create, object.fill, object.stroke, object.group and separate text frames. Consult the live catalog for available parameters. Every created object must specify its target spread; references such as $0.id target earlier results in the same plan. Keep semantic parts separate and label them, so a person can select, recolor, move or correct individual parts later.
+Build original illustrations with `frame.create` shapes, `path.create` anchors and their native Bézier handles, `line.create`, `object.pathfinder` (`add`, `subtract`, `intersect`, `exclude`, `minusBack`), `object.compoundPath.make`/`release`, `object.convertShape`, `edit.stepAndRepeat` (for regular grids, ticks, and repeated vector icons), `object.fill`, `object.gradientFill` (`linear`/`radial` stops), `object.stroke`, `object.effects` (drop shadow, inner shadow, outer/inner glow, bevel/emboss, satin, feather), `transform.rotate`/`scale`/`shear`/`flip`, `object.group` and separate text frames. Consult the live catalog for available parameters. Every created object must specify its target spread; references such as `$0.id` target earlier results in the same plan. Keep semantic parts separate and label them, so a person can select, recolor, move or correct individual parts later.
 
 Use consistent stroke weight, shape language, proportions, perspective and color roles within a document. Prefer readable filled forms over a mass of decorative outlines. Keep caption typography native and away from geometry. Drawings and photos may coexist in independent frames; raster pixels are not automatically editable vector parts.
 

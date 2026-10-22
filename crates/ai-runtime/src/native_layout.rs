@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
     let mut candidate = plan.clone();
-    let mut notes = format_populated_new_stories(&mut candidate)?;
+    let mut notes = normalize_command_aliases(&mut candidate);
+    notes.extend(format_populated_new_stories(&mut candidate)?);
     notes.extend(recover_unregistered_swatches(&mut candidate, base)?);
+    notes.extend(normalize_unit_interval_fields(&mut candidate));
     crate::image_repetition::normalize(&mut candidate)?;
     crate::design::check_document_image_slots(base, &candidate.images)?;
     let mut scratch = Session::new();
@@ -25,17 +27,25 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     let results = result.get("results").and_then(Value::as_array).ok_or("Native layout did not return command results")?;
     let mut frames = Vec::new();
     let mut created_frames = BTreeMap::new();
+    let current_doc = &scratch.doc().map_err(|e| e.to_string())?.doc;
     for (index, action) in candidate.commands.iter().enumerate() {
         if action.command == "frame.create"
             && action.params.get("content").and_then(Value::as_str) == Some("unassigned")
             && let Some(id) = results.get(index).and_then(|value| value.get("id")).and_then(Value::as_u64)
+            && current_doc.item(ItemId(id)).is_some()
         {
             created_frames.insert(ItemId(id), index);
         }
         if action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text") {
             let id = results.get(index).and_then(|v| v.get("id")).and_then(Value::as_u64).ok_or("Native text frame has no ID")?;
-            let story = results.get(index).and_then(|v| v.get("story")).and_then(Value::as_u64).ok_or("Native text frame has no story")?;
-            frames.push((index, ItemId(id), StoryId(story)));
+            let initial_story = results.get(index).and_then(|v| v.get("story")).and_then(Value::as_u64).ok_or("Native text frame has no story")?;
+            let Some(item) = current_doc.item(ItemId(id)) else {
+                continue;
+            };
+            let story_id = item.text_frame().map(|tf| tf.story).unwrap_or(StoryId(initial_story));
+            if current_doc.story(story_id).is_some() {
+                frames.push((index, ItemId(id), story_id));
+            }
         }
     }
     notes.extend(recover_text_positions(&mut candidate, &mut scratch, base, &frames, cancel)?);
@@ -193,6 +203,110 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     Ok(notes)
 }
 
+/// Normalize common model-emitted command aliases (such as `type.set` -> `story.setText`,
+/// `style.para.*` -> `style.paragraph.*`, `style.char.*` -> `style.character.*`,
+/// `pathfinder.*` -> `object.pathfinder`, `qr.create` -> `object.qrCode`) before validation.
+pub(crate) fn normalize_command_aliases(plan: &mut ProductionPlan) -> Vec<Value> {
+    let mut notes = Vec::new();
+    for (index, action) in plan.commands.iter_mut().enumerate() {
+        let original = action.command.trim();
+        let (canonical, inferred_op) = match original {
+            "type.set" | "text.set" | "story.set" => (Some("story.setText"), None),
+            "object.delete" | "item.delete" | "frame.delete" | "edit.delete" => (Some("edit.clear"), None),
+            "text.replace" | "find.replace" => (Some("find.change"), None),
+            "style.para.create" => (Some("style.paragraph.create"), None),
+            "style.para.edit" => (Some("style.paragraph.edit"), None),
+            "style.para.apply" => (Some("style.paragraph.apply"), None),
+            "style.char.create" => (Some("style.character.create"), None),
+            "style.char.edit" => (Some("style.character.edit"), None),
+            "style.char.apply" => (Some("style.character.apply"), None),
+            "pathfinder.add" => (Some("object.pathfinder"), Some("add")),
+            "pathfinder.subtract" => (Some("object.pathfinder"), Some("subtract")),
+            "pathfinder.intersect" => (Some("object.pathfinder"), Some("intersect")),
+            "pathfinder.exclude" => (Some("object.pathfinder"), Some("exclude")),
+            "pathfinder.minusBack" => (Some("object.pathfinder"), Some("minusBack")),
+            "object.compoundPath.make" | "compoundPath.make" => (Some("object.makeCompoundPath"), None),
+            "object.compoundPath.release" | "compoundPath.release" => (Some("object.releaseCompoundPath"), None),
+            "object.gradientFill" | "gradient.fill" => (Some("object.gradient"), None),
+            "qr.create" | "qrcode.create" => (Some("object.qrCode"), None),
+            "page.insert" | "pages.insert" => (Some("layout.pages.insert"), None),
+            "table.set_cell" | "table.cell" => (Some("table.setCell"), None),
+            "table.mergeCells" => (Some("table.merge"), None),
+            "table.unmergeCells" => (Some("table.unmerge"), None),
+            "table.setTableStyle" | "table.setHeaderFooterRows" => (Some("table.options"), None),
+            "object.stepAndRepeat" | "transform.stepAndRepeat" => (Some("edit.stepAndRepeat"), None),
+            _ => (None, None),
+        };
+        if let Some(target) = canonical {
+            let requested = action.command.clone();
+            action.command = target.to_owned();
+            if let Some(op) = inferred_op
+                && let Some(obj) = action.params.as_object_mut()
+                && !obj.contains_key("op")
+            {
+                obj.insert("op".into(), Value::String(op.into()));
+            }
+            notes.push(json!({
+                "kind": "commandAliasNormalized",
+                "command": index,
+                "requested": requested,
+                "resolved": target,
+                "message": "Normalized command alias to canonical vetted engine command"
+            }));
+        }
+        if action.command == "story.setText"
+            && let Some(obj) = action.params.as_object_mut()
+        {
+            if !obj.contains_key("story")
+                && let Some(id) = obj.remove("id")
+            {
+                obj.insert("story".into(), id);
+            }
+            if !obj.contains_key("text")
+                && let Some(content) = obj.remove("content")
+            {
+                obj.insert("text".into(), content);
+            }
+        }
+        for container_key in ["para", "attrs"] {
+            if let Some(para) = action.params.get_mut(container_key).and_then(Value::as_object_mut)
+                && let Some(lt) = para.get_mut("listType")
+            {
+                let normalized = match lt.as_str() {
+                    Some("bullet") => Some("bullets"),
+                    Some("numbered" | "number") => Some("numbers"),
+                    _ => None,
+                };
+                if let Some(target_lt) = normalized {
+                    *lt = Value::String(target_lt.into());
+                }
+            }
+        }
+    }
+    let table_inserts: BTreeSet<usize> =
+        plan.commands.iter().enumerate().filter_map(|(i, a)| (a.command == "table.insert").then_some(i)).collect();
+    for (index, action) in plan.commands.iter_mut().enumerate() {
+        if let Some(table_val) = action.params.get_mut("table")
+            && let Some(raw_ref) = table_val.as_str()
+            && let Some(source_idx) = raw_ref.strip_prefix('$').and_then(|s| s.strip_suffix(".id")).and_then(|s| s.parse::<usize>().ok())
+            && source_idx < index
+            && table_inserts.contains(&source_idx)
+        {
+            let resolved = format!("${source_idx}.table");
+            let requested = raw_ref.to_owned();
+            *table_val = Value::String(resolved.clone());
+            notes.push(json!({
+                "kind": "commandAliasNormalized",
+                "command": index,
+                "requested": requested,
+                "resolved": resolved,
+                "message": "Normalized table.insert result reference from .id to .table"
+            }));
+        }
+    }
+    notes
+}
+
 /// A generation plan has already supplied its complete copy. A start caret
 /// followed by character formatting would otherwise style only future typing,
 /// leaving the generated words at the engine defaults. Recover this narrow
@@ -289,8 +403,12 @@ pub(crate) fn recover_unregistered_swatches(plan: &mut ProductionPlan, base: &Do
     for (index, action) in plan.commands.iter_mut().enumerate() {
         let field = match action.command.as_str() {
             "object.fill" | "object.stroke" => action.params.get_mut("swatch"),
+            "object.dropShadow" | "object.qrCode" => action.params.get_mut("color"),
             "type.char" => action.params.get_mut("attrs").and_then(|attrs| attrs.get_mut("fill")),
-            "table.setCell" => action.params.get_mut("fill"),
+            "style.paragraph.create" | "style.paragraph.edit" | "style.character.create" | "style.character.edit" => {
+                action.params.get_mut("chars").and_then(|chars| chars.get_mut("fill"))
+            }
+            "style.object.create" | "style.cell.create" | "table.setCell" => action.params.get_mut("fill"),
             _ => None,
         };
         let Some(slot) = field else { continue };
@@ -336,6 +454,32 @@ pub(crate) fn recover_unregistered_swatches(plan: &mut ProductionPlan, base: &Do
         }
     }
     Ok(notes)
+}
+
+fn normalize_unit_interval_fields(plan: &mut ProductionPlan) -> Vec<Value> {
+    let mut notes = Vec::new();
+    for (index, action) in plan.commands.iter_mut().enumerate() {
+        let key = match action.command.as_str() {
+            "object.opacity" | "object.dropShadow" | "object.effects" => "opacity",
+            "object.fill" | "object.stroke" | "table.setCell" | "style.cell.create" => "tint",
+            _ => continue,
+        };
+        let Some(slot) = action.params.get_mut(key) else { continue };
+        let Some(raw) = slot.as_f64().filter(|v| v.is_finite() && *v > 1.0 && *v <= 100.0) else {
+            continue;
+        };
+        let normalized = raw / 100.0;
+        *slot = json!(normalized);
+        notes.push(json!({
+            "kind": "unitIntervalNormalized",
+            "command": index,
+            "field": format!("{}.{}", action.command, key),
+            "requested": raw,
+            "resolved": normalized,
+            "message": "Normalized percentage unit-interval value into [0.0, 1.0]"
+        }));
+    }
+    notes
 }
 
 fn parse_keyed_channels<const N: usize>(raw: &str, keys: [char; N], max: f32) -> Option<[f32; N]> {
@@ -1471,5 +1615,37 @@ mod tests {
         assert_eq!(plan.commands[7].params["swatch"], "C=0 M=0 Y=100 K=0");
         assert_eq!(plan.commands[8].params["swatch"], "C=0 M=0 Y=100 K=0");
         assert_eq!(notes.iter().filter(|n| n["kind"] == "nativeSwatchFallback").count(), 6);
+    }
+
+    #[test]
+    fn command_aliases_including_type_set_normalize_to_vetted_engine_commands() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Command alias normalization",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [60, 60, 300, 120], "content": "text", "text": "Initial", "caret": false}},
+                {"command": "type.set", "params": {"id": "$0.story", "content": "Updated Copy"}},
+                {"command": "style.para.create", "params": {"name": "TitleStyle", "chars": {"size": 16}}},
+                {"command": "style.para.apply", "params": {"name": "TitleStyle"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [60, 150, 140, 230], "shape": "ellipse", "content": "unassigned"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [100, 150, 180, 230], "shape": "ellipse", "content": "unassigned"}},
+                {"command": "pathfinder.add", "params": {"ids": ["$4.id", "$5.id"]}},
+                {"command": "qr.create", "params": {"type": "url", "content": "https://example.com", "rect": [360, 150, 440, 230]}}
+            ]
+        }))
+        .unwrap();
+        let base = session.doc().unwrap().clone();
+        let notes = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap();
+        assert_eq!(plan.commands[1].command, "story.setText");
+        assert_eq!(plan.commands[1].params["story"], "$0.story");
+        assert_eq!(plan.commands[1].params["text"], "Updated Copy");
+        assert_eq!(plan.commands[2].command, "style.paragraph.create");
+        assert_eq!(plan.commands[3].command, "style.paragraph.apply");
+        assert_eq!(plan.commands[6].command, "object.pathfinder");
+        assert_eq!(plan.commands[6].params["op"], "add");
+        assert_eq!(plan.commands[7].command, "object.qrCode");
+        assert!(notes.iter().any(|n| n["kind"] == "commandAliasNormalized"));
     }
 }
