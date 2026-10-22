@@ -42,3 +42,22 @@ pub struct ModelSelection {
     pub model: String,
     pub endpoint: Option<String>,
 }
+
+/// Identifies known image, audio, video, speech, live-session, and embedding model identifiers
+/// using delimited tokens or family prefixes so custom/local text aliases (such as `silver-text`)
+/// are not rejected by substring collisions.
+pub fn is_non_text_model(model: &str) -> bool {
+    let model = model.trim().trim_start_matches("models/").to_ascii_lowercase();
+    if model.is_empty() {
+        return false;
+    }
+    if ["dall-e", "gpt-image", "imagen", "veo", "whisper"]
+        .iter()
+        .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")) || model.starts_with(&format!("{prefix}_")))
+    {
+        return true;
+    }
+    model.split(|c: char| !c.is_ascii_alphanumeric()).any(|component| {
+        matches!(component, "image" | "images" | "imagen" | "tts" | "audio" | "embedding" | "embeddings" | "live" | "veo" | "aqa" | "whisper")
+    })
+}

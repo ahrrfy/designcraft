@@ -891,19 +891,28 @@ fn bind_copy(plan: &mut ProductionPlan, scope: BatchScope, brief: &str, bindings
     for binding in bindings {
         *id_counts.entry(binding.copy_id.as_str()).or_default() += 1;
     }
+    let explicit_frames: BTreeSet<usize> = bindings
+        .iter()
+        .map(|binding| binding.frame)
+        .filter(|&frame| {
+            plan.commands
+                .get(frame)
+                .is_some_and(|action| action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text"))
+        })
+        .collect();
     for binding in bindings {
         if binding.copy_id.is_empty() || binding.copy_id.len() > 64 {
             return Err("Copy binding has an invalid source ID or repeats a native frame".into());
         }
         let source = sources.get(&binding.copy_id).ok_or("Copy binding source is not in the current explicit page scope")?;
         let candidate = plan.commands.get(binding.frame).ok_or("Copy binding frame is outside the authored command plan")?;
-        let resolved_frame = if candidate.command == "frame.create" {
+        let resolved_frame = if candidate.command == "frame.create" && candidate.params.get("content").and_then(Value::as_str) == Some("text") {
             binding.frame
         } else {
             (0..=binding.frame)
-                .rev()
                 .find(|&idx| {
                     !frames.contains(&idx)
+                        && !explicit_frames.contains(&idx)
                         && plan.commands.get(idx).is_some_and(|action| {
                             action.command == "frame.create"
                                 && action.params.get("content").and_then(Value::as_str) == Some("text")
@@ -1443,5 +1452,24 @@ mod tests {
         assert_eq!(plan.commands[0].params["text"], "Fourteen (10 + 4)");
         assert_eq!(plan.commands[2].params["text"], "أَرْبَعَةَ عَشَرَ");
         validate_plan(brief, scope, &plan).unwrap();
+
+        let grouped = json!({
+            "title": "Page 1 — Fourteen grouped",
+            "commands": [
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,45,280,100],"text":"placeholder"}},
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[300,45,550,100],"text":"placeholder"}},
+                {"command":"type.char","params":{"attrs":{"size":18}}},
+                {"command":"type.para","params":{"attrs":{"align":"right","direction":"rightToLeft"}}}
+            ],
+            "images": [],
+            "copy_bindings": [
+                {"frame": 2, "copy_id": "p1.en.1", "word_range": [0, 1]},
+                {"frame": 3, "copy_id": "p1.ar.1", "word_range": [0, 1]}
+            ]
+        });
+        let grouped_plan = compile_native_plan_for_brief(&grouped.to_string(), scope, brief).unwrap();
+        assert_eq!(grouped_plan.commands[0].params["text"], "Fourteen (10 + 4)");
+        assert_eq!(grouped_plan.commands[1].params["text"], "أَرْبَعَةَ عَشَرَ");
+        validate_plan(brief, scope, &grouped_plan).unwrap();
     }
 }

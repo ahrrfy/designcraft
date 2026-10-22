@@ -11,8 +11,7 @@ use serde_json::Value;
 const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
 
 pub(crate) fn is_non_text_model(model: &str) -> bool {
-    let model = model.trim().trim_start_matches("models/").to_ascii_lowercase();
-    ["image", "imagen", "tts", "audio", "embedding", "live", "veo", "aqa", "dall-e", "gpt-image"].iter().any(|token| model.contains(token))
+    designcraft_ai_types::is_non_text_model(model)
 }
 
 /// Never persisted, and never included in a debug dump.
@@ -3084,6 +3083,7 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         ui.horizontal_wrapped(|ui| {
             let ready = !s.skill_prompt.trim().is_empty()
                 && !s.settings.text_model.model.trim().is_empty()
+                && !is_non_text_model(&s.settings.text_model.model)
                 && s.workflow_ready()
                 && (s.settings.budget.max_cost_usd.is_none() || s.rates_confirmed);
             if ui.add_enabled(ready, egui::Button::new(rtl::widget(ui, text(a, "Generate draft", "إنشاء المسودة")))).clicked() {
@@ -4849,9 +4849,15 @@ mod tests {
         assert!(is_non_text_model("gemini-3.1-flash-lite-image"));
         assert!(is_non_text_model("models/imagen-3.0-generate-002"));
         assert!(is_non_text_model("gemini-3.8-flash-tts"));
+        assert!(is_non_text_model("dall-e-3"));
+        assert!(is_non_text_model("gpt-image-1"));
+        assert!(is_non_text_model("gemini-embedding-001"));
         assert!(!is_non_text_model("gemini-3.8-flash"));
         assert!(!is_non_text_model("gemini-flash-latest"));
         assert!(!is_non_text_model("gemini-pro-latest"));
+        assert!(!is_non_text_model("silver-text"));
+        assert!(!is_non_text_model("olive-chat:latest"));
+        assert!(!is_non_text_model("imaginative-writer-7b"));
         let mut model_state = AiUiState { prompt: "Page 1 brief".into(), new_document: true, ..Default::default() };
 
         model_state.settings.output_mode = OutputMode::NativeOnly;
