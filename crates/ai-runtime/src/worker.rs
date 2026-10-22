@@ -665,6 +665,10 @@ impl Runner<'_> {
             let mut template_context = context;
             let object = template_context.as_object_mut().ok_or("Invalid template production context")?;
             object.insert("selected_skill_guidance".into(), json!(guidance));
+            object.insert(
+                "skill_tool_mastermind".into(),
+                crate::template_plan::skill_tool_mastermind_brief(&request.prompt, &skills, scope, total_pages),
+            );
             if scope.count > crate::template_plan::capacity(style, request.settings.output_mode)? {
                 if !review_group {
                     return Err("Template pages exceed one internal native plan; use a human-reviewed book batch".into());
@@ -1609,15 +1613,24 @@ fn project_image_requests(
 
 /// Repeated shared reference bodies are sent once, without dropping ownership or pins.
 pub(crate) fn compact_skill_guidance(skills: &[SkillSnapshot]) -> Result<String, String> {
-    compact_skill_guidance_limit(skills, 32 * 1024)
+    let limit = (32 * 1024usize).saturating_add(skills.len().saturating_sub(2).saturating_mul(16 * 1024)).min(128 * 1024);
+    compact_skill_guidance_limit(skills, limit)
 }
 
 fn compact_skill_guidance_limit(skills: &[SkillSnapshot], limit: usize) -> Result<String, String> {
     let mut bodies: BTreeMap<String, &str> = BTreeMap::new();
     let mut entries = Vec::new();
     for skill in skills {
+        if skill.instructions.len() > 32 * 1024 {
+            return Err("AI context exceeds its byte limit".into());
+        }
+        let mut ref_bytes = 0usize;
         let mut references = BTreeMap::new();
         for (path, body) in &skill.references {
+            ref_bytes = ref_bytes.saturating_add(path.len()).saturating_add(body.len());
+            if skill.instructions.len().saturating_add(ref_bytes) > 64 * 1024 {
+                return Err("AI context exceeds its byte limit".into());
+            }
             let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
             if bodies.get(&digest).is_some_and(|known| *known != body) {
                 return Err("Conflicting shared skill reference digest".into());
@@ -2057,19 +2070,20 @@ fn production_system(
     adaptive_layout: bool,
 ) -> Result<String, String> {
     let native_catalog = compact_catalog(catalog)?;
+    let multi_limit = (64 * 1024usize).saturating_add(skills.len().saturating_sub(2).saturating_mul(16 * 1024)).min(160 * 1024);
     let instructions = if adaptive_layout {
         // Preserve every instruction, reference owner/hash and revision while
         // sending a shared reference body once, as task admission already does.
-        let guidance: Value = serde_json::from_str(&compact_skill_guidance_limit(skills, 64 * 1024)?).map_err(|error| error.to_string())?;
+        let guidance: Value = serde_json::from_str(&compact_skill_guidance_limit(skills, multi_limit)?).map_err(|error| error.to_string())?;
         let profiles: Vec<_> = skills
             .iter()
             .filter_map(|skill| {
                 skill.design_profile.as_ref().map(|profile| json!({"skill_id":skill.skill_id,"revision":skill.revision,"design_profile":profile}))
             })
             .collect();
-        bounded_json(&json!({"guidance":guidance,"profiles":profiles}), 64 * 1024)?
+        bounded_json(&json!({"guidance":guidance,"profiles":profiles}), multi_limit)?
     } else {
-        bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?
+        bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, multi_limit)?
     };
     let image_policy = match mode {
         OutputMode::NativeOnly => "NATIVE ONLY: images must be empty. Do not use file.place or any raster commands.".into(),
@@ -2080,7 +2094,7 @@ fn production_system(
         }
     };
     let mut system = format!(
-        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
+        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Act as the master architect of the native tool engine across any user prompt, subject, language, age stage, or publication genre, synthesizing all selected skills and context.templatePlan (including skill_tool_mastermind and curriculum_blueprint when present) into cohesive, geometrically balanced pages. Use native frame.create, path.create, line.create, table.insert, object.fill, object.stroke, type.set, type.char, and type.para with deliberate spatial zones and >=12pt breathing room between sibling cards. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
         bounded_json(&native_catalog, MAX_PROMPT / 2)?
     );
     system.push('\n');

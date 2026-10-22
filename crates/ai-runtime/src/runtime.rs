@@ -429,7 +429,9 @@ impl ProductionRunner {
             }
         };
         let ids = if task.auto_select_skills {
-            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+            let auto_ids = self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?;
+            let pinned_ids = self.prepare_pinned_skills(session, &task.skill_ids)?;
+            merge_pinned_and_automatic_skills(&pinned_ids, auto_ids, task.settings.design_style.as_deref())
         } else {
             let mut ids = task.skill_ids.clone();
             if let Some(id) = task.settings.design_style.as_deref() {
@@ -508,7 +510,9 @@ impl ProductionRunner {
             _ => return Err("Curriculum preview requires a new 1–1000-page book or an existing book to continue".into()),
         }
         let ids = if task.auto_select_skills {
-            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+            let auto_ids = self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?;
+            let pinned_ids = self.prepare_pinned_skills(session, &task.skill_ids)?;
+            merge_pinned_and_automatic_skills(&pinned_ids, auto_ids, task.settings.design_style.as_deref())
         } else {
             let mut ids = task.skill_ids.clone();
             if let Some(style) = &task.settings.design_style
@@ -1124,6 +1128,53 @@ impl ProductionRunner {
         Ok(ids)
     }
 
+    fn prepare_pinned_skills(&mut self, session: &Session, pinned: &[String]) -> Result<Vec<String>, String> {
+        if pinned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let supported = supported_commands();
+        let mut active_pinned = Vec::new();
+        for id in pinned {
+            let Some(entry) = self.registry.catalog("").into_iter().find(|e| &e.skill_id == id) else {
+                continue;
+            };
+            if !entry.enabled {
+                continue;
+            }
+            if entry.active_revision.is_some() {
+                active_pinned.push(id.clone());
+                continue;
+            }
+            let Some(revision) = entry.revisions.last() else { continue };
+            if revision.manifest.design_profile.is_some() || !skill_is_compatible(revision, &supported) {
+                continue;
+            }
+            let rev_id = revision.revision.clone();
+            if validate_skill_templates(&self.registry, session, id, &rev_id).and_then(|()| self.run_sample(session, id, &rev_id)).is_ok()
+                && let Some(evidence) = self.sample.as_ref()
+            {
+                self.registry
+                    .activate_automatically(
+                        id,
+                        &rev_id,
+                        ApprovalEvidence {
+                            reviewer: String::new(),
+                            sample_artifact: evidence.path.clone(),
+                            executed_actions: evidence.actions.clone(),
+                            supported_commands: supported.clone(),
+                            notes: String::new(),
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
+                active_pinned.push(id.clone());
+            }
+        }
+        if !active_pinned.is_empty() {
+            self.refresh_catalog();
+        }
+        Ok(active_pinned)
+    }
+
     fn prepare_style(&mut self, session: &Session, id: &str) -> Result<(), String> {
         let entry = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown design style: {id}"))?;
         if !entry.enabled {
@@ -1296,6 +1347,7 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
             }
         }
     }
+    let multi_limit = (64 * 1024usize).saturating_add(skills.len().saturating_sub(2).saturating_mul(16 * 1024)).min(160 * 1024);
     if matches!(target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook) && skills.iter().any(crate::template_plan::eligible) {
         for skill in &mut skills {
             if skill.design_profile.is_none() {
@@ -1311,7 +1363,7 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
                 return Err("Template style rules exceed the bounded context limit".into());
             }
             bytes = bytes.checked_add(rules).ok_or("Selected skill context size overflow")?;
-            if bytes > 64 * 1024 {
+            if bytes > multi_limit {
                 return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
             }
         }
@@ -1336,7 +1388,41 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
             return Ok(skills);
         }
     }
+    if task_skill_context_bytes(&skills)? <= multi_limit {
+        return Ok(skills);
+    }
     Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into())
+}
+
+fn merge_pinned_and_automatic_skills(pinned: &[String], auto_ids: Vec<String>, style_id: Option<&str>) -> Vec<String> {
+    if pinned.is_empty() {
+        return auto_ids;
+    }
+    let mut merged = Vec::new();
+    for id in pinned {
+        if !merged.contains(id) {
+            merged.push(id.clone());
+        }
+    }
+    let reserve_style = style_id.filter(|style| !merged.iter().any(|existing| existing == *style) && auto_ids.iter().any(|id| id == *style));
+    let cap = if reserve_style.is_some() { 7 } else { 8 };
+    for id in auto_ids {
+        if reserve_style.is_some_and(|style| style == id) {
+            continue;
+        }
+        if merged.len() >= cap {
+            break;
+        }
+        if !merged.contains(&id) {
+            merged.push(id);
+        }
+    }
+    if let Some(style) = reserve_style
+        && merged.len() < 8
+    {
+        merged.push(style.to_owned());
+    }
+    merged
 }
 
 fn task_skill_context_bytes(skills: &[SkillSnapshot]) -> Result<usize, String> {
@@ -1604,6 +1690,8 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "منهج",
         "مناهج",
         "مقرر",
+        "مادة",
+        "ماده",
         "وحدة",
         "درس",
         "رياضيات",
@@ -1613,6 +1701,18 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "كمبيوتر",
         "برمجة",
         "تقنية",
+        "إسلامية",
+        "اسلامية",
+        "اسلاميه",
+        "الاسلاميه",
+        "قرآن",
+        "قران",
+        "عبادات",
+        "سيرة",
+        "سيره",
+        "لغتي",
+        "العربية",
+        "اجتماعيات",
         "curriculum",
         "book",
         "workbook",
@@ -1623,17 +1723,29 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "computer",
         "computing",
         "ict",
+        "islamic",
+        "arabic",
+        "social studies",
     ]);
     let children = mentions(&[
         "أطفال",
         "اطفال",
         "طفل",
         "روضة",
+        "روضه",
+        "تمهيدي",
+        "مرحلة",
+        "مرحله",
         "للصغار",
         "ابتدائي",
         "مدرسي",
         "طلاب",
         "تلاميذ",
+        "kg",
+        "kg1",
+        "kg2",
+        "fs1",
+        "fs2",
         "kindergarten",
         "preschool",
         "children",
@@ -1681,6 +1793,8 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "curriculum map",
         "spiral curriculum",
     ]);
+    let math_or_cpa =
+        mentions(&["رياضيات", "حساب", "العد", "كميات", "منطق", "محسوس", "قواعد", "math", "mathematics", "counting", "subitiz", "grammar", "cpa"]);
     let purpose = match entry.skill_id.as_str() {
         "native-engine-workflow" => 64,
         "arabic-english-typography" if arabic => 56,
@@ -1688,27 +1802,12 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "curriculum-print-design-studio" if book && print => 41,
         "kg-garnet-ict-computing" if kg && computing => 46,
         "kg-international-curriculum-architect" if (kg || book) && architecture => 45,
-        "kg-cambridge-thinking-cpa"
-            if kg
-                && (computing
-                    || intl
-                    || mentions(&[
-                        "رياضيات",
-                        "حساب",
-                        "العد",
-                        "كميات",
-                        "منطق",
-                        "محسوس",
-                        "قواعد",
-                        "math",
-                        "mathematics",
-                        "counting",
-                        "subitiz",
-                        "grammar",
-                        "cpa",
-                    ])) =>
-        {
-            44
+        "kg-cambridge-thinking-cpa" if kg && (computing || intl || math_or_cpa) => {
+            if math_or_cpa {
+                44
+            } else {
+                37
+            }
         }
         "kg-international-curriculum-architect" if kg && (intl || book) => {
             if intl {
@@ -3911,5 +4010,79 @@ mod tests {
         let saved = runner.handle(&mut session, AiRequest::UpdateSettings(alias_settings));
         assert_eq!(saved.message, "AI settings saved; API keys remain outside settings and reports");
         assert_eq!(saved.settings.text_model.model, "silver-text");
+    }
+
+    #[test]
+    fn kg2_islamic_curriculum_combines_seven_skills_and_pinned_skills_without_context_overflow() {
+        let prompt = "ابي انتج منهج دولي لماده الاسلاميه لمرحله kg2";
+        let supported = supported_commands();
+
+        let live_skills_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("outputs/ai-preview-profile/AI/skills"));
+        if let Some(skills_dir) = live_skills_dir.filter(|path| path.exists()) {
+            let live_registry = SkillRegistry::open(&skills_dir).unwrap();
+            let catalog = live_registry.catalog("");
+            let auto_ids = choose_compatible_skills(prompt, catalog.clone(), &supported);
+            assert!(auto_ids.contains(&"kg-international-curriculum-architect".to_string()), "auto_ids={auto_ids:?}");
+            assert!(auto_ids.contains(&"kg-cognitive-sensory-layout".to_string()), "auto_ids={auto_ids:?}");
+            assert!(
+                !auto_ids.contains(&"kg-cambridge-thinking-cpa".to_string()),
+                "math CPA skill should not displace Islamic/KG curriculum skills: {auto_ids:?}"
+            );
+            let mut full_ids = auto_ids.clone();
+            full_ids.push("kg-oxford-cambridge-style".into());
+            let merged = merge_pinned_and_automatic_skills(&["arabic-editorial-book-design".into()], full_ids, Some("kg-oxford-cambridge-style"));
+            assert!(merged.contains(&"arabic-editorial-book-design".to_string()));
+            assert!(merged.contains(&"kg-oxford-cambridge-style".to_string()));
+            assert!(merged.len() >= 7 && merged.len() <= 8, "merged={merged:?}");
+
+            let mut snapshots = Vec::new();
+            for id in &merged {
+                if let Some(card) = catalog.iter().find(|e| &e.skill_id == id)
+                    && let Some(rev) = &card.active_revision
+                    && let Ok(rec) = live_registry.revision(id, rev)
+                {
+                    let refs = selected_skill_references(rec);
+                    if let Ok(snap) = live_registry.snapshot(id, &refs) {
+                        snapshots.push(snap);
+                    }
+                }
+            }
+            assert!(snapshots.len() >= 7);
+            let bounded = bounded_task_skills(snapshots, &TaskTarget::NewA4 { pages: 8 }).unwrap();
+            let compacted = worker::compact_skill_guidance(&bounded).unwrap();
+            assert!(!compacted.is_empty());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+
+        let preview = runner.handle(
+            &mut session,
+            AiRequest::PreviewProduction(TaskRequest {
+                prompt: prompt.into(),
+                target: TaskTarget::NewA4 { pages: 8 },
+                settings: AiSettings::default(),
+                skill_ids: vec!["early-years-booklet-planning".into()],
+                auto_select_skills: true,
+                export_directory: None,
+            }),
+        );
+        assert_ne!(preview.stage, "failed", "preview failed: {}", preview.message);
+        let blueprint = preview.production_preview.as_ref().and_then(|value| value.get("blueprint")).expect("curriculum preview blueprint");
+        assert!(blueprint.get("subject_domain").and_then(Value::as_str).is_some_and(|s| s.contains("Islamic Studies")), "{blueprint}");
+        assert!(
+            blueprint
+                .get("selected_profile_authority")
+                .and_then(|v| v.get("inferred_learner_stage"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("KG2")),
+            "{blueprint}"
+        );
+        assert_eq!(preview.production_preview.as_ref().and_then(|v| v.get("binding")).and_then(Value::as_str), Some("RTL"));
     }
 }
