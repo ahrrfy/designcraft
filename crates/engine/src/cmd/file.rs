@@ -93,9 +93,11 @@ pub fn specs() -> Vec<CommandSpec> {
             s.close_document(i);
             ok()
         }),
-        cmd!(noundo "file.activate", "Activate Document", [], None, "{index}", has_doc, |s, p| {
-            s.set_active(p.get("index").and_then(Value::as_u64).unwrap_or(0) as usize);
-            ok()
+        cmd!(noundo "file.activate", "Activate Document", [], None, "{index?, title?, name?, path?}", has_doc, |s, p| {
+            activate_document(s, p, "file.activate")
+        }),
+        cmd!(noundo "file.switch", "Switch Document", [], None, "{index?, title?, name?, path?}", has_doc, |s, p| {
+            activate_document(s, p, "file.switch")
         }),
         cmd!(query "snippet.export", "Export Selection as Snippet", ["File", "Export"], None,
             "{path?} — the selected items (with their stories, styles and images) as a .designcraft snippet; no path: {base64}", super::has_selection, snippet_export),
@@ -241,6 +243,56 @@ fn file_new(s: &mut Session, p: &Value) -> Result<Value> {
     let d = Document::new(&nd);
     let i = s.add_document(DocState::new(d, None));
     Ok(json!({"index": i}))
+}
+
+fn activate_document(s: &mut Session, p: &Value, cmd_name: &str) -> Result<Value> {
+    if let Some(raw_index) = p.get("index").filter(|v| !v.is_null()) {
+        let index = raw_index.as_u64().ok_or_else(|| bad(cmd_name, "`index` must be a non-negative integer"))?;
+        let i = usize::try_from(index).map_err(|_| bad(cmd_name, "`index` is out of range"))?;
+        if cmd_name == "file.switch" && i >= s.documents().len() {
+            return Err(bad(cmd_name, format!("no open document at index {i}")));
+        }
+        s.set_active(i);
+        return ok();
+    }
+    for key in ["title", "name", "path"] {
+        if let Some(raw) = p.get(key).filter(|v| !v.is_null()) {
+            let target =
+                raw.as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad(cmd_name, format!("`{key}` must be a non-empty string")))?;
+            fn stem_of(name: &str) -> Option<&str> {
+                std::path::Path::new(name).file_stem().and_then(|st| st.to_str())
+            }
+            let found = s
+                .documents()
+                .iter()
+                .position(|d| {
+                    let title = d.title();
+                    title == target || stem_of(&title) == Some(target) || d.doc.title == target || d.path.as_deref() == Some(target)
+                })
+                .or_else(|| {
+                    s.documents().iter().position(|d| {
+                        let title = d.title();
+                        title.eq_ignore_ascii_case(target)
+                            || stem_of(&title).is_some_and(|st| st.eq_ignore_ascii_case(target))
+                            || d.doc.title.eq_ignore_ascii_case(target)
+                            || d.path.as_deref().is_some_and(|path| path.eq_ignore_ascii_case(target))
+                    })
+                })
+                .ok_or_else(|| bad(cmd_name, format!("no open document matching `{target}`")))?;
+            s.set_active(found);
+            return ok();
+        }
+    }
+    if cmd_name == "file.switch" {
+        let n = s.documents().len();
+        if n > 1 {
+            let cur = s.active_index().unwrap_or(0);
+            s.set_active((cur + 1) % n);
+        }
+        return ok();
+    }
+    s.set_active(0);
+    ok()
 }
 
 impl Session {
@@ -643,6 +695,9 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .transpose()?;
     // Image Import Options: which page of a PDF (1-based).
+    if designcraft_render::is_pdf(&bytes) {
+        designcraft_render::check_pdf_input_size(bytes.len()).map_err(|e| bad("file.place", e.to_string()))?;
+    }
     let pdf_page = match p.get("pdfPage").and_then(Value::as_u64) {
         Some(n) if designcraft_render::is_pdf(&bytes) => {
             let count = designcraft_render::pdf_page_count(&bytes).unwrap_or(1);
@@ -2123,7 +2178,6 @@ mod recent_tests {
         assert!(s.prefs.recent_files.is_empty(), "0 keeps no list");
     }
 
-    /// The list is a preference: it survives the round trip through prefs.json.
     #[test]
     fn the_list_survives_a_restart() {
         let mut s = Session::new();
@@ -2134,5 +2188,28 @@ mod recent_tests {
         assert_eq!(back.recent_files_max, 20);
         let old: crate::Prefs = serde_json::from_slice(br#"{"recoveryMinutes": 2.0}"#).unwrap();
         assert!(old.recent_files.is_empty(), "older prefs.json without the list still load");
+    }
+
+    #[test]
+    fn file_switch_and_activate_support_index_title_and_cycling() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"title": "Untitled-1"})).unwrap();
+        s.doc_mut().unwrap().path = Some("D:/work/book-48-production-working-copy.designcraft".into());
+        s.execute("file.new", &json!({"title": "Untitled-11"})).unwrap();
+        assert_eq!(s.active_index(), Some(1));
+        s.execute("file.switch", &json!({"index": 0})).unwrap();
+        assert_eq!(s.active_index(), Some(0));
+        s.execute("file.switch", &json!({"title": "Untitled-11"})).unwrap();
+        assert_eq!(s.active_index(), Some(1));
+        s.execute("file.switch", &json!({"title": "book-48-production-working-copy"})).unwrap();
+        assert_eq!(s.active_index(), Some(0));
+        s.execute("file.switch", &json!({})).unwrap();
+        assert_eq!(s.active_index(), Some(1));
+        s.execute("file.activate", &json!({"name": "BOOK-48-PRODUCTION-WORKING-COPY.DESIGNCRAFT"})).unwrap();
+        assert_eq!(s.active_index(), Some(0));
+        assert!(s.execute("file.switch", &json!({"index": 9})).is_err());
+        assert!(s.execute("file.switch", &json!({"index": -1})).is_err());
+        assert!(s.execute("file.switch", &json!({"title": ""})).is_err());
+        assert!(s.execute("file.switch", &json!({"title": "missing"})).is_err());
     }
 }

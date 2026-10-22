@@ -44,16 +44,24 @@ fn supports_review(settings: &AiSettings) -> bool {
     // Live models are excluded even when their names share a family prefix.
     // https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
     [
+        "gemini-flash",
+        "gemini-flash-lite",
+        "gemini-pro",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.5-pro",
         "gemini-3-flash",
         "gemini-3-pro",
+        "gemini-3.1-flash",
         "gemini-3.1-pro",
         "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.5-pro",
         "gemini-3.5-flash-lite",
         "gemini-3.6-flash",
+        "gemini-3.6-pro",
         "gemini-3.8-flash",
+        "gemini-3.8-pro",
     ]
     .iter()
     .any(|family| {
@@ -257,12 +265,30 @@ mod tests {
         assert!(!enabled(&settings));
         assert!(request(&placement(), &fixture_image(), &settings).unwrap_err().contains("disabled"));
         settings.verify_generated_images = true;
-        for model in ["gemini", "gemini-unknown", "gemini-3.8-flash-tts", "gemini-3.1-flash-image", "gemini-embedding-001", "gemini-3.8-live"] {
+        for model in [
+            "gemini",
+            "gemini-unknown",
+            "gemini-3.8-flash-tts",
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-lite-image",
+            "gemini-embedding-001",
+            "gemini-3.8-live",
+        ] {
             settings.text_model.model = model.into();
             assert!(!enabled(&settings), "{model}");
             assert!(request(&placement(), &fixture_image(), &settings).unwrap_err().contains("no provider or model fallback"));
         }
-        for model in ["gemini-2.5-flash", "models/gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3-flash-preview"] {
+        for model in [
+            "gemini-flash-latest",
+            "gemini-flash-lite-latest",
+            "gemini-pro-latest",
+            "gemini-2.5-flash",
+            "models/gemini-3.8-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+            "gemini-3.8-pro",
+        ] {
             settings.text_model.model = model.into();
             assert!(enabled(&settings), "{model}");
         }

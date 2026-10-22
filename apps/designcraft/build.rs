@@ -12,8 +12,17 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    let src_icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/app-icon/designcraft.ico");
+    let icon_path = std::env::var_os("OUT_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(|out| {
+            let dst = out.join("designcraft.ico");
+            std::fs::copy(&src_icon, &dst).ok().map(|_| dst)
+        })
+        .unwrap_or(src_icon);
+    let icon_str = icon_path.to_string_lossy().replace('\\', "/");
     let mut res = winresource::WindowsResource::new();
-    res.set_icon(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/app-icon/designcraft.ico"))
+    res.set_icon(&icon_str)
         .set("ProductName", "Smart Design")
         .set("FileDescription", "Smart Design page layout and AI production")
         .set("CompanyName", "Smart Design contributors")

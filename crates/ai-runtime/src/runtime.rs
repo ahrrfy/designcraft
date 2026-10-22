@@ -1825,6 +1825,9 @@ fn validate_settings(settings: &AiSettings) -> Result<(), String> {
     if settings.text_model.model.len() > 256 || settings.image_model.model.len() > 256 {
         return Err("Model name is too long".into());
     }
+    if !settings.text_model.model.trim().is_empty() && designcraft_ai_types::is_non_text_model(&settings.text_model.model) {
+        return Err("The selected text model is an image/media model; choose a text model for planning".into());
+    }
     UsageLedger::new(settings.budget.clone())?;
     if let Some(rates) = &settings.image_rates {
         crate::ledger::validate_rates(rates)?;
@@ -1853,6 +1856,9 @@ fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     }
     if matches!(settings.text_model.provider, ProviderKind::ComfyUi) {
         return Err("ComfyUI is an image provider; choose a text provider for planning".into());
+    }
+    if designcraft_ai_types::is_non_text_model(&settings.text_model.model) {
+        return Err("The selected text model is an image/media model; choose a text model for planning".into());
     }
     Ok(())
 }
@@ -3856,5 +3862,54 @@ mod tests {
         );
         assert!(snapshot.message.contains("already attempted"), "{}", snapshot.message);
         assert!(session.doc().unwrap().history.undo.is_empty());
+    }
+
+    #[test]
+    fn runtime_rejects_media_models_in_text_slot_and_allows_component_safe_text_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+
+        for bad_model in [
+            "gemini-3.1-flash-lite-image",
+            "models/imagen-3.0-generate-002",
+            "gemini-3.8-flash-tts",
+            "gemini-embedding-001",
+            "dall-e-3",
+            "gpt-image-1",
+            "veo-2.0-generate-001",
+        ] {
+            let settings = AiSettings {
+                text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: bad_model.into(), endpoint: None },
+                ..Default::default()
+            };
+            let update = runner.handle(&mut session, AiRequest::UpdateSettings(settings.clone()));
+            assert_eq!(update.stage, "failed", "{bad_model}");
+            assert!(update.message.contains("image/media model"), "{bad_model}: {}", update.message);
+
+            let start = runner.handle(
+                &mut session,
+                AiRequest::Start(TaskRequest {
+                    prompt: "Page 1 test".into(),
+                    settings,
+                    skill_ids: Vec::new(),
+                    auto_select_skills: false,
+                    target: TaskTarget::CurrentDocument,
+                    export_directory: None,
+                }),
+            );
+            assert_eq!(start.stage, "failed", "{bad_model}");
+            assert!(start.message.contains("image/media model"), "{bad_model}: {}", start.message);
+            assert!(!dir.path().join("production-draft.json").exists(), "rejected media model must not persist a production draft");
+        }
+
+        let alias_settings = AiSettings {
+            text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Ollama, model: "silver-text".into(), endpoint: None },
+            ..Default::default()
+        };
+        let saved = runner.handle(&mut session, AiRequest::UpdateSettings(alias_settings));
+        assert_eq!(saved.message, "AI settings saved; API keys remain outside settings and reports");
+        assert_eq!(saved.settings.text_model.model, "silver-text");
     }
 }

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, cancel: &AtomicBool) -> Result<Vec<Value>, String> {
     let mut candidate = plan.clone();
     let mut notes = format_populated_new_stories(&mut candidate)?;
+    notes.extend(recover_unregistered_swatches(&mut candidate, base)?);
     crate::image_repetition::normalize(&mut candidate)?;
     crate::design::check_document_image_slots(base, &candidate.images)?;
     let mut scratch = Session::new();
@@ -254,6 +255,166 @@ fn format_populated_new_stories(plan: &mut ProductionPlan) -> Result<Vec<Value>,
             "message":"Applied generated character formatting to the complete newly supplied copy, using a native UTF-8 text selection"}));
     }
     Ok(notes)
+}
+
+/// Resolve bare special swatch names (`Paper` -> `[Paper]`), inline color literals
+/// (`C=0 M=15 Y=95 K=0`, `C:85 M:75 Y:0 K:0`, `R=... G=... B=...`, `#RRGGBB`, `#RGB`),
+/// and semantic palette color names to existing document swatches when page-isolated
+/// production cannot call `swatch.create`.
+pub(crate) fn recover_unregistered_swatches(plan: &mut ProductionPlan, base: &DocState) -> Result<Vec<Value>, String> {
+    let mut known: BTreeSet<String> = base.doc.swatches.iter().map(|s| s.name.clone()).collect();
+    for action in &plan.commands {
+        if action.command == "swatch.create" {
+            if let Some(name) = action.params.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                known.insert(name.to_owned());
+            } else if let Some(color) = action.params.get("color").and_then(Value::as_object)
+                && let (Some(c), Some(m), Some(y), Some(k)) = (
+                    color.get("c").and_then(Value::as_f64),
+                    color.get("m").and_then(Value::as_f64),
+                    color.get("y").and_then(Value::as_f64),
+                    color.get("k").and_then(Value::as_f64),
+                )
+            {
+                known.insert(designcraft_engine::doc::color::swatch::cmyk_name(
+                    (c / 100.0) as f32,
+                    (m / 100.0) as f32,
+                    (y / 100.0) as f32,
+                    (k / 100.0) as f32,
+                ));
+            }
+        }
+    }
+    let bare = |name: &str| name.trim().trim_start_matches('[').trim_end_matches(']').to_lowercase();
+    let mut notes = Vec::new();
+    for (index, action) in plan.commands.iter_mut().enumerate() {
+        let field = match action.command.as_str() {
+            "object.fill" | "object.stroke" => action.params.get_mut("swatch"),
+            "type.char" => action.params.get_mut("attrs").and_then(|attrs| attrs.get_mut("fill")),
+            "table.setCell" => action.params.get_mut("fill"),
+            _ => None,
+        };
+        let Some(slot) = field else { continue };
+        let Some(requested) = slot.as_str().map(str::to_owned) else { continue };
+        if requested.is_empty() || requested.starts_with('$') || known.contains(&requested) {
+            continue;
+        }
+        let requested_bare = bare(&requested);
+        let replacement = if let Some(exact) = base.doc.swatches.iter().find(|s| bare(&s.name) == requested_bare) {
+            Some(exact.name.clone())
+        } else if requested_bare == "transparent"
+            && let Some(none_swatch) = base.doc.swatches.iter().find(|s| matches!(s.value, designcraft_engine::doc::color::SwatchValue::None))
+        {
+            Some(none_swatch.name.clone())
+        } else if let Some(target) = parse_inline_color(&requested) {
+            let target_rgb = target.to_rgb_uncalibrated();
+            base.doc
+                .swatches
+                .iter()
+                .filter(|s| {
+                    !matches!(s.value, designcraft_engine::doc::color::SwatchValue::None | designcraft_engine::doc::color::SwatchValue::Registration)
+                })
+                .filter_map(|s| {
+                    let color = designcraft_engine::doc::color::swatch::resolve(&base.doc.swatches, &s.name, 1.0)?;
+                    let rgb = color.to_rgb_uncalibrated();
+                    let dist = (rgb[0] - target_rgb[0]).powi(2) + (rgb[1] - target_rgb[1]).powi(2) + (rgb[2] - target_rgb[2]).powi(2);
+                    Some((s.name.clone(), dist))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(name, _)| name)
+        } else {
+            None
+        };
+        if let Some(resolved) = replacement {
+            *slot = Value::String(resolved.clone());
+            notes.push(json!({
+                "kind": "nativeSwatchFallback",
+                "command": index,
+                "requested": requested,
+                "resolved": resolved,
+                "message": "Resolved unregistered swatch reference to an existing document swatch"
+            }));
+        }
+    }
+    Ok(notes)
+}
+
+fn parse_keyed_channels<const N: usize>(raw: &str, keys: [char; N], max: f32) -> Option<[f32; N]> {
+    let mut normalized = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ',' || ch == ';' {
+            normalized.push(' ');
+        } else if ch == '=' || ch == ':' {
+            normalized.push('=');
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    let parts: Vec<&str> = normalized.split_whitespace().collect();
+    if parts.len() != N {
+        return None;
+    }
+    let mut out = [0.0; N];
+    for (slot, (key, part)) in out.iter_mut().zip(keys.into_iter().zip(parts.iter())) {
+        let rest = part.strip_prefix(key).or_else(|| part.strip_prefix(key.to_ascii_lowercase()))?.strip_prefix('=')?.trim_end_matches('%');
+        let value = rest.parse::<f32>().ok()?;
+        if !value.is_finite() || !(0.0..=max).contains(&value) {
+            return None;
+        }
+        *slot = value / max;
+    }
+    Some(out)
+}
+
+fn parse_inline_color(raw: &str) -> Option<designcraft_engine::doc::color::Color> {
+    use designcraft_engine::doc::color::Color;
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed.strip_prefix('#') {
+        if hex.len() == 6
+            && let (Ok(r), Ok(g), Ok(b)) =
+                (u8::from_str_radix(&hex[0..2], 16), u8::from_str_radix(&hex[2..4], 16), u8::from_str_radix(&hex[4..6], 16))
+        {
+            return Some(Color::rgb8(r, g, b));
+        }
+        if hex.len() == 3
+            && let (Ok(r), Ok(g), Ok(b)) =
+                (u8::from_str_radix(&hex[0..1], 16), u8::from_str_radix(&hex[1..2], 16), u8::from_str_radix(&hex[2..3], 16))
+        {
+            return Some(Color::rgb8(r * 17, g * 17, b * 17));
+        }
+    }
+    if let Some([c, m, y, k]) = parse_keyed_channels(trimmed, ['C', 'M', 'Y', 'K'], 100.0) {
+        return Some(Color::cmyk(c, m, y, k));
+    }
+    if let Some([r, g, b]) = parse_keyed_channels(trimmed, ['R', 'G', 'B'], 255.0) {
+        return Some(Color::rgb(r, g, b));
+    }
+    let normalized: String = trimmed
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match normalized.as_str() {
+        "white" | "paper" | "warm cream" | "cream" | "ivory" => Some(Color::WHITE),
+        "black" | "charcoal" | "ink" | "dark" => Some(Color::cmyk(0.0, 0.0, 0.0, 1.0)),
+        "gray" | "grey" | "silver" | "slate" => Some(Color::cmyk(0.0, 0.0, 0.0, 0.5)),
+        "sunshine yellow" | "yellow" | "gold" | "amber" | "lemon" => Some(Color::cmyk(0.0, 0.15, 0.95, 0.0)),
+        "emerald green" | "emerald" | "green" | "mint" | "lime" | "sage" => Some(Color::cmyk(0.75, 0.10, 0.85, 0.0)),
+        "berry purple" | "purple" | "violet" | "plum" | "lavender" => Some(Color::cmyk(0.45, 0.85, 0.0, 0.0)),
+        "cosmic indigo" | "indigo" | "navy" | "blue" | "royal blue" => Some(Color::cmyk(0.85, 0.75, 0.0, 0.0)),
+        "sunny tangerine" | "tangerine" | "orange" | "coral" | "peach" => Some(Color::cmyk(0.0, 0.50, 0.95, 0.0)),
+        "sky cyan" | "sky blue" | "cyan" | "teal" | "aqua" | "turquoise" => Some(Color::cmyk(0.65, 0.10, 0.0, 0.0)),
+        "red" | "crimson" | "scarlet" => Some(Color::cmyk(0.0, 1.0, 1.0, 0.0)),
+        "magenta" | "pink" | "rose" => Some(Color::cmyk(0.0, 1.0, 0.0, 0.0)),
+        _ => None,
+    }
 }
 
 fn check_repeated_slots(plan: &ProductionPlan, state: &DocState, cancel: &AtomicBool) -> Result<(), String> {
@@ -1279,5 +1440,36 @@ mod tests {
         let result = prepare(&mut plan, session.doc().unwrap(), &session.prefs, &AtomicBool::new(false));
         assert!(result.is_err(), "Unsafe fitting must fail before a paid image request");
         assert_eq!(serde_json::to_value(plan).unwrap(), original);
+    }
+
+    #[test]
+    fn unregistered_inline_cmyk_and_bare_swatch_names_resolve_to_existing_swatches() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Inline swatch recovery",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [60, 60, 200, 120], "content": "unassigned"}},
+                {"command": "object.fill", "params": {"ids": ["$0.id"], "swatch": "C=0 M=15 Y=95 K=0", "tint": 0.15}},
+                {"command": "object.stroke", "params": {"ids": ["$0.id"], "swatch": "Paper", "weight": 1.0}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [60, 140, 200, 200], "content": "unassigned"}},
+                {"command": "object.fill", "params": {"ids": ["$3.id"], "swatch": "C:85 M:75 Y:0 K:0", "tint": 1.0}},
+                {"command": "object.stroke", "params": {"ids": ["$3.id"], "swatch": "Transparent", "weight": 0.0}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [60, 220, 200, 280], "content": "unassigned"}},
+                {"command": "object.fill", "params": {"ids": ["$6.id"], "swatch": "Sunshine Yellow", "tint": 0.2}},
+                {"command": "object.stroke", "params": {"ids": ["$6.id"], "swatch": "#FF0", "weight": 1.0}}
+            ]
+        }))
+        .unwrap();
+        let base = session.doc().unwrap().clone();
+        let notes = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap();
+        assert_eq!(plan.commands[1].params["swatch"], "C=0 M=0 Y=100 K=0");
+        assert_eq!(plan.commands[2].params["swatch"], "[Paper]");
+        assert_eq!(plan.commands[4].params["swatch"], "C=100 M=90 Y=10 K=0");
+        assert_eq!(plan.commands[5].params["swatch"], "[None]");
+        assert_eq!(plan.commands[7].params["swatch"], "C=0 M=0 Y=100 K=0");
+        assert_eq!(plan.commands[8].params["swatch"], "C=0 M=0 Y=100 K=0");
+        assert_eq!(notes.iter().filter(|n| n["kind"] == "nativeSwatchFallback").count(), 6);
     }
 }

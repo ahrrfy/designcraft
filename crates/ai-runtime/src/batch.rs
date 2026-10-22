@@ -60,6 +60,24 @@ pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRo
     Ok(Some(snapshot))
 }
 
+fn page_ranges_summary(spreads: &[Arc<designcraft_engine::doc::Spread>], filled: bool) -> String {
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    for (index, spread) in spreads.iter().enumerate() {
+        if spread.items.is_empty() != filled {
+            let page = index.saturating_add(1);
+            if let Some(last) = ranges.last_mut().filter(|last| last[1].saturating_add(1) == page) {
+                last[1] = page;
+            } else {
+                ranges.push([page, page]);
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return "none".into();
+    }
+    ranges.into_iter().map(|[start, end]| if start == end { start.to_string() } else { format!("{start}–{end}") }).collect::<Vec<_>>().join(", ")
+}
+
 /// A continuation starts only from a deliberately selected current book. Never
 /// infer permission or a page offset from stale, editable checkpoint metadata.
 pub(super) fn continuation_progress(
@@ -94,9 +112,21 @@ pub(super) fn continuation_progress(
                 .into(),
         );
     }
+    if let Some(contract) = crate::script_contract::parse(brief)?
+        && u64::try_from(contract.pages.len()).ok() != Some(u64::from(pages))
+    {
+        return Err(format!(
+            "Explicit page-script count ({}) must match the selected book page count ({pages}); choose a matching book or start a new document",
+            contract.pages.len()
+        ));
+    }
     let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
     if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
-        return Err("Continue book requires completed opening pages followed only by blank pages; existing content will not be overwritten".into());
+        let completed = page_ranges_summary(&base.doc.spreads, true);
+        let blank = page_ranges_summary(&base.doc.spreads, false);
+        return Err(format!(
+            "Continue book requires completed opening pages followed only by blank pages; existing content will not be overwritten (completed pages: {completed}; blank pages: {blank})"
+        ));
     }
     Ok((pages, u32::try_from(start).map_err(|_| "Invalid continuation page")?))
 }
@@ -948,6 +978,21 @@ mod tests {
         session.execute("file.new", &json!({"width":195.0*72.0/25.4,"height":265.0*72.0/25.4,"pages":3,"facingPages":false})).unwrap();
         session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
         assert_eq!(continuation_progress(session.doc().unwrap(), Some(&profile), "").unwrap(), (3, 1));
+    }
+
+    #[test]
+    fn continuation_reports_page_map_gaps_and_rejects_script_page_count_mismatch() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width":360,"height":480,"pages":4,"facingPages":false})).unwrap();
+        session.execute("frame.create", &json!({"spread":1,"rect":[50,50,100,100]})).unwrap();
+        session.execute("frame.create", &json!({"spread":2,"rect":[50,50,100,100]})).unwrap();
+        let leading_blank_err = continuation_progress(session.doc().unwrap(), None, "").unwrap_err().to_string();
+        assert!(leading_blank_err.contains("completed pages: 2–3; blank pages: 1, 4"), "{leading_blank_err}");
+
+        session.execute("frame.create", &json!({"spread":0,"rect":[50,50,100,100]})).unwrap();
+        let script = (1..=3).map(|page| format!("### PAGE {page:02} — Lesson {page}\n")).collect::<String>();
+        let mismatch_err = continuation_progress(session.doc().unwrap(), None, &script).unwrap_err().to_string();
+        assert!(mismatch_err.contains("Explicit page-script count (3) must match the selected book page count (4)"), "{mismatch_err}");
     }
 
     #[test]
