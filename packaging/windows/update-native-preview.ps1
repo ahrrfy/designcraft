@@ -18,6 +18,8 @@ function Assert-UpdateMetadata($Metadata) {
         if ($value -isnot [string]) { throw 'Update metadata must contain scalar strings.' }
     }
     if ($Metadata.sourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid source commit.' }
+    $syncBase = $Metadata.PSObject.Properties['syncBaseCommit']
+    if ($null -ne $syncBase -and $null -ne $syncBase.Value -and ($syncBase.Value -isnot [string] -or $syncBase.Value -cnotmatch '^[0-9a-f]{40}$')) { throw 'Invalid sync base commit.' }
     if ($Metadata.archive.name -cnotmatch '^smart-design-[0-9A-Za-z.-]+-windows-x64-unsigned-portable\.zip$') { throw 'Invalid archive name.' }
     if ($Metadata.archive.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid archive digest.' }
     $archiveSize = [long]0
@@ -160,9 +162,16 @@ function Get-PreviewUpdateDecision([string]$CurrentCommit, [string]$CandidateCom
     throw 'Automatic update would diverge from the installed fork.'
 }
 
-function Assert-PreviewCiProof($Ci, [string]$SourceCommit) {
-    if ($Ci.head_sha -cne $SourceCommit -or $Ci.head_repository.full_name -cne 'ahrrfy/designcraft' -or $Ci.path -cne '.github/workflows/ci.yml' -or $Ci.status -ne 'completed' -or $Ci.conclusion -ne 'success' -or
-        -not (($Ci.event -eq 'push' -and $Ci.head_branch -eq 'main') -or $Ci.event -eq 'workflow_dispatch')) { throw 'The exact source commit has no successful trusted CI proof.' }
+function Assert-PreviewCiProof($Ci, [string]$SourceCommit, [string]$SyncBaseCommit = '', [string]$MainComparisonStatus = '') {
+    if ($Ci.head_repository.full_name -cne 'ahrrfy/designcraft' -or $Ci.status -ne 'completed' -or $Ci.conclusion -ne 'success') {
+        throw 'The exact source commit has no successful trusted CI proof.'
+    }
+    $directCi = $Ci.path -ceq '.github/workflows/ci.yml' -and $Ci.head_sha -ceq $SourceCommit -and
+        (($Ci.event -eq 'push' -and $Ci.head_branch -eq 'main') -or $Ci.event -eq 'workflow_dispatch')
+    $upstreamSyncCi = $Ci.path -ceq '.github/workflows/upstream-sync.yml' -and $Ci.head_branch -ceq 'main' -and
+        $Ci.event -in @('schedule', 'workflow_dispatch') -and $SyncBaseCommit -cmatch '^[0-9a-f]{40}$' -and
+        $Ci.head_sha -ceq $SyncBaseCommit -and $MainComparisonStatus -in @('identical', 'ahead')
+    if (-not ($directCi -or $upstreamSyncCi)) { throw 'The exact source commit has no successful trusted CI proof.' }
 }
 
 if ($LibraryOnly) { return }
@@ -205,7 +214,17 @@ try {
     }
     $runId = $meta.ciUrl.Split('/')[-1]
     $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
-    Assert-PreviewCiProof $ci $meta.sourceCommit
+    for ($attempt = 0; $attempt -lt 3 -and $ci.path -ceq '.github/workflows/upstream-sync.yml' -and $ci.status -in @('in_progress', 'queued'); $attempt++) {
+        Start-Sleep -Seconds 5
+        $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
+    }
+    $syncBaseVal = if ($null -ne $meta.PSObject.Properties['syncBaseCommit'] -and $meta.syncBaseCommit) { [string]$meta.syncBaseCommit } else { '' }
+    $mainStatus = ''
+    if ($ci.path -ceq '.github/workflows/upstream-sync.yml') {
+        $mainComparison = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 45
+        $mainStatus = [string]$mainComparison.status
+    }
+    Assert-PreviewCiProof $ci $meta.sourceCommit $syncBaseVal $mainStatus
     $archiveAsset = @($release.assets | Where-Object name -CEQ $meta.archive.name)
     if ($archiveAsset.Count -ne 1 -or $archiveAsset[0].size -ne $meta.archive.size -or $archiveAsset[0].browser_download_url -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/v[0-9A-Za-z.-]+/smart-design-[0-9A-Za-z.-]+-windows-x64-unsigned-portable\.zip$') { throw 'Invalid archive asset.' }
     $destination = Join-Path $root ('versions/' + $meta.sourceCommit)

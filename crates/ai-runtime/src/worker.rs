@@ -668,7 +668,13 @@ impl Runner<'_> {
             object.insert("selected_skill_guidance".into(), json!(guidance));
             object.insert(
                 "skill_tool_mastermind".into(),
-                crate::template_plan::skill_tool_mastermind_brief(&request.prompt, &skills, scope, total_pages),
+                crate::template_plan::skill_tool_mastermind_brief(
+                    &request.prompt,
+                    &skills,
+                    scope,
+                    total_pages,
+                    Some(crate::runtime::book_binding(&request.settings, &request.prompt)),
+                ),
             );
             if scope.count > crate::template_plan::capacity(style, request.settings.output_mode)? {
                 if !review_group {
@@ -761,7 +767,13 @@ impl Runner<'_> {
             let total_pages = u32::try_from(base.doc.spreads.len()).unwrap_or(eff_scope.start.saturating_add(eff_scope.count)).max(1);
             object.insert(
                 "skill_tool_mastermind".into(),
-                crate::template_plan::skill_tool_mastermind_brief(&request.prompt, skills, eff_scope, total_pages),
+                crate::template_plan::skill_tool_mastermind_brief(
+                    &request.prompt,
+                    skills,
+                    eff_scope,
+                    total_pages,
+                    Some(crate::runtime::book_binding(&request.settings, &request.prompt)),
+                ),
             );
         }
         if explicit_script && let Some(scope) = scope {
@@ -1665,15 +1677,19 @@ pub(crate) fn compact_skill_guidance_limit(skills: &[SkillSnapshot], limit: usiz
             return Err("AI context exceeds its byte limit".into());
         }
         let mut ref_bytes = 0usize;
+        let mut seen_digests = std::collections::BTreeSet::new();
         let mut references = BTreeMap::new();
         for (path, body) in &skill.references {
-            ref_bytes = ref_bytes.saturating_add(path.len()).saturating_add(body.len());
-            if skill.instructions.len().saturating_add(ref_bytes) > 64 * 1024 {
-                return Err("AI context exceeds its byte limit".into());
-            }
             let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
             if bodies.get(&digest).is_some_and(|known| *known != body) {
                 return Err("Conflicting shared skill reference digest".into());
+            }
+            ref_bytes = ref_bytes.saturating_add(path.len());
+            if seen_digests.insert(digest.clone()) {
+                ref_bytes = ref_bytes.saturating_add(body.len());
+            }
+            if skill.instructions.len().saturating_add(ref_bytes) > 64 * 1024 {
+                return Err("AI context exceeds its byte limit".into());
             }
             bodies.entry(digest.clone()).or_insert(body);
             references.insert(path, digest);

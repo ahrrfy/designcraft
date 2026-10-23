@@ -35,6 +35,38 @@ function Set-PreviewLaunchEnvironment([string]$Path, $Record) {
     $env:DESIGNCRAFT_PREVIEW_MANIFEST = [IO.Path]::GetFullPath($Path)
 }
 
+function Get-PreviewUpdateTaskDefinition([string]$Path, [string]$TaskName = 'Smart Design Auto Update', [int]$IntervalMinutes = 120) {
+    if (-not [IO.Path]::IsPathRooted($Path)) { throw 'An absolute launcher manifest is required.' }
+    if ([string]::IsNullOrWhiteSpace($TaskName) -or $TaskName -match '[\\/:*?"<>|]') { throw 'Invalid scheduled task name.' }
+    if ($IntervalMinutes -lt 15 -or $IntervalMinutes -gt 1440) { throw 'Scheduled update interval must be between 15 and 1440 minutes.' }
+    Resolve-PreviewLaunch $Path -ValidateOnly | Out-Null
+    $updater = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))
+    $fullManifest = [IO.Path]::GetFullPath($Path)
+    $powershellExe = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
+    $arguments = '-NoProfile -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File "' + $updater + '" -ManifestPath "' + $fullManifest + '"'
+    return [pscustomobject]@{
+        task_name = $TaskName
+        executable = $powershellExe
+        arguments = $arguments
+        working_directory = (Split-Path $fullManifest -Parent)
+        updater_script = $updater
+        manifest_path = $fullManifest
+        interval_minutes = $IntervalMinutes
+    }
+}
+
+function Install-PreviewUpdateScheduledTask([string]$Path, [string]$TaskName = 'Smart Design Auto Update', [int]$IntervalMinutes = 120) {
+    $spec = Get-PreviewUpdateTaskDefinition $Path $TaskName $IntervalMinutes
+    $record = Read-UpdateJson $spec.manifest_path
+    $record | Add-Member -NotePropertyName update_script_path -NotePropertyValue $spec.updater_script -Force
+    Write-UpdateManifest $spec.manifest_path $record
+    $action = New-ScheduledTaskAction -Execute $spec.executable -Argument $spec.arguments -WorkingDirectory $spec.working_directory
+    $periodicTrigger = New-ScheduledTaskTrigger -Once -At ([DateTime]::Now.AddMinutes(5)) -RepetitionInterval (New-TimeSpan -Minutes $spec.interval_minutes)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
+    Register-ScheduledTask -TaskName $spec.task_name -Action $action -Trigger @($periodicTrigger) -Settings $settings -Description 'Checks ahrrfy/designcraft for verified Smart Design updates and installs or stages them without interrupting open documents.' -Force | Out-Null
+    return $spec
+}
+
 # Explicit setup step: a normal launch opens the existing document; its paired
 # update shortcut checks/stages only. Neither action changes installed ArtCraft.
 function Install-PreviewLauncherShortcuts([string]$Path, [string]$ShortcutDirectory) {

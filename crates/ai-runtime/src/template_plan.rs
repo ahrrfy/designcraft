@@ -617,35 +617,37 @@ pub(crate) fn normalize_curriculum_query(text: &str) -> String {
 pub(crate) fn detect_curriculum_subject(prompt: &str) -> CurriculumSubject {
     let norm = normalize_curriculum_query(prompt);
     let has = |terms: &[&str]| terms.iter().any(|t| norm.contains(&normalize_curriculum_query(t)));
-    if has(&[
-        "islamic",
-        "islam",
-        "quran",
-        "hadith",
-        "seerah",
-        "fiqh",
-        "aqeedah",
-        "tawheed",
-        "azkar",
-        "adhkar",
-        "اسلاميه",
-        "اسلامي",
-        "الاسلاميه",
-        "تربيه اسلاميه",
-        "التربيه الاسلاميه",
-        "قران",
-        "حديث",
-        "سيره",
-        "عبادات",
-        "توحيد",
-        "عقيده",
-        "اذكار",
-        "اداب اسلاميه",
-        "فقه",
-        "اركان الاسلام",
-        "الوضوء",
-        "الصلاه",
-    ]) {
+    let has_word = |word: &str| norm.split_whitespace().any(|w| w == word);
+    if has_word("islam")
+        || has(&[
+            "islamic",
+            "quran",
+            "hadith",
+            "seerah",
+            "fiqh",
+            "aqeedah",
+            "tawheed",
+            "azkar",
+            "adhkar",
+            "اسلاميه",
+            "اسلامي",
+            "الاسلاميه",
+            "تربيه اسلاميه",
+            "التربيه الاسلاميه",
+            "قران",
+            "حديث",
+            "سيره",
+            "عبادات",
+            "توحيد",
+            "عقيده",
+            "اذكار",
+            "اداب اسلاميه",
+            "فقه",
+            "اركان الاسلام",
+            "الوضوء",
+            "الصلاه",
+        ])
+    {
         CurriculumSubject::IslamicStudies
     } else if has(&[
         "math",
@@ -810,16 +812,65 @@ pub(crate) fn detect_curriculum_subject(prompt: &str) -> CurriculumSubject {
     }
 }
 
+fn parsed_grade_number(norm: &str) -> Option<u32> {
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    for (idx, word) in words.iter().enumerate() {
+        if matches!(*word, "grade" | "صف" | "الصف")
+            && let Some(next) = words.get(idx + 1)
+        {
+            if let Ok(num) = next.parse::<u32>() {
+                return Some(num);
+            }
+            let two = words.get(idx + 2).copied().unwrap_or("");
+            if *next == "الحادي" || (*next == "الثاني" && two == "عشر") || *next == "العاشر" {
+                return Some(10);
+            }
+            if matches!(*next, "السابع" | "الثامن" | "التاسع" | "سابع" | "ثامن" | "تاسع") {
+                return Some(7);
+            }
+            if matches!(
+                *next,
+                "الاول"
+                    | "الثاني"
+                    | "الثالث"
+                    | "الرابع"
+                    | "الخامس"
+                    | "السادس"
+                    | "اول"
+                    | "ثاني"
+                    | "ثالث"
+                    | "رابع"
+                    | "خامس"
+                    | "سادس"
+            ) {
+                return Some(1);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn infer_learner_stage(prompt: &str) -> &'static str {
     let norm = normalize_curriculum_query(prompt);
     let has = |terms: &[&str]| terms.iter().any(|t| norm.contains(&normalize_curriculum_query(t)));
-    if has(&["kg 2", "kg2", "روضه ثانيه", "المستوي الثاني للروضه", "تمهيدي متقدم"]) {
+    if has(&["kg 2", "kg2", "fs2", "روضه ثانيه", "الروضه الثانيه", "روضه 2", "الروضه 2", "المستوي الثاني للروضه", "تمهيدي متقدم"])
+    {
         "KG2 / Early Years Foundation Stage 2 (Ages 5–6) / مرحلة الروضة الثانية (KG2)"
-    } else if has(&["kg 1", "kg1", "روضه اولي", "المستوي الاول للروضه"]) {
+    } else if has(&["kg 1", "kg1", "fs1", "روضه اولي", "الروضه الاولي", "روضه 1", "الروضه 1", "المستوي الاول للروضه"])
+    {
         "KG1 / Early Years Foundation Stage 1 (Ages 4–5) / مرحلة الروضة الأولى (KG1)"
-    } else if has(&["kg", "kindergarten", "preschool", "early years", "روضه", "تمهيدي", "اطفال", "للصغار"]) {
+    } else if has(&["secondary", "high school", "ثانوي", "ثانويه", "المرحله الثانويه"])
+        || parsed_grade_number(&norm).is_some_and(|g| (10..=12).contains(&g))
+    {
+        "Secondary & High School Stage / المرحلة الثانوية"
+    } else if has(&["middle school", "preparatory", "اعدادي", "متوسط", "المرحله الاعداديه", "المرحله المتوسطه"])
+        || parsed_grade_number(&norm).is_some_and(|g| (7..=9).contains(&g))
+    {
+        "Middle & Preparatory Stage / المرحلة المتوسطة والإعدادية"
+    } else if has(&["kg", "kindergarten", "preschool", "early years", "روضه", "الروضه", "تمهيدي", "اطفال", "للصغار"]) {
         "Early Years & Kindergarten (Ages 4–6) / مرحلة رياض الأطفال والتمهيدي"
-    } else if has(&["primary", "elementary", "grade", "ابتدائي", "صف"]) {
+    } else if has(&["primary", "elementary", "ابتدائي", "المرحله الابتدائيه"]) || parsed_grade_number(&norm).is_some_and(|g| (1..=6).contains(&g))
+    {
         "Primary & Elementary Stage / المرحلة الابتدائية"
     } else {
         "Adaptive Learner & Reader Stage (inferred from brief and style profile)"
@@ -827,10 +878,16 @@ pub(crate) fn infer_learner_stage(prompt: &str) -> &'static str {
 }
 
 /// Mastermind orchestration brief combining active skills, native layout tools, and spatial harmony rules.
-pub(crate) fn skill_tool_mastermind_brief(prompt: &str, skills: &[SkillSnapshot], scope: BatchScope, total_pages: u32) -> Value {
+pub(crate) fn skill_tool_mastermind_brief(
+    prompt: &str,
+    skills: &[SkillSnapshot],
+    scope: BatchScope,
+    total_pages: u32,
+    explicit_rtl_binding: Option<bool>,
+) -> Value {
     let subject = detect_curriculum_subject(prompt);
     let topic_focus = extract_prompt_topic(prompt);
-    let has_arabic = prompt.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c) && c.is_alphabetic());
+    let rtl_primary = explicit_rtl_binding.unwrap_or_else(|| crate::facing_pages::auto_direction(prompt) == "rightToLeft");
     let stage = infer_learner_stage(prompt);
     let active_skills: Vec<Value> = skills
         .iter()
@@ -851,7 +908,7 @@ pub(crate) fn skill_tool_mastermind_brief(prompt: &str, skills: &[SkillSnapshot]
         "inferred_subject": format!("{subject:?}"),
         "prompt_topic_focus": topic_focus,
         "inferred_learner_stage": stage,
-        "inferred_direction": if has_arabic { "Right-to-Left (RTL) primary with bidirectional support" } else { "Left-to-Right (LTR) primary" },
+        "inferred_direction": if rtl_primary { "Right-to-Left (RTL) primary with bidirectional support" } else { "Left-to-Right (LTR) primary" },
         "page_scope": { "start": scope.start, "count": scope.count, "total_pages": total_pages },
         "active_skill_synergy": active_skills,
         "spatial_and_logical_harmony_rules": [
@@ -2881,7 +2938,7 @@ mod tests {
         let social_bp = curriculum_blueprint("منهج الدراسات الاجتماعية والوطنية للأطفال", &style, BatchScope { start: 0, count: 4 }, 16).unwrap();
         assert!(social_bp["subject_domain"].as_str().unwrap().contains("Social Studies"));
 
-        let mastermind = skill_tool_mastermind_brief(islamic_prompt, std::slice::from_ref(&style), BatchScope { start: 0, count: 4 }, 16);
+        let mastermind = skill_tool_mastermind_brief(islamic_prompt, std::slice::from_ref(&style), BatchScope { start: 0, count: 4 }, 16, None);
         assert!(mastermind["inferred_subject"].as_str().unwrap().contains("IslamicStudies"));
         assert!(mastermind["inferred_learner_stage"].as_str().unwrap().contains("KG2"));
         assert_eq!(mastermind["spatial_and_logical_harmony_rules"].as_array().unwrap().len(), 4);

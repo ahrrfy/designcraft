@@ -1,6 +1,10 @@
 name: Windows AI preview
 
 on:
+  workflow_run:
+    workflows: ['Rust CI']
+    branches: [main]
+    types: [completed]
   push:
     tags: ['v*-ai*']
   workflow_dispatch:
@@ -9,12 +13,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-ai-preview-${{ github.ref }}
+  group: windows-ai-preview-${{ github.event.workflow_run.head_sha || github.ref }}
   cancel-in-progress: false
 
 jobs:
   verified:
-    if: github.repository == 'ahrrfy/designcraft'
+    if: >-
+      github.repository == 'ahrrfy/designcraft' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == 'ahrrfy/designcraft' &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')))
     name: Verify existing exact-commit Rust CI
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -23,6 +32,8 @@ jobs:
       contents: read
     outputs:
       ci_url: ${{ steps.proof.outputs.ci_url }}
+      source_sha: ${{ steps.proof.outputs.source_sha }}
+      already_published: ${{ steps.proof.outputs.already_published }}
     steps:
       - name: Require a completed successful Rust CI run without rerunning it
         id: proof
@@ -30,13 +41,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          DIRECT_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha || '' }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          source_sha="$DIRECT_SHA"
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            source_sha="$WORKFLOW_RUN_SHA"
+          fi
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
           gh api --method GET "repos/$GH_REPO/actions/workflows/ci.yml/runs" \
-            -f head_sha="$SOURCE_SHA" -f per_page=100 > runs.json
-          ci_url="$(jq -er --arg sha "$SOURCE_SHA" --arg repo "$GH_REPO" '
+            -f head_sha="$source_sha" -f per_page=100 > runs.json
+          ci_url="$(jq -er --arg sha "$source_sha" --arg repo "$GH_REPO" '
             [.workflow_runs[] | select(
               .head_sha == $sha and .head_repository.full_name == $repo and
               ((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch") and
@@ -49,18 +66,32 @@ jobs:
               error("Unexpected CI run URL")
             else .html_url end
           ' runs.json)"
-          printf 'ci_url=%s\n' "$ci_url" >> "$GITHUB_OUTPUT"
-          printf 'Reusing successful Rust CI for %s: %s\n' "$SOURCE_SHA" "$ci_url" >> "$GITHUB_STEP_SUMMARY"
+          already_published="false"
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            short_sha="${source_sha:0:12}"
+            gh api --method GET "repos/$GH_REPO/releases" -f per_page=30 > releases.json
+            if jq -e --arg suffix "-ai.${short_sha}" 'any(.[]; (.draft | not) and (.tag_name | endswith($suffix)))' releases.json >/dev/null; then
+              already_published="true"
+            fi
+          fi
+          {
+            printf 'ci_url=%s\n' "$ci_url"
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'already_published=%s\n' "$already_published"
+          } >> "$GITHUB_OUTPUT"
+          printf 'Verified Rust CI for %s: %s (already_published=%s)\n' "$source_sha" "$ci_url" "$already_published" >> "$GITHUB_STEP_SUMMARY"
 
   portable:
     name: Unsigned Windows x64 portable
     needs: verified
+    if: needs.verified.outputs.already_published != 'true'
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
       contents: read
     outputs:
       ci_url: ${{ needs.verified.outputs.ci_url }}
+      release_tag: ${{ steps.package.outputs.release_tag }}
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
@@ -71,6 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.verified.outputs.source_sha }}
           persist-credentials: false
       - name: Pinned redistributable font collection
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -99,6 +131,7 @@ jobs:
           git diff --exit-code -- Cargo.lock
           if ($LASTEXITCODE -ne 0) { throw 'Release changed the lockfile' }
       - name: Assemble portable preview and licenses
+        id: package
         shell: pwsh
         env:
           RELEASE_REF: ${{ github.ref }}
@@ -108,11 +141,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $sha = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve commit' }
-          $label = 'preview-' + $sha.Substring(0, 12)
+          $cargoToml = Get-Content -LiteralPath 'Cargo.toml' -Raw -Encoding UTF8
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') { throw 'Cannot resolve Cargo.toml workspace version' }
+          $workspaceVersion = $Matches[1]
+          $label = 'v' + $workspaceVersion + '-ai.' + $sha.Substring(0, 12)
           if ($env:RELEASE_REF.StartsWith('refs/tags/')) {
             if ($env:RELEASE_REF_NAME -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+-ai[0-9A-Za-z.-]*$') { throw 'Expected vX.Y.Z-ai... prerelease tag' }
             $label = $env:RELEASE_REF_NAME
           }
+          ('release_tag=' + $label) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           $stage = Join-Path $env:GITHUB_WORKSPACE 'dist/smart-design-portable'
           $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'dist/preview'
           New-Item -ItemType Directory -Force -Path $stage, $releaseDir | Out-Null
@@ -169,10 +206,14 @@ jobs:
           path: dist/preview/*
           if-no-files-found: error
 
-  draft:
-    name: Draft tagged prerelease
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: portable
+  publish:
+    name: Publish verified prerelease
+    if: >-
+      needs.verified.outputs.already_published != 'true' &&
+      (github.event_name == 'workflow_run' ||
+       startsWith(github.ref, 'refs/tags/') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    needs: [verified, portable]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -181,20 +222,37 @@ jobs:
         with:
           name: smart-design-windows-x64-unsigned
           path: preview
-      - name: Create draft without replacing an existing release
+      - name: Publish verified release without overwriting existing assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PREVIEW_TAG: ${{ github.ref_name }}
-          SOURCE_SHA: ${{ github.sha }}
+          PREVIEW_TAG: ${{ needs.portable.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.verified.outputs.source_sha }}
           VERIFIED_CI_URL: ${{ needs.portable.outputs.ci_url }}
+          IS_TAG_PUSH: ${{ startsWith(github.ref, 'refs/tags/') && 'true' || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-ai[0-9A-Za-z.-]*$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           if gh release view "$PREVIEW_TAG" >/dev/null 2>&1; then
-            echo 'Release already exists; review it instead of replacing assets.' >&2
-            exit 1
+            printf 'Release %s already exists; preserving existing release assets.\n' "$PREVIEW_TAG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          printf '%s\n' 'Independent Smart Design fork. Unsigned Windows x64 portable preview; no MSI.' "Source commit: $SOURCE_SHA" "Existing successful Rust CI for this exact commit: $VERIFIED_CI_URL" 'CI was verified and reused without rerunning it. This does not certify physical printing or commercial-press output.' > notes.txt
-          gh release create "$PREVIEW_TAG" --verify-tag --draft --prerelease --title "Smart Design $PREVIEW_TAG (unsigned preview)" --notes-file notes.txt preview/*
+          if [ "$IS_TAG_PUSH" != "true" ]; then
+            status="$(gh api "repos/$GH_REPO/compare/${SOURCE_SHA}...main" --jq '.status')"
+            if [ "$status" != "identical" ] && [ "$status" != "ahead" ]; then
+              printf 'Refusing to publish %s because it is not on main (status=%s).\n' "$SOURCE_SHA" "$status" >&2
+              exit 1
+            fi
+          fi
+          printf '%s\n' \
+            'Independent Smart Design fork. Unsigned Windows x64 portable preview; no MSI.' \
+            "Source commit: $SOURCE_SHA" \
+            "Verified successful Rust CI for this exact commit: $VERIFIED_CI_URL" \
+            'Automatically published after exact-commit CI passed on main. This does not certify physical printing or commercial-press output.' > notes.txt
+          if [ "$IS_TAG_PUSH" = "true" ]; then
+            gh release create "$PREVIEW_TAG" --verify-tag --prerelease --title "Smart Design $PREVIEW_TAG (unsigned preview)" --notes-file notes.txt preview/*
+          else
+            gh release create "$PREVIEW_TAG" --target "$SOURCE_SHA" --prerelease --title "Smart Design $PREVIEW_TAG (unsigned preview)" --notes-file notes.txt preview/*
+          fi

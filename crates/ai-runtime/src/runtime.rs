@@ -1435,9 +1435,7 @@ fn merge_pinned_and_automatic_skills(pinned: &[String], auto_ids: Vec<String>, s
             merged.push(id);
         }
     }
-    if let Some(style) = reserve_style
-        && merged.len() < 8
-    {
+    if let Some(style) = reserve_style {
         merged.push(style.to_owned());
     }
     merged
@@ -1745,6 +1743,24 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "arabic",
         "social studies",
     ]);
+    let upper_stage = mentions(&[
+        "ثانوي",
+        "ثانوية",
+        "ثانويه",
+        "إعدادي",
+        "اعدادي",
+        "متوسط",
+        "متوسطة",
+        "متوسطه",
+        "جامعي",
+        "جامعة",
+        "جامعه",
+        "secondary",
+        "high school",
+        "middle school",
+        "university",
+        "college",
+    ]);
     let children = mentions(&[
         "أطفال",
         "اطفال",
@@ -1752,12 +1768,8 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "روضة",
         "روضه",
         "تمهيدي",
-        "مرحلة",
-        "مرحله",
         "للصغار",
         "ابتدائي",
-        "مدرسي",
-        "طلاب",
         "تلاميذ",
         "kg",
         "kg1",
@@ -1771,7 +1783,7 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "early-years",
         "primary",
     ]);
-    let visual = (children || intl || computing) && book
+    let visual = (!upper_stage && (children || intl || computing) && book)
         || mentions(&[
             "تصميم",
             "صمم",
@@ -1789,7 +1801,7 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
             "flashcard",
         ]);
     let print = book || mentions(&["طباعة", "للطباعة", "مطبعة", "مطبوع", "print", "a4"]);
-    let kg = (children || intl || computing) && (book || visual);
+    let kg = !upper_stage && (children || intl || computing) && (book || visual);
     let architecture = mentions(&[
         "تسلسل",
         "وتسلسله",

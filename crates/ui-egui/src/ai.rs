@@ -448,6 +448,7 @@ pub struct AiUiState {
     open_document_path: String,
     pick_target_document: bool,
     open_target_document_requested: bool,
+    expand_advanced_settings: Option<bool>,
 }
 impl std::fmt::Debug for AiUiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -531,6 +532,7 @@ impl Default for AiUiState {
             open_document_path: String::new(),
             pick_target_document: false,
             open_target_document_requested: false,
+            expand_advanced_settings: None,
         }
     }
 }
@@ -2001,10 +2003,11 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
     let Some(alert) = s.active_diagnostic_alert() else {
         return;
     };
-    let fill = egui::Color32::from_rgba_unmultiplied(150, 24, 32, 48);
-    let border = egui::Stroke::new(2.0, egui::Color32::from_rgb(225, 65, 75));
-    let title_color = egui::Color32::from_rgb(255, 110, 115);
-    let accent_color = egui::Color32::from_rgb(255, 205, 120);
+    let tokens = crate::theme::Tokens::get(ui.ctx());
+    let fill = tokens.panel_darker;
+    let title_color = ui.visuals().error_fg_color;
+    let accent_color = ui.visuals().warn_fg_color;
+    let border = egui::Stroke::new(2.0, title_color);
     let show_ar = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
     egui::Frame::group(ui.style()).fill(fill).stroke(border).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
         ui,
@@ -2040,16 +2043,18 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
                         if ui.button(rtl::widget(ui, text(a, "Enable Smart Skill Compaction", "تفعيل الدمج الذكي للمهارات"))).clicked()
                         {
                             s.automatic_skills = true;
-                            while s.selected_skills.len() > 2 {
-                                s.selected_skills.pop_last();
-                            }
+                            s.selected_skills.clear();
                             s.clear_failure_alert();
                         }
                     }
-                    DiagnosticAlertKind::MissingCredential
-                    | DiagnosticAlertKind::CostBudget
-                    | DiagnosticAlertKind::InvalidModel
-                    | DiagnosticAlertKind::ConnectionOrRateLimit => {
+                    DiagnosticAlertKind::CostBudget => {
+                        if ui.button(rtl::widget(ui, text(a, "Open Budget Settings", "فتح إعدادات التكلفة والميزانية"))).clicked()
+                        {
+                            s.tab = 0;
+                            s.expand_advanced_settings = Some(true);
+                        }
+                    }
+                    DiagnosticAlertKind::MissingCredential | DiagnosticAlertKind::InvalidModel | DiagnosticAlertKind::ConnectionOrRateLimit => {
                         if ui.button(rtl::widget(ui, text(a, "Open Keys & Providers", "فتح المفاتيح والمزودين"))).clicked() {
                             s.tab = 3;
                         }
@@ -2068,7 +2073,7 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
                     }
                     DiagnosticAlertKind::TokenBudget => {
                         if ui.button(rtl::widget(ui, text(a, "Raise Token Limit", "رفع سقف الرموز تلقائياً"))).clicked() {
-                            s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).max(256_000);
+                            s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).clamp(256_000, 4_000_000);
                             s.clear_failure_alert();
                         }
                     }
@@ -2552,7 +2557,7 @@ fn production(
                 });
             });
         }
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).show(ui, |ui| {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).open(s.expand_advanced_settings.take()).show(ui, |ui| {
             budgets(ui, s, a);
             ui.separator();
             ui.horizontal_wrapped(|ui| {
@@ -2578,7 +2583,7 @@ fn production(
                     ),
                 ))
                 .show(ui, |ui| {
-                    for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
+                    for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible && c.design_profile.is_none()) {
                         let mut selected = s.selected_skills.contains(&card.id);
                         if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
                             if selected {
