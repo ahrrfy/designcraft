@@ -141,7 +141,7 @@ fn prepare_with_printers(s: &Session, p: &Value, printers: impl FnOnce() -> Vec<
             .filter(|v| v.is_finite() && (1.0..=2400.0).contains(v))
             .ok_or_else(|| bad("file.preparePrint", "minPpi must be finite and between 1 and 2400"))?,
     };
-    for key in ["spreads", "bleed", "grayscale", "dryRun", "created"] {
+    for key in ["spreads", "bleed", "grayscale", "dryRun"] {
         if p.get(key).is_some() {
             bool_option(p, key)?;
         }
