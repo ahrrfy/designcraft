@@ -97,11 +97,11 @@ jobs:
             printf '# Upstream integration review\n\n'
             printf 'CONFLICTS: automatic merge stopped safely to preserve Smart Design features. Resolve conflicts manually.\n\n'
             printf -- '- Fork main base: %s\n- Upstream main: %s\n- Source: https://github.com/storytold/designcraft\n\n' "$base" "$upstream"
-            printf '## Conflicting paths\n\n```text\n'
+            printf '## Conflicting paths\n\n~~~text\n'
             cat "$RUNNER_TEMP/upstream-conflicts.txt"
-            printf '```\n\n## Upstream changed paths\n\n```text\n'
+            printf '~~~\n\n## Upstream changed paths\n\n~~~text\n'
             cat "$RUNNER_TEMP/upstream-paths.txt"
-            printf '```\n'
+            printf '~~~\n'
           } > "$report"
           git add -- "$report"
           git commit -m "docs(sync): record upstream ${short_up} conflict report"
