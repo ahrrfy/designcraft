@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.designcraft.png" width="128" height="128" alt="DesignCraft icon: an engraved cat in a polka-dot scarf on a green tile">
+</p>
+
 <h1 align="center">التصميم الذكي · Smart Design</h1>
 
 <p align="center">

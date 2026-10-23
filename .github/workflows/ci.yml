@@ -35,6 +35,9 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: windows-quality
@@ -51,7 +54,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Workspace tests
-        run: cargo test --locked --workspace
+        run: cargo nextest run --locked --workspace --lib --bins --tests
+      - name: Workspace doctests
+        run: cargo test --locked --workspace --doc
       - name: PDF dependency policy
         run: cargo run --locked -p xtask -- pdf-deps
       - name: Asset attribution
