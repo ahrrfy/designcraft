@@ -10,7 +10,7 @@ use crate::{Result, Session};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(query "file.preparePrint","Prepare Frozen Print",[],None,
-            "{printer?, copies?: 1, pages?: string | [n], spreads?: bool, marks?: bool | object, bleed?: bool, standard?: none|x4|a2b, scaling?: exact|shrinkToFit, duplex?: off|longEdge|shortEdge, grayscale?: bool, minPpi?: 150} → {token, sha256, bytes, pages, manifest}; freezes one preflighted PDF with printer settings, replacing the previous artifact",has_doc,prepare_command),
+            "{printer?, copies?: 1, pages?: string | [n], spreads?: bool, marks?: bool | object, bleed?: bool, standard?: none|x4|a2b, scaling?: exact|shrinkToFit, duplex?: off|longEdge|shortEdge, grayscale?: bool, minPpi?: 150, created?: int} → {token, sha256, bytes, pages, manifest}; freezes one preflighted PDF with printer settings, replacing the previous artifact",has_doc,prepare_command),
         cmd!(noundo "file.printPrepared","Print Frozen PDF",[],None,
             "{token, dryRun?: bool} → submission evidence for the exact engine-owned PDF and frozen printer settings; no document re-export",super::always,print_prepared_command),
         cmd!(query "file.savePreparedPrint","Save Frozen Print PDF",[],None,
@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Print…",
             ["File"],
             Some("Cmd+P"),
-            "{printer?, copies?: 1, pages?: \"1-3,5\", spreads?, marks?, bleed?, standard?: none|x4|a2b, minPpi?: 150, scaling?: exact|shrinkToFit (default exact: preserve physical dimensions), duplex?: off|longEdge|shortEdge (default off), grayscale?: bool, dryRun?: bool (prepare and preview submission without printing)} → {printer, copies, pages, scaling, duplex, grayscale, command, bytes, token, sha256, manifest}",
+            "{printer?, copies?: 1, pages?: \"1-3,5\", spreads?, marks?, bleed?, standard?: none|x4|a2b, minPpi?: 150, scaling?: exact|shrinkToFit (default exact: preserve physical dimensions), duplex?: off|longEdge|shortEdge (default off), grayscale?: bool, dryRun?: bool (prepare and preview submission without printing), created?: int (Unix seconds, as file.exportPdf)} → {printer, copies, pages, scaling, duplex, grayscale, command, bytes, token, sha256, manifest}",
             has_doc,
             print
         ),
@@ -113,7 +113,7 @@ pub fn prepare(s: &Session, p: &Value) -> Result<PreparedPrint> {
 }
 
 fn prepare_with_printers(s: &Session, p: &Value, printers: impl FnOnce() -> Vec<craft_print::Printer>) -> Result<PreparedPrint> {
-    let allowed = ["printer", "copies", "pages", "spreads", "marks", "bleed", "standard", "minPpi", "scaling", "duplex", "grayscale", "dryRun"];
+    let allowed = ["printer", "copies", "pages", "spreads", "marks", "bleed", "standard", "minPpi", "scaling", "duplex", "grayscale", "dryRun", "created"];
     let object = p.as_object().ok_or_else(|| bad("file.preparePrint", "parameters must be an object"))?;
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(bad("file.preparePrint", "unsupported preparation parameter"));
@@ -140,7 +140,7 @@ fn prepare_with_printers(s: &Session, p: &Value, printers: impl FnOnce() -> Vec<
             .filter(|v| v.is_finite() && (1.0..=2400.0).contains(v))
             .ok_or_else(|| bad("file.preparePrint", "minPpi must be finite and between 1 and 2400"))?,
     };
-    for key in ["spreads", "bleed", "grayscale", "dryRun"] {
+    for key in ["spreads", "bleed", "grayscale", "dryRun", "created"] {
         if p.get(key).is_some() {
             bool_option(p, key)?;
         }
@@ -369,10 +369,14 @@ mod tests {
     fn print_submits_the_selected_export_and_reports_refusal() {
         let mut s = Session::new();
         s.execute("file.new", &json!({"pages": 4})).unwrap();
-        let params = json!({"printer": "Office (east)", "copies": 2, "pages": "2-3", "marks": true, "bleed": true});
-        let prepared = prepare(&s, &params).unwrap();
-        let expected = prepared.bytes().to_vec();
-        let r = submit_with(&prepared, false, |pdf, job| {
+        // A fixed creation date: both exports would otherwise take the clock's second.
+        let params = json!({"printer": "Office (east)", "copies": 2, "pages": "2-3", "marks": true, "bleed": true, "created": 1_700_000_000});
+        let expected = {
+            let d = &s.doc().unwrap().doc;
+            let options = super::super::export::options(&params, d.page_count()).unwrap();
+            designcraft_pdf::export_pdf(&super::super::interchange::with_pdf_boxes(d), &s.cache, &options).unwrap()
+        };
+        let r = print_with(&mut s, &params, |pdf, job| {
             // The production export options and full bytes reach the shared spooler boundary.
             assert_eq!(pdf, expected);
             assert!(pdf.starts_with(b"%PDF-"));
@@ -389,6 +393,7 @@ mod tests {
         assert!(refusal.to_string().contains("printer offline"));
         print_with(&mut s, &json!({"printer":"Office","dryRun": true}), |_, _| panic!("dry runs must not spool")).unwrap();
         assert!(print_with(&mut s, &json!({"pages": "9"}), |_, _| panic!("invalid ranges must not spool")).is_err());
+        assert!(print_with(&mut s, &json!({"created": "today"}), |_, _| panic!("an invalid date must not spool")).is_err());
     }
 
     #[test]
