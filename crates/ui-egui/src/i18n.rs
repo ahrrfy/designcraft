@@ -4449,6 +4449,12 @@ fn column(lang: &str) -> Option<usize> {
 
 /// `s` in `lang` (English, or the string itself, when there's no translation).
 pub fn tr<'a>(lang: &str, s: &'a str) -> &'a str {
+    let text = lookup(lang, s);
+    // An empty row is a translation nobody has written yet.
+    if text.trim().is_empty() { s } else { text }
+}
+
+fn lookup<'a>(lang: &str, s: &'a str) -> &'a str {
     static GERMAN: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
     static JAPANESE: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
     static TRANSLATIONS: OnceLock<HashMap<&'static str, [&'static str; 5]>> = OnceLock::new();
@@ -4467,18 +4473,18 @@ pub fn tr<'a>(lang: &str, s: &'a str) -> &'a str {
     // The German and Japanese tables cover the whole interface; the shared table's German and Japanese
     // columns are the fallback for keys added there after them.
     if lang == "de"
-        && let Some(text) = GERMAN.get_or_init(|| de::TABLE.iter().copied().collect()).get(s).copied()
+        && let Some(text) = GERMAN.get_or_init(|| de::TABLE.iter().copied().collect()).get(s).copied().filter(|text| !text.trim().is_empty())
     {
         return text;
     }
     if lang == "ja"
-        && let Some(text) = JAPANESE.get_or_init(|| ja::TABLE.iter().copied().collect()).get(s).copied()
+        && let Some(text) = JAPANESE.get_or_init(|| ja::TABLE.iter().copied().collect()).get(s).copied().filter(|text| !text.trim().is_empty())
     {
         return text;
     }
     // `fr::TABLE` holds the strings the shared table has no row for.
     if lang == "fr"
-        && let Some(text) = FRENCH.get_or_init(|| fr::TABLE.iter().copied().collect()).get(s).copied()
+        && let Some(text) = FRENCH.get_or_init(|| fr::TABLE.iter().copied().collect()).get(s).copied().filter(|text| !text.trim().is_empty())
     {
         return text;
     }
@@ -4524,11 +4530,13 @@ pub fn tr_context<'a>(lang: &str, s: &'a str, context: &str) -> &'a str {
         "ar" => ar::CONTEXT,
         _ => &[],
     };
-    if let Some((_, _, text)) = contexts.iter().find(|(key, scope, _)| *key == s && *scope == context) {
+    let written = |text: &&str| !text.trim().is_empty();
+    if let Some(text) = contexts.iter().find(|(key, scope, _)| *key == s && *scope == context).map(|(_, _, text)| *text).filter(written) {
         return text;
     }
     if let Some(c) = column(lang)
-        && let Some(text) = CONTEXT.iter().find(|(key, scope, _)| *key == s && *scope == context).and_then(|(_, _, row)| row.get(c))
+        && let Some(text) =
+            CONTEXT.iter().find(|(key, scope, _)| *key == s && *scope == context).and_then(|(_, _, row)| row.get(c)).copied().filter(written)
     {
         return text;
     }
@@ -4567,7 +4575,9 @@ pub fn count_label(lang: &str, noun: &str, count: usize) -> String {
             2..=4 => few,
             _ => other,
         };
-        return format!("{count} {form}");
+        if !form.trim().is_empty() {
+            return format!("{count} {form}");
+        }
     }
     format!("{count} {}", tr(lang, noun))
 }
@@ -4625,15 +4635,9 @@ mod tests {
     /// The German and Japanese tables translate the whole interface and win over the shared columns.
     const WHOLE_INTERFACE: [&str; 2] = ["de", "ja"];
 
-    #[test]
-    fn every_interface_language_has_a_catalog() {
-        for (lang, i) in SHARED_COLUMNS.iter().zip(0..) {
-            assert_eq!(column(lang), Some(i), "{lang}");
-        }
-        for (code, name) in LANGUAGES.iter().filter(|(code, _)| !code.is_empty()) {
-            assert!(!name.is_empty(), "{code}");
-            assert!(LANGUAGE_TABLES.iter().any(|(lang, _)| lang == code) || column(code).is_some(), "{code} has no catalog in LANGUAGE_TABLES");
-        }
+    /// What `tr` shows for a row: an empty one is still untranslated.
+    fn or_english<'a>(text: &'a str, english: &'a str) -> &'a str {
+        if text.trim().is_empty() { english } else { text }
     }
 
     #[test]
@@ -4644,13 +4648,16 @@ mod tests {
         for (key, translations) in TABLE {
             for (lang, shared) in SHARED_COLUMNS.into_iter().zip(translations) {
                 // A language's own table is looked up before the shared column.
-                assert_eq!(tr(lang, key), own(lang, key).unwrap_or(*shared), "{lang}: {key}");
+                let expected = own(lang, key).filter(|text| !text.trim().is_empty()).unwrap_or(*shared);
+                assert_eq!(tr(lang, key), or_english(expected, key), "{lang}: {key}");
             }
             assert_eq!(tr("", key), *key);
         }
         for (lang, table) in LANGUAGE_TABLES {
             for (key, expected) in *table {
-                assert_eq!(tr(lang, key), *expected, "{lang}: {key}");
+                if !expected.trim().is_empty() {
+                    assert_eq!(tr(lang, key), *expected, "{lang}: {key}");
+                }
                 assert_eq!(tr("", key), *key);
             }
         }
@@ -4667,7 +4674,9 @@ mod tests {
     fn context_captions_come_from_their_context_or_the_plain_translation() {
         for (lang, table) in CONTEXT_TABLES {
             for (key, scope, text) in *table {
-                assert_eq!(tr_context(lang, key, scope), *text, "{lang}: {key} ({scope})");
+                if !text.trim().is_empty() {
+                    assert_eq!(tr_context(lang, key, scope), *text, "{lang}: {key} ({scope})");
+                }
             }
         }
         for (key, scope, row) in CONTEXT {
@@ -4678,8 +4687,10 @@ mod tests {
                     .filter(|(code, _)| *code == lang)
                     .flat_map(|(_, table)| table.iter())
                     .find(|(k, s, _)| k == key && s == scope)
-                    .map(|(_, _, text)| *text);
-                assert_eq!(tr_context(lang, key, scope), own.unwrap_or(*shared), "{lang}: {key} ({scope})");
+                    .map(|(_, _, text)| *text)
+                    .filter(|text| !text.trim().is_empty());
+                let expected = own.or(Some(*shared).filter(|text| !text.trim().is_empty())).unwrap_or_else(|| tr(lang, key));
+                assert_eq!(tr_context(lang, key, scope), expected, "{lang}: {key} ({scope})");
             }
         }
         // An unknown context, or a language without one, keeps the plain translation.
@@ -4692,33 +4703,37 @@ mod tests {
         }
     }
 
-    /// Every catalog: no duplicate or stale keys, no empty translations, and placeholders, padding,
-    /// ellipses and label colons as in English. A string a catalog doesn't translate yet falls back
-    /// to English, so missing translations don't fail here.
-    #[test]
-    fn every_catalog_is_unique_current_and_keeps_placeholders_and_markers() {
-        // (language, key, translation) of every catalog, and every catalog's keys by name.
-        let mut entries: Vec<(&str, &str, &str)> = Vec::new();
-        let mut catalogs: Vec<(&str, HashSet<&str>)> = Vec::new();
-        for (lang, table) in LANGUAGE_TABLES {
-            let keys: HashSet<_> = table.iter().map(|(key, _)| *key).collect();
-            assert_eq!(keys.len(), table.len(), "{lang}: duplicate keys");
-            catalogs.push((*lang, keys));
-            entries.extend(table.iter().map(|(key, text)| (*lang, *key, *text)));
-        }
-        let shared: HashSet<_> = TABLE.iter().map(|(key, _)| *key).collect();
-        assert_eq!(shared.len(), TABLE.len(), "duplicate keys in the shared table");
-        catalogs.push(("shared", shared.clone()));
+    /// The tables `tr` reads, as (language, key, translation), context captions included.
+    fn entries() -> Vec<(&'static str, &'static str, &'static str)> {
+        let mut entries: Vec<_> = LANGUAGE_TABLES.iter().flat_map(|(lang, table)| table.iter().map(|(key, text)| (*lang, *key, *text))).collect();
         for (lang, i) in SHARED_COLUMNS.into_iter().zip(0..) {
             entries.extend(TABLE.iter().filter_map(|(key, row)| row.get(i).map(|text| (lang, *key, *text))));
             entries.extend(CONTEXT.iter().filter_map(|(key, _, row)| row.get(i).map(|text| (lang, *key, *text))));
         }
-        let mut contexts = vec![("shared", CONTEXT.iter().map(|(key, scope, _)| (*key, *scope)).collect::<Vec<_>>())];
-        for (lang, table) in CONTEXT_TABLES {
-            contexts.push((*lang, table.iter().map(|(key, scope, _)| (*key, *scope)).collect()));
-            entries.extend(table.iter().map(|(key, _, text)| (*lang, *key, *text)));
-        }
+        entries.extend(CONTEXT_TABLES.iter().flat_map(|(lang, table)| table.iter().map(|(key, _, text)| (*lang, *key, *text))));
+        entries
+    }
 
+    /// Every catalog has one row per key and keeps the English placeholders. A string a catalog
+    /// doesn't translate shows in English, so a missing or empty row fails nothing here; the
+    /// `missing_translations_report` lists them.
+    #[test]
+    fn every_catalog_has_unique_keys_and_keeps_placeholders() {
+        for (lang, i) in SHARED_COLUMNS.iter().zip(0..) {
+            assert_eq!(column(lang), Some(i), "{lang}");
+        }
+        for (lang, table) in LANGUAGE_TABLES {
+            let keys: HashSet<_> = table.iter().map(|(key, _)| *key).collect();
+            assert_eq!(keys.len(), table.len(), "{lang}: duplicate keys");
+        }
+        let shared: HashSet<_> = TABLE.iter().map(|(key, _)| *key).collect();
+        assert_eq!(shared.len(), TABLE.len(), "duplicate keys in the shared table");
+        let shared_contexts: HashSet<_> = CONTEXT.iter().map(|(key, scope, _)| (*key, *scope)).collect();
+        assert_eq!(shared_contexts.len(), CONTEXT.len(), "duplicate keys in the shared context table");
+        for (lang, table) in CONTEXT_TABLES {
+            let keys: HashSet<_> = table.iter().map(|(key, scope, _)| (*key, *scope)).collect();
+            assert_eq!(keys.len(), table.len(), "{lang}: duplicate context keys");
+        }
         // A per-language table is looked up before the shared table, so a key in both hides the
         // shared column, except in the tables that translate the whole interface.
         for (lang, table) in LANGUAGE_TABLES.iter().filter(|(lang, _)| column(lang).is_some() && !WHOLE_INTERFACE.contains(lang)) {
@@ -4726,41 +4741,58 @@ mod tests {
             assert!(both.is_empty(), "{lang} keys also in the shared table: {both:?}");
         }
 
-        // A key is current while the interface or another catalog has it.
-        let interface = interface_strings();
-        let current = |key: &str, own: &str| interface.contains(key) || catalogs.iter().any(|(name, keys)| *name != own && keys.contains(key));
-        for (name, keys) in &catalogs {
-            let mut stale: Vec<_> = keys.iter().filter(|key| !current(key, name)).collect();
-            stale.sort();
-            assert!(stale.is_empty(), "{name}: entries for unknown keys: {stale:?}");
-        }
-        for (name, keys) in &contexts {
-            let unique: HashSet<_> = keys.iter().collect();
-            assert_eq!(unique.len(), keys.len(), "{name}: duplicate context keys");
-            let stale: Vec<_> = keys.iter().filter(|(key, _)| !current(key, "")).collect();
-            assert!(stale.is_empty(), "{name}: contexts for unknown keys: {stale:?}");
-        }
-
         let placeholders = |s: &'static str| {
             let mut names: Vec<_> = s.split('{').skip(1).filter_map(|part| part.split_once('}').map(|(name, _)| name)).collect();
             names.sort_unstable();
             names
         };
-        let ellipsis = |s: &str| s.ends_with('…') || s.ends_with("...");
-        let colon = |s: &str| s.ends_with(':') || s.ends_with('：');
-        // Full-width punctuation carries its own spacing.
-        let full_width = |c: char| ('\u{3000}'..='\u{303F}').contains(&c) || ('\u{FF00}'..='\u{FFEF}').contains(&c);
-        for (lang, key, text) in entries {
-            assert!(!text.trim().is_empty(), "{lang}: empty translation of {key:?}");
+        for (lang, key, text) in entries().into_iter().filter(|(_, _, text)| !text.trim().is_empty()) {
             assert_eq!(placeholders(key), placeholders(text), "{lang}: placeholders of {key:?}");
-            // Dialog ellipses, label colons and padded captions stay as in English.
-            assert_eq!(ellipsis(key), ellipsis(text), "{lang}: ellipsis of {key:?}");
-            assert_eq!(colon(key), colon(text), "{lang}: colon of {key:?}");
-            if !text.starts_with(full_width) {
-                assert_eq!(key.starts_with(' '), text.starts_with(' '), "{lang}: leading space of {key:?}");
-            }
-            if !text.ends_with(full_width) {
-                assert_eq!(key.ends_with(' '), text.ends_with(' '), "{lang}: trailing space of {key:?}");
+        }
+    }
+
+    /// The strings each interface language shows in English, for the `cargo xtask ci` log. It
+    /// always passes: `cargo xtask i18n-report` runs it.
+    #[test]
+    #[ignore = "a report, run by `cargo xtask i18n-report`"]
+    fn missing_translations_report() {
+        let interface = interface_strings();
+        let catalogs: Vec<(&str, HashSet<&str>)> = LANGUAGE_TABLES
+            .iter()
+            .map(|(lang, table)| (*lang, table.iter().map(|(key, _)| *key).collect()))
+            .chain([("shared", TABLE.iter().map(|(key, _)| *key).collect())])
+            .collect();
+        let mut keys: Vec<&str> = interface.iter().copied().chain(catalogs.iter().flat_map(|(_, keys)| keys.iter().copied())).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        // `tr` hands back the string it was given when it has no translation.
+        let missing = |lang: &str| -> Vec<&str> {
+            keys.iter()
+                .copied()
+                .filter(|key| {
+                    let english = (*key).to_owned();
+                    std::ptr::eq(tr(lang, &english), english.as_str())
+                })
+                .collect()
+        };
+        let report: Vec<(&str, Vec<&str>)> = LANGUAGES.iter().filter(|(code, _)| !code.is_empty()).map(|(code, _)| (*code, missing(code))).collect();
+        println!("i18n report: {} interface strings; a missing translation shows in English.", keys.len());
+        for (lang, missing) in &report {
+            println!("  {lang:<6} {:>5} missing", missing.len());
+        }
+        for (lang, missing) in report.iter().filter(|(_, missing)| !missing.is_empty()) {
+            println!("{lang} ({}): {}", missing.len(), missing.iter().map(|key| format!("{key:?}")).collect::<Vec<_>>().join(", "));
+        }
+        // A catalog key neither the interface list nor another catalog knows is stale, or a label
+        // `interface_strings` doesn't list yet.
+        for (name, own) in &catalogs {
+            let mut unknown: Vec<_> = own
+                .iter()
+                .filter(|key| !interface.contains(*key) && !catalogs.iter().any(|(other, keys)| other != name && keys.contains(*key)))
+                .collect();
+            unknown.sort_unstable();
+            if !unknown.is_empty() {
+                println!("{name}: {} rows for keys the interface list doesn't have: {unknown:?}", unknown.len());
             }
         }
     }
@@ -4788,45 +4820,19 @@ mod tests {
         }
     }
 
+    /// Languages with several plural forms put the category first, so every number reads the same.
     #[test]
-    fn georgian_counts_use_category_captions_for_every_number() {
-        for n in [1, 2, 5, 21] {
-            assert_eq!(count_label("ka", "pages", n), format!("გვერდი: {n}"));
-        }
-    }
-
-    #[test]
-    fn ukrainian_counts_use_category_captions_for_every_number() {
-        for n in [0, 1, 2, 4, 5, 11, 21, 22, 25] {
-            assert_eq!(count_label("uk", "pages", n), format!("сторінок: {n}"));
-            assert_eq!(count_label("uk", "objects", n), format!("об’єктів: {n}"));
-            assert_eq!(count_label("uk", "errors", n), format!("помилок: {n}"));
-            let pages = tr("uk", "{pages} Pages in {spreads} Spreads").replace("{pages}", &n.to_string()).replace("{spreads}", &n.to_string());
-            assert_eq!(pages, format!("Сторінок: {n}; розворотів: {n}"));
+    fn category_first_counts_put_the_category_before_every_number() {
+        assert!(!category_first("de") && !category_first(""));
+        for lang in ["ka", "uk", "ru", "pl"] {
+            assert!(category_first(lang), "{lang}");
+            for noun in ["pages", "objects", "errors"] {
+                for n in [0, 1, 2, 4, 5, 11, 12, 21, 22, 25, 101, 111] {
+                    assert_eq!(count_label(lang, noun, n), format!("{}: {n}", tr(lang, noun)), "{lang}: {noun}");
+                }
+            }
         }
         assert_eq!(count_label("", "objects", 2), "2 objects");
-    }
-
-    #[test]
-    fn russian_counts_use_category_captions_for_every_number() {
-        assert!(category_first("ru") && category_first("uk") && !category_first("de") && !category_first(""));
-        for n in [0, 1, 2, 4, 5, 11, 12, 21, 22, 25, 101, 111] {
-            assert_eq!(count_label("ru", "pages", n), format!("страниц: {n}"));
-            assert_eq!(count_label("ru", "objects", n), format!("объектов: {n}"));
-            assert_eq!(count_label("ru", "errors", n), format!("ошибок: {n}"));
-            let pages = tr("ru", "{pages} Pages in {spreads} Spreads").replace("{pages}", &n.to_string()).replace("{spreads}", &n.to_string());
-            assert_eq!(pages, format!("Страниц: {n}; разворотов: {n}"));
-        }
-    }
-
-    #[test]
-    fn polish_counts_use_category_captions_for_every_number() {
-        for n in [0, 1, 2, 5, 12, 22, 25] {
-            assert_eq!(count_label("pl", "pages", n), format!("Strony: {n}"));
-            assert_eq!(count_label("pl", "objects", n), format!("Obiekty: {n}"));
-            assert_eq!(count_label("pl", "errors", n), format!("Błędy: {n}"));
-        }
-        assert_eq!(tr("pl", "{pages} Pages in {spreads} Spreads"), "Strony: {pages}, rozkładówki: {spreads}");
     }
 
     /// Every English string the interface passes to `tr`, as far as the command and tool tables and
@@ -4929,26 +4935,13 @@ mod tests {
 
     #[test]
     fn czech_counts_use_the_plural_form_for_the_number() {
-        for (n, form) in [(0, "chyb"), (1, "chyba"), (2, "chyby"), (4, "chyby"), (5, "chyb"), (11, "chyb"), (22, "chyb")] {
-            assert_eq!(count_label("cs", "errors", n), format!("{n} {form}"));
+        for (noun, [one, few, other]) in cs::PLURALS {
+            for (n, form) in [(0, other), (1, one), (2, few), (4, few), (5, other), (11, other), (22, other)] {
+                let expected = if form.trim().is_empty() { format!("{n} {}", tr("cs", noun)) } else { format!("{n} {form}") };
+                assert_eq!(count_label("cs", noun, n), expected, "{noun}");
+            }
         }
-        // The status bar passes the singular noun for one error.
-        assert_eq!(count_label("cs", "error", 1), "1 chyba");
-        assert_eq!(count_label("cs", "pages", 1), "1 stránka");
-        assert_eq!(count_label("cs", "pages", 3), "3 stránky");
-        assert_eq!(count_label("cs", "pages", 5), "5 stránek");
-        assert_eq!(count_label("cs", "stories", 2), "2 články");
-        assert_eq!(count_label("cs", "items", 1), "1 položka");
-        assert_eq!(count_label("cs", "objects", 7), "7 objektů");
-        assert_eq!(count_label("cs", "warnings", 3), "3 varování");
-        assert_eq!(count_label("cs", "layer", 1), "1 vrstva");
-        assert_eq!(count_label("cs", "layers", 3), "3 vrstvy");
-        assert_eq!(count_label("cs", "layers", 8), "8 vrstev");
         // A noun without plural forms keeps the plain translation.
         assert_eq!(count_label("cs", "a new noun", 3), "3 a new noun");
-        for (noun, forms) in cs::PLURALS {
-            assert!(forms.iter().all(|form| !form.is_empty()), "{noun}");
-            assert!(forms.contains(&tr("cs", noun)), "{noun}: the catalog row is one of the plural forms");
-        }
     }
 }

@@ -186,8 +186,11 @@ try {
     }
 
     $shortMain = $originMain.Substring(0, 12)
-    $existingRelease = (gh api 'repos/ahrrfy/designcraft/releases?per_page=20' --jq ("[ .[] | select((.draft | not) and (.tag_name | endswith(`"-ai.$shortMain`"))) ] | length")).Trim()
-    $mainReleaseExists = ($existingRelease -match '^[1-9][0-9]*$')
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $apiHeaders = @{ 'User-Agent' = 'Smart-Design-Sync'; 'Accept' = 'application/vnd.github+json' }
+    $rawReleases = Invoke-RestMethod -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers $apiHeaders -TimeoutSec 45
+    $releases = @($rawReleases | ForEach-Object { $_ })
+    $mainReleaseExists = @($releases | Where-Object { -not $_.draft -and $_.tag_name -like "*-ai.$shortMain" }).Count -gt 0
     $action = Resolve-UpstreamSyncAction $upstreamIsAncestor $mainReleaseExists
 
     if ($action -ne 'check_local_update_only') {
@@ -199,7 +202,9 @@ try {
             if ($action -eq 'integrate_upstream_and_publish') {
                 $shortUp = $upstreamSha.Substring(0, 12)
                 $syncBranch = "sync/upstream-$shortUp"
-                $openPr = (gh pr list --repo ahrrfy/designcraft --state open --head $syncBranch --json url --jq '.[0].url // empty').Trim()
+                $openPrRaw = gh pr list --repo ahrrfy/designcraft --state open --head $syncBranch --json url | ConvertFrom-Json
+                $openPrs = @($openPrRaw | ForEach-Object { $_ })
+                $openPr = if ($openPrs.Count -gt 0) { [string]$openPrs[0].url } else { '' }
                 if (-not $openPr) {
                     git -C $RepoPath worktree add --detach $worktree $originMain | Out-Null
                     Push-Location -LiteralPath $worktree
@@ -208,12 +213,24 @@ try {
                         git merge --no-ff --no-commit $upstreamSha
                         if ($LASTEXITCODE -ne 0) {
                             $conflicts = @(git diff --name-only --diff-filter=U)
-                            if ($conflicts.Count -eq 1 -and $conflicts[0] -eq 'Cargo.lock') {
-                                git checkout --ours Cargo.lock
-                                $env:CARGO_TARGET_DIR = $targetDir
-                                cargo update --workspace
-                                if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock workspace refresh failed.' }
-                                git add Cargo.lock
+                            $autoResolvable = $conflicts.Count -gt 0 -and @($conflicts | Where-Object { $_ -ne 'Cargo.lock' -and $_ -cnotmatch '^\.github/workflows/[^/]+\.yml$' }).Count -eq 0
+                            if ($autoResolvable) {
+                                foreach ($wfPath in @($conflicts | Where-Object { $_ -cmatch '^\.github/workflows/[^/]+\.yml$' })) {
+                                    git cat-file -e ("HEAD:" + $wfPath) 2>$null
+                                    if ($LASTEXITCODE -eq 0) {
+                                        git checkout --ours -- $wfPath
+                                        git add -- $wfPath
+                                    } else {
+                                        git rm -f -- $wfPath | Out-Null
+                                    }
+                                }
+                                if ($conflicts -contains 'Cargo.lock') {
+                                    git checkout --ours Cargo.lock
+                                    $env:CARGO_TARGET_DIR = $targetDir
+                                    cargo update --workspace
+                                    if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock workspace refresh failed.' }
+                                    git add Cargo.lock
+                                }
                             } else {
                                 git merge --abort
                                 throw ("Upstream $shortUp requires manual conflict resolution: " + ($conflicts -join ', '))
