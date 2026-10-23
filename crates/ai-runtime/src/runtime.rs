@@ -429,7 +429,9 @@ impl ProductionRunner {
             }
         };
         let ids = if task.auto_select_skills {
-            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+            let auto_ids = self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?;
+            let pinned_ids = self.prepare_pinned_skills(session, &task.skill_ids)?;
+            merge_pinned_and_automatic_skills(&pinned_ids, auto_ids, task.settings.design_style.as_deref())
         } else {
             let mut ids = task.skill_ids.clone();
             if let Some(id) = task.settings.design_style.as_deref() {
@@ -508,7 +510,9 @@ impl ProductionRunner {
             _ => return Err("Curriculum preview requires a new 1–1000-page book or an existing book to continue".into()),
         }
         let ids = if task.auto_select_skills {
-            self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?
+            let auto_ids = self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?;
+            let pinned_ids = self.prepare_pinned_skills(session, &task.skill_ids)?;
+            merge_pinned_and_automatic_skills(&pinned_ids, auto_ids, task.settings.design_style.as_deref())
         } else {
             let mut ids = task.skill_ids.clone();
             if let Some(style) = &task.settings.design_style
@@ -1124,6 +1128,53 @@ impl ProductionRunner {
         Ok(ids)
     }
 
+    fn prepare_pinned_skills(&mut self, session: &Session, pinned: &[String]) -> Result<Vec<String>, String> {
+        if pinned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let supported = supported_commands();
+        let mut active_pinned = Vec::new();
+        for id in pinned {
+            let Some(entry) = self.registry.catalog("").into_iter().find(|e| &e.skill_id == id) else {
+                continue;
+            };
+            if !entry.enabled {
+                continue;
+            }
+            if entry.active_revision.is_some() {
+                active_pinned.push(id.clone());
+                continue;
+            }
+            let Some(revision) = entry.revisions.last() else { continue };
+            if revision.manifest.design_profile.is_some() || !skill_is_compatible(revision, &supported) {
+                continue;
+            }
+            let rev_id = revision.revision.clone();
+            if validate_skill_templates(&self.registry, session, id, &rev_id).and_then(|()| self.run_sample(session, id, &rev_id)).is_ok()
+                && let Some(evidence) = self.sample.as_ref()
+            {
+                self.registry
+                    .activate_automatically(
+                        id,
+                        &rev_id,
+                        ApprovalEvidence {
+                            reviewer: String::new(),
+                            sample_artifact: evidence.path.clone(),
+                            executed_actions: evidence.actions.clone(),
+                            supported_commands: supported.clone(),
+                            notes: String::new(),
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
+                active_pinned.push(id.clone());
+            }
+        }
+        if !active_pinned.is_empty() {
+            self.refresh_catalog();
+        }
+        Ok(active_pinned)
+    }
+
     fn prepare_style(&mut self, session: &Session, id: &str) -> Result<(), String> {
         let entry = self.registry.catalog("").into_iter().find(|e| e.skill_id == id).ok_or_else(|| format!("Unknown design style: {id}"))?;
         if !entry.enabled {
@@ -1296,6 +1347,7 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
             }
         }
     }
+    let multi_limit = (64 * 1024usize).saturating_add(skills.len().saturating_sub(2).saturating_mul(16 * 1024)).min(160 * 1024);
     if matches!(target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook) && skills.iter().any(crate::template_plan::eligible) {
         for skill in &mut skills {
             if skill.design_profile.is_none() {
@@ -1311,7 +1363,7 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
                 return Err("Template style rules exceed the bounded context limit".into());
             }
             bytes = bytes.checked_add(rules).ok_or("Selected skill context size overflow")?;
-            if bytes > 64 * 1024 {
+            if bytes > multi_limit {
                 return Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into());
             }
         }
@@ -1336,7 +1388,57 @@ fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> R
             return Ok(skills);
         }
     }
+    if task_skill_context_bytes(&skills)? <= multi_limit {
+        return Ok(skills);
+    }
+    if skills.len() > 1
+        && skills.iter().all(|s| s.instructions.len() <= 32 * 1024 && s.references.values().all(|r| r.len() <= 32 * 1024))
+        && let Ok(guidance) = worker::compact_skill_guidance_limit(&skills, multi_limit)
+    {
+        let mut dedup_bytes = guidance.len();
+        let mut fits = true;
+        for profile in skills.iter().filter_map(|skill| skill.design_profile.as_ref()) {
+            let rules = serde_json::to_vec(profile).map_err(|e| e.to_string())?.len();
+            if rules > 32 * 1024 {
+                fits = false;
+                break;
+            }
+            dedup_bytes = dedup_bytes.saturating_add(rules);
+        }
+        if fits && dedup_bytes <= multi_limit {
+            return Ok(skills);
+        }
+    }
     Err("Selected skills exceed the 64-KiB task context limit; reduce references or split the skill before retrying".into())
+}
+
+fn merge_pinned_and_automatic_skills(pinned: &[String], auto_ids: Vec<String>, style_id: Option<&str>) -> Vec<String> {
+    if pinned.is_empty() {
+        return auto_ids;
+    }
+    let mut merged = Vec::new();
+    for id in pinned {
+        if !merged.contains(id) {
+            merged.push(id.clone());
+        }
+    }
+    let reserve_style = style_id.filter(|style| !merged.iter().any(|existing| existing == *style) && auto_ids.iter().any(|id| id == *style));
+    let cap = if reserve_style.is_some() { 7 } else { 8 };
+    for id in auto_ids {
+        if reserve_style.is_some_and(|style| style == id) {
+            continue;
+        }
+        if merged.len() >= cap {
+            break;
+        }
+        if !merged.contains(&id) {
+            merged.push(id);
+        }
+    }
+    if let Some(style) = reserve_style {
+        merged.push(style.to_owned());
+    }
+    merged
 }
 
 fn task_skill_context_bytes(skills: &[SkillSnapshot]) -> Result<usize, String> {
@@ -1604,6 +1706,8 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "منهج",
         "مناهج",
         "مقرر",
+        "مادة",
+        "ماده",
         "وحدة",
         "درس",
         "رياضيات",
@@ -1613,6 +1717,18 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "كمبيوتر",
         "برمجة",
         "تقنية",
+        "إسلامية",
+        "اسلامية",
+        "اسلاميه",
+        "الاسلاميه",
+        "قرآن",
+        "قران",
+        "عبادات",
+        "سيرة",
+        "سيره",
+        "لغتي",
+        "العربية",
+        "اجتماعيات",
         "curriculum",
         "book",
         "workbook",
@@ -1623,17 +1739,43 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "computer",
         "computing",
         "ict",
+        "islamic",
+        "arabic",
+        "social studies",
+    ]);
+    let upper_stage = mentions(&[
+        "ثانوي",
+        "ثانوية",
+        "ثانويه",
+        "إعدادي",
+        "اعدادي",
+        "متوسط",
+        "متوسطة",
+        "متوسطه",
+        "جامعي",
+        "جامعة",
+        "جامعه",
+        "secondary",
+        "high school",
+        "middle school",
+        "university",
+        "college",
     ]);
     let children = mentions(&[
         "أطفال",
         "اطفال",
         "طفل",
         "روضة",
+        "روضه",
+        "تمهيدي",
         "للصغار",
         "ابتدائي",
-        "مدرسي",
-        "طلاب",
         "تلاميذ",
+        "kg",
+        "kg1",
+        "kg2",
+        "fs1",
+        "fs2",
         "kindergarten",
         "preschool",
         "children",
@@ -1641,7 +1783,7 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "early-years",
         "primary",
     ]);
-    let visual = (children || intl || computing) && book
+    let visual = (!upper_stage && (children || intl || computing) && book)
         || mentions(&[
             "تصميم",
             "صمم",
@@ -1659,7 +1801,7 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
             "flashcard",
         ]);
     let print = book || mentions(&["طباعة", "للطباعة", "مطبعة", "مطبوع", "print", "a4"]);
-    let kg = (children || intl || computing) && (book || visual);
+    let kg = !upper_stage && (children || intl || computing) && (book || visual);
     let architecture = mentions(&[
         "تسلسل",
         "وتسلسله",
@@ -1681,6 +1823,8 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "curriculum map",
         "spiral curriculum",
     ]);
+    let math_or_cpa =
+        mentions(&["رياضيات", "حساب", "العد", "كميات", "منطق", "محسوس", "قواعد", "math", "mathematics", "counting", "subitiz", "grammar", "cpa"]);
     let purpose = match entry.skill_id.as_str() {
         "native-engine-workflow" => 64,
         "arabic-english-typography" if arabic => 56,
@@ -1688,27 +1832,12 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "curriculum-print-design-studio" if book && print => 41,
         "kg-garnet-ict-computing" if kg && computing => 46,
         "kg-international-curriculum-architect" if (kg || book) && architecture => 45,
-        "kg-cambridge-thinking-cpa"
-            if kg
-                && (computing
-                    || intl
-                    || mentions(&[
-                        "رياضيات",
-                        "حساب",
-                        "العد",
-                        "كميات",
-                        "منطق",
-                        "محسوس",
-                        "قواعد",
-                        "math",
-                        "mathematics",
-                        "counting",
-                        "subitiz",
-                        "grammar",
-                        "cpa",
-                    ])) =>
-        {
-            44
+        "kg-cambridge-thinking-cpa" if kg && (computing || intl || math_or_cpa) => {
+            if math_or_cpa {
+                44
+            } else {
+                37
+            }
         }
         "kg-international-curriculum-architect" if kg && (intl || book) => {
             if intl {
@@ -2004,23 +2133,125 @@ fn compact_context(session: &Session) -> Result<Value, String> {
         }
     }
     let mut objects = Vec::new();
+    let mut objects_bytes = 0usize;
+    let mut objects_truncated = false;
     for (spread_index, spread) in doc.spreads.iter().enumerate() {
-        for item in &spread.items {
-            if objects.len() >= 200 {
+        let first_page = doc.first_page_of_spread(spread_index);
+        let mut stack: Vec<(&designcraft_engine::doc::Item, designcraft_geom::Affine, Option<u64>, usize)> =
+            spread.items.iter().rev().map(|item| (item.as_ref(), designcraft_geom::Affine::IDENTITY, None, 0usize)).collect();
+        while let Some((item, parent_xf, parent_group, depth)) = stack.pop() {
+            if objects.len() >= 200 || objects_bytes >= 24 * 1024 {
+                objects_truncated = true;
                 break;
             }
-            let bounds = item.bounds();
-            let text = item.text_frame().and_then(|t| doc.stories.get(&t.story)).map(|s| s.text.chars().take(500).collect::<String>());
-            objects.push(
-                json!({"id":item.id.0,"label":item.label,"spread":spread_index,"bounds":[bounds.x0,bounds.y0,bounds.x1,bounds.y1],"text":text}),
-            );
+            let bounds = parent_xf.transform_rect_bbox(item.bounds());
+            let page_offset = spread.page_at_x(bounds.center().x).unwrap_or(0);
+            let page = first_page.saturating_add(page_offset).saturating_add(1);
+            let content = match &item.content {
+                designcraft_engine::doc::Content::Text(_) => "text",
+                designcraft_engine::doc::Content::Graphic(_) => "graphic",
+                designcraft_engine::doc::Content::Group { .. } => "group",
+                designcraft_engine::doc::Content::Unassigned if item.object_style == doc.styles.default_graphic_frame => "graphic",
+                designcraft_engine::doc::Content::Unassigned => "unassigned",
+            };
+            let shape = match item.shape {
+                designcraft_engine::doc::Shape::Rectangle => "rectangle",
+                designcraft_engine::doc::Shape::Oval => "ellipse",
+                designcraft_engine::doc::Shape::Polygon => "polygon",
+                designcraft_engine::doc::Shape::GraphicLine => "line",
+                designcraft_engine::doc::Shape::Path => "path",
+                designcraft_engine::doc::Shape::Group => "group",
+            };
+            let story_id = item.text_frame().map(|tf| tf.story.0);
+            let story_ref = item.text_frame().and_then(|tf| doc.stories.get(&tf.story));
+            let text = story_ref.map(|s| s.text.chars().take(500).collect::<String>());
+            let typography = story_ref.and_then(|story| {
+                let para = story.paras.first()?;
+                let (paragraph, base) = doc.styles.resolve_para(para);
+                let chars = doc.styles.resolve_char(&base, story.char_format_at(0));
+                Some(json!({
+                    "fontFamily": chars.font_family.chars().take(160).collect::<String>(),
+                    "fontStyle": chars.font_style.chars().take(80).collect::<String>(),
+                    "size": chars.size,
+                    "fill": chars.fill.chars().take(160).collect::<String>(),
+                    "leading": chars.leading,
+                    "direction": paragraph.direction,
+                    "align": paragraph.align,
+                }))
+            });
+            let tables = story_ref.filter(|story| !story.tables.is_empty()).map(|story| {
+                story
+                    .tables
+                    .values()
+                    .take(8)
+                    .map(|table| {
+                        let cols = table.columns.len();
+                        let cells: Vec<Value> = table
+                            .cells
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, cell)| !cell.text.text.trim().is_empty())
+                            .take(32)
+                            .map(|(idx, cell)| {
+                                let row = idx.checked_div(cols).unwrap_or(0);
+                                let col = idx.checked_rem(cols).unwrap_or(0);
+                                json!({
+                                    "row": row,
+                                    "col": col,
+                                    "text": cell.text.text.chars().take(120).collect::<String>(),
+                                    "fill": cell.fill.chars().take(80).collect::<String>(),
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "table": table.id,
+                            "rows": table.rows.len(),
+                            "cols": cols,
+                            "cells": cells,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let entry = json!({
+                "id": item.id.0,
+                "label": item.label,
+                "spread": spread_index,
+                "page": page,
+                "bounds": [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                "content": content,
+                "shape": shape,
+                "story": story_id,
+                "text": text,
+                "fillSwatch": item.fill.swatch.chars().take(160).collect::<String>(),
+                "fillTint": item.fill.tint,
+                "strokeSwatch": item.stroke.swatch.chars().take(160).collect::<String>(),
+                "strokeWeight": item.stroke.weight,
+                "locked": item.locked,
+                "parentGroup": parent_group,
+                "typography": typography,
+                "tables": tables,
+            });
+            let entry_len = serde_json::to_vec(&entry).map(|v| v.len()).unwrap_or(512);
+            if !objects.is_empty() && objects_bytes.saturating_add(entry_len) > 24 * 1024 {
+                objects_truncated = true;
+                break;
+            }
+            objects_bytes = objects_bytes.saturating_add(entry_len);
+            objects.push(entry);
+            if depth < 8 && !item.children().is_empty() {
+                let child_xf = parent_xf * item.xf;
+                for child in item.children().iter().rev() {
+                    stack.push((child.as_ref(), child_xf, Some(item.id.0), depth + 1));
+                }
+            }
         }
-        if objects.len() >= 200 {
+        if objects_truncated || objects.len() >= 200 {
+            objects_truncated = true;
             break;
         }
     }
     Ok(
-        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects.len()==200,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
+        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects_truncated,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
     )
 }
 
@@ -3911,5 +4142,116 @@ mod tests {
         let saved = runner.handle(&mut session, AiRequest::UpdateSettings(alias_settings));
         assert_eq!(saved.message, "AI settings saved; API keys remain outside settings and reports");
         assert_eq!(saved.settings.text_model.model, "silver-text");
+    }
+
+    #[test]
+    fn kg2_islamic_curriculum_combines_seven_skills_and_pinned_skills_without_context_overflow() {
+        let prompt = "ابي انتج منهج دولي لماده الاسلاميه لمرحله kg2";
+        let supported = supported_commands();
+
+        let live_skills_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join("outputs/ai-preview-profile/AI/skills"));
+        if let Some(skills_dir) = live_skills_dir.filter(|path| path.exists()) {
+            let live_registry = SkillRegistry::open(&skills_dir).unwrap();
+            let catalog = live_registry.catalog("");
+            let auto_ids = choose_compatible_skills(prompt, catalog.clone(), &supported);
+            assert!(auto_ids.contains(&"kg-international-curriculum-architect".to_string()), "auto_ids={auto_ids:?}");
+            assert!(auto_ids.contains(&"kg-cognitive-sensory-layout".to_string()), "auto_ids={auto_ids:?}");
+            assert!(
+                !auto_ids.contains(&"kg-cambridge-thinking-cpa".to_string()),
+                "math CPA skill should not displace Islamic/KG curriculum skills: {auto_ids:?}"
+            );
+            let mut full_ids = auto_ids.clone();
+            full_ids.push("kg-oxford-cambridge-style".into());
+            let merged = merge_pinned_and_automatic_skills(&["arabic-editorial-book-design".into()], full_ids, Some("kg-oxford-cambridge-style"));
+            assert!(merged.contains(&"arabic-editorial-book-design".to_string()));
+            assert!(merged.contains(&"kg-oxford-cambridge-style".to_string()));
+            assert!(merged.len() >= 7 && merged.len() <= 8, "merged={merged:?}");
+
+            let mut snapshots = Vec::new();
+            for id in &merged {
+                if let Some(card) = catalog.iter().find(|e| &e.skill_id == id)
+                    && let Some(rev) = &card.active_revision
+                    && let Ok(rec) = live_registry.revision(id, rev)
+                {
+                    let refs = selected_skill_references(rec);
+                    if let Ok(snap) = live_registry.snapshot(id, &refs) {
+                        snapshots.push(snap);
+                    }
+                }
+            }
+            assert!(snapshots.len() >= 7);
+            let bounded = bounded_task_skills(snapshots, &TaskTarget::NewA4 { pages: 8 }).unwrap();
+            let compacted = worker::compact_skill_guidance(&bounded).unwrap();
+            assert!(!compacted.is_empty());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+
+        let preview = runner.handle(
+            &mut session,
+            AiRequest::PreviewProduction(TaskRequest {
+                prompt: prompt.into(),
+                target: TaskTarget::NewA4 { pages: 8 },
+                settings: AiSettings::default(),
+                skill_ids: vec!["early-years-booklet-planning".into()],
+                auto_select_skills: true,
+                export_directory: None,
+            }),
+        );
+        assert_ne!(preview.stage, "failed", "preview failed: {}", preview.message);
+        let blueprint = preview.production_preview.as_ref().and_then(|value| value.get("blueprint")).expect("curriculum preview blueprint");
+        assert!(blueprint.get("subject_domain").and_then(Value::as_str).is_some_and(|s| s.contains("Islamic Studies")), "{blueprint}");
+        assert!(
+            blueprint
+                .get("selected_profile_authority")
+                .and_then(|v| v.get("inferred_learner_stage"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("KG2")),
+            "{blueprint}"
+        );
+        assert_eq!(preview.production_preview.as_ref().and_then(|v| v.get("binding")).and_then(Value::as_str), Some("RTL"));
+    }
+
+    #[test]
+    fn compact_context_exposes_existing_document_stories_tables_and_group_children() {
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(1)).unwrap();
+        let text_frame =
+            session.execute("frame.create", &json!({"spread":0,"rect":[36.0,36.0,280.0,180.0],"content":"text","text":"Existing Heading"})).unwrap();
+        let text_id = text_frame["id"].as_u64().unwrap();
+        let story_id = text_frame["story"].as_u64().unwrap();
+        let table = session.execute("table.insert", &json!({"story":story_id,"rows":2,"cols":2})).unwrap()["table"].as_u64().unwrap();
+        session.execute("table.setCell", &json!({"table":table,"row":0,"col":0,"text":"Cell A1"})).unwrap();
+        let g1 = session.execute("frame.create", &json!({"spread":0,"rect":[300.0,36.0,420.0,140.0],"content":"graphic"})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let g2 = session.execute("frame.create", &json!({"spread":0,"rect":[430.0,36.0,520.0,140.0],"content":"unassigned"})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let group_id = session.execute("object.group", &json!({"ids":[g1,g2]})).unwrap()["id"].as_u64().unwrap();
+
+        let ctx = compact_context(&session).unwrap();
+        let objects = ctx["objects"].as_array().expect("objects array");
+        let text_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(text_id)).expect("text frame entry");
+        assert_eq!(text_entry["content"].as_str(), Some("text"));
+        assert_eq!(text_entry["shape"].as_str(), Some("rectangle"));
+        assert_eq!(text_entry["story"].as_u64(), Some(story_id));
+        assert!(text_entry["typography"]["size"].as_f64().is_some_and(|s| s > 0.0));
+        let tables = text_entry["tables"].as_array().expect("tables array");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0]["table"].as_u64(), Some(table));
+        assert_eq!(tables[0]["cells"][0]["text"].as_str(), Some("Cell A1"));
+
+        let group_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(group_id)).expect("group entry");
+        assert_eq!(group_entry["content"].as_str(), Some("group"));
+        let child_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(g1)).expect("grouped child entry");
+        assert_eq!(child_entry["parentGroup"].as_u64(), Some(group_id));
+        assert_eq!(child_entry["content"].as_str(), Some("graphic"));
     }
 }

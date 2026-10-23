@@ -1,9 +1,9 @@
-name: Propose upstream sync
+name: Upstream sync
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 4 * * *'
+    - cron: '17 */6 * * *'
 
 permissions:
   contents: read
@@ -13,78 +13,324 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  propose:
+  sync:
     if: github.repository == 'ahrrfy/designcraft'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Merge, verify and land upstream main
+    runs-on: windows-latest
+    timeout-minutes: 120
     permissions:
+      checks: write
       contents: write
       pull-requests: write
+    outputs:
+      synced: ${{ steps.land.outputs.synced || 'false' }}
+      merged_sha: ${{ steps.land.outputs.merged_sha || '' }}
+      base_sha: ${{ steps.prep.outputs.base_sha || '' }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 3
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_BACKTRACE: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Merge fixed upstream into a separate review branch
+      - name: Fetch and merge upstream main
+        id: prep
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          # No fetched scripts/workflows execute here. Main is never reset, pushed or auto-merged.
           git fetch --no-tags https://github.com/storytold/designcraft.git main
           upstream="$(git rev-parse FETCH_HEAD)"
           base="$(git rev-parse HEAD)"
+          short_up="${upstream:0:12}"
+          {
+            printf 'base_sha=%s\n' "$base"
+            printf 'upstream_sha=%s\n' "$upstream"
+            printf 'short_up=%s\n' "$short_up"
+          } >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$upstream" HEAD; then
-            echo 'Upstream main is already integrated.' >> "$GITHUB_STEP_SUMMARY"
+            printf 'state=up_to_date\n' >> "$GITHUB_OUTPUT"
+            printf 'Upstream main (%s) is already integrated.\n' "$short_up" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          branch="sync/upstream-${upstream:0:12}"
+          branch="sync/upstream-${short_up}"
+          printf 'branch=%s\n' "$branch" >> "$GITHUB_OUTPUT"
           existing="$(gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty')"
           if [ -n "$existing" ]; then
-            printf 'Existing integration review: %s\n' "$existing" >> "$GITHUB_STEP_SUMMARY"
+            printf 'state=existing_pr\n' >> "$GITHUB_OUTPUT"
+            printf 'Existing integration PR: %s\n' "$existing" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "$branch"
+          git diff --name-status "$base...$upstream" > "$RUNNER_TEMP/upstream-paths.txt"
+          if git merge --no-ff --no-commit "$upstream"; then
+            git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
+            printf 'state=ready_for_ci\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
+          conflict_count="$(wc -l < "$RUNNER_TEMP/upstream-conflicts.txt" | tr -d '[:space:]')"
+          if [ "$conflict_count" = "1" ] && grep -qx 'Cargo.lock' "$RUNNER_TEMP/upstream-conflicts.txt"; then
+            git checkout --ours Cargo.lock
+            printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -s "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
+            printf 'Merge failed without file conflicts; aborting.\n' >&2
+            exit 1
+          fi
+          git merge --abort
           report_dir='.github/upstream-sync-reports'
           mkdir -p "$report_dir"
-          report="$report_dir/${upstream:0:12}.md"
-          git diff --name-status "$base...$upstream" > "$RUNNER_TEMP/upstream-paths.txt"
-          draft=()
-          if git merge --no-ff --no-commit "$upstream"; then
-            git commit -m "Merge upstream ${upstream:0:12} for review"
-            result='Upstream merged into this review branch; feature preservation and CI still require review.'
-          else
-            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
-            if [ ! -s "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
-              echo 'Merge failed without file conflicts; no branch is published.' >&2
-              exit 1
-            fi
-            git merge --abort
-            draft=(--draft)
-            result='CONFLICTS: this branch contains only a report. Upstream code has NOT been merged; resolve manually before review.'
-          fi
+          report="${report_dir}/${short_up}.md"
           {
-            printf '# Upstream integration review\n\n%s\n\n' "$result"
+            printf '# Upstream integration review\n\n'
+            printf 'CONFLICTS: automatic merge stopped safely to preserve Smart Design features. Resolve conflicts manually.\n\n'
             printf -- '- Fork main base: %s\n- Upstream main: %s\n- Source: https://github.com/storytold/designcraft\n\n' "$base" "$upstream"
-            printf '## Upstream changed paths\n\n```text\n'
+            printf '## Conflicting paths\n\n~~~text\n'
+            cat "$RUNNER_TEMP/upstream-conflicts.txt"
+            printf '~~~\n\n## Upstream changed paths\n\n~~~text\n'
             cat "$RUNNER_TEMP/upstream-paths.txt"
-            printf '```\n'
-            if [ -f "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
-              printf '\n## Conflicting paths\n\n```text\n'
-              cat "$RUNNER_TEMP/upstream-conflicts.txt"
-              printf '```\n'
-            fi
-            printf '\nReview AI production, skills, provider contracts, native commands, branding and packaging. Do not resolve conflicts by replacing fork main with upstream.\n'
-            printf '\nThe GitHub token-created PR may not start CI automatically. Run Rust CI manually against this exact branch before merging. No automatic merge or release is performed.\n'
+            printf '~~~\n'
           } > "$report"
           git add -- "$report"
-          git commit -m "Document upstream ${upstream:0:12} integration review"
+          git commit -m "docs(sync): record upstream ${short_up} conflict report"
           gh auth setup-git
-          # An existing remote branch causes a normal push refusal; never force overwrite it.
           git push --set-upstream origin "$branch"
-          gh pr create --base main --head "$branch" --title "Review upstream ${upstream:0:12} integration" --body-file "$report" "${draft[@]}"
+          gh pr create --base main --head "$branch" --draft --title "Review upstream ${short_up} conflicts" --body-file "$report"
+          printf 'state=conflict_pr\n' >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        with:
+          key: windows-quality
+
+      - name: Refresh workspace Cargo.lock after clean Cargo.toml merge
+        if: steps.prep.outputs.state == 'needs_lock_refresh'
+        env:
+          SHORT_UP: ${{ steps.prep.outputs.short_up }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo update --workspace
+          git add Cargo.lock
+          git commit -m "chore(sync): merge upstream ${SHORT_UP} into Smart Design"
+
+      - name: Resolve only locked dependencies
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo fetch --locked
+      - name: Protected-profile launcher and updater regression checks
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        shell: powershell
+        run: |
+          & packaging/windows/test-preview-launcher.ps1
+          & packaging/windows/test-preview-updater.ps1
+          & packaging/windows/test-preview-update-flow.ps1
+      - name: Formatting
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Workspace tests
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo nextest run --locked --workspace --lib --bins --tests
+      - name: Workspace doctests
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo test --locked --workspace --doc
+      - name: PDF dependency policy
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo run --locked -p xtask -- pdf-deps
+      - name: Asset attribution
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo run --locked -p xtask -- assets
+      - name: Dependency layering
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: cargo run --locked -p xtask -- layers
+      - name: Portable crates and UI compile for WebAssembly
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: cargo run --locked -p xtask -- wasm
+      - name: Lockfile stayed unchanged
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        run: git diff --exit-code -- Cargo.lock
+
+      - name: Publish verified check and auto-merge into main
+        id: land
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SYNC_BRANCH: ${{ steps.prep.outputs.branch }}
+          SHORT_UP: ${{ steps.prep.outputs.short_up }}
+          UPSTREAM_SHA: ${{ steps.prep.outputs.upstream_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          gh auth setup-git
+          git push --set-upstream origin "$SYNC_BRANCH"
+          gh api --method POST "repos/$GH_REPO/check-runs" \
+            -f name='Windows quality gates' \
+            -f head_sha="$head_sha" \
+            -f status='completed' \
+            -f conclusion='success' \
+            -f details_url="$RUN_URL" >/dev/null
+          pr_url="$(gh pr create \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --title "chore(sync): integrate upstream ${SHORT_UP}" \
+            --body "Automated integration of upstream storytold/designcraft commit ${UPSTREAM_SHA}. Full Windows quality gates passed in ${RUN_URL}.")"
+          merged="false"
+          for _ in 1 2 3 4 5; do
+            if gh pr merge "$pr_url" --merge --delete-branch; then
+              merged="true"
+              break
+            fi
+            sleep 3
+          done
+          if [ "$merged" != "true" ]; then
+            printf 'Could not merge %s automatically.\n' "$pr_url" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          merged_sha="$(git rev-parse FETCH_HEAD)"
+          printf 'synced=true\n' >> "$GITHUB_OUTPUT"
+          printf 'merged_sha=%s\n' "$merged_sha" >> "$GITHUB_OUTPUT"
+          printf 'Auto-merged upstream %s into main (%s).\n' "$SHORT_UP" "$merged_sha" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Build and publish synced Windows preview
+    needs: sync
+    if: needs.sync.outputs.synced == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 3
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      DESIGNCRAFT_REQUIRE_WINRES: '1'
+      CRAFT_FONTS_REQUIRED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sync.outputs.merged_sha }}
+          persist-credentials: false
+      - name: Pinned redistributable font collection
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.95.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-ai-preview
+      - name: Build and publish synced release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SYNC_BASE_SHA: ${{ needs.sync.outputs.base_sha }}
+          VERIFIED_CI_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CRAFT_FONTS_DIR = Join-Path $env:GITHUB_WORKSPACE 'craft-fonts'
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve build commit' }
+          $env:DESIGNCRAFT_BUILD_SHA = $sha
+          $env:DESIGNCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+          cargo build --release --locked -p designcraft -p designcraft-cli --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          git diff --exit-code -- Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw 'Release changed the lockfile' }
+          $cargoToml = Get-Content -LiteralPath 'Cargo.toml' -Raw -Encoding UTF8
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') { throw 'Cannot resolve Cargo.toml workspace version' }
+          $label = 'v' + $Matches[1] + '-ai.' + $sha.Substring(0, 12)
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist/smart-design-portable'
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'dist/preview'
+          New-Item -ItemType Directory -Force -Path $stage, $releaseDir | Out-Null
+          Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/designcraft.exe', 'target/x86_64-pc-windows-msvc/release/designcraft-cli.exe' -Destination $stage
+          Copy-Item -LiteralPath 'NOTICE', 'LICENSE-MIT', 'LICENSE-APACHE', 'LICENSE-FOXIT', 'ASSETS.md' -Destination $stage
+          'Portable Smart Design preview. Settings and recovery remain beside these executables.' | Set-Content -LiteralPath (Join-Path $stage 'portable.txt') -Encoding ascii
+          Copy-Item -LiteralPath 'docs/ai-production.ar.md' -Destination $stage
+          Copy-Item -LiteralPath 'skills' -Destination $stage -Recurse
+          $fontNotices = Join-Path $stage 'font-licenses'
+          New-Item -ItemType Directory -Force -Path $fontNotices | Out-Null
+          Copy-Item -LiteralPath 'licenses/epaint-default-fonts' -Destination $fontNotices -Recurse
+          Get-ChildItem -LiteralPath 'assets/fonts' -File -Filter 'OFL-*.txt' | Copy-Item -Destination $fontNotices
+          Copy-Item -LiteralPath 'craft-fonts/ATTRIBUTION.md', 'craft-fonts/LICENSE-MIT', 'craft-fonts/LICENSE-APACHE' -Destination $fontNotices
+          Get-ChildItem -LiteralPath 'craft-fonts/fonts' -Recurse -File | Where-Object { $_.Name -match '^(OFL|LICENSE|COPYING|NOTICE|AUTHORS)' -or $_.Extension -eq '.md' } | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath((Join-Path $env:GITHUB_WORKSPACE 'craft-fonts'), $_.FullName)
+            $destination = Join-Path $fontNotices $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $destination
+          }
+          $instructions = @(
+            'Smart Design / التصميم الذكي — independent Windows x64 preview',
+            'Based on DesignCraft by the ArtCraft team and contributors. This fork is independently maintained.',
+            'UNSIGNED PREVIEW: these binaries are not code-signed. Pre-alpha; keep backup copies of documents.',
+            'Extract the whole ZIP into a new folder, then run .\designcraft.exe. No MSI or system associations are installed.',
+            ('Source commit: ' + $sha),
+            ('Verified upstream sync CI: ' + $env:VERIFIED_CI_URL)
+          )
+          $instructions | Set-Content -LiteralPath (Join-Path $stage 'RUN-ME.txt') -Encoding utf8
+          $sha | Set-Content -LiteralPath (Join-Path $stage 'SOURCE-COMMIT.txt') -Encoding ascii
+          $env:VERIFIED_CI_URL | Set-Content -LiteralPath (Join-Path $stage 'CI-RUN.txt') -Encoding ascii
+          $zip = Join-Path $releaseDir ('smart-design-' + $label + '-windows-x64-unsigned-portable.zip')
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          ($hash + '  ' + (Split-Path $zip -Leaf)) | Set-Content -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt') -Encoding ascii
+          $update = @{
+            schemaVersion = 1; repository = 'ahrrfy/designcraft'; sourceCommit = $sha
+            syncBaseCommit = $env:SYNC_BASE_SHA
+            ciUrl = $env:VERIFIED_CI_URL
+            archive = @{ name = (Split-Path $zip -Leaf); sha256 = $hash; size = (Get-Item -LiteralPath $zip).Length }
+            binaries = @{
+              'designcraft.exe' = (Get-FileHash -LiteralPath (Join-Path $stage 'designcraft.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+              'designcraft-cli.exe' = (Get-FileHash -LiteralPath (Join-Path $stage 'designcraft-cli.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          $update | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $releaseDir 'update.json') -Encoding utf8
+          $notes = @(
+            'Independent Smart Design fork (automated upstream integration). Unsigned Windows x64 portable preview; no MSI.',
+            ('Source commit: ' + $sha),
+            ('Verified upstream sync run: ' + $env:VERIFIED_CI_URL),
+            'Automatically integrated, verified and published. This does not certify physical printing or commercial-press output.'
+          )
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.txt'
+          $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
+          gh release view $label *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $label --target $sha --prerelease --title ('Smart Design ' + $label + ' (unsigned preview)') --notes-file $notesPath (Join-Path $releaseDir '*')
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create synced GitHub release' }
+          }

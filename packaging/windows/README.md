@@ -9,13 +9,16 @@ probes can use `-Hidden`. Run `powershell.exe -NoProfile -File packaging/windows
 to verify Arabic paths, UTF-8 with and without a BOM, read-only validation and missing-path rejection.
 
 `update-native-preview.ps1 -ManifestPath <absolute-json-path>` checks published
-`v*-ai*` previews only in `ahrrfy/designcraft`. Release packaging supplies
-`update.json` with archive and executable SHA-256, size, source commit and a
-successful exact-commit main/manual Rust CI URL. The updater verifies that proof
-and forward-only ancestry, bounds archive expansion, rejects traversal/scripts,
-installs side by side and retains the old version. These previews are unsigned;
-hashes and GitHub CI prove source/channel integrity, not a code-signing identity.
-Upstream releases are integrated into the fork before becoming eligible.
+`v*-ai*` previews only in `ahrrfy/designcraft`. Release packaging (triggered automatically
+after successful `Rust CI` on `main`, and automatically every 6 hours by `upstream-sync.yml`
+when upstream `storytold/designcraft` commits merge cleanly and pass full Windows quality gates,
+or locally via `sync-upstream-local.ps1` using an isolated worktree if GitHub Actions is paused)
+supplies `update.json` with archive and executable SHA-256, size, source commit, optional
+`syncBaseCommit`, and a verified CI or commit-status URL. The updater verifies that proof and forward-only
+ancestry, bounds archive expansion, rejects traversal/scripts, installs side by side and
+retains the old version. These previews are unsigned; hashes and GitHub CI prove source/channel
+integrity, not a code-signing identity. Upstream releases are integrated and verified in the
+fork before becoming eligible.
 
 A running app is never closed: the updater atomically records its verified staged
 pointer while retaining the active executable. The next launcher invocation, after
@@ -33,8 +36,12 @@ ancestor of the installed development build reports `up_to_date` with the curren
 commit and executable; an older published release is never installed.
 Published drafts are not eligible. `test-preview-updater.ps1` exercises the
 archive/source/digest guards and preservation with synthetic local files and no
-provider or network requests. A per-user scheduled task can invoke the updater;
-launch the app through the stable `start-native-preview.ps1` manifest shortcut.
+provider or network requests.
+
+For automatic background update checks on Windows, dot-source `start-native-preview.ps1 -ManifestPath <absolute-json-path> -LibraryOnly`
+and invoke `Install-PreviewUpdateScheduledTask <absolute-manifest> 'Smart Design Auto Update' 120`.
+This registers a hidden per-user scheduled task (network-only, battery-safe) that stages or
+promotes verified updates for the next launch without closing an open session.
 Source development and publication remain separate from user installation.
 
 Every successful updater invocation prints exactly one compressed JSON object:
@@ -51,13 +58,13 @@ It creates `Smart Design Launcher.lnk` (open/promote) and
 `Check Smart Design Updates.lnk` (check/stage), each invoking the local script via
 hidden Windows PowerShell. The existing ArtCraft shortcuts are preserved. The
 in-app update button supplies visible asynchronous status for check/stage results.
-`Promote-StagedUpdate` and `Resolve-PreviewLaunch` are library helpers: tests invoke
-them without starting a binary. Both launcher and updater serialize normal actions
-with the same exclusive update lock.
+`Promote-StagedUpdate`, `Resolve-PreviewLaunch` and `Get-PreviewUpdateTaskDefinition`
+are library helpers: tests invoke them without starting a binary. Both launcher and
+updater serialize normal actions with the same exclusive update lock.
 
 Run `powershell.exe -NoProfile -File packaging/windows/test-preview-update-flow.ps1`
-for synthetic archive and CI guards, persisted staging, all corrupt/missing stage
-files, next-launch promotion, read-only validation, nested settings and environment
+for synthetic archive and CI/upstream-sync guards, persisted staging, all corrupt/missing stage
+files, next-launch promotion, read-only validation, scheduled-task spec validation, nested settings and environment
 preservation, shortcut creation/inspection and every JSON success outcome. Its
 network/process doubles make no real requests and never execute fixture binaries.
 

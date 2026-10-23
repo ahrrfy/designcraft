@@ -34,13 +34,29 @@ Reject { Assert-PreviewCiProof $ci $sha }
 $ci.head_repository.full_name = 'ahrrfy/designcraft'
 $ci.event = 'workflow_dispatch'
 Assert-PreviewCiProof $ci $sha
+$syncBase = 'c' * 40
+$syncCi = [pscustomobject]@{head_sha=$syncBase; head_repository=[pscustomobject]@{full_name='ahrrfy/designcraft'}; path='.github/workflows/upstream-sync.yml'; status='completed'; conclusion='success'; event='schedule'; head_branch='main'}
+Assert-PreviewCiProof $syncCi $sha $syncBase 'identical'
+Assert-PreviewCiProof $syncCi $sha $syncBase 'ahead'
+$syncCi.event = 'workflow_dispatch'
+Assert-PreviewCiProof $syncCi $sha $syncBase 'identical'
+Reject { Assert-PreviewCiProof $syncCi $sha $syncBase 'diverged' }
+Reject { Assert-PreviewCiProof $syncCi $sha $syncBase 'behind' }
+Reject { Assert-PreviewCiProof $syncCi $sha ('d' * 40) 'identical' }
+Reject { Assert-PreviewCiProof $syncCi $sha '' 'identical' }
+$combined = [pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='success'; creator=[pscustomobject]@{login='ahrrfy'}})}
+Assert-PreviewCommitStatusProof $combined $sha 'identical'
+Assert-PreviewCommitStatusProof $combined $sha 'ahead'
+Reject { Assert-PreviewCommitStatusProof $combined $sha 'diverged' }
+Reject { Assert-PreviewCommitStatusProof ([pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='success'; creator=[pscustomobject]@{login='other'}})}) $sha 'identical' }
+Reject { Assert-PreviewCommitStatusProof ([pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='failure'; creator=[pscustomobject]@{login='ahrrfy'}})}) $sha 'identical' }
 [IO.File]::WriteAllText((Join-Path $source 'SOURCE-COMMIT.txt'), $sha)
 $archive = Join-Path $testRoot 'fixture.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($source, $archive)
 $meta = [pscustomobject]@{
     schemaVersion = 1; repository = 'ahrrfy/designcraft'; sourceCommit = $sha
     ciUrl = 'https://github.com/ahrrfy/designcraft/actions/runs/1'
-    archive = [pscustomobject]@{name = 'smart-design-v0.9.0-ai.test-windows-x64-unsigned-portable.zip'; sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant(); size = (Get-Item -LiteralPath $archive).Length}
+    archive = [pscustomobject]@{name = 'smart-design-v0.12.0-ai.test-windows-x64-unsigned-portable.zip'; sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant(); size = (Get-Item -LiteralPath $archive).Length}
     binaries = [pscustomobject]@{
         'designcraft.exe' = (Get-FileHash -LiteralPath (Join-Path $source 'designcraft.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
         'designcraft-cli.exe' = (Get-FileHash -LiteralPath (Join-Path $source 'designcraft-cli.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -49,6 +65,16 @@ $meta = [pscustomobject]@{
 $installed = Join-Path $testRoot 'installed'
 Expand-VerifiedUpdate $archive $installed $meta
 Reject { Expand-VerifiedUpdate $archive $installed $meta }
+$meta | Add-Member -NotePropertyName syncBaseCommit -NotePropertyValue $syncBase -Force
+Assert-UpdateMetadata $meta
+$meta.syncBaseCommit = 'invalid-sha'
+Reject { Assert-UpdateMetadata $meta }
+$meta.PSObject.Properties.Remove('syncBaseCommit')
+$meta.ciUrl = ('https://github.com/ahrrfy/designcraft/commit/' + $sha)
+Assert-UpdateMetadata $meta
+$meta.ciUrl = ('https://github.com/ahrrfy/designcraft/commit/' + ('d' * 40))
+Reject { Assert-UpdateMetadata $meta }
+$meta.ciUrl = 'https://github.com/ahrrfy/designcraft/actions/runs/1'
 $meta.repository = 'storytold/designcraft'
 Reject { Assert-UpdateMetadata $meta }
 $meta.repository = 'ahrrfy/designcraft'
@@ -107,5 +133,5 @@ Check ($after.profile -eq $profile -and $after.document_path -eq $book -and $aft
 Check ((Get-Content -LiteralPath $book -Raw) -eq 'Synthetic user work; never overwrite.') 'User book changed.'
 Check ((Get-Content -LiteralPath (Join-Path $profile 'sentinel.txt') -Raw) -eq 'Synthetic existing settings; never overwrite.') 'Profile changed.'
 Check (Test-Path -LiteralPath ($manifest + '.before-update')) 'Rollback pointer is missing.'
-Write-Output 'Updater tests passed: source/size/digest/path and exact-CI guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
+Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

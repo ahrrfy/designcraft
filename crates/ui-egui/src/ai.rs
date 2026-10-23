@@ -445,6 +445,10 @@ pub struct AiUiState {
     print_save_path: String,
     ollama_executable: String,
     pick_ollama: bool,
+    open_document_path: String,
+    pick_target_document: bool,
+    open_target_document_requested: bool,
+    expand_advanced_settings: Option<bool>,
 }
 impl std::fmt::Debug for AiUiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -525,6 +529,10 @@ impl Default for AiUiState {
             print_save_path: String::new(),
             ollama_executable: String::new(),
             pick_ollama: false,
+            open_document_path: String::new(),
+            pick_target_document: false,
+            open_target_document_requested: false,
+            expand_advanced_settings: None,
         }
     }
 }
@@ -688,7 +696,7 @@ impl AiUiState {
             prompt: self.prompt.clone(),
             settings: self.settings.clone(),
             auto_select_skills: self.automatic_skills,
-            skill_ids: if self.automatic_skills { Vec::new() } else { self.selected_skills.iter().cloned().collect() },
+            skill_ids: self.selected_skills.iter().cloned().collect(),
             target: if self.new_document {
                 TaskTarget::NewA4 { pages: self.pages }
             } else if self.continue_book {
@@ -968,6 +976,164 @@ impl AiUiState {
             format!("Phase: {phase} · {timer}")
         }
     }
+
+    pub(crate) fn active_diagnostic_alert(&self) -> Option<DiagnosticAlert> {
+        let raw_error = if !self.error.is_empty() {
+            self.error.trim()
+        } else if (self.snapshot.stage == "failed" || self.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "failed"))
+            && !self.snapshot.message.trim().is_empty()
+        {
+            self.snapshot.message.trim()
+        } else {
+            return None;
+        };
+        if raw_error.is_empty() {
+            return None;
+        }
+        Some(classify_diagnostic_alert(raw_error))
+    }
+
+    pub(crate) fn clear_failure_alert(&mut self) {
+        self.error.clear();
+        if self.snapshot.stage == "failed" {
+            self.snapshot.stage = "idle".into();
+            self.snapshot.message.clear();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiagnosticAlertKind {
+    ContextLimit,
+    MissingCredential,
+    RequestBudget,
+    TokenBudget,
+    CostBudget,
+    InvalidModel,
+    PageCountMismatch,
+    LayoutPreflight,
+    ConnectionOrRateLimit,
+    General,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiagnosticAlert {
+    pub raw_error: String,
+    pub kind: DiagnosticAlertKind,
+    pub title_ar: &'static str,
+    pub title_en: &'static str,
+    pub cause_ar: &'static str,
+    pub cause_en: &'static str,
+    pub solution_ar: &'static str,
+    pub solution_en: &'static str,
+}
+
+pub(crate) fn classify_diagnostic_alert(raw_error: &str) -> DiagnosticAlert {
+    let lower = raw_error.to_ascii_lowercase();
+    let has = |terms: &[&str]| terms.iter().any(|term| lower.contains(term) || raw_error.contains(term));
+    let (kind, title_ar, title_en, cause_ar, cause_en, solution_ar, solution_en) =
+        if has(&["exceeds its byte limit", "context limit", "64-kib", "bounded context limit", "size overflow"]) {
+            (
+                DiagnosticAlertKind::ContextLimit,
+                "تنبيه سعة السياق — تجاوز حجم سياق المهارات أو المراجع",
+                "AI Context Capacity Alert — Skill or Reference Context Limit Exceeded",
+                "تجاوز حجم إرشادات المهارات أو المراجع المدمجة الحد الأقصى المسموح به للطلب الواحد.",
+                "The combined size of active skill instructions or references exceeded the per-request byte limit.",
+                "اضغط على (تفعيل الدمج الذكي للمهارات) لضغط المراجع المشتركة تلقائياً أو قلل المهارات المحددة يدوياً ثم أعد المحاولة.",
+                "Click 'Enable Smart Skill Compaction' to deduplicate shared references automatically or reduce manually pinned skills, then retry.",
+            )
+        } else if has(&["credential", "api key", "api_key", "no key", "unauthorized", "unauthenticated", "401", "403", "invalid key"]) {
+            (
+                DiagnosticAlertKind::MissingCredential,
+                "تنبيه المصادقة — مفتاح المزود (API Key) مفقود أو غير صالح",
+                "Authentication Alert — Provider API Key Missing or Unauthorized",
+                "لم يتم العثور على مفتاح API صالح للمزود المحدد أو أن المفتاح الحالي منتهي الصلاحية.",
+                "No valid API key was found for the selected provider, or the configured key was rejected.",
+                "اضغط على (فتح المفاتيح والمزودين) لإدخال مفتاح API صالح وحفظه، أو اختر مزوداً محلياً (Ollama).",
+                "Click 'Open Keys & Providers' to enter and save a valid API key, or switch to a local provider (Ollama).",
+            )
+        } else if has(&["request limit", "max_requests", "request budget", "request allowance", "requests exhausted", "request ceiling"]) {
+            (
+                DiagnosticAlertKind::RequestBudget,
+                "تنبيه ميزانية الطلبات — وصلت المهمة إلى سقف عدد الطلبات",
+                "Request Budget Alert — Task Reached Request Allowance Ceiling",
+                "عدد الطلبات المسموح به في ميزانية المهمة أقل من العدد المطلوب لإكمال صفحات المراجعة أو الكتاب.",
+                "The configured request allowance in the task budget is lower than what is needed to complete the review group or book.",
+                "اضغط على (رفع حصة الطلبات تلقائياً) لضبط السقف بما يناسب صفحات الكتاب ثم اضغط إنتاج أو إعادة المحاولة.",
+                "Click 'Raise Request Allowance' to match your review group or book pages, then click Produce or Retry.",
+            )
+        } else if has(&["token limit", "token_limit", "token budget", "max_output_tokens", "input budget", "tokens exceeded"]) {
+            (
+                DiagnosticAlertKind::TokenBudget,
+                "تنبيه ميزانية الرموز (Tokens) — تجاوز سقف الرموز المسموح",
+                "Token Budget Alert — Token Reservation Exceeded Configured Limit",
+                "حجم الإدخال أو الإخراج المتوقع للمهمة يتجاوز سقف الرموز (Tokens) المحدد في الإعدادات المتقدمة.",
+                "The estimated input or output tokens for this batch exceed the configured token limit in Advanced settings.",
+                "اضغط على (رفع سقف الرموز تلقائياً) لزيادة ميزانية الرموز أو قلل عدد الصفحات لكل مراجعة.",
+                "Click 'Raise Token Limit' to increase the token budget, or reduce Pages per review.",
+            )
+        } else if has(&["cost", "max_cost_usd", "price", "rates"]) {
+            (
+                DiagnosticAlertKind::CostBudget,
+                "تنبيه سقف التكلفة — يلزم مراجعة سقف الكلفة أو أسعار المزود",
+                "Cost Ceiling Alert — Cost Limit Reached or Provider Rates Unconfirmed",
+                "وصلت التكلفة التقديرية إلى السقف المحدد أو لم يتم تأكيد أسعار المزود في الإعدادات المتقدمة.",
+                "Estimated task cost reached the configured ceiling, or provider token rates have not been confirmed.",
+                "راجع سقف التكلفة وأسعار المزود في قسم الإعدادات المتقدمة ثم أعد المحاولة.",
+                "Review the cost ceiling and confirm provider rates in Advanced settings, then retry.",
+            )
+        } else if has(&["image/media model", "non-text", "choose a text model", "missing model"]) {
+            (
+                DiagnosticAlertKind::InvalidModel,
+                "تنبيه اختيار النموذج — النموذج المحدد لا يدعم توليد النصوص",
+                "Model Selection Alert — Selected Model Does Not Support Text Planning",
+                "النموذج المختار في خانة النص مخصص للصور أو الوسائط أو أن حقل النموذج فارغ.",
+                "The model in the text slot is an image/media model or no text model name was entered.",
+                "اختر نموذج نص قياسي (مثل gemini-2.5-flash أو gpt-4.1-mini) في حقل النموذج أعلى اللوحة.",
+                "Select a standard text generation model (such as gemini-2.5-flash) in the Model field at the top.",
+            )
+        } else if has(&["page count", "pages require reviewed batches", "explicit page", "script defines"]) {
+            (
+                DiagnosticAlertKind::PageCountMismatch,
+                "تنبيه إعداد الصفحات — تعارض في عدد الصفحات أو نظام الدفعات",
+                "Page Configuration Alert — Page Count or Batch Review Mismatch",
+                "يوجد اختلاف بين عدد الصفحات المطلوب في التعليمات وعدد صفحات المستند أو إعداد المراجعة.",
+                "There is a mismatch between the prompt's page count and the target document or batch review setting.",
+                "طابق عدد صفحات المستند مع التعليمات وتأكد من ضبط (الصفحات لكل مراجعة) على ١ أو أكثر.",
+                "Match the document page count to the prompt and ensure Pages per review is set to at least 1.",
+            )
+        } else if has(&["overflow", "exceeds frame", "saferect", "safe area", "preflight", "repeated body layout"]) {
+            (
+                DiagnosticAlertKind::LayoutPreflight,
+                "تنبيه الفحص المطبعي والتخطيط — عنصر خارج الهوامش أو نص فائض",
+                "Print Preflight & Layout Alert — Text Overflow or Safe-Area Violation",
+                "رفض الفحص الهندسي المسبق الخطة المولدة بسبب نص فائض أو إطار يتجاوز هوامش الأمان.",
+                "Native print preflight rejected the generated layout due to text frame overflow or safe-area margin bounds.",
+                "أعد المحاولة ليقوم المحرك بإعادة توزيع الإطارات تلقائياً داخل منطقة الأمان، أو اختر نمط تصميم معتمد.",
+                "Retry the group so the engine reflows frames within the safe area, or select an approved design style.",
+            )
+        } else if has(&["connect", "timeout", "timed out", "11434", "8188", "rate limit", "429", "502", "503"]) {
+            (
+                DiagnosticAlertKind::ConnectionOrRateLimit,
+                "تنبيه الاتصال بالمزود — تعذّر الوصول للخادم أو تجاوز الحد الزمني",
+                "Provider Connection Alert — Endpoint Unreachable or Rate Limited",
+                "تعذّر الاتصال بخادم الذكاء الاصطناعي أو تم إيقاف الطلب مؤقتاً بسبب ضغط الطلبات (Rate Limit).",
+                "Could not connect to the AI provider endpoint, or the provider temporarily rate-limited the request.",
+                "تحقق من اتصال الإنترنت أو تشغيل الخادم المحلي (Ollama / ComfyUI) ثم أعد المحاولة بعد لحظات.",
+                "Check your network connection or local server status (Ollama / ComfyUI), then retry.",
+            )
+        } else {
+            (
+                DiagnosticAlertKind::General,
+                "تنبيه الذكاء الاصطناعي — تعذّر إكمال المهمة",
+                "AI Production Alert — Task Could Not Complete",
+                "توقفت عملية الإنتاج بسبب قيد فني أو تعذّر التحقق من مخرجات الطلب الحالي.",
+                "Production stopped due to a technical validation constraint or provider execution error.",
+                "راجع التفاصيل الفنية أدناه واضبط الإعدادات المقترحة ثم أعد المحاولة.",
+                "Review the technical detail below, apply the suggested adjustment, and retry.",
+            )
+        };
+    DiagnosticAlert { raw_error: raw_error.to_owned(), kind, title_ar, title_en, cause_ar, cause_en, solution_ar, solution_en }
 }
 
 /// Typed UI path shared by all panel buttons. Credentials move directly to the host without JSON,
@@ -1025,6 +1191,9 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
     let snapshot = host(&mut app.session, request);
     let result = serde_json::to_value(&snapshot).map_err(|e| e.to_string());
     app.ui.ai.accept(snapshot);
+    if let Some(alert) = app.ui.ai.active_diagnostic_alert() {
+        app.ui.status = format!("⚠ {} | {}", alert.title_ar, alert.title_en);
+    }
     if let Some(request) = production_request {
         app.ui.ai.load_production_request(&request);
     }
@@ -1343,6 +1512,44 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         app.ui.ai.ollama_executable = path;
         ctx.request_repaint();
     }
+    if std::mem::take(&mut app.ui.ai.pick_target_document) {
+        if app.services.pick_open.is_some() {
+            if let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("open")) {
+                app.ui.ai.open_document_path = path.clone();
+                match open_target_document_path(app, &path) {
+                    Ok(_) => {
+                        app.ui.ai.new_document = false;
+                        app.ui.ai.continue_book = false;
+                        app.ui.ai.restored_target_unconfirmed = false;
+                        app.ui.ai.error.clear();
+                        ctx.request_repaint();
+                    }
+                    Err(error) => app.ui.ai.error = error,
+                }
+            }
+        } else if let Err(error) = app.pick_and_open("open") {
+            app.ui.ai.error = error;
+        }
+        requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
+    }
+    if std::mem::take(&mut app.ui.ai.open_target_document_requested) {
+        let path = app.ui.ai.open_document_path.trim().to_string();
+        if path.is_empty() {
+            app.ui.ai.error = text(a, "Enter a document path to open.", "أدخل مسار مستند لفتحه.").into();
+        } else {
+            match open_target_document_path(app, &path) {
+                Ok(_) => {
+                    app.ui.ai.new_document = false;
+                    app.ui.ai.continue_book = false;
+                    app.ui.ai.restored_target_unconfirmed = false;
+                    app.ui.ai.error.clear();
+                    ctx.request_repaint();
+                }
+                Err(error) => app.ui.ai.error = error,
+            }
+        }
+        requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
+    }
     if !requests.is_empty() {
         ctx.request_repaint();
     }
@@ -1355,6 +1562,49 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     load_preview(app, ctx);
     load_proof_preview(app, ctx);
     load_companion_proof(app, ctx);
+}
+
+fn open_target_document_path(app: &mut DesignApp, path: &str) -> Result<serde_json::Value, String> {
+    let lower = path.to_ascii_lowercase();
+    let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("Imported");
+    if [".docx", ".rtf", ".txt", ".md", ".xlsx"].iter().any(|ext| lower.ends_with(ext)) {
+        let created = app.run("file.new", serde_json::json!({"preset": "A4", "pages": 1, "facingPages": false, "title": stem}))?;
+        match app.open_file("file.place", serde_json::json!({"path": path, "autoflow": true})) {
+            Ok(v) => Ok(v),
+            Err(error) => {
+                if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
+                    let _ = app.run("file.close", serde_json::json!({"index": index}));
+                }
+                Err(error)
+            }
+        }
+    } else if lower.ends_with(".pdf") {
+        let bytes = if let Some(read) = app.services.read.as_mut() { read(path) } else { designcraft_engine::io::read_file(path) };
+        let bytes = match bytes {
+            Ok(b) if designcraft_render::is_pdf(&b) => b,
+            Ok(_) => return app.open_file("file.open", serde_json::json!({"path": path})),
+            Err(error) => return Err(error),
+        };
+        let pages = designcraft_render::pdf_page_count(&bytes).unwrap_or(1).clamp(1, 500);
+        let (w, h) = designcraft_render::pdf_page_size(&bytes, 0).unwrap_or((595.27559, 841.88976));
+        let created = app.run("file.new", serde_json::json!({"width": w, "height": h, "pages": pages, "facingPages": false, "title": stem}))?;
+        let mut last = serde_json::Value::Null;
+        for page in 1..=pages {
+            match app.open_file("file.place", serde_json::json!({"path": path, "pdfPage": page, "spread": page - 1, "x": 0.0, "y": 0.0, "width": w}))
+            {
+                Ok(v) => last = v,
+                Err(error) => {
+                    if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
+                        let _ = app.run("file.close", serde_json::json!({"index": index}));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(last)
+    } else {
+        app.open_file("file.open", serde_json::json!({"path": path}))
+    }
 }
 
 fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, requests: &mut Vec<AiRequest>) {
@@ -1749,6 +1999,95 @@ fn production_recovery(
     }
 }
 
+fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], activate_document: Option<usize>) {
+    let Some(alert) = s.active_diagnostic_alert() else {
+        return;
+    };
+    let tokens = crate::theme::Tokens::get(ui.ctx());
+    let fill = tokens.panel_darker;
+    let title_color = ui.visuals().error_fg_color;
+    let accent_color = ui.visuals().warn_fg_color;
+    let border = egui::Stroke::new(2.0, title_color);
+    let show_ar = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
+    egui::Frame::group(ui.style()).fill(fill).stroke(border).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
+        ui,
+        |ui| {
+            if show_ar {
+                rtl::label(ui, egui::RichText::new(format!("⚠ {}", alert.title_ar)).color(title_color).strong().size(14.0));
+            }
+            rtl::label(ui, egui::RichText::new(format!("⚠ {}", alert.title_en)).color(title_color).strong().size(13.5));
+            ui.add_space(4.0);
+            let cause_text =
+                if show_ar { format!("السبب / Cause: {} — {}", alert.cause_ar, alert.cause_en) } else { format!("Cause: {}", alert.cause_en) };
+            rtl::label(ui, egui::RichText::new(cause_text).color(accent_color).strong());
+            let solution_text = if show_ar {
+                format!("الحل المقترح / Solution: {} — {}", alert.solution_ar, alert.solution_en)
+            } else {
+                format!("Solution: {}", alert.solution_en)
+            };
+            rtl::label(ui, solution_text);
+            let detail_text = if show_ar {
+                format!("التفاصيل الفنية / Technical detail: {}", alert.raw_error)
+            } else {
+                format!("Technical detail: {}", alert.raw_error)
+            };
+            if show_ar {
+                rtl::label(ui, detail_text);
+            } else {
+                ui.label(detail_text);
+            }
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                match alert.kind {
+                    DiagnosticAlertKind::ContextLimit => {
+                        if ui.button(rtl::widget(ui, text(a, "Enable Smart Skill Compaction", "تفعيل الدمج الذكي للمهارات"))).clicked()
+                        {
+                            s.automatic_skills = true;
+                            s.selected_skills.clear();
+                            s.clear_failure_alert();
+                        }
+                    }
+                    DiagnosticAlertKind::CostBudget => {
+                        if ui.button(rtl::widget(ui, text(a, "Open Budget Settings", "فتح إعدادات التكلفة والميزانية"))).clicked()
+                        {
+                            s.tab = 0;
+                            s.expand_advanced_settings = Some(true);
+                        }
+                    }
+                    DiagnosticAlertKind::MissingCredential | DiagnosticAlertKind::InvalidModel | DiagnosticAlertKind::ConnectionOrRateLimit => {
+                        if ui.button(rtl::widget(ui, text(a, "Open Keys & Providers", "فتح المفاتيح والمزودين"))).clicked() {
+                            s.tab = 3;
+                        }
+                    }
+                    DiagnosticAlertKind::RequestBudget => {
+                        if ui.button(rtl::widget(ui, text(a, "Raise Request Allowance", "رفع حصة الطلبات تلقائياً"))).clicked() {
+                            let target = s
+                                .request_estimate(documents, activate_document)
+                                .map(|est| est.book_allowance.max(est.allowance()))
+                                .unwrap_or(32)
+                                .max(s.settings.budget.max_requests.saturating_mul(2))
+                                .min(MAX_REQUEST_ALLOWANCE);
+                            s.settings.budget.max_requests = target;
+                            s.clear_failure_alert();
+                        }
+                    }
+                    DiagnosticAlertKind::TokenBudget => {
+                        if ui.button(rtl::widget(ui, text(a, "Raise Token Limit", "رفع سقف الرموز تلقائياً"))).clicked() {
+                            s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).clamp(256_000, 4_000_000);
+                            s.clear_failure_alert();
+                        }
+                    }
+                    DiagnosticAlertKind::PageCountMismatch | DiagnosticAlertKind::LayoutPreflight | DiagnosticAlertKind::General => {}
+                }
+                if ui.button(rtl::widget(ui, text(a, "Dismiss Alert", "إخفاء التنبيه"))).clicked() {
+                    s.clear_failure_alert();
+                }
+            });
+        },
+    );
+    ui.add_space(6.0);
+}
+
 fn production(
     ui: &mut egui::Ui,
     s: &mut AiUiState,
@@ -1758,6 +2097,7 @@ fn production(
     activate_document: &mut Option<usize>,
     requests: &mut Vec<AiRequest>,
 ) {
+    render_diagnostic_alert_banner(ui, s, a, documents, *activate_document);
     production_recovery(ui, s, a, available, documents, activate_document, requests);
     if (s.proof_display.is_some() && s.show_saved_proof) || s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
         if s.proof_key.is_none() {
@@ -1911,6 +2251,9 @@ fn production(
                 s.continue_book = true;
                 s.restored_target_unconfirmed = false;
             }
+            if button(ui, a, "Open file to edit…", "فتح ملف للتعديل…") {
+                s.pick_target_document = true;
+            }
             if s.new_document {
                 ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
             }
@@ -1940,6 +2283,21 @@ fn production(
                 if let Some(selected) = selected {
                     rtl::label(ui, format!("{} {}", selected.pages, text(a, "pages", "صفحة")));
                     rtl::label(ui, selected.page_map_line(a));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                label(
+                    ui,
+                    a,
+                    "Document file (.designcraft, .idml, .indd, .indt, .pdf, .docx, .rtf, .txt, .md, .xlsx)",
+                    "ملف المستند (.designcraft أو .idml أو .indd أو .indt أو .pdf أو .docx أو .rtf أو .txt أو .md أو .xlsx)",
+                );
+                ui.add(egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0));
+                if button(ui, a, "Open path", "فتح المسار") {
+                    s.open_target_document_requested = true;
+                }
+                if button(ui, a, "Browse…", "استعراض…") {
+                    s.pick_target_document = true;
                 }
             });
             if let Some(selected) = selected
@@ -2179,15 +2537,27 @@ fn production(
                 label(ui,a,"Suggested family sequence only; refresh after changing the request. Educator review is required.",
                     "تسلسل عائلات مقترح؛ أعد المعاينة بعد تغيير الطلب. يلزم فحص تربوي بشري.");
                 egui::ScrollArea::vertical().id_salt("ai_curriculum_summary").max_height(100.0).show(ui,|ui| {
+                    let has_ar_font = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
                     for page in preview["blueprint"]["scoped_page_plan"].as_array().into_iter().flatten().take(32) {
                         if let Some(number)=page["page"].as_u64() {
-                            rtl::label(ui,format!("{} {}: {}",text(a,"Page","الصفحة"),number.saturating_add(1),page["recommended_family"].as_str().unwrap_or("")));
+                            let archetype = if has_ar_font {
+                                page["display_archetype"].as_str().or_else(|| page["recommended_family"].as_str()).unwrap_or("")
+                            } else {
+                                page["recommended_family"].as_str().unwrap_or("")
+                            };
+                            let lesson = if has_ar_font { page["chapter_and_lesson"].as_str().unwrap_or("") } else { "" };
+                            let line = if lesson.is_empty() {
+                                format!("{} {}: {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype)
+                            } else {
+                                format!("{} {}: {} — {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype, lesson)
+                            };
+                            rtl::label(ui, line);
                         }
                     }
                 });
             });
         }
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).show(ui, |ui| {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).open(s.expand_advanced_settings.take()).show(ui, |ui| {
             budgets(ui, s, a);
             ui.separator();
             ui.horizontal_wrapped(|ui| {
@@ -2203,7 +2573,28 @@ fn production(
                 image_inspection_setting(ui, s, a);
             }
             ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
-            if !s.automatic_skills {
+            if s.automatic_skills {
+                egui::CollapsingHeader::new(rtl::widget(
+                    ui,
+                    text(
+                        a,
+                        "Pin additional skills alongside automatic selection",
+                        "تثبيت مهارات إضافية مع الاختيار التلقائي",
+                    ),
+                ))
+                .show(ui, |ui| {
+                    for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible && c.design_profile.is_none()) {
+                        let mut selected = s.selected_skills.contains(&card.id);
+                        if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
+                            if selected {
+                                s.selected_skills.insert(card.id.clone());
+                            } else {
+                                s.selected_skills.remove(&card.id);
+                            }
+                        }
+                    }
+                });
+            } else {
                 for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
                     let mut selected = s.selected_skills.contains(&card.id);
                     if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
@@ -4965,5 +5356,122 @@ mod tests {
         assert_eq!(panel.state().0.pages, 48);
         assert!(!panel.get_by_label("Produce").accesskit_node().is_disabled());
         assert!(panel.state().1.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_alert_banner_displays_cause_solution_and_executes_recovery_actions() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut state = AiUiState {
+            automatic_skills: false,
+            selected_skills: std::collections::BTreeSet::from([
+                "skill-1".to_string(),
+                "skill-2".to_string(),
+                "skill-3".to_string(),
+                "skill-4".to_string(),
+                "skill-5".to_string(),
+            ]),
+            ..Default::default()
+        };
+        state.snapshot.stage = "failed".into();
+        state.snapshot.message = "AI context exceeds its byte limit".into();
+
+        let alert = state.active_diagnostic_alert().expect("context limit alert should be active");
+        assert_eq!(alert.kind, DiagnosticAlertKind::ContextLimit);
+
+        let documents = vec![OpenDocument {
+            index: 0,
+            uid: 1,
+            path: None,
+            title: "KG2-Islamic".into(),
+            facing_pages: true,
+            right_to_left_binding: true,
+            pages: 8,
+            remaining_pages: 8,
+            continuable: false,
+            filled_ranges: Vec::new(),
+            blank_ranges: vec![[1, 8]],
+        }];
+
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+            move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
+            (state, Vec::new(), Some(0)),
+        );
+        panel.run_steps(3);
+        assert!(panel.query_by_label("⚠ AI Context Capacity Alert — Skill or Reference Context Limit Exceeded").is_some());
+        panel.get_by_label("Enable Smart Skill Compaction").click();
+        panel.run_steps(3);
+        assert!(panel.state().0.automatic_skills);
+        assert!(panel.state().0.selected_skills.len() <= 2);
+        assert!(panel.state().0.active_diagnostic_alert().is_none());
+
+        panel.state_mut().0.snapshot.stage = "failed".into();
+        panel.state_mut().0.snapshot.message = "Provider request failed: 401 Unauthorized API key".into();
+        panel.run_steps(3);
+        assert!(panel.query_by_label("⚠ Authentication Alert — Provider API Key Missing or Unauthorized").is_some());
+        panel.get_by_label("Open Keys & Providers").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.tab, 3);
+    }
+
+    #[test]
+    fn production_panel_open_file_to_edit_switches_target_to_current_document() {
+        use egui_kittest::kittest::Queryable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("existing-poster.designcraft");
+        let txt_path = dir.path().join("imported-notes.txt");
+        std::fs::write(&txt_path, "Imported heading line\nSecond body paragraph for editing.").unwrap();
+        let mut author = DesignApp::new(
+            Session::new(),
+            Services { write: Some(Box::new(|path, bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()))), ..Default::default() },
+        );
+        author.run("file.new", serde_json::json!({"preset":"A4","pages":2})).unwrap();
+        author
+            .run("frame.create", serde_json::json!({"spread":0,"rect":[72.0,72.0,320.0,160.0],"content":"text","text":"Existing Poster Heading"}))
+            .unwrap();
+        author.run("file.save", serde_json::json!({"path": file_path.to_string_lossy()})).unwrap();
+
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services {
+                read: Some(Box::new(|path| std::fs::read(path).map_err(|e| e.to_string()))),
+                pick_open: Some(Box::new(|_| None)),
+                ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })),
+                ..Default::default()
+            },
+        );
+        app.ui.ai.open = true;
+        app.ui.ai.new_document = true;
+        app.ui.ai.continue_book = true;
+        app.ui.ai.open_document_path = file_path.to_string_lossy().into_owned();
+        app.ui.ai.open_target_document_requested = true;
+
+        let mut harness =
+            egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 900.0)).build_ui_state(|ui, app: &mut DesignApp| show(app, ui.ctx()), app);
+        harness.run_steps(3);
+
+        assert!(!harness.state().ui.ai.new_document, "opening a file to edit switches target mode to CurrentDocument");
+        assert!(!harness.state().ui.ai.continue_book, "opening a file to edit clears continue_book");
+        assert!(harness.state().ui.ai.error.is_empty(), "error={}", harness.state().ui.ai.error);
+        assert_eq!(harness.state().session.active().map(|d| d.doc.page_count()), Some(2));
+        assert!(harness.query_by_label("Open path").is_some());
+        assert!(harness.query_by_label("Browse…").is_some());
+
+        // Cancelling the file picker must not flip target mode when a document is already open.
+        harness.state_mut().ui.ai.new_document = true;
+        harness.state_mut().ui.ai.pick_target_document = true;
+        harness.run_steps(3);
+        assert!(harness.state().ui.ai.new_document, "cancelled picker must preserve new_document mode");
+
+        // Opening a text file imports and autoflows it into a new editable document and switches to CurrentDocument.
+        harness.state_mut().ui.ai.continue_book = true;
+        harness.state_mut().ui.ai.open_document_path = txt_path.to_string_lossy().into_owned();
+        harness.state_mut().ui.ai.open_target_document_requested = true;
+        harness.run_steps(3);
+        assert!(!harness.state().ui.ai.new_document);
+        assert!(!harness.state().ui.ai.continue_book);
+        assert!(harness.state().ui.ai.error.is_empty(), "error={}", harness.state().ui.ai.error);
+        assert_eq!(harness.state().session.active().map(|d| d.doc.title.as_str()), Some("imported-notes"));
     }
 }

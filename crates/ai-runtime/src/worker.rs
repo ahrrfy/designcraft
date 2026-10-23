@@ -46,7 +46,7 @@ pub(crate) struct BatchScope {
 enum GeometryCheck<'a> {
     Engine,
     Profile(&'a designcraft_ai_types::DesignProfile),
-    OpenedDocument,
+    OpenedDocument { allow_geometry_edits: bool },
 }
 
 // Each job deliberately owns an isolated document/settings snapshot for its thread.
@@ -327,6 +327,7 @@ impl Runner<'_> {
             return Ok(None);
         };
         let valid = (|| {
+            crate::native_layout::normalize_command_aliases(&mut plan);
             validate_actions(&plan.commands, catalog, OutputMode::NativeOnly)?;
             prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
             if let Some(scope) = scope {
@@ -665,6 +666,16 @@ impl Runner<'_> {
             let mut template_context = context;
             let object = template_context.as_object_mut().ok_or("Invalid template production context")?;
             object.insert("selected_skill_guidance".into(), json!(guidance));
+            object.insert(
+                "skill_tool_mastermind".into(),
+                crate::template_plan::skill_tool_mastermind_brief(
+                    &request.prompt,
+                    &skills,
+                    scope,
+                    total_pages,
+                    Some(crate::runtime::book_binding(&request.settings, &request.prompt)),
+                ),
+            );
             if scope.count > crate::template_plan::capacity(style, request.settings.output_mode)? {
                 if !review_group {
                     return Err("Template pages exceed one internal native plan; use a human-reviewed book batch".into());
@@ -709,8 +720,9 @@ impl Runner<'_> {
             || unbound_math_request(&request.prompt, skills)
             || continuation_style_geometry_differs(request, base, skills);
         let geometry_profile = if opened_document || adaptive_layout { None } else { profile };
+        let allow_geometry_edits = current_document && scope.is_none() && prompt_requests_document_geometry_edit(&request.prompt);
         let geometry_check = if opened_document || adaptive_layout {
-            GeometryCheck::OpenedDocument
+            GeometryCheck::OpenedDocument { allow_geometry_edits }
         } else {
             profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
         };
@@ -737,11 +749,32 @@ impl Runner<'_> {
         if crate::script_contract::parse(&request.prompt)?.is_some() {
             system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten/twenty-frame: {page,rect,frame:five|ten|twenty,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
         }
+        if current_document {
+            system.push_str("\nEXISTING DOCUMENT EDITING CONTRACT: document.objects lists the opened document's existing native items with their numeric id, spread, page, bounds, content (text|graphic|group|unassigned), shape, story (numeric StoryId for text frames), text preview, fillSwatch, fillTint, strokeSwatch, strokeWeight, locked flag, parentGroup, typography, and tables (numeric table ID, rows, cols, cells). When the user asks to modify, restyle, translate, replace, align, transform, or delete existing elements in the opened document, target those existing items directly by their numeric id (e.g. object.fill, object.stroke, object.gradient, object.cornerOptions, object.opacity, object.dropShadow, object.feather, object.gradientFeather, object.effects, object.textWrap, object.arrange, object.align, object.distribute, object.pathfinder, object.makeCompoundPath, object.releaseCompoundPath, object.fit, object.ungroup, edit.stepAndRepeat, transform.set, transform.move, transform.rotate, transform.scale, transform.flip, style.object.apply, edit.clear), target existing text stories by their numeric story ID (story.setText, story.setDirection, text.select + type.char/type.para/style.paragraph.apply/style.character.apply, list.define, text.thread/text.unthread, or find.change), and target existing tables by their numeric story + table IDs (table.setCell, table.insertRow, table.insertColumn, table.deleteRow, table.deleteColumn, table.merge, table.unmerge, table.setRowHeight, table.setColumnWidth, table.distributeColumns, table.distributeRows, table.options, style.table.apply, style.cell.apply). If the user explicitly asks to add pages or adjust margins/page setup, use layout.pages.insert, layout.marginsAndColumns, or layout.documentSetup. To replace or populate an existing graphic frame with a generated illustration in NativeWithImages mode, emit an images[] entry whose page (0-based spread index) and rect match the existing graphic frame's spread and bounds; the host places the generated image directly into that frame. Only create new frames when adding new design elements or replacing deleted ones; never stack duplicate text or graphic frames on top of unchanged existing frames.");
+        }
         let scoped_prompt =
             scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
         let mut document_context = context.clone();
         if opened_document || adaptive_layout {
             opened_document_geometry(&mut document_context, base)?;
+        }
+        if adaptive_layout
+            && serde_json::to_vec(&document_context).is_ok_and(|bytes| bytes.len() < MAX_PROMPT / 3)
+            && let Some(object) = document_context.as_object_mut()
+            && !object.contains_key("skill_tool_mastermind")
+        {
+            let eff_scope = scope.unwrap_or(BatchScope { start: 0, count: u32::try_from(base.doc.spreads.len()).unwrap_or(1).max(1) });
+            let total_pages = u32::try_from(base.doc.spreads.len()).unwrap_or(eff_scope.start.saturating_add(eff_scope.count)).max(1);
+            object.insert(
+                "skill_tool_mastermind".into(),
+                crate::template_plan::skill_tool_mastermind_brief(
+                    &request.prompt,
+                    skills,
+                    eff_scope,
+                    total_pages,
+                    Some(crate::runtime::book_binding(&request.settings, &request.prompt)),
+                ),
+            );
         }
         if explicit_script && let Some(scope) = scope {
             document_context
@@ -790,7 +823,15 @@ impl Runner<'_> {
             if self.planning_only {
                 return Ok(plan);
             }
-            let expanded = self.expand_images_with_geometry(plan, &request.settings, &mut BTreeMap::new(), &mut 0, profile, geometry_profile)?;
+            let expanded = self.expand_images_with_geometry(
+                plan,
+                &request.settings,
+                &mut BTreeMap::new(),
+                &mut 0,
+                profile,
+                geometry_profile,
+                opened_document.then_some(base),
+            )?;
             simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check)?;
             self.audit_print(&expanded, base, prefs)?;
             return Ok(expanded);
@@ -882,6 +923,7 @@ impl Runner<'_> {
                             &mut image_bytes,
                             profile,
                             geometry_profile,
+                            opened_document.then_some(base),
                         )?;
                         self.progress("Validating commands and print preflight on a private document", 0.85)?;
                         match simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check) {
@@ -962,8 +1004,11 @@ impl Runner<'_> {
             || unbound_math_request(&request.prompt, skills)
             || continuation_style_geometry_differs(request, base, skills);
         let geometry_profile = if opened || adaptive { None } else { profile };
-        let geometry_check =
-            if opened || adaptive { GeometryCheck::OpenedDocument } else { profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile) };
+        let geometry_check = if opened || adaptive {
+            GeometryCheck::OpenedDocument { allow_geometry_edits: false }
+        } else {
+            profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
+        };
         let capacity =
             if crate::script_contract::parse(&request.prompt)?.is_some() || self.print.is_some() || unbound_math_request(&request.prompt, skills) {
                 1
@@ -1032,7 +1077,7 @@ impl Runner<'_> {
         plan_bytes = 0;
         for (plan, scope) in plans {
             check_cancel(self.cancel)?;
-            let plan = self.expand_images_with_geometry(plan, &request.settings, &mut cached, &mut cached_bytes, profile, geometry_profile)?;
+            let plan = self.expand_images_with_geometry(plan, &request.settings, &mut cached, &mut cached_bytes, profile, geometry_profile, None)?;
             let expanded_bytes = serde_json::to_vec(&plan).map_err(|error| error.to_string())?.len();
             plan_bytes = plan_bytes
                 .checked_add(expanded_bytes)
@@ -1067,8 +1112,9 @@ impl Runner<'_> {
         bytes_used: &mut usize,
         profile: Option<&designcraft_ai_types::DesignProfile>,
     ) -> Result<ProductionPlan, String> {
-        self.expand_images_with_geometry(plan, settings, cache, bytes_used, profile, profile)
+        self.expand_images_with_geometry(plan, settings, cache, bytes_used, profile, profile, None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn expand_images_with_geometry(
         &mut self,
         mut plan: ProductionPlan,
@@ -1077,6 +1123,7 @@ impl Runner<'_> {
         bytes_used: &mut usize,
         style_profile: Option<&designcraft_ai_types::DesignProfile>,
         profile: Option<&designcraft_ai_types::DesignProfile>,
+        existing_base: Option<&DocState>,
     ) -> Result<ProductionPlan, String> {
         if plan.images.is_empty() {
             return Ok(plan);
@@ -1102,6 +1149,7 @@ impl Runner<'_> {
         project_image_requests(&mut projected, &plan, settings, profile, &style_context, cache)?;
         let authored_count = plan.commands.len();
         let mut filled_frames = BTreeSet::new();
+        let mut filled_existing_frames = BTreeSet::new();
         let mut placed_bytes = 0usize;
         for placement in &plan.images {
             self.progress(&format!("Generating illustration for page {}", placement.page.saturating_add(1)), 0.55)?;
@@ -1235,22 +1283,30 @@ impl Runner<'_> {
                     });
                     continue;
                 }
-                // Fill an explicitly authored slot in place: new top-level frames would
-                // otherwise paint over the native dialogue/labels above its artwork.
+                // Fill an explicitly authored slot or matching existing graphic frame in place:
+                // new top-level frames would otherwise paint over the native dialogue/labels above its artwork.
                 let authored = plan.commands.get(..authored_count).ok_or("Authored image slots disappeared")?;
                 let slot = authored_image_frame(authored, placement.page, view_rect, &filled_frames);
                 let index = if let Some(index) = slot {
                     filled_frames.insert(index);
+                    plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
                     index
+                } else if let Some(existing_id) =
+                    existing_document_image_frame(existing_base, authored, placement.page, view_rect, &filled_existing_frames)
+                {
+                    filled_existing_frames.insert(existing_id);
+                    let place_index = plan.commands.len();
+                    plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":existing_id,"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
+                    place_index
                 } else {
                     let index = plan.commands.len();
                     plan.commands.push(EngineAction {
                         command: "frame.create".into(),
                         params: json!({"spread":placement.page,"rect":view_rect,"content":"graphic"}),
                     });
+                    plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
                     index
                 };
-                plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
                 if repeated {
                     unit_source = Some(index);
                     plan.commands.push(EngineAction {
@@ -1609,18 +1665,31 @@ fn project_image_requests(
 
 /// Repeated shared reference bodies are sent once, without dropping ownership or pins.
 pub(crate) fn compact_skill_guidance(skills: &[SkillSnapshot]) -> Result<String, String> {
-    compact_skill_guidance_limit(skills, 32 * 1024)
+    let limit = (32 * 1024usize).saturating_add(skills.len().saturating_sub(2).saturating_mul(16 * 1024)).min(128 * 1024);
+    compact_skill_guidance_limit(skills, limit)
 }
 
-fn compact_skill_guidance_limit(skills: &[SkillSnapshot], limit: usize) -> Result<String, String> {
+pub(crate) fn compact_skill_guidance_limit(skills: &[SkillSnapshot], limit: usize) -> Result<String, String> {
     let mut bodies: BTreeMap<String, &str> = BTreeMap::new();
     let mut entries = Vec::new();
     for skill in skills {
+        if skill.instructions.len() > 32 * 1024 {
+            return Err("AI context exceeds its byte limit".into());
+        }
+        let mut ref_bytes = 0usize;
+        let mut seen_digests = std::collections::BTreeSet::new();
         let mut references = BTreeMap::new();
         for (path, body) in &skill.references {
             let digest = format!("{:x}", Sha256::digest(body.as_bytes()));
             if bodies.get(&digest).is_some_and(|known| *known != body) {
                 return Err("Conflicting shared skill reference digest".into());
+            }
+            ref_bytes = ref_bytes.saturating_add(path.len());
+            if seen_digests.insert(digest.clone()) {
+                ref_bytes = ref_bytes.saturating_add(body.len());
+            }
+            if skill.instructions.len().saturating_add(ref_bytes) > 64 * 1024 {
+                return Err("AI context exceeds its byte limit".into());
             }
             bodies.entry(digest.clone()).or_insert(body);
             references.insert(path, digest);
@@ -1660,7 +1729,7 @@ fn continuation_style_geometry_differs(request: &TaskRequest, base: &DocState, s
 }
 
 fn unbound_math_request(brief: &str, skills: &[SkillSnapshot]) -> bool {
-    crate::template_plan::requires_adaptive_math(brief, skills)
+    crate::template_plan::requires_adaptive_mastermind(brief, skills)
 }
 fn generic_page_capacity(mode: OutputMode) -> u32 {
     match mode {
@@ -1693,6 +1762,66 @@ fn opened_document_geometry(context: &mut Value, state: &DocState) -> Result<(),
     object.insert("pageGeometryTruncated".into(), json!(state.doc.page_count() > pages.len()));
     object.insert("pageGeometry".into(), json!(pages));
     Ok(())
+}
+
+pub(crate) fn prompt_requests_document_geometry_edit(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "add page",
+        "add a page",
+        "add pages",
+        "insert page",
+        "insert pages",
+        "new page",
+        "extra page",
+        "more pages",
+        "margin",
+        "margins",
+        "page size",
+        "page setup",
+        "document setup",
+        "bleed",
+        "slug",
+        "facing pages",
+        "landscape",
+        "portrait",
+        "column",
+        "columns",
+        "أضف صفحة",
+        "اضف صفحة",
+        "إضافة صفحة",
+        "اضافة صفحة",
+        "إضافة صفحات",
+        "اضافة صفحات",
+        "صفحة جديدة",
+        "صفحات إضافية",
+        "صفحات اضافية",
+        "هوامش",
+        "الهامش",
+        "هامش",
+        "حجم الصفحة",
+        "مقاس الصفحة",
+        "إعداد المستند",
+        "اعداد المستند",
+        "أعمدة",
+        "اعمدة",
+    ];
+    PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn check_opened_document_geometry_with_policy(before: &DocState, after: &DocState, allow_geometry_edits: bool) -> Result<(), String> {
+    if allow_geometry_edits {
+        if after.doc.page_count() < before.doc.page_count() || after.doc.spreads.len() < before.doc.spreads.len() {
+            return Err("Opened document geometry edits cannot delete existing pages or spreads".into());
+        }
+        for (old, new) in before.doc.spreads.iter().zip(&after.doc.spreads) {
+            if new.pages.len() < old.pages.len() {
+                return Err("Opened document geometry edits cannot delete pages from existing spreads".into());
+            }
+        }
+        return Ok(());
+    }
+    check_opened_document_geometry(before, after)
 }
 
 fn check_opened_document_geometry(before: &DocState, after: &DocState) -> Result<(), String> {
@@ -2057,19 +2186,24 @@ fn production_system(
     adaptive_layout: bool,
 ) -> Result<String, String> {
     let native_catalog = compact_catalog(catalog)?;
-    let instructions = if adaptive_layout {
-        // Preserve every instruction, reference owner/hash and revision while
-        // sending a shared reference body once, as task admission already does.
-        let guidance: Value = serde_json::from_str(&compact_skill_guidance_limit(skills, 64 * 1024)?).map_err(|error| error.to_string())?;
+    let multi_limit = (64 * 1024usize).saturating_add(skills.len().saturating_sub(2).saturating_mul(16 * 1024)).min(160 * 1024);
+    let compact_instructions = || -> Result<String, String> {
+        let guidance: Value = serde_json::from_str(&compact_skill_guidance_limit(skills, multi_limit)?).map_err(|error| error.to_string())?;
         let profiles: Vec<_> = skills
             .iter()
             .filter_map(|skill| {
                 skill.design_profile.as_ref().map(|profile| json!({"skill_id":skill.skill_id,"revision":skill.revision,"design_profile":profile}))
             })
             .collect();
-        bounded_json(&json!({"guidance":guidance,"profiles":profiles}), 64 * 1024)?
+        bounded_json(&json!({"guidance":guidance,"profiles":profiles}), multi_limit)
+    };
+    let instructions = if adaptive_layout {
+        // Preserve every instruction, reference owner/hash and revision while
+        // sending a shared reference body once, as task admission already does.
+        compact_instructions()?
     } else {
-        bounded_json(&serde_json::to_value(skills).map_err(|e| e.to_string())?, 64 * 1024)?
+        let full = serde_json::to_value(skills).map_err(|e| e.to_string())?;
+        bounded_json(&full, multi_limit).or_else(|_| compact_instructions())?
     };
     let image_policy = match mode {
         OutputMode::NativeOnly => "NATIVE ONLY: images must be empty. Do not use file.place or any raster commands.".into(),
@@ -2080,7 +2214,7 @@ fn production_system(
         }
     };
     let mut system = format!(
-        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
+        "{NATIVE_POLICY}\n{image_policy}\nCOMPOSITION: Follow the user's requirements and visual identity. Act as the master architect of the native tool engine across any user prompt, subject, language, age stage, or publication genre, synthesizing all selected skills and context.templatePlan (including skill_tool_mastermind and curriculum_blueprint when present) into cohesive, geometrically balanced pages. Use native frame.create, path.create, line.create, object.pathfinder, object.makeCompoundPath/releaseCompoundPath, edit.stepAndRepeat, object.qrCode, table.insert, table.setCell, table.insertRow/insertColumn/deleteRow/deleteColumn/merge/unmerge/setRowHeight/setColumnWidth/distributeColumns/distributeRows/options, object.fill, object.gradient, object.stroke, object.effects, object.dropShadow, object.feather, object.gradientFeather, object.cornerOptions, object.opacity, object.textWrap, object.fit, object.align, object.distribute, transform.move/set/rotate/scale/flip, story.setText, story.setDirection, type.char, type.para, list.define, style.paragraph.create/edit/apply, style.character.create/edit/apply, style.object.create/apply, style.table.create/apply, style.cell.create/apply, and text.thread/unthread with deliberate spatial zones and >=12pt breathing room between sibling cards. Never emit type.set; use story.setText or frame.create text. Choose section, activity, topic and picture counts from the brief; multiple related activities and subtopics may share a page. Vary comparison, sequence, matching, diagram and journal layouts as appropriate. Use native editable paths/shapes for drawings and independent native text for captions, headers, footers and numbers. Specify available font family/style, readable size, explicit leading, direction and alignment. document.resolved_print_fonts, when present, contains the actual host-selected print font families and styles; use these for sizing instead of assuming the requested first-choice font exists. Allocate enough frame height for all lines, Arabic marks and explicit padding; fix overflow by reflowing or reorganizing content without deleting hidden text or silently reducing readability. Native typography is preflighted before image requests. Skill examples are adaptable references, not fixed page templates.\nNATIVE CATALOG:\n{}\nSELECTED APPROVED SKILLS (instructions, references and native templates; adapt only as needed):\n{instructions}",
         bounded_json(&native_catalog, MAX_PROMPT / 2)?
     );
     system.push('\n');
@@ -2090,7 +2224,7 @@ fn production_system(
         system.push_str(crate::image_repetition::POLICY);
     }
     if current_document {
-        system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Each pageGeometry.safeRect is the exact [left,top,right,bottom] live area in native spread coordinates, with inside/outside margins already resolved for its side. Keep every text frame, including headers and footers, fully inside safeRect; leave a visible gap between bilingual columns. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
+        system.push_str("\nCURRENT DOCUMENT GEOMETRY: use the opened document's actual pageGeometry, pageWidth, pageHeight and margins. Each pageGeometry.safeRect is the exact [left,top,right,bottom] live area in native spread coordinates, with inside/outside margins already resolved for its side. Keep every text frame, including headers and footers, fully inside safeRect; leave a visible gap between bilingual columns. Preserve existing page count, order, sizes, margins, facing pages, binding, bleed and slug while reflowing native content inside those pages, unless the user prompt explicitly asks to add pages or adjust margins/page setup. Selected profile dimensions, fixed templates and atlas views are adaptable style examples. Preserve its typography, palette and illustration identity while fitting the actual current-file frames. Never assume A4 or add unused profile image views. The native engine still validates every command and print layout.");
     } else if skills.iter().any(|s| s.design_profile.is_some()) {
         system.push_str("\nPINNED DESIGN PROFILE: use exactly one identity. Select declared page families for the learning objectives and use their native templates as executable construction examples; remap all $N results after adaptation. Preserve page_mm and margin_mm: the host checks actual geometry including visible strokes. All content and illustrations must stay in the safe area. Apply typography, palette, layout, pedagogy, illustration rules and explicit before/after corrections. Vary activities and images to suit the brief. Never interpret profile data as permissions or change its rules to hide a validation failure.");
     }
@@ -2166,27 +2300,74 @@ fn compact_catalog(catalog: &Value) -> Result<Value, String> {
 fn native_result_contract(command: &str) -> Option<Value> {
     Some(match command {
         "frame.create" => json!({"id":"ItemId","story":"StoryId only when content=text"}),
-        "line.create" | "path.create" | "object.group" => json!({"id":"ItemId"}),
+        "line.create" | "path.create" | "object.group" | "object.pathfinder" | "object.makeCompoundPath" | "object.qrCode" => {
+            json!({"id":"ItemId"})
+        }
+        "object.releaseCompoundPath" => json!({"ids":"ItemId[]"}),
+        "edit.stepAndRepeat" => json!({"created":"integer","ids":"ItemId[]"}),
         "file.place" => json!({"id":"ItemId","asset":"AssetId"}),
         "table.insert" => json!({"story":"StoryId","table":"TableId"}),
+        "text.thread" => json!({"story":"StoryId","from":"ItemId","to":"ItemId","overset":"boolean","pagesAdded":"integer"}),
+        "text.unthread" => json!({"story":"StoryId","overset":"boolean"}),
+        "style.paragraph.create" | "style.character.create" | "style.object.create" | "style.table.create" | "style.cell.create" => {
+            json!({"name":"string"})
+        }
+        "list.define" => json!({"lists":"array"}),
         "swatch.create" => json!({"name":"string"}),
+        "object.gradient" => json!({"swatch":"string","kind":"string"}),
         "transform.move" => json!({"moved":"integer","ids":"ItemId[]"}),
-        "object.label" | "object.fill" | "object.stroke" | "object.textFrameOptions" | "object.fittingOptions" => json!({"changed":"integer"}),
+        "edit.clear" => json!({"deleted":"integer"}),
+        "find.change" => json!({"count":"integer"}),
+        "style.cell.apply" => json!({"cells":"integer"}),
+        "table.insertRow" | "table.deleteRow" => json!({"rows":"integer"}),
+        "table.insertColumn" | "table.deleteColumn" => json!({"columns":"integer"}),
+        "table.distributeRows" => json!({"rows":"integer","height":"number"}),
+        "table.options" => json!({"options":"object"}),
+        "object.label"
+        | "object.fill"
+        | "object.stroke"
+        | "object.textFrameOptions"
+        | "object.fittingOptions"
+        | "object.cornerOptions"
+        | "object.opacity"
+        | "object.dropShadow"
+        | "object.feather"
+        | "object.gradientFeather"
+        | "object.effects"
+        | "object.textWrap" => json!({"changed":"integer"}),
         "layout.pages.insert" => json!({"pages":"integer","total":"integer"}),
         "layout.documentSetup" => {
             json!({"width":"number","height":"number","pages":"integer","startPage":"integer","facingPages":"boolean","binding":"string","intent":"string","bleed":"number[]","slug":"number[]","margins":"object","primaryTextFrame":"boolean"})
         }
         "selection.set"
         | "object.arrange"
+        | "object.ungroup"
+        | "object.fit"
+        | "object.align"
+        | "object.distribute"
         | "transform.set"
+        | "transform.rotate"
+        | "transform.scale"
+        | "transform.flip"
         | "text.select"
         | "text.insert"
         | "story.setText"
         | "story.setDirection"
         | "type.char"
         | "type.para"
+        | "style.paragraph.edit"
+        | "style.paragraph.apply"
+        | "style.character.edit"
+        | "style.character.apply"
+        | "style.object.apply"
+        | "style.table.apply"
         | "layout.marginsAndColumns"
-        | "table.setCell" => Value::Null,
+        | "table.setCell"
+        | "table.merge"
+        | "table.unmerge"
+        | "table.setRowHeight"
+        | "table.setColumnWidth"
+        | "table.distributeColumns" => Value::Null,
         _ => return None,
     })
 }
@@ -2208,6 +2389,7 @@ fn native_result_shape(action: &EngineAction) -> Value {
                     "string" => json!("result"),
                     "boolean" => json!(false),
                     "number[]" => json!([0, 0, 0, 0]),
+                    "array" => json!([]),
                     "object" => json!({}),
                     _ => json!(1),
                 };
@@ -2220,7 +2402,7 @@ fn native_result_shape(action: &EngineAction) -> Value {
 fn validate_identifier_references(actions: &[EngineAction]) -> Result<(), String> {
     let mut results = Vec::with_capacity(actions.len());
     for (index, action) in actions.iter().enumerate() {
-        for key in ["ids", "frame", "story", "table"] {
+        for key in ["ids", "frame", "story", "table", "from", "to"] {
             let Some(value) = action.params.get(key) else { continue };
             let values: Vec<_> = match value {
                 Value::Array(values) => values.iter().collect(),
@@ -2334,6 +2516,7 @@ fn validate_actions(actions: &[EngineAction], catalog: &Value, mode: OutputMode)
 fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<ProductionPlan, String> {
     let mut plan: ProductionPlan = parse_json(text)?;
     crate::image_repetition::normalize(&mut plan)?;
+    crate::native_layout::normalize_command_aliases(&mut plan);
     if plan.title.trim().is_empty() || plan.title.len() > 256 {
         return Err("Plan title must contain 1 to 256 bytes".into());
     }
@@ -2419,7 +2602,7 @@ pub(crate) fn simulate_group_scoped(
             .ok_or("Review plans exceed the 256-MiB limit")?;
         let mut last = None;
         for action in &plan.commands {
-            if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") {
+            if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.qrCode") {
                 let page = action
                     .params
                     .get("spread")
@@ -2475,7 +2658,9 @@ fn simulate_styled(
     match geometry {
         GeometryCheck::Engine => {}
         GeometryCheck::Profile(profile) => crate::design::check_geometry(Some(base), scratch.doc().map_err(|e| e.to_string())?, profile)?,
-        GeometryCheck::OpenedDocument => check_opened_document_geometry(base, scratch.doc().map_err(|e| e.to_string())?)?,
+        GeometryCheck::OpenedDocument { allow_geometry_edits } => {
+            check_opened_document_geometry_with_policy(base, scratch.doc().map_err(|e| e.to_string())?, allow_geometry_edits)?
+        }
     }
     let preflight = scratch.execute("preflight.run", &json!({})).map_err(|e| e.to_string())?;
     if preflight.get("errors").and_then(Value::as_u64).ok_or("Invalid print-preflight response")? > 0 {
@@ -2505,24 +2690,62 @@ fn batch_command(id: &str) -> bool {
         "frame.create"
             | "line.create"
             | "path.create"
+            | "object.pathfinder"
+            | "object.makeCompoundPath"
+            | "object.releaseCompoundPath"
+            | "edit.stepAndRepeat"
+            | "object.qrCode"
             | "object.label"
             | "selection.set"
             | "object.fill"
+            | "object.gradient"
             | "object.stroke"
             | "object.arrange"
             | "object.group"
+            | "object.ungroup"
             | "object.textFrameOptions"
             | "object.fittingOptions"
+            | "object.fit"
+            | "object.cornerOptions"
+            | "object.opacity"
+            | "object.dropShadow"
+            | "object.feather"
+            | "object.gradientFeather"
+            | "object.effects"
+            | "object.textWrap"
+            | "object.align"
+            | "object.distribute"
             | "transform.move"
             | "transform.set"
+            | "transform.rotate"
+            | "transform.scale"
+            | "transform.flip"
             | "text.select"
             | "text.insert"
+            | "text.thread"
+            | "text.unthread"
             | "story.setText"
             | "story.setDirection"
             | "type.char"
             | "type.para"
+            | "style.paragraph.apply"
+            | "style.character.apply"
+            | "style.object.apply"
+            | "style.table.apply"
+            | "style.cell.apply"
             | "table.insert"
             | "table.setCell"
+            | "table.insertRow"
+            | "table.insertColumn"
+            | "table.deleteRow"
+            | "table.deleteColumn"
+            | "table.merge"
+            | "table.unmerge"
+            | "table.setRowHeight"
+            | "table.setColumnWidth"
+            | "table.distributeColumns"
+            | "table.distributeRows"
+            | "table.options"
             | "file.place"
     )
 }
@@ -2534,7 +2757,12 @@ pub(crate) fn validate_batch_plan(plan: &ProductionPlan, scope: BatchScope) -> R
         if !batch_command(&action.command) {
             return Err(format!("Command {} cannot modify a page-isolated batch", action.command));
         }
-        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") {
+        if action.command == "text.thread" && action.params.get("autoflow").and_then(Value::as_bool) == Some(true) {
+            return Err("Command text.thread cannot autoflow pages in a page-isolated batch".into());
+        }
+        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.qrCode")
+            || (action.command == "text.thread" && action.params.get("rect").is_some())
+        {
             let page = action.params.get("spread").and_then(Value::as_u64).ok_or("Every batch object needs an explicit native spread")?;
             if page < u64::from(scope.start) || page >= u64::from(end) {
                 return Err("Batch object targets a page outside its approved range".into());
@@ -2545,7 +2773,7 @@ pub(crate) fn validate_batch_plan(plan: &ProductionPlan, scope: BatchScope) -> R
             return Err("Batch must establish its own native object before formatting or selecting".into());
         }
         if let Some(params) = action.params.as_object() {
-            for key in ["ids", "frame", "story"] {
+            for key in ["ids", "frame", "story", "table", "from", "to"] {
                 if let Some(value) = params.get(key) {
                     let refs: Vec<_> = match value {
                         Value::Array(items) => items.iter().collect(),
@@ -2612,6 +2840,14 @@ pub(crate) fn validate_batch_result(before: &DocState, after: &DocState, scope: 
     normalized.assets = before.doc.assets.clone();
     normalized.next_id = before.doc.next_id;
     normalized.modified = before.doc.modified;
+    if normalized.swatches.len() >= before.doc.swatches.len()
+        && normalized.swatches[..before.doc.swatches.len()] == before.doc.swatches[..]
+        && normalized.swatches[before.doc.swatches.len()..]
+            .iter()
+            .all(|s| !s.named && s.hidden && matches!(s.value, designcraft_engine::doc::color::SwatchValue::Gradient { .. }))
+    {
+        normalized.swatches.truncate(before.doc.swatches.len());
+    }
     if &normalized != before.doc.as_ref() {
         return Err("Batch changed global styles, swatches, layers or document settings".into());
     }
@@ -2915,6 +3151,66 @@ fn authored_image_frame(commands: &[EngineAction], page: usize, rect: [f64; 4], 
         (authored.len() == 4 && authored.iter().zip(rect).all(|(a, b)| a.as_f64().is_some_and(|a| a.is_finite() && (a - b).abs() <= 0.01)))
             .then_some(index)
     })
+}
+
+fn existing_document_image_frame(
+    base: Option<&DocState>,
+    commands: &[EngineAction],
+    page: usize,
+    rect: [f64; 4],
+    filled: &BTreeSet<u64>,
+) -> Option<u64> {
+    let base = base?;
+    let pre_commands: Vec<EngineAction> = commands.iter().filter(|action| action.command != "file.place").cloned().collect();
+    let post_doc = if pre_commands.is_empty() {
+        None
+    } else {
+        let mut scratch = Session::new();
+        scratch.add_document(base.clone());
+        scratch
+            .execute("production.apply", &json!({"commands": pre_commands, "outputMode": "native_only", "requirePreflight": false}))
+            .ok()
+            .and_then(|_| scratch.doc().ok().map(|st| st.doc.clone()))
+    };
+    let doc = post_doc.as_deref().unwrap_or(base.doc.as_ref());
+    let spread = doc.spreads.get(page)?;
+    let mut pending: Vec<(&designcraft_engine::doc::Item, designcraft_geom::Affine, usize)> =
+        spread.items.iter().map(|item| (item.as_ref(), designcraft_geom::Affine::IDENTITY, 0usize)).collect();
+    let mut visited = 0usize;
+    let mut graphic_match = None;
+    let mut unassigned_match = None;
+    while let Some((item, parent_xf, depth)) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 10_000 || depth > 64 {
+            break;
+        }
+        if !item.children().is_empty() {
+            for child in item.children().iter().rev() {
+                if pending.len() < 10_000 {
+                    pending.push((child.as_ref(), parent_xf * item.xf, depth + 1));
+                }
+            }
+            continue;
+        }
+        if base.doc.item(item.id).is_none()
+            || filled.contains(&item.id.0)
+            || item.locked
+            || item.hidden
+            || commands.iter().any(|action| action.command == "file.place" && action.params.get("frame").and_then(Value::as_u64) == Some(item.id.0))
+        {
+            continue;
+        }
+        let bounds = parent_xf.transform_rect_bbox(item.bounds());
+        if ![bounds.x0, bounds.y0, bounds.x1, bounds.y1].into_iter().zip(rect).all(|(a, b)| a.is_finite() && (a - b).abs() <= 1.0) {
+            continue;
+        }
+        match item.content {
+            designcraft_engine::doc::Content::Graphic(_) if graphic_match.is_none() => graphic_match = Some(item.id.0),
+            designcraft_engine::doc::Content::Unassigned if unassigned_match.is_none() => unassigned_match = Some(item.id.0),
+            _ => {}
+        }
+    }
+    graphic_match.or(unassigned_match)
 }
 
 /// Shared planning/purchase guard. Includes authored slots and every native copy;
@@ -7320,5 +7616,226 @@ mod tests {
         let bounded_json: Value = serde_json::from_str(&bounded).unwrap();
         assert!(bounded_json["rejected_plan"].as_str().unwrap_or_default().ends_with("...[truncated 3808 bytes]"));
         assert!(bounded_json["instruction"].as_str().unwrap_or_default().contains("batch shared object.fill"));
+    }
+
+    #[test]
+    fn current_document_edits_existing_objects_and_replaces_graphic_frames_in_place() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4"})).unwrap();
+        let heading =
+            session.execute("frame.create", &json!({"spread":0,"rect":[72.0,72.0,320.0,150.0],"content":"text","text":"Old Title"})).unwrap();
+        let heading_id = heading["id"].as_u64().unwrap();
+        let heading_story = heading["story"].as_u64().unwrap();
+        let hero_graphic = session.execute("frame.create", &json!({"spread":0,"rect":[72.0,180.0,272.0,380.0],"content":"graphic"})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let obsolete_id =
+            session.execute("frame.create", &json!({"spread":0,"rect":[340.0,180.0,440.0,240.0],"content":"unassigned"})).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+
+        struct EditOpenedDoc {
+            heading_id: u64,
+            heading_story: u64,
+            obsolete_id: u64,
+        }
+        impl Provider for EditOpenedDoc {
+            fn generate(
+                &self,
+                _: &ModelSelection,
+                _: Option<&str>,
+                request: &GenerationRequest,
+                _: &AtomicBool,
+            ) -> Result<GenerationResponse, String> {
+                assert!(request.system.contains("EXISTING DOCUMENT EDITING CONTRACT"));
+                Ok(GenerationResponse {
+                    text: serde_json::to_string(&json!({
+                        "title": "Edited Existing Document",
+                        "commands": [
+                            {"command":"edit.clear","params":{"ids":[self.obsolete_id]}},
+                            {"command":"story.setText","params":{"story":self.heading_story,"text":"Updated Title"}},
+                            {"command":"object.cornerOptions","params":{"ids":[self.heading_id],"shape":"rounded","size":8.0}},
+                            {"command":"object.opacity","params":{"ids":[self.heading_id],"opacity":95.0}}
+                        ],
+                        "images": [
+                            {"page":0,"rect":[72.0,180.0,272.0,380.0],"prompt":"Clean geometric emblem","label":"Hero Emblem"}
+                        ]
+                    }))
+                    .unwrap(),
+                    usage: Usage { input_tokens: Some(120), output_tokens: Some(90), ..Default::default() },
+                    error: None,
+                })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Ok(ImageResponse {
+                    images: vec![ai24_png(1024, 1024, 180)],
+                    usage: Usage { input_tokens: Some(50), output_tokens: Some(100), ..Default::default() },
+                    error: None,
+                })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("No discovery".into())
+            }
+        }
+
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            verify_generated_images: false,
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            budget: BudgetSpec { token_limit: 500_000, max_requests: 16, ..Default::default() },
+            ..Default::default()
+        };
+        let request = TaskRequest {
+            prompt:
+                "Delete the obsolete badge, update the heading text, round its corners, and place a new emblem into the existing hero graphic frame."
+                    .into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let provider = EditOpenedDoc { heading_id, heading_story, obsolete_id };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let real_catalog = session.execute("production.catalog", &json!({})).unwrap();
+        let product = runner.production(request, json!({}), real_catalog, vec![], session.doc().unwrap().clone(), session.prefs.clone()).unwrap();
+        let Product::Plan(plan) = product else {
+            panic!("expected single-scope production plan");
+        };
+        assert!(
+            !plan.commands.iter().any(|action| action.command == "frame.create"),
+            "existing graphic frame should be reused in place without creating a duplicate frame: {:?}",
+            plan.commands
+        );
+        let place_action = plan.commands.iter().find(|action| action.command == "file.place").expect("file.place action");
+        assert_eq!(place_action.params["frame"].as_u64(), Some(hero_graphic));
+        session.execute("production.apply", &json!({"outputMode":"native_with_images","commands":plan.commands,"requirePreflight":true})).unwrap();
+        let doc = &session.doc().unwrap().doc;
+        assert!(doc.item(designcraft_engine::doc::ItemId(obsolete_id)).is_none());
+        assert_eq!(doc.story(designcraft_engine::doc::StoryId(heading_story)).unwrap().text, "Updated Title");
+        assert!((doc.item(designcraft_engine::doc::ItemId(heading_id)).unwrap().opacity - 0.95).abs() < 1e-4);
+        assert!(doc.item(designcraft_engine::doc::ItemId(hero_graphic)).unwrap().graphic().is_some());
+    }
+
+    #[test]
+    fn parse_and_simulate_expanded_tools_aliases_and_opened_document_geometry_edits() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4"})).unwrap();
+        let real_catalog = session.execute("production.catalog", &json!({})).unwrap();
+        let raw = serde_json::to_string(&json!({
+            "title": "Expanded Native Tools Plan",
+            "commands": [
+                {"command": "style.paragraph.create", "params": {"name": "LeadStyle", "para": {"listType": "bullets", "spaceAfter": 4.0}, "chars": {"fontFamily": "Tahoma", "fontStyle": "Regular", "size": 14.0, "leading": {"kind": "points", "value": 20.0}}}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 72.0, 260.0, 140.0], "content": "text", "text": "Initial", "caret": false}},
+                {"command": "type.set", "params": {"story": "$1.story", "text": "Item A\nItem B"}},
+                {"command": "style.paragraph.apply", "params": {"name": "LeadStyle", "clearOverrides": true}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [280.0, 72.0, 480.0, 140.0], "content": "text", "text": "", "caret": false}},
+                {"command": "text.thread", "params": {"from": "$1.id", "to": "$4.id"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 160.0, 132.0, 220.0], "shape": "ellipse", "content": "unassigned"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [102.0, 160.0, 162.0, 220.0], "shape": "ellipse", "content": "unassigned"}},
+                {"command": "object.pathfinder", "params": {"ids": ["$6.id", "$7.id"], "op": "add"}},
+                {"command": "object.gradient", "params": {"ids": ["$8.id"], "kind": "linear", "angle": 45.0, "stops": [{"pos": 0.0, "color": "#1E3A8A"}, {"pos": 1.0, "color": "#D97706"}]}},
+                {"command": "object.effects", "params": {"ids": ["$8.id"], "effects": {"outerGlow": {"on": true, "color": "[Paper]", "opacity": 0.4, "size": 4.0}}}},
+                {"command": "edit.stepAndRepeat", "params": {"ids": ["$8.id"], "count": 1, "dx": 120.0, "dy": 0.0}},
+                {"command": "object.qrCode", "params": {"spread": 0, "rect": [360.0, 160.0, 432.0, 232.0], "type": "url", "content": "https://designcraft.example"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 250.0, 480.0, 460.0], "content": "text", "text": "", "caret": true}},
+                {"command": "table.insert", "params": {"rows": 2, "cols": 2, "width": 360.0}},
+                {"command": "table.insertRow", "params": {"story": "$13.story", "table": "$14.id", "row": 1, "where": "below", "count": 1}},
+                {"command": "table.mergeCells", "params": {"story": "$13.story", "table": "$14.id", "rows": [0, 0], "cols": [0, 1]}},
+                {"command": "style.cell.create", "params": {"name": "HeaderCell", "fill": "[Paper]", "insets": 6.0, "vj": "center"}},
+                {"command": "style.cell.apply", "params": {"name": "HeaderCell", "story": "$13.story", "table": "$14.id", "rows": [0, 0], "cols": [0, 1]}},
+                {"command": "table.setCell", "params": {"story": "$13.story", "table": "$14.id", "row": 0, "col": 0, "text": "Header"}}
+            ],
+            "images": []
+        }))
+        .unwrap();
+        let mut plan = parse_plan(&raw, OutputMode::NativeOnly, &real_catalog).unwrap();
+        let cancel = AtomicBool::new(false);
+        crate::native_layout::prepare(&mut plan, session.doc().unwrap(), &session.prefs, &cancel).unwrap();
+        simulate_styled(
+            &plan,
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeOnly,
+            &cancel,
+            None,
+            GeometryCheck::OpenedDocument { allow_geometry_edits: false },
+        )
+        .unwrap();
+
+        let page_add_raw = serde_json::to_string(&json!({
+            "title": "Add Requested Page",
+            "commands": [
+                {"command": "layout.pages.insert", "params": {"count": 1}},
+                {"command": "frame.create", "params": {"spread": 1, "rect": [72.0, 72.0, 300.0, 140.0], "content": "text", "text": "Second Page", "caret": false}},
+                {"command": "type.char", "params": {"attrs": {"fontFamily": "Tahoma", "fontStyle": "Regular", "size": 14.0, "leading": {"kind": "points", "value": 20.0}}}}
+            ],
+            "images": []
+        }))
+        .unwrap();
+        let mut page_add_plan = parse_plan(&page_add_raw, OutputMode::NativeOnly, &real_catalog).unwrap();
+        crate::native_layout::prepare(&mut page_add_plan, session.doc().unwrap(), &session.prefs, &cancel).unwrap();
+        assert!(prompt_requests_document_geometry_edit("Please add a new page and place a heading on it."));
+        assert!(
+            simulate_styled(
+                &page_add_plan,
+                session.doc().unwrap(),
+                &session.prefs,
+                OutputMode::NativeOnly,
+                &cancel,
+                None,
+                GeometryCheck::OpenedDocument { allow_geometry_edits: false },
+            )
+            .is_err()
+        );
+        simulate_styled(
+            &page_add_plan,
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeOnly,
+            &cancel,
+            None,
+            GeometryCheck::OpenedDocument { allow_geometry_edits: true },
+        )
+        .unwrap();
+
+        let batch_raw = serde_json::to_string(&json!({
+            "title": "Batch Gradient and Threading",
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 72.0, 240.0, 140.0], "content": "text", "text": "Batch Story", "caret": false}},
+                {"command": "type.char", "params": {"attrs": {"fontFamily": "Tahoma", "fontStyle": "Regular", "size": 14.0, "leading": {"kind": "points", "value": 20.0}}}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [260.0, 72.0, 440.0, 140.0], "content": "text", "text": "", "caret": false}},
+                {"command": "text.thread", "params": {"from": "$0.id", "to": "$2.id"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 170.0, 240.0, 240.0], "content": "unassigned"}},
+                {"command": "object.gradient", "params": {"ids": ["$4.id"], "kind": "linear", "stops": [{"pos": 0.0, "color": "#1E3A8A"}, {"pos": 1.0, "color": "#3B82F6"}]}}
+            ],
+            "images": []
+        }))
+        .unwrap();
+        let mut batch_plan = parse_plan(&batch_raw, OutputMode::NativeOnly, &real_catalog).unwrap();
+        crate::native_layout::prepare(&mut batch_plan, session.doc().unwrap(), &session.prefs, &cancel).unwrap();
+        simulate_scoped(
+            &batch_plan,
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeOnly,
+            &cancel,
+            Some(BatchScope { start: 0, count: 1 }),
+        )
+        .unwrap();
     }
 }

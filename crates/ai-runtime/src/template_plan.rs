@@ -91,6 +91,34 @@ pub(crate) fn requires_adaptive_math(brief: &str, skills: &[SkillSnapshot]) -> b
         })
 }
 
+/// Determines when production should transition from fixed textbook template slots
+/// to Adaptive Mastermind Native Tool Generation (`frame.create`, `path.create`,
+/// `table.insert`, `object.fill`, `object.cornerOptions`, `object.dropShadow`, etc.):
+/// 1. Math requests with unbound counting templates (`requires_adaptive_math`),
+/// 2. Non-textbook publication formats (`Brochure`, `Magazine`, `Report`, `PosterOrCertificate`),
+/// 3. Fixed plant-anatomy templates (`explore-plant-parts` with `leaves-ar`) when the brief is not Science.
+pub(crate) fn requires_adaptive_mastermind(brief: &str, skills: &[SkillSnapshot]) -> bool {
+    if requires_adaptive_math(brief, skills) {
+        return true;
+    }
+    let subject = detect_curriculum_subject(brief);
+    if matches!(
+        subject,
+        CurriculumSubject::Brochure | CurriculumSubject::Magazine | CurriculumSubject::Report | CurriculumSubject::PosterOrCertificate
+    ) {
+        return true;
+    }
+    let has_plant_bound_slots = skills.iter().any(|skill| {
+        skill.design_profile.as_ref().is_some_and(|profile| {
+            profile
+                .page_families
+                .iter()
+                .any(|family| family.id == "explore-plant-parts" && family.text_slots.iter().any(|slot| slot.id == "leaves-ar"))
+        })
+    });
+    has_plant_bound_slots && subject != CurriculumSubject::Science
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NumberTriplet {
     left: u32,
@@ -390,14 +418,44 @@ fn schema_inner(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, allo
 
 #[cfg(test)]
 pub(crate) fn system(skill: &SkillSnapshot) -> Result<String, String> {
-    system_inner(skill, false)
+    system_inner(skill, false, None)
 }
 
 pub(crate) fn system_for_brief(skill: &SkillSnapshot, brief: &str) -> Result<String, String> {
-    system_inner(skill, detect_curriculum_subject(brief) == CurriculumSubject::Mathematics)
+    let subject = detect_curriculum_subject(brief);
+    system_inner(skill, subject == CurriculumSubject::Mathematics, Some(subject))
 }
 
-fn system_inner(skill: &SkillSnapshot, allow_counting: bool) -> Result<String, String> {
+fn adapt_profile_families_for_subject(profile: &mut designcraft_ai_types::DesignProfile, subject: CurriculumSubject) {
+    for family in &mut profile.page_families {
+        if family.id == "garnet-computing-systems-lab" && subject != CurriculumSubject::ComputerScience {
+            family.purpose =
+                "Structured Step-by-Step Sequence, Concept Classification Cards, Process Flowchart & Guided Practical Application".into();
+            for slot in &mut family.image_slots {
+                if slot.id == "computing-items" {
+                    slot.purpose = "Row of 4 isolated educational illustrations directly representing the current lesson's 4 core items or steps on a clean background, no text".into();
+                } else if slot.id == "computing-lab-scene" {
+                    slot.purpose =
+                        "Warm educational scene showing children practicing or exploring the current lesson's topic together, no text".into();
+                }
+            }
+        }
+        if family.id == "oxford-phonics-maze" && !matches!(subject, CurriculumSubject::Languages | CurriculumSubject::ArabicLanguage) {
+            family.purpose = "Key Term & Concept Card Arch, Guided Practice Writing Lines & Interactive Learning Path Maze".into();
+            for slot in &mut family.image_slots {
+                if slot.id == "phonics-words" {
+                    slot.purpose =
+                        "Row of 3 isolated educational illustrations representing the current lesson's key concepts on a clean background, no text"
+                            .into();
+                } else if slot.id == "phonics-maze-art" {
+                    slot.purpose = "Playful educational path-maze illustration matching the current lesson's theme, no text or numbers".into();
+                }
+            }
+        }
+    }
+}
+
+fn system_inner(skill: &SkillSnapshot, allow_counting: bool, subject: Option<CurriculumSubject>) -> Result<String, String> {
     let mut profile = profile(skill)?.clone();
     profile.page_families.retain(|family| {
         skill
@@ -407,6 +465,9 @@ fn system_inner(skill: &SkillSnapshot, allow_counting: bool) -> Result<String, S
     });
     if profile.page_families.is_empty() {
         return Err("No native template family is supported for this brief; use structured adaptive activities".into());
+    }
+    if let Some(subj) = subject {
+        adapt_profile_families_for_subject(&mut profile, subj);
     }
     let bound_counting = profile.page_families.iter().any(|family| {
         skill.templates.get(&family.template).is_some_and(|template| counting_family(family, template) && bindable_counting_family(family, template))
@@ -454,15 +515,73 @@ fn system_inner(skill: &SkillSnapshot, allow_counting: bool) -> Result<String, S
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CurriculumSubject {
+    IslamicStudies,
+    ArabicLanguage,
+    SocialStudies,
     Mathematics,
     ComputerScience,
     Science,
     Languages,
+    Storybook,
+    Magazine,
+    Brochure,
+    Report,
+    Flashcards,
+    ActivityWorkbook,
+    PosterOrCertificate,
     Integrated,
 }
 
-/// Normalize mixed Arabic/Latin prompts (such as "اريد منهج دولي لمادةmath") by
-/// separating script transitions and stripping diacritics for deterministic subject detection.
+/// Extracts a concise human-readable topic phrase from an open-ended user prompt
+/// so custom subjects and publications reflect the user's actual request.
+pub(crate) fn extract_prompt_topic(prompt: &str) -> String {
+    let first_line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or(prompt).trim();
+    let stop_words = [
+        "اريد",
+        "أريد",
+        "ابي",
+        "أبي",
+        "ابغى",
+        "أبغى",
+        "صمم",
+        "انتج",
+        "أنتج",
+        "انشئ",
+        "أنشئ",
+        "اعمل",
+        "لي",
+        "لنا",
+        "عن",
+        "في",
+        "باسلوب",
+        "بأسلوب",
+        "من",
+        "صفحات",
+        "صفحة",
+        "صفحه",
+        "please",
+        "create",
+        "design",
+        "produce",
+        "make",
+        "build",
+        "generate",
+    ];
+    let cleaned: Vec<&str> = first_line
+        .split_whitespace()
+        .filter(|w| {
+            let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
+            !trimmed.is_empty() && !stop_words.contains(&trimmed.to_lowercase().as_str())
+        })
+        .take(10)
+        .collect();
+    let candidate = if cleaned.is_empty() { first_line.to_owned() } else { cleaned.join(" ") };
+    let chars: String = candidate.chars().take(72).collect();
+    if chars.trim().is_empty() { "الموضوع المخصص / Custom Publication".into() } else { chars }
+}
+
+/// Normalize mixed Arabic/Latin prompts (such as "اريد منهج دولي لمادةmath" or "لماده الاسلاميه لمرحله kg2")
+/// by separating script transitions, stripping diacritics, and unifying Arabic alef/ta-marbuta variants.
 pub(crate) fn normalize_curriculum_query(text: &str) -> String {
     let bounded_cap = text.len().min(32_768).saturating_add(16);
     let mut out = String::with_capacity(bounded_cap);
@@ -471,6 +590,12 @@ pub(crate) fn normalize_curriculum_query(text: &str) -> String {
         if matches!(c, '\u{0610}'..='\u{061a}' | '\u{0640}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}') {
             continue;
         }
+        let c = match c {
+            'أ' | 'إ' | 'آ' | 'ٱ' => 'ا',
+            'ة' => 'ه',
+            'ى' => 'ي',
+            other => other,
+        };
         let cur_script = if ('\u{0600}'..='\u{06ff}').contains(&c) {
             1
         } else if c.is_ascii_alphanumeric() {
@@ -491,8 +616,40 @@ pub(crate) fn normalize_curriculum_query(text: &str) -> String {
 
 pub(crate) fn detect_curriculum_subject(prompt: &str) -> CurriculumSubject {
     let norm = normalize_curriculum_query(prompt);
-    let has = |terms: &[&str]| terms.iter().any(|t| norm.contains(t));
-    if has(&[
+    let has = |terms: &[&str]| terms.iter().any(|t| norm.contains(&normalize_curriculum_query(t)));
+    let has_word = |word: &str| norm.split_whitespace().any(|w| w == word);
+    if has_word("islam")
+        || has(&[
+            "islamic",
+            "quran",
+            "hadith",
+            "seerah",
+            "fiqh",
+            "aqeedah",
+            "tawheed",
+            "azkar",
+            "adhkar",
+            "اسلاميه",
+            "اسلامي",
+            "الاسلاميه",
+            "تربيه اسلاميه",
+            "التربيه الاسلاميه",
+            "قران",
+            "حديث",
+            "سيره",
+            "عبادات",
+            "توحيد",
+            "عقيده",
+            "اذكار",
+            "اداب اسلاميه",
+            "فقه",
+            "اركان الاسلام",
+            "الوضوء",
+            "الصلاه",
+        ])
+    {
+        CurriculumSubject::IslamicStudies
+    } else if has(&[
         "math",
         "maths",
         "mathematics",
@@ -562,6 +719,35 @@ pub(crate) fn detect_curriculum_subject(prompt: &str) -> CurriculumSubject {
     ]) {
         CurriculumSubject::Science
     } else if has(&[
+        "social studies",
+        "civics",
+        "citizenship",
+        "geography",
+        "اجتماعيات",
+        "الدراسات الاجتماعيه",
+        "دراسات اجتماعيه",
+        "تربيه وطنيه",
+        "وطنيه",
+        "جغرافيا",
+        "تاريخ",
+        "حضاره",
+    ]) {
+        CurriculumSubject::SocialStudies
+    } else if has(&[
+        "arabic language",
+        "arabic literacy",
+        "لغتي",
+        "اللغه العربيه",
+        "لغه عربيه",
+        "حروف الهجاء",
+        "ابجديه عربيه",
+        "نحو",
+        "املاء",
+        "الخط العربي",
+    ]) && !has(&["english", "انجليزي", "انكليزي"])
+    {
+        CurriculumSubject::ArabicLanguage
+    } else if has(&[
         "english",
         "phonics",
         "grammar",
@@ -579,8 +765,210 @@ pub(crate) fn detect_curriculum_subject(prompt: &str) -> CurriculumSubject {
         "قواعد",
     ]) {
         CurriculumSubject::Languages
+    } else if has(&[
+        "brochure",
+        "pamphlet",
+        "flyer",
+        "leaflet",
+        "catalog",
+        "catalogue",
+        "company profile",
+        "بروشور",
+        "مطويه",
+        "كتالوج",
+        "دليل تعريفي",
+        "بروفايل",
+        "عرض خدمات",
+    ]) {
+        CurriculumSubject::Brochure
+    } else if has(&["magazine", "newsletter", "periodical", "journal", "editorial issue", "مجله", "نشره", "دوريه", "صحيفه"]) {
+        CurriculumSubject::Magazine
+    } else if has(&[
+        "annual report",
+        "technical report",
+        "whitepaper",
+        "case study",
+        "executive summary",
+        "تقرير",
+        "دراسه",
+        "ورقه عمل",
+        "احصائيات",
+        "مؤشرات اداء",
+    ]) {
+        CurriculumSubject::Report
+    } else if has(&["poster", "certificate", "infographic", "diploma", "banner", "ملصق", "بوستر", "شهاده", "لوحه جداريه", "انفوجرافيك"])
+    {
+        CurriculumSubject::PosterOrCertificate
+    } else if has(&["storybook", "picture book", "bedtime story", "fairy tale", "قصه مصوره", "قصه اطفال", "قصص", "حكايه", "روايه مصوره"])
+    {
+        CurriculumSubject::Storybook
+    } else if has(&["flashcard", "flashcards", "study cards", "بطاقات", "فلاش كارد", "بطاقه تعليميه"]) {
+        CurriculumSubject::Flashcards
+    } else if has(&["workbook", "activity book", "worksheet", "worksheets", "كتاب انشطه", "كراسه تمارين", "دفتر عمل", "اوراق عمل", "تدريبات"])
+    {
+        CurriculumSubject::ActivityWorkbook
     } else {
         CurriculumSubject::Integrated
+    }
+}
+
+fn parsed_grade_number(norm: &str) -> Option<u32> {
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    for (idx, word) in words.iter().enumerate() {
+        if matches!(*word, "grade" | "صف" | "الصف")
+            && let Some(next) = words.get(idx + 1)
+        {
+            if let Ok(num) = next.parse::<u32>() {
+                return Some(num);
+            }
+            let two = words.get(idx + 2).copied().unwrap_or("");
+            if *next == "الحادي" || (*next == "الثاني" && two == "عشر") || *next == "العاشر" {
+                return Some(10);
+            }
+            if matches!(*next, "السابع" | "الثامن" | "التاسع" | "سابع" | "ثامن" | "تاسع") {
+                return Some(7);
+            }
+            if matches!(
+                *next,
+                "الاول"
+                    | "الثاني"
+                    | "الثالث"
+                    | "الرابع"
+                    | "الخامس"
+                    | "السادس"
+                    | "اول"
+                    | "ثاني"
+                    | "ثالث"
+                    | "رابع"
+                    | "خامس"
+                    | "سادس"
+            ) {
+                return Some(1);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn infer_learner_stage(prompt: &str) -> &'static str {
+    let norm = normalize_curriculum_query(prompt);
+    let has = |terms: &[&str]| terms.iter().any(|t| norm.contains(&normalize_curriculum_query(t)));
+    if has(&["kg 2", "kg2", "fs2", "روضه ثانيه", "الروضه الثانيه", "روضه 2", "الروضه 2", "المستوي الثاني للروضه", "تمهيدي متقدم"])
+    {
+        "KG2 / Early Years Foundation Stage 2 (Ages 5–6) / مرحلة الروضة الثانية (KG2)"
+    } else if has(&["kg 1", "kg1", "fs1", "روضه اولي", "الروضه الاولي", "روضه 1", "الروضه 1", "المستوي الاول للروضه"])
+    {
+        "KG1 / Early Years Foundation Stage 1 (Ages 4–5) / مرحلة الروضة الأولى (KG1)"
+    } else if has(&["secondary", "high school", "ثانوي", "ثانويه", "المرحله الثانويه"])
+        || parsed_grade_number(&norm).is_some_and(|g| (10..=12).contains(&g))
+    {
+        "Secondary & High School Stage / المرحلة الثانوية"
+    } else if has(&["middle school", "preparatory", "اعدادي", "متوسط", "المرحله الاعداديه", "المرحله المتوسطه"])
+        || parsed_grade_number(&norm).is_some_and(|g| (7..=9).contains(&g))
+    {
+        "Middle & Preparatory Stage / المرحلة المتوسطة والإعدادية"
+    } else if has(&["kg", "kindergarten", "preschool", "early years", "روضه", "الروضه", "تمهيدي", "اطفال", "للصغار"]) {
+        "Early Years & Kindergarten (Ages 4–6) / مرحلة رياض الأطفال والتمهيدي"
+    } else if has(&["primary", "elementary", "ابتدائي", "المرحله الابتدائيه"]) || parsed_grade_number(&norm).is_some_and(|g| (1..=6).contains(&g))
+    {
+        "Primary & Elementary Stage / المرحلة الابتدائية"
+    } else {
+        "Adaptive Learner & Reader Stage (inferred from brief and style profile)"
+    }
+}
+
+/// Mastermind orchestration brief combining active skills, native layout tools, and spatial harmony rules.
+pub(crate) fn skill_tool_mastermind_brief(
+    prompt: &str,
+    skills: &[SkillSnapshot],
+    scope: BatchScope,
+    total_pages: u32,
+    explicit_rtl_binding: Option<bool>,
+) -> Value {
+    let subject = detect_curriculum_subject(prompt);
+    let topic_focus = extract_prompt_topic(prompt);
+    let rtl_primary = explicit_rtl_binding.unwrap_or_else(|| crate::facing_pages::auto_direction(prompt) == "rightToLeft");
+    let stage = infer_learner_stage(prompt);
+    let active_skills: Vec<Value> = skills
+        .iter()
+        .map(|s| {
+            json!({
+                "skill_id": s.skill_id,
+                "revision": s.revision,
+                "role": if s.design_profile.is_some() {
+                    "Pinned Design Style & Page-Family Architecture"
+                } else {
+                    "Active Domain, Typography, Pedagogy & Preflight Skill"
+                }
+            })
+        })
+        .collect();
+    json!({
+        "engine_role": "Universal Skill & Native Tool Mastermind",
+        "inferred_subject": format!("{subject:?}"),
+        "prompt_topic_focus": topic_focus,
+        "inferred_learner_stage": stage,
+        "inferred_direction": if rtl_primary { "Right-to-Left (RTL) primary with bidirectional support" } else { "Left-to-Right (LTR) primary" },
+        "page_scope": { "start": scope.start, "count": scope.count, "total_pages": total_pages },
+        "active_skill_synergy": active_skills,
+        "spatial_and_logical_harmony_rules": [
+            "Zone 1 (Header & Identity): Keep unit badge, lesson title, and objective pill aligned at the top safe margin with clear visual hierarchy.",
+            "Zone 2 (Discovery & Visual Anchor): Connect hero scenes, concept cards, or 4-panel stories directly to the lesson topic with generous breathing room.",
+            "Zone 3 (Structured Analysis & Sequence): Use ordered cards, step flowcharts, or comparison tables with consistent gutters and logical reading order (right-to-left for Arabic, left-to-right for English/equations).",
+            "Zone 4 (Interactive Student Task & Self-Check): Provide clear student response boxes, tracing/matching activities, and a calm footer with page numbering inside safe margins."
+        ]
+    })
+}
+
+fn family_display_archetype(subject: CurriculumSubject, family_id: &str) -> &'static str {
+    match family_id {
+        "international-curriculum-cover" | "cover" => "غلاف الإصدار وهوية السلسلة | Cover & Series Identity",
+        "international-scope-sequence" | "curriculum-map" => "خريطة المحتوى وتسلسل الوحدات | Scope & Sequence Map",
+        "observe-growth-sequence" => "مشهد الاستكشاف المتدرج | Guided Discovery Opener",
+        "oxford-vocab-story" => match subject {
+            CurriculumSubject::IslamicStudies => "بطاقات المفاهيم وقصة السيرة والآداب | Islamic Concept Cards & 4-Panel Moral Story",
+            CurriculumSubject::ArabicLanguage => "مفردات الحروف المصورة وقصة القراءة | Illustrated Vocabulary & 4-Panel Arabic Story",
+            CurriculumSubject::SocialStudies => "بطاقات الهوية والمجتمع والمشهد الحواري | Social Concept Cards & Community Story",
+            CurriculumSubject::Storybook => "لوحات القصة المصورة والحوار السردي | Illustrated Storyboard & Narrative Panels",
+            CurriculumSubject::Flashcards => "شبكة البطاقات التعليمية المصورة | Illustrated Flashcard Grid & Context",
+            _ => "بطاقات المفاهيم المصورة والقصة التطبيقية | Concept Cards & 4-Panel Story",
+        },
+        "oxford-skills-time" => match subject {
+            CurriculumSubject::IslamicStudies => "تلاوة وفهم السور القصيرة والحديث والاستماع | Surah/Hadith Reflection, Listening & Discussion",
+            CurriculumSubject::ArabicLanguage => "القراءة الفاهمة والاستماع والتحدث بالعربية | Arabic Reading Comprehension, Listening & Talk",
+            CurriculumSubject::SocialStudies => "نص استقصائي عن الوطن والمجتمع وحوار ثنائي | Civic Reading Passage & Guided Discussion",
+            _ => "القراءة الفاهمة والاستماع والحوار التطبيقي | Reading Passage, Listening & Discussion",
+        },
+        "oxford-fluency-project" => match subject {
+            CurriculumSubject::IslamicStudies => "الأذكار والآداب اليومية ومشروع العمل الصالح | Daily Adhkar, Sunnah Manners & Practical Project",
+            CurriculumSubject::ArabicLanguage => "التعبير الشفهي ومشروع القصة والتقييم الذاتي | Oral Expression, Mini-Book Project & Self-Check",
+            _ => "التطبيق الحواري والمشروع العملي والتقييم الذاتي | Practical Dialogue, 3-Step Project & Self-Check",
+        },
+        "oxford-song-colours" => match subject {
+            CurriculumSubject::IslamicStudies => "أنشودة القيم الإسلامية وتصنيف المفاهيم | Islamic Values Chant & Visual Classification",
+            CurriculumSubject::ArabicLanguage => "أنشودة الحروف والألوان ومطابقة الكلمات | Alphabet Chant & Visual Word Matching",
+            _ => "اللوحة البصرية والأنشودة التعليمية والتصنيف | Visual Swatches, Chant & Classification",
+        },
+        "oxford-workbook-print" => match subject {
+            CurriculumSubject::IslamicStudies => "تدريبات ومراجعة التربية الإسلامية | Islamic Studies Workbook & Review Activities",
+            CurriculumSubject::ArabicLanguage => "تدريبات الإملاء وتكوين الكلمات والخط | Arabic Literacy Workbook & Writing Practice",
+            _ => "أنشطة وتدريبات المراجعة التحريرية | Summative Workbook & Practice Exercises",
+        },
+        "garnet-computing-systems-lab" => match subject {
+            CurriculumSubject::IslamicStudies => "خطوات العبادات العملية بالترتيب (الوضوء والصلاة) | Ordered Worship Steps & Practical Flowchart",
+            CurriculumSubject::ComputerScience => "مختبر أنظمة الحاسوب وتدفق البيانات (IPO) | Computing Systems Lab & IPO Flowchart",
+            _ => "المخطط التسلسلي والخطوات العملية والمقارنة | Step-by-Step Sequence Flowchart & Lab",
+        },
+        "oxford-phonics-maze" => match subject {
+            CurriculumSubject::IslamicStudies => "كتابة المصطلحات الإسلامية ومتاهة العمل الصالح | Islamic Key Terms Writing & Good-Deed Path Maze",
+            CurriculumSubject::ArabicLanguage => "تشكيل الحروف الهجائية والخط ومتاهة الحرف | Arabic Letter Formation Staves & Letter Maze",
+            _ => "تدريب الكتابة الموجهة ومتاهة المسار الذهني | Guided Writing Lines & Concept Path Maze",
+        },
+        "cambridge-cpa-grammar" => match subject {
+            CurriculumSubject::Mathematics => "التمثيل الحسي والبصري والرمزي (CPA) ومكونات العدد | Concrete-Pictorial-Abstract (CPA) & Number Bonds",
+            _ => "القاعدة التطبيقية والأمثلة المتدرجة | Structured Rule Discovery & Guided Examples",
+        },
+        _ => "صفحة تفاعلية منظمة | Structured Interactive Page",
     }
 }
 
@@ -605,9 +993,11 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
 
     let norm = normalize_curriculum_query(prompt);
     let subject = detect_curriculum_subject(prompt);
+    let topic_focus = extract_prompt_topic(prompt);
+    let learner_stage = infer_learner_stage(prompt);
     let has_arabic = prompt.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c) && c.is_alphabetic());
     let explicit_bilingual =
-        ["ثنائي اللغة", "ثنائية اللغة", "عربي وانجليزي", "عربي وإنجليزي", "بالعربية والإنجليزية", "bilingual"].iter().any(|term| norm.contains(term));
+        ["ثنائي اللغه", "ثنائيه اللغه", "عربي وانجليزي", "بالعربيه والانجليزيه", "bilingual"].iter().any(|term| norm.contains(term));
     let non_subject_latin_words = norm
         .split(|c: char| !c.is_ascii_alphabetic())
         .filter(|w| w.len() >= 2)
@@ -628,6 +1018,14 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
                     | "ipo"
                     | "kg"
                     | "pdf"
+                    | "islamic"
+                    | "islam"
+                    | "quran"
+                    | "arabic"
+                    | "social"
+                    | "studies"
+                    | "grade"
+                    | "level"
             )
         })
         .count();
@@ -639,9 +1037,177 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
         "English primary (follow explicit user and profile language)"
     };
 
-    let (domain_name, methodology, units, preferred_cycle): (&str, &str, Vec<Value>, &[&str]) = match subject {
+    let (domain_name, methodology, units, preferred_cycle): (String, &str, Vec<Value>, &[&str]) = match subject {
+        CurriculumSubject::IslamicStudies => (
+            "Islamic Studies, Noble Quran, Prophetic Seerah & Daily Manners (منهج التربية الإسلامية والقرآن الكريم والسيرة النبوية والآداب)".into(),
+            "Age-appropriate spiritual and moral nurturing: Short Surahs & listening reflection, Faith & Tawheed wonder through creation, Ordered Acts of Worship (Purity, Wudu & Prayer steps), Prophetic Seerah stories, and Daily Islamic Manners & Adhkar",
+            vec![
+                json!({
+                    "unit": 1,
+                    "title": "Unit 1: Allah Our Creator, Blessings & Short Surahs / الوحدة 1: الله خالقي العظيم وتلاوة قصار السور (الفاتحة والإخلاص)",
+                    "chapters": [
+                        "Ch 1.1: Allah's Beautiful Creation (Sun, Moon, Plants, Family) & Saying Alhamdulillah",
+                        "Ch 1.2: Listening and Reciting Surah Al-Fatihah & Surah Al-Ikhlas with Loving Reflection"
+                    ],
+                    "core_concepts": ["ربّي الله الخالق", "الحمد لله على نعمه", "سورة الفاتحة", "سورة الإخلاص", "أحب القرآن الكريم"],
+                    "lab_and_project": "Create a Blessings of Allah gratitude wheel and practice reciting Surah Al-Fatihah with the class"
+                }),
+                json!({
+                    "unit": 2,
+                    "title": "Unit 2: Purity, Step-by-Step Wudu & The Joy of Prayer / الوحدة 2: الطهارة والنظافة وخطوات الوضوء والصلاة",
+                    "chapters": [
+                        "Ch 2.1: Cleanliness in Islam, Saving Water & Ordered Steps of Wudu (الوضوء خطوة بخطوة)",
+                        "Ch 2.2: The Call to Prayer (Adhan), Five Daily Prayers & Calm Positions of Salah"
+                    ],
+                    "core_concepts": ["الطهارة والنظافة", "خطوات الوضوء بالترتيب", "الصلوات الخمس", "القبلة والمسجد", "أحافظ على صلاتي"],
+                    "lab_and_project": "Order the illustrated Wudu sequence cards and build a My Daily Prayer Star chart"
+                }),
+                json!({
+                    "unit": 3,
+                    "title": "Unit 3: Our Beloved Prophet Muhammad (PBUH) & Moral Stories / الوحدة 3: نبينا محمد ﷺ وقصص الرحمة والصدق والأمانة",
+                    "chapters": [
+                        "Ch 3.1: Knowing Prophet Muhammad (PBUH), His Kindness to Children & Sending Salawat",
+                        "Ch 3.2: 4-Panel Seerah Stories of Truthfulness (Al-Sadiq), Trustworthiness (Al-Amin) & Mercy to Animals"
+                    ],
+                    "core_concepts": ["نبينا محمد ﷺ", "الصادق الأمين", "الرحمة بالصغار والحيوان", "الصلاة على النبي ﷺ", "الاقتداء بأخلاق الرسول"],
+                    "lab_and_project": "Role-play a 4-panel Seerah kindness story and craft a Prophetic Morals classroom tree"
+                }),
+                json!({
+                    "unit": 4,
+                    "title": "Unit 4: Daily Adhkar, Islamic Manners & Family Kindness / الوحدة 4: الأذكار اليومية والآداب الإسلامية وبر الوالدين",
+                    "chapters": [
+                        "Ch 4.1: Morning/Evening Adhkar, Greeting with Assalamu Alaikum & Manners of Eating (Bismillah)",
+                        "Ch 4.2: Honoring Parents, Sharing with Friends & Summative Islamic Workbook Review"
+                    ],
+                    "core_concepts": ["بسم الله والحمد لله", "السلام عليكم ورحمة الله", "أذكار الصباح والمساء", "بر الوالدين وإكرام الضيف", "التعاون والرفق"],
+                    "lab_and_project": "Make a My Daily Adhkar & Good Deeds flipbook and complete the summative review activities"
+                }),
+            ],
+            &[
+                "oxford-vocab-story",
+                "oxford-skills-time",
+                "oxford-fluency-project",
+                "oxford-song-colours",
+                "oxford-workbook-print",
+                "garnet-computing-systems-lab",
+                "oxford-phonics-maze",
+                "cambridge-cpa-grammar",
+            ],
+        ),
+        CurriculumSubject::ArabicLanguage => (
+            "Arabic Language, Alphabet Literacy, Reading & Expression (منهج اللغة العربية وحروف الهجاء والقراءة والتعبير)".into(),
+            "Authentic Arabic literacy progression: Letter shapes (isolated, initial, medial, final), short/long vowels (Harakat & Madd), thematic illustrated vocabulary, 4-panel reading stories, guided Naskh handwriting, and oral fluency",
+            vec![
+                json!({
+                    "unit": 1,
+                    "title": "Unit 1: Arabic Alphabet Group 1 (أ ب ت ث ج ح خ) & Family Words / الوحدة 1: حروف الهجاء الأولى وعالم الأسرة",
+                    "chapters": [
+                        "Ch 1.1: Recognizing Letter Sounds, Initial/Medial/Final Shapes & Illustrated Words",
+                        "Ch 1.2: Guided Arabic Line Writing, Letter Path Mazes & Short Family Dialogue"
+                    ],
+                    "core_concepts": ["حروف أ ب ت ث ج ح خ", "أشكال الحرف في الكلمة", "الحركات القصيرة (فتحة ضمة كسرة)", "كلمات الأسرة والبيت"],
+                    "lab_and_project": "Trace Arabic letter forms on guided lines and build illustrated letter-word flashcards"
+                }),
+                json!({
+                    "unit": 2,
+                    "title": "Unit 2: Nature & School Letters (د ذ ر ز س ش ص ض) & Long Vowels / الوحدة 2: حروف الطبيعة والمدرسة وحروف المد",
+                    "chapters": [
+                        "Ch 2.1: Connecting Letters with Long Vowels (مد الألف والواو والياء) & Rhythmic Chant",
+                        "Ch 2.2: 4-Panel Classroom Story Reading & Demonstrative Sentences (هذا / هذه)"
+                    ],
+                    "core_concepts": ["حروف د ذ ر ز س ش ص ض", "حروف المد الثلاثة", "هذا وهذه للإشارة", "أناشيد الحروف"],
+                    "lab_and_project": "Match syllables to form complete Arabic words and act out the 4-panel school story"
+                }),
+                json!({
+                    "unit": 3,
+                    "title": "Unit 3: Reading Comprehension, Listening & Expressive Speaking / الوحدة 3: مهارات القراءة الفاهمة والاستماع والتحدث",
+                    "chapters": [
+                        "Ch 3.1: Letters (ط ظ ع غ ف ق ك ل) in Short Descriptive Passages & Listening Checks",
+                        "Ch 3.2: Constructing Nominal & Verbal Sentences and Pair Question-Answer Practice"
+                    ],
+                    "core_concepts": ["حروف ط ظ ع غ ف ق ك ل", "اللام الشمسية واللام القمرية", "قراءة جمل قصيرة", "التحدث بلغة عربية سليمة"],
+                    "lab_and_project": "Classify Sun and Moon letters in a visual chart and interview a classmate in Arabic"
+                }),
+                json!({
+                    "unit": 4,
+                    "title": "Unit 4: Completing the Alphabet (م ن هـ و ي), Story Project & Workbook / الوحدة 4: إتمام الحروف والتعبير الكتابي والمشروع",
+                    "chapters": [
+                        "Ch 4.1: Letters (م ن هـ و ي), Everyday Polite Expressions & Illustrated Story Booklet",
+                        "Ch 4.2: Summative Arabic Word Bank, Crossword Puzzle & Guided Sentence Writing"
+                    ],
+                    "core_concepts": ["حروف م ن هـ و ي", "التاء المربوطة والمفتوحة", "تركيب الكلمات والجمل", "مراجعة الحروف الهجائية"],
+                    "lab_and_project": "Assemble an Arabic Alphabet & Stories mini-book and solve the summative workbook review"
+                }),
+            ],
+            &[
+                "oxford-vocab-story",
+                "oxford-phonics-maze",
+                "oxford-skills-time",
+                "oxford-song-colours",
+                "oxford-fluency-project",
+                "oxford-workbook-print",
+                "cambridge-cpa-grammar",
+                "garnet-computing-systems-lab",
+            ],
+        ),
+        CurriculumSubject::SocialStudies => (
+            "Social Studies, Citizenship, Heritage & Geography (منهج الدراسات الاجتماعية والهوية الوطنية والجغرافيا)".into(),
+            "Guided social inquiry: Identity and family, community helpers and institutions, maps and natural environments, cultural heritage, and responsible citizenship",
+            vec![
+                json!({
+                    "unit": 1,
+                    "title": "Unit 1: My Identity, My Family & My Home / الوحدة 1: هويتي وأسرتي وبيتي",
+                    "chapters": [
+                        "Ch 1.1: Who Am I? Family Members, Roles, Cooperation & Respect at Home",
+                        "Ch 1.2: Daily Routines, Timeline of Growth & Safe Home Habits"
+                    ],
+                    "core_concepts": ["اسمي وهويتي", "أفراد الأسرة والتعاون", "ترتيب الأحداث الزمني", "حقوقي وواجباتي في البيت"],
+                    "lab_and_project": "Create an illustrated Family Tree & Home Cooperation chart"
+                }),
+                json!({
+                    "unit": 2,
+                    "title": "Unit 2: My School, My Neighborhood & Community Helpers / الوحدة 2: مدرستي وحيّي والمهن في مجتمعي",
+                    "chapters": [
+                        "Ch 2.1: School Places, Classroom Rules & Helping Each Other",
+                        "Ch 2.2: Community Helpers (Teacher, Doctor, Firefighter, Engineer, Farmer) & How Services Work"
+                    ],
+                    "core_concepts": ["المدرسة والنظام", "أصحاب المهن وخدمة المجتمع", "المؤسسات الخدمية", "احترام العمل"],
+                    "lab_and_project": "Role-play community professions and trace how a neighborhood service helps families"
+                }),
+                json!({
+                    "unit": 3,
+                    "title": "Unit 3: Places, Maps, Weather & Natural Environments / الوحدة 3: الجغرافيا المبسطة والبيئات الطبيعية والخريطة",
+                    "chapters": [
+                        "Ch 3.1: Directions, Simple Map Symbols & Landforms (Land, Sea, Mountain, Desert, Oasis)",
+                        "Ch 3.2: Weather, Seasons, Water Conservation & Caring for Our Planet"
+                    ],
+                    "core_concepts": ["الخريطة والاتجاهات", "اليابسة والماء والجبل والصحراء", "فصول السنة والطقس", "المحافظة على البيئة والماء"],
+                    "lab_and_project": "Draw a simple classroom/neighborhood map with a symbol key and classify natural environments"
+                }),
+                json!({
+                    "unit": 4,
+                    "title": "Unit 4: Our Homeland, Cultural Heritage & Good Citizenship / الوحدة 4: وطني وتراثي والمواطنة الصالحة",
+                    "chapters": [
+                        "Ch 4.1: National Symbols, Traditional Crafts, Hospitality & Historic Landmarks",
+                        "Ch 4.2: Traffic Safety, Volunteering & Summative Social Studies Workbook"
+                    ],
+                    "core_concepts": ["حب الوطن وعلمه", "التراث والعادات الأصيلة", "قواعد السلامة المرورية", "المواطن الصالح"],
+                    "lab_and_project": "Build a Heritage & Homeland showcase poster and complete the summative review"
+                }),
+            ],
+            &[
+                "oxford-vocab-story",
+                "oxford-skills-time",
+                "oxford-fluency-project",
+                "oxford-song-colours",
+                "oxford-workbook-print",
+                "garnet-computing-systems-lab",
+                "oxford-phonics-maze",
+                "cambridge-cpa-grammar",
+            ],
+        ),
         CurriculumSubject::Mathematics => (
-            "Mathematics (Concrete -> Pictorial -> Abstract / CPA & Sensory Numeracy / منهج الرياضيات المتدرج)",
+            "Mathematics (Concrete -> Pictorial -> Abstract / CPA & Sensory Numeracy / منهج الرياضيات المتدرج)".into(),
             "Concrete -> Pictorial -> Abstract (CPA) progression, visual subitizing, ten-frames, part-whole number bonds, function machines, and story problem contexts",
             vec![
                 json!({
@@ -697,7 +1263,7 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             ],
         ),
         CurriculumSubject::ComputerScience => (
-            "Computer Science, Coding & ICT Systems (منهج الحاسوب والبرمجة وتقنية المعلومات)",
+            "Computer Science, Coding & ICT Systems (منهج الحاسوب والبرمجة وتقنية المعلومات)".into(),
             "Input -> Process -> Output (IPO) systems architecture, binary data representation, algorithmic sequence mazes, and safe digital citizenship",
             vec![
                 json!({
@@ -753,7 +1319,7 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             ],
         ),
         CurriculumSubject::Science => (
-            "Science & Guided Inquiry (منهج العلوم والاستقصاء العلمي)",
+            "Science & Guided Inquiry (منهج العلوم والاستقصاء العلمي)".into(),
             "Scientific inquiry (Observe -> Predict -> Test -> Record), hands-on investigation, and visual concept modeling",
             vec![
                 json!({
@@ -808,8 +1374,8 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
                 "oxford-workbook-print",
             ],
         ),
-        CurriculumSubject::Languages | CurriculumSubject::Integrated => (
-            "Language, Literacy & Integrated Curriculum (منهج اللغات والمهارات المتكاملة)",
+        CurriculumSubject::Languages => (
+            "Language, Literacy & Communication Curriculum (منهج اللغات والقراءة والتواصل)".into(),
             "Thematic vocabulary, phonics/symbol formation, functional grammar in context, integrated reading/listening/speaking, and project work",
             vec![
                 json!({
@@ -864,6 +1430,81 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
                 "garnet-computing-systems-lab",
             ],
         ),
+        CurriculumSubject::Storybook
+        | CurriculumSubject::Magazine
+        | CurriculumSubject::Brochure
+        | CurriculumSubject::Report
+        | CurriculumSubject::Flashcards
+        | CurriculumSubject::ActivityWorkbook
+        | CurriculumSubject::PosterOrCertificate
+        | CurriculumSubject::Integrated => {
+            let genre_label = match subject {
+                CurriculumSubject::Storybook => "Illustrated Storybook & Narrative Series (قصة مصورة وسلسلة سردية)",
+                CurriculumSubject::Magazine => "Editorial Magazine & Feature Publication (مجلة وإصدار تحريري)",
+                CurriculumSubject::Brochure => "Brochure, Catalog & Identity Showcase (بروشور تعريفي وكتالوج)",
+                CurriculumSubject::Report => "Structured Report, Study & Data Publication (تقرير ودراسة تحليلية)",
+                CurriculumSubject::Flashcards => "Illustrated Flashcards & Visual Learning Deck (بطاقات تعليمية مصورة)",
+                CurriculumSubject::ActivityWorkbook => "Interactive Activity & Practice Workbook (كتاب أنشطة وتدريبات تطبيقية)",
+                CurriculumSubject::PosterOrCertificate => "Visual Poster, Infographic & Certificate Design (ملصق ولوحة بصرية وشهادة)",
+                _ => "Custom Prompt-Driven Publication & Integrated Curriculum (إصدار ومنهج مخصص حسب الطلب)",
+            };
+            (
+                format!("{genre_label} — {topic_focus}"),
+                "Dynamic prompt-driven architecture tailored directly to the user's requested topic, genre, language, and visual hierarchy",
+                vec![
+                    json!({
+                        "unit": 1,
+                        "title": format!("Unit 1: Introduction & Core Foundations ({topic_focus}) / الوحدة 1: المدخل والمفاهيم الأساسية ({topic_focus})"),
+                        "chapters": [
+                            format!("Ch 1.1: Visual Overview, Key Pillars & Opening Context ({topic_focus})"),
+                            format!("Ch 1.2: Illustrated Concepts & Guided Exploration ({topic_focus})")
+                        ],
+                        "core_concepts": [&topic_focus, "المفاهيم المحورية", "الهوية البصرية المتناسقة", "التسلسل المنطقي للمحتوى"],
+                        "lab_and_project": format!("Explore the foundational themes and visual cards of {topic_focus}")
+                    }),
+                    json!({
+                        "unit": 2,
+                        "title": format!("Unit 2: Deep Dive, Stories & Practical Scenarios ({topic_focus}) / الوحدة 2: التفصيل والقصص والمواقف التطبيقية"),
+                        "chapters": [
+                            format!("Ch 2.1: Real-World Scenarios, Illustrated Panels & Case Examples ({topic_focus})"),
+                            format!("Ch 2.2: Visual Classification, Comparisons & Key Highlights ({topic_focus})")
+                        ],
+                        "core_concepts": ["أمثلة واقعية مصورة", "مقارنة وتصنيف", "ترابط الفقرات والبطاقات"],
+                        "lab_and_project": format!("Analyze real-world examples and visual comparisons for {topic_focus}")
+                    }),
+                    json!({
+                        "unit": 3,
+                        "title": format!("Unit 3: Step-by-Step Workflows, Reading & Analysis ({topic_focus}) / الوحدة 3: الخطوات المنظمة والتحليل التطبيقي"),
+                        "chapters": [
+                            format!("Ch 3.1: Detailed Reading, Key Takeaways & Comprehension Check ({topic_focus})"),
+                            format!("Ch 3.2: Ordered Process Flowchart, Structured Table & Guided Discussion ({topic_focus})")
+                        ],
+                        "core_concepts": ["خطوات عملية متسلسلة", "جداول ومخططات توضيحية", "أسئلة فهم واستيعاب"],
+                        "lab_and_project": format!("Follow the step-by-step workflow and structured summary for {topic_focus}")
+                    }),
+                    json!({
+                        "unit": 4,
+                        "title": format!("Unit 4: Creative Project, Hands-On Application & Review ({topic_focus}) / الوحدة 4: المشروع التطبيقي والمراجعة الشاملة"),
+                        "chapters": [
+                            format!("Ch 4.1: 3-Step Practical Project & Self-Check ({topic_focus})"),
+                            format!("Ch 4.2: Comprehensive Summary, Interactive Exercises & Closing Synthesis ({topic_focus})")
+                        ],
+                        "core_concepts": ["مشروع تطبيقي عملي", "تقييم ذاتي ومراجعة", "خلاصة شاملة"],
+                        "lab_and_project": format!("Complete the hands-on project and comprehensive review for {topic_focus}")
+                    }),
+                ],
+                &[
+                    "oxford-vocab-story",
+                    "oxford-skills-time",
+                    "oxford-fluency-project",
+                    "oxford-song-colours",
+                    "oxford-workbook-print",
+                    "garnet-computing-systems-lab",
+                    "oxford-phonics-maze",
+                    "cambridge-cpa-grammar",
+                ],
+            )
+        }
     };
 
     // A suggested family must be accepted by the same strict compiler. Fixed
@@ -947,15 +1588,26 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             let unit_no = unit_idx.saturating_add(1);
             let lesson_no = (body_idx % 4).saturating_add(1);
             let unit_title = units.get(unit_idx).and_then(|u| u.get("title")).and_then(Value::as_str).unwrap_or("Core Unit");
-            let stage = match recommended_family {
-                "cambridge-cpa-grammar" => "Concrete -> Pictorial -> Abstract (CPA) Rule Discovery & Part-Whole Reasoning",
-                "oxford-vocab-story" => "Contextual Concept Vocabulary Flashcards & 4-Panel Story/Scenario Dialogue",
-                "oxford-phonics-maze" => "Symbol/Number/Term Formation Staves & Algorithmic Sequence Maze",
-                "garnet-computing-systems-lab" => "Input -> Process/Rule -> Output Systems Flowchart & Practical Lab Investigation",
-                "oxford-song-colours" => "Visual Swatches, Panoramic Exploration Chant & Code Classification",
-                "oxford-skills-time" => "Integrated Reading Passage, Listening Discrimination & Pair Talk",
-                "oxford-fluency-project" => "Collaborative Dialogue, 3-Step Hands-On Project & Self-Check",
-                "oxford-workbook-print" => "Summative Print Workbook: Word/Number Bank, Line-Art, Crossword & Writing",
+            let stage = match (subject, recommended_family) {
+                (CurriculumSubject::IslamicStudies, "oxford-vocab-story") => "Islamic Concept Cards & 4-Panel Prophetic Seerah / Daily Manners Story",
+                (CurriculumSubject::IslamicStudies, "oxford-skills-time") => {
+                    "Short Surah / Hadith Reflection, Listening Check & Guided Pair Discussion"
+                }
+                (CurriculumSubject::IslamicStudies, "oxford-fluency-project") => {
+                    "Daily Adhkar & Sunnah Dialogue, 3-Step Good Deeds Craft & Self-Check"
+                }
+                (CurriculumSubject::IslamicStudies, "garnet-computing-systems-lab") => {
+                    "Step-by-Step Worship Sequence (Wudu / Prayer / Moral Action Flowchart) & Practical Application"
+                }
+                (CurriculumSubject::IslamicStudies, "oxford-phonics-maze") => "Key Islamic Term Writing Staves & Good-Deed Path Maze",
+                (_, "cambridge-cpa-grammar") => "Concrete -> Pictorial -> Abstract (CPA) Rule Discovery & Part-Whole Reasoning",
+                (_, "oxford-vocab-story") => "Contextual Concept Vocabulary Flashcards & 4-Panel Story/Scenario Dialogue",
+                (_, "oxford-phonics-maze") => "Symbol/Number/Term Formation Staves & Algorithmic Sequence Maze",
+                (_, "garnet-computing-systems-lab") => "Input -> Process/Rule -> Output Systems Flowchart & Practical Lab Investigation",
+                (_, "oxford-song-colours") => "Visual Swatches, Panoramic Exploration Chant & Code Classification",
+                (_, "oxford-skills-time") => "Integrated Reading Passage, Listening Discrimination & Pair Talk",
+                (_, "oxford-fluency-project") => "Collaborative Dialogue, 3-Step Hands-On Project & Self-Check",
+                (_, "oxford-workbook-print") => "Summative Print Workbook: Word/Number Bank, Line-Art, Crossword & Writing",
                 _ => "Guided Observation, Structured Practice & Independent Application",
             };
             (
@@ -968,9 +1620,11 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             )
         };
 
+        let display_archetype = family_display_archetype(subject, recommended_family);
         scoped_page_plan.push(json!({
             "page": page,
             "recommended_family": recommended_family,
+            "display_archetype": display_archetype,
             "unit_number": unit_num,
             "chapter_and_lesson": chapter_label,
             "cognitive_stage": cognitive_stage,
@@ -989,6 +1643,7 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             "style_id": skill.skill_id,
             "name": profile.name,
             "age_range": profile.age_range,
+            "inferred_learner_stage": learner_stage,
             "page_mm": profile.page_mm,
             "margin_mm": profile.margin_mm,
             "palette": profile.palette,
@@ -999,6 +1654,8 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
             "precedence_rule": "The explicit user request and this selected design_profile retain full control over art backgrounds, recurring characters, fonts, age range, language, and page compositions. Use fallback suggestions below only when left unspecified by the request and profile."
         },
         "subject_domain": domain_name,
+        "prompt_topic_focus": topic_focus,
+        "learner_stage": learner_stage,
         "language_and_script_mode": language_mode,
         "suggested_methodology": methodology,
         "units_and_chapters": units,
@@ -2230,5 +2887,93 @@ mod tests {
         assert_eq!(bp["selected_profile_authority"]["illustration"][0], "Warm cream backgrounds with an original recurring pair of young explorers");
         assert_eq!(bp["selected_profile_authority"]["layout"][0], "Four distinct native page compositions");
         assert_eq!(bp["selected_profile_authority"]["typography"][0], "Authored science editorial font hierarchy");
+    }
+
+    #[test]
+    fn curriculum_blueprint_and_mastermind_support_islamic_arabic_social_and_kg2_briefs() {
+        let mut style = skill();
+        style.design_profile.as_mut().unwrap().page_families = [
+            "international-curriculum-cover",
+            "international-scope-sequence",
+            "oxford-vocab-story",
+            "oxford-skills-time",
+            "oxford-fluency-project",
+            "oxford-song-colours",
+            "oxford-workbook-print",
+            "oxford-phonics-maze",
+        ]
+        .into_iter()
+        .map(|id| {
+            serde_json::from_value(json!({
+                "id": id,
+                "purpose": id,
+                "template": "templates/practice.json",
+                "text_slots": [{"id":"heading","purpose":"Heading","command":0,"max_chars":24}],
+                "image_slots": []
+            }))
+            .unwrap()
+        })
+        .collect();
+
+        let islamic_prompt = "ابي انتج منهج دولي لماده الاسلاميه لمرحله kg2";
+        let islamic_bp = curriculum_blueprint(islamic_prompt, &style, BatchScope { start: 0, count: 4 }, 16).unwrap();
+        assert!(
+            islamic_bp["subject_domain"].as_str().unwrap().contains("Islamic Studies"),
+            "Expected Islamic Studies domain, got: {}",
+            islamic_bp["subject_domain"]
+        );
+        assert!(islamic_bp["learner_stage"].as_str().unwrap().contains("KG2"), "Expected KG2 learner stage, got: {}", islamic_bp["learner_stage"]);
+        assert!(
+            islamic_bp["language_and_script_mode"].as_str().unwrap().starts_with("Arabic primary"),
+            "Expected Arabic primary script mode, got: {}",
+            islamic_bp["language_and_script_mode"]
+        );
+        assert_eq!(islamic_bp["units_and_chapters"].as_array().unwrap().len(), 4);
+        assert_eq!(islamic_bp["scoped_page_plan"].as_array().unwrap().len(), 4);
+
+        let arabic_bp = curriculum_blueprint("منهج اللغة العربية التأسيسي لمرحلة KG1", &style, BatchScope { start: 0, count: 4 }, 16).unwrap();
+        assert!(arabic_bp["subject_domain"].as_str().unwrap().contains("Arabic Language"));
+        assert!(arabic_bp["learner_stage"].as_str().unwrap().contains("KG1"));
+
+        let social_bp = curriculum_blueprint("منهج الدراسات الاجتماعية والوطنية للأطفال", &style, BatchScope { start: 0, count: 4 }, 16).unwrap();
+        assert!(social_bp["subject_domain"].as_str().unwrap().contains("Social Studies"));
+
+        let mastermind = skill_tool_mastermind_brief(islamic_prompt, std::slice::from_ref(&style), BatchScope { start: 0, count: 4 }, 16, None);
+        assert!(mastermind["inferred_subject"].as_str().unwrap().contains("IslamicStudies"));
+        assert!(mastermind["inferred_learner_stage"].as_str().unwrap().contains("KG2"));
+        assert_eq!(mastermind["spatial_and_logical_harmony_rules"].as_array().unwrap().len(), 4);
+        assert!(
+            islamic_bp["scoped_page_plan"][2]["display_archetype"].as_str().unwrap().contains("السيرة والآداب"),
+            "Expected Islamic archetype on page 3, got: {}",
+            islamic_bp["scoped_page_plan"][2]["display_archetype"]
+        );
+
+        let storybook_bp = curriculum_blueprint("صمم قصة مصورة للأطفال عن الأمانة والتعاون", &style, BatchScope { start: 0, count: 4 }, 8).unwrap();
+        assert!(storybook_bp["subject_domain"].as_str().unwrap().contains("Illustrated Storybook"));
+        assert!(storybook_bp["prompt_topic_focus"].as_str().unwrap().contains("الأمانة"));
+
+        let custom_bp = curriculum_blueprint("صمم كتيب تدريبي في مهارات التفكير الإبداعي", &style, BatchScope { start: 0, count: 4 }, 8).unwrap();
+        assert!(custom_bp["subject_domain"].as_str().unwrap().contains("التفكير الإبداعي"));
+        assert!(!custom_bp["units_and_chapters"][0]["title"].as_str().unwrap().contains("Phonics"));
+
+        assert!(requires_adaptive_mastermind("صمم بروشور تعريفي للشركة", std::slice::from_ref(&style)));
+        assert!(requires_adaptive_mastermind("صمم مجلة ثقافية شهرية", std::slice::from_ref(&style)));
+        assert!(requires_adaptive_mastermind("صمم تقرير سنوي مع مؤشرات أداء", std::slice::from_ref(&style)));
+        assert!(requires_adaptive_mastermind("صمم شهادة تقدير للطالب المتفوق", std::slice::from_ref(&style)));
+        assert!(!requires_adaptive_mastermind(islamic_prompt, std::slice::from_ref(&style)));
+
+        let mut plant_style = skill();
+        plant_style.design_profile.as_mut().unwrap().page_families = vec![
+            serde_json::from_value(json!({
+                "id": "explore-plant-parts",
+                "purpose": "Explore plant parts",
+                "template": "templates/practice.json",
+                "text_slots": [{"id":"leaves-ar","purpose":"Arabic word for leaves","command":0,"max_chars":24}],
+                "image_slots": []
+            }))
+            .unwrap(),
+        ];
+        assert!(requires_adaptive_mastermind(islamic_prompt, std::slice::from_ref(&plant_style)));
+        assert!(!requires_adaptive_mastermind("صمم منهج علوم عن أجزاء النبات", std::slice::from_ref(&plant_style)));
     }
 }
