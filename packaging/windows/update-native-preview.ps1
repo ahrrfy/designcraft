@@ -12,6 +12,10 @@ function Read-UpdateJson([string]$Path) {
     Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+function Test-TrustedCiUrl([string]$Url) {
+    return ($Url -cmatch '^https://github\.com/ahrrfy/designcraft/(?:actions/runs/[0-9]+|commit/[0-9a-f]{40})$')
+}
+
 function Assert-UpdateMetadata($Metadata) {
     if ($Metadata.schemaVersion -ne 1 -or $Metadata.repository -cne 'ahrrfy/designcraft') { throw 'Unexpected update source.' }
     foreach ($value in @($Metadata.repository, $Metadata.sourceCommit, $Metadata.archive.name, $Metadata.archive.sha256, $Metadata.ciUrl)) {
@@ -24,7 +28,10 @@ function Assert-UpdateMetadata($Metadata) {
     if ($Metadata.archive.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Invalid archive digest.' }
     $archiveSize = [long]0
     if (-not [long]::TryParse([string]$Metadata.archive.size, [ref]$archiveSize) -or $archiveSize -le 0 -or $archiveSize -gt 536870912) { throw 'Archive exceeds the 512 MiB limit.' }
-    if ($Metadata.ciUrl -cnotmatch '^https://github\.com/ahrrfy/designcraft/actions/runs/[0-9]+$') { throw 'Invalid CI proof URL.' }
+    if (-not (Test-TrustedCiUrl $Metadata.ciUrl)) { throw 'Invalid CI proof URL.' }
+    if ($Metadata.ciUrl -cmatch '^https://github\.com/ahrrfy/designcraft/commit/([0-9a-f]{40})$' -and $Matches[1] -cne $Metadata.sourceCommit) {
+        throw 'Commit proof URL must match sourceCommit.'
+    }
     foreach ($name in @('designcraft.exe', 'designcraft-cli.exe')) {
         $property = $Metadata.binaries.PSObject.Properties[$name]
         if ($null -eq $property -or $property.Value -isnot [string] -or $property.Value -cnotmatch '^[0-9a-f]{64}$') { throw 'Executable digest is missing.' }
@@ -89,7 +96,7 @@ function Write-UpdateManifest([string]$Path, $Record) {
 function Assert-StagedUpdateFiles([string]$Executable, [string]$ExeSha, [string]$CliSha, [string]$SourceCommit, [string]$CiUrl) {
     if (-not [IO.Path]::IsPathRooted($Executable) -or [IO.Path]::GetFileName($Executable) -cne 'designcraft.exe') { throw 'Invalid staged executable path.' }
     if ($ExeSha -cnotmatch '^[0-9a-f]{64}$' -or $CliSha -cnotmatch '^[0-9a-f]{64}$' -or $SourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
-        $CiUrl -cnotmatch '^https://github\.com/ahrrfy/designcraft/actions/runs/[0-9]+$') { throw 'Staged verification metadata is missing or invalid.' }
+        -not (Test-TrustedCiUrl $CiUrl)) { throw 'Staged verification metadata is missing or invalid.' }
     $destination = Split-Path $Executable -Parent
     foreach ($name in @('designcraft.exe', 'designcraft-cli.exe')) {
         $path = Join-Path $destination $name
@@ -149,7 +156,7 @@ function Write-PreviewUpdateResult([string]$Status, $SelectedCommit, $TargetExe,
     if ($Status -notin @('up_to_date', 'no_published_update', 'staged_waiting_for_app_close', 'installed_for_next_launch')) { throw 'Invalid update result status.' }
     if ($null -ne $SelectedCommit -and ($SelectedCommit -isnot [string] -or $SelectedCommit -cnotmatch '^[0-9a-f]{40}$')) { throw 'Invalid update result commit.' }
     if ($null -ne $TargetExe -and ($TargetExe -isnot [string] -or -not [IO.Path]::IsPathRooted($TargetExe) -or $TargetExe.Length -gt 32767)) { throw 'Invalid update result path.' }
-    if ($null -ne $CiUrl -and ($CiUrl -isnot [string] -or $CiUrl -cnotmatch '^https://github\.com/ahrrfy/designcraft/actions/runs/[0-9]+$')) { throw 'Invalid update result CI URL.' }
+    if ($null -ne $CiUrl -and ($CiUrl -isnot [string] -or -not (Test-TrustedCiUrl $CiUrl))) { throw 'Invalid update result CI URL.' }
     $json = [pscustomobject]@{status=$Status; selectedCommit=$SelectedCommit; targetExe=$TargetExe; ciUrl=$CiUrl} | ConvertTo-Json -Compress
     if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 65536) { throw 'Update result exceeds 64 KiB.' }
     Write-Output $json
@@ -172,6 +179,21 @@ function Assert-PreviewCiProof($Ci, [string]$SourceCommit, [string]$SyncBaseComm
         $Ci.event -in @('schedule', 'workflow_dispatch') -and $SyncBaseCommit -cmatch '^[0-9a-f]{40}$' -and
         $Ci.head_sha -ceq $SyncBaseCommit -and $MainComparisonStatus -in @('identical', 'ahead')
     if (-not ($directCi -or $upstreamSyncCi)) { throw 'The exact source commit has no successful trusted CI proof.' }
+}
+
+function Assert-PreviewCommitStatusProof($CombinedStatus, [string]$SourceCommit, [string]$MainComparisonStatus) {
+    if ($SourceCommit -cnotmatch '^[0-9a-f]{40}$' -or $MainComparisonStatus -notin @('identical', 'ahead')) {
+        throw 'Candidate commit is not on main.'
+    }
+    if ($null -eq $CombinedStatus -or $CombinedStatus.sha -cne $SourceCommit) {
+        throw 'Commit status SHA does not match source commit.'
+    }
+    $verified = @($CombinedStatus.statuses | Where-Object {
+        $_.context -ceq 'Windows quality gates' -and $_.state -ceq 'success' -and $_.creator.login -ceq 'ahrrfy'
+    })
+    if ($verified.Count -lt 1) {
+        throw 'The exact source commit has no successful trusted quality-gate status.'
+    }
 }
 
 if ($LibraryOnly) { return }
@@ -212,19 +234,25 @@ try {
         Write-PreviewUpdateResult 'up_to_date' $record.published_source_commit $record.executable $currentCiUrl
         return
     }
-    $runId = $meta.ciUrl.Split('/')[-1]
-    $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
-    for ($attempt = 0; $attempt -lt 3 -and $ci.path -ceq '.github/workflows/upstream-sync.yml' -and $ci.status -in @('in_progress', 'queued'); $attempt++) {
-        Start-Sleep -Seconds 5
-        $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
-    }
-    $syncBaseVal = if ($null -ne $meta.PSObject.Properties['syncBaseCommit'] -and $meta.syncBaseCommit) { [string]$meta.syncBaseCommit } else { '' }
-    $mainStatus = ''
-    if ($ci.path -ceq '.github/workflows/upstream-sync.yml') {
+    if ($meta.ciUrl -cmatch '^https://github\.com/ahrrfy/designcraft/commit/([0-9a-f]{40})$') {
+        $combinedStatus = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/commits/' + $meta.sourceCommit + '/status') -Headers $headers -TimeoutSec 45
         $mainComparison = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 45
-        $mainStatus = [string]$mainComparison.status
+        Assert-PreviewCommitStatusProof $combinedStatus $meta.sourceCommit ([string]$mainComparison.status)
+    } else {
+        $runId = $meta.ciUrl.Split('/')[-1]
+        $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
+        for ($attempt = 0; $attempt -lt 3 -and $ci.path -ceq '.github/workflows/upstream-sync.yml' -and $ci.status -in @('in_progress', 'queued'); $attempt++) {
+            Start-Sleep -Seconds 5
+            $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
+        }
+        $syncBaseVal = if ($null -ne $meta.PSObject.Properties['syncBaseCommit'] -and $meta.syncBaseCommit) { [string]$meta.syncBaseCommit } else { '' }
+        $mainStatus = ''
+        if ($ci.path -ceq '.github/workflows/upstream-sync.yml') {
+            $mainComparison = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 45
+            $mainStatus = [string]$mainComparison.status
+        }
+        Assert-PreviewCiProof $ci $meta.sourceCommit $syncBaseVal $mainStatus
     }
-    Assert-PreviewCiProof $ci $meta.sourceCommit $syncBaseVal $mainStatus
     $archiveAsset = @($release.assets | Where-Object name -CEQ $meta.archive.name)
     if ($archiveAsset.Count -ne 1 -or $archiveAsset[0].size -ne $meta.archive.size -or $archiveAsset[0].browser_download_url -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/v[0-9A-Za-z.-]+/smart-design-[0-9A-Za-z.-]+-windows-x64-unsigned-portable\.zip$') { throw 'Invalid archive asset.' }
     $destination = Join-Path $root ('versions/' + $meta.sourceCommit)

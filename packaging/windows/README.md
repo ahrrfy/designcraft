@@ -11,9 +11,10 @@ to verify Arabic paths, UTF-8 with and without a BOM, read-only validation and m
 `update-native-preview.ps1 -ManifestPath <absolute-json-path>` checks published
 `v*-ai*` previews only in `ahrrfy/designcraft`. Release packaging (triggered automatically
 after successful `Rust CI` on `main`, and automatically every 6 hours by `upstream-sync.yml`
-when upstream `storytold/designcraft` commits merge cleanly and pass full Windows quality gates)
+when upstream `storytold/designcraft` commits merge cleanly and pass full Windows quality gates,
+or locally via `sync-upstream-local.ps1` using an isolated worktree if GitHub Actions is paused)
 supplies `update.json` with archive and executable SHA-256, size, source commit, optional
-`syncBaseCommit`, and a verified CI URL. The updater verifies that proof and forward-only
+`syncBaseCommit`, and a verified CI or commit-status URL. The updater verifies that proof and forward-only
 ancestry, bounds archive expansion, rejects traversal/scripts, installs side by side and
 retains the old version. These previews are unsigned; hashes and GitHub CI prove source/channel
 integrity, not a code-signing identity. Upstream releases are integrated and verified in the

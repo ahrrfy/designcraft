@@ -50,6 +50,17 @@ fn known_status(value: &str) -> bool {
     matches!(value, "up_to_date" | "no_published_update" | "staged_waiting_for_app_close" | "installed_for_next_launch")
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn valid_ci_url(value: &str) -> bool {
+    if let Some(run) = value.strip_prefix("https://github.com/ahrrfy/designcraft/actions/runs/") {
+        !run.is_empty() && run.bytes().all(|byte| byte.is_ascii_digit())
+    } else if let Some(sha) = value.strip_prefix("https://github.com/ahrrfy/designcraft/commit/") {
+        valid_commit(sha)
+    } else {
+        false
+    }
+}
+
 impl Manifest {
     #[cfg(any(target_os = "windows", test))]
     fn parse(source: &str) -> Result<Self, String> {
@@ -139,11 +150,7 @@ impl UpdateResult {
         if target.is_some_and(|value| !absolute_path(value)) {
             return Err("Updater executable is not absolute.".into());
         }
-        if optional("ciUrl")?.is_some_and(|value| {
-            value
-                .strip_prefix("https://github.com/ahrrfy/designcraft/actions/runs/")
-                .is_none_or(|run| run.is_empty() || !run.bytes().all(|byte| byte.is_ascii_digit()))
-        }) {
+        if optional("ciUrl")?.is_some_and(|value| !valid_ci_url(value)) {
             return Err("Updater CI proof URL is invalid.".into());
         }
         if matches!(status, "staged_waiting_for_app_close" | "installed_for_next_launch") && (commit.is_none() || target.is_none()) {
@@ -519,6 +526,22 @@ mod tests {
         assert!(super::UpdateResult::parse(false, good.as_bytes(), b"download failed").is_err());
         assert!(super::UpdateResult::parse(true, br#"{"status":"error"}"#, b"").is_err());
         assert!(super::UpdateResult::parse(true, b"The preview is up to date", b"").is_err());
+        let commit_proof = json!({
+            "status": "installed_for_next_launch",
+            "selectedCommit": STAGED,
+            "targetExe": std::env::temp_dir().join("designcraft.exe"),
+            "ciUrl": format!("https://github.com/ahrrfy/designcraft/commit/{STAGED}")
+        })
+        .to_string();
+        assert_eq!(super::UpdateResult::parse(true, commit_proof.as_bytes(), b"").unwrap().status, "installed_for_next_launch");
+        let untrusted_proof = json!({
+            "status": "installed_for_next_launch",
+            "selectedCommit": STAGED,
+            "targetExe": std::env::temp_dir().join("designcraft.exe"),
+            "ciUrl": format!("https://github.com/storytold/designcraft/commit/{STAGED}")
+        })
+        .to_string();
+        assert!(super::UpdateResult::parse(true, untrusted_proof.as_bytes(), b"").is_err());
     }
 
     #[test]

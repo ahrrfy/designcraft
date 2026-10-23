@@ -44,6 +44,12 @@ Reject { Assert-PreviewCiProof $syncCi $sha $syncBase 'diverged' }
 Reject { Assert-PreviewCiProof $syncCi $sha $syncBase 'behind' }
 Reject { Assert-PreviewCiProof $syncCi $sha ('d' * 40) 'identical' }
 Reject { Assert-PreviewCiProof $syncCi $sha '' 'identical' }
+$combined = [pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='success'; creator=[pscustomobject]@{login='ahrrfy'}})}
+Assert-PreviewCommitStatusProof $combined $sha 'identical'
+Assert-PreviewCommitStatusProof $combined $sha 'ahead'
+Reject { Assert-PreviewCommitStatusProof $combined $sha 'diverged' }
+Reject { Assert-PreviewCommitStatusProof ([pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='success'; creator=[pscustomobject]@{login='other'}})}) $sha 'identical' }
+Reject { Assert-PreviewCommitStatusProof ([pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='failure'; creator=[pscustomobject]@{login='ahrrfy'}})}) $sha 'identical' }
 [IO.File]::WriteAllText((Join-Path $source 'SOURCE-COMMIT.txt'), $sha)
 $archive = Join-Path $testRoot 'fixture.zip'
 [IO.Compression.ZipFile]::CreateFromDirectory($source, $archive)
@@ -64,6 +70,11 @@ Assert-UpdateMetadata $meta
 $meta.syncBaseCommit = 'invalid-sha'
 Reject { Assert-UpdateMetadata $meta }
 $meta.PSObject.Properties.Remove('syncBaseCommit')
+$meta.ciUrl = ('https://github.com/ahrrfy/designcraft/commit/' + $sha)
+Assert-UpdateMetadata $meta
+$meta.ciUrl = ('https://github.com/ahrrfy/designcraft/commit/' + ('d' * 40))
+Reject { Assert-UpdateMetadata $meta }
+$meta.ciUrl = 'https://github.com/ahrrfy/designcraft/actions/runs/1'
 $meta.repository = 'storytold/designcraft'
 Reject { Assert-UpdateMetadata $meta }
 $meta.repository = 'ahrrfy/designcraft'
@@ -122,5 +133,5 @@ Check ($after.profile -eq $profile -and $after.document_path -eq $book -and $aft
 Check ((Get-Content -LiteralPath $book -Raw) -eq 'Synthetic user work; never overwrite.') 'User book changed.'
 Check ((Get-Content -LiteralPath (Join-Path $profile 'sentinel.txt') -Raw) -eq 'Synthetic existing settings; never overwrite.') 'Profile changed.'
 Check (Test-Path -LiteralPath ($manifest + '.before-update')) 'Rollback pointer is missing.'
-Write-Output 'Updater tests passed: source/size/digest/path, exact-CI and upstream-sync CI guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
+Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

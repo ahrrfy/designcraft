@@ -2,9 +2,14 @@ $ErrorActionPreference = 'Stop'
 # Reuse the local archive, digest and protection regressions; no fixture is executable.
 . (Join-Path $PSScriptRoot 'test-preview-updater.ps1')
 . (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $manifest -LibraryOnly
+. (Join-Path $PSScriptRoot 'sync-upstream-local.ps1') -ManifestPath $manifest -LibraryOnly
 $launcher = Join-Path $PSScriptRoot 'start-native-preview.ps1'
 $updater = Join-Path $PSScriptRoot 'update-native-preview.ps1'
+$syncScript = Join-Path $PSScriptRoot 'sync-upstream-local.ps1'
 $activeExe = Join-Path $source 'designcraft.exe'
+Check ((Resolve-UpstreamSyncAction $false $true) -eq 'integrate_upstream_and_publish') 'New upstream commits were not scheduled for integration.'
+Check ((Resolve-UpstreamSyncAction $true $false) -eq 'publish_existing_main') 'Unpublished main commit was not scheduled for publication.'
+Check ((Resolve-UpstreamSyncAction $true $true) -eq 'check_local_update_only') 'Already synced and published main did not fast-path to local update check.'
 function Reset-FlowManifest {
     JsonFile $manifest ([pscustomobject]@{
         profile=$profile; document_path=$book; executable=$activeExe; port=65335
@@ -25,9 +30,12 @@ Check (-not (Test-Path -LiteralPath (Join-Path $testRoot 'managed-updates'))) 'V
 $taskSpec = Get-PreviewUpdateTaskDefinition $manifest 'Smart Design Auto Update' 120
 Check ($taskSpec.task_name -eq 'Smart Design Auto Update' -and $taskSpec.interval_minutes -eq 120) 'Scheduled task definition metadata differs.'
 Check ($taskSpec.executable.EndsWith('powershell.exe') -and $taskSpec.arguments.Contains('-WindowStyle Hidden') -and $taskSpec.arguments.Contains('-NonInteractive') -and $taskSpec.arguments.Contains($updater) -and $taskSpec.arguments.Contains($manifest)) 'Scheduled task command arguments differ.'
+$syncTaskSpec = Get-PreviewUpdateTaskDefinition $manifest 'Smart Design Upstream Sync' 360 'sync-upstream-local.ps1' $PSScriptRoot
+Check ($syncTaskSpec.arguments.Contains($syncScript) -and $syncTaskSpec.arguments.Contains('-RepoPath')) 'Upstream sync scheduled task definition differs.'
 Check ((Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'Task definition mutated the manifest.'
 Reject { Get-PreviewUpdateTaskDefinition $manifest 'Invalid:TaskName' 120 }
 Reject { Get-PreviewUpdateTaskDefinition $manifest 'Smart Design Auto Update' 5 }
+Reject { Get-PreviewUpdateTaskDefinition $manifest 'Smart Design Auto Update' 120 'evil.ps1' }
 Reject { Resolve-PreviewLaunch $manifest -AppRunning:$true }
 Check ((Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'Live launcher promoted a stage.'
 Reject { Resolve-PreviewLaunch $manifest $activeExe }
@@ -68,6 +76,13 @@ $syncMeta = [pscustomobject]@{
 }
 $syncMetaFile = Join-Path $testRoot 'sync-metadata.json'
 JsonFile $syncMetaFile $syncMeta
+$commitMeta = [pscustomobject]@{
+    schemaVersion = 1; repository = 'ahrrfy/designcraft'; sourceCommit = $sha
+    ciUrl = ('https://github.com/ahrrfy/designcraft/commit/' + $sha)
+    archive = $meta.archive; binaries = $meta.binaries
+}
+$commitMetaFile = Join-Path $testRoot 'commit-metadata.json'
+JsonFile $commitMetaFile $commitMeta
 $destination = Join-Path $testRoot ('managed-updates/versions/' + $sha)
 [IO.Directory]::CreateDirectory($destination) | Out-Null
 foreach ($name in @('designcraft.exe','designcraft-cli.exe','SOURCE-COMMIT.txt')) { [IO.File]::Copy((Join-Path $source $name), (Join-Path $destination $name), $true) }
@@ -85,6 +100,9 @@ function Invoke-FlowScenario([string]$Scenario) {
                 )
             }
         }
+        if ($Uri -like '*/commits/*/status') {
+            return [pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='success'; creator=[pscustomobject]@{login='ahrrfy'}})}
+        }
         if ($Uri -like '*/compare/*...main') { return [pscustomobject]@{status='identical'} }
         if ($Uri -like '*/compare/*') { return [pscustomobject]@{status=$(if ($Scenario -eq 'older_ancestor') { 'behind' } else { 'ahead' })} }
         if ($Uri -like '*/actions/runs/*') {
@@ -98,7 +116,7 @@ function Invoke-FlowScenario([string]$Scenario) {
     function Invoke-WebRequest {
         param([switch]$UseBasicParsing, $Uri, $OutFile, $TimeoutSec)
         if ($Uri -notlike '*/update.json') { throw 'Unexpected archive download.' }
-        $sourceMeta = if ($Scenario -eq 'upstream_sync') { $syncMetaFile } else { $metaFile }
+        $sourceMeta = if ($Scenario -eq 'upstream_sync') { $syncMetaFile } elseif ($Scenario -eq 'commit_status_proof') { $commitMetaFile } else { $metaFile }
         [IO.File]::Copy($sourceMeta, $OutFile, $true)
     }
     function Get-Process {
@@ -108,7 +126,7 @@ function Invoke-FlowScenario([string]$Scenario) {
     $lines = @(& $updater -ManifestPath $manifest)
     Check ($lines.Count -eq 1 -and $lines[0] -is [string] -and $lines[0].Length -lt 40000) 'Updater did not emit exactly one bounded JSON result.'
     $result = $lines[0] | ConvertFrom-Json
-    $expectedStatus = if ($Scenario -eq 'older_ancestor') { 'up_to_date' } elseif ($Scenario -eq 'already_staged') { 'staged_waiting_for_app_close' } elseif ($Scenario -eq 'upstream_sync') { 'installed_for_next_launch' } else { $Scenario }
+    $expectedStatus = if ($Scenario -eq 'older_ancestor') { 'up_to_date' } elseif ($Scenario -eq 'already_staged') { 'staged_waiting_for_app_close' } elseif ($Scenario -in @('upstream_sync', 'commit_status_proof')) { 'installed_for_next_launch' } else { $Scenario }
     Check ($result.status -eq $expectedStatus -and @($result.PSObject.Properties).Count -eq 4) 'Updater result schema/status differs.'
     if ($Scenario -eq 'no_published_update') {
         Check ($null -eq $result.selectedCommit -and $null -eq $result.targetExe -and $null -eq $result.ciUrl) 'Missing release result must use null targets.'
@@ -116,11 +134,11 @@ function Invoke-FlowScenario([string]$Scenario) {
         Check ($result.selectedCommit -eq ('b' * 40) -and $result.targetExe -eq $activeExe -and $null -eq $result.ciUrl) 'Older published ancestor replaced the installed build.'
         Check ((Read-UpdateJson $manifest).executable -eq $activeExe) 'Older published ancestor changed the active pointer.'
     } else {
-        $expectedCiUrl = if ($Scenario -eq 'upstream_sync') { $syncMeta.ciUrl } else { $meta.ciUrl }
+        $expectedCiUrl = if ($Scenario -eq 'upstream_sync') { $syncMeta.ciUrl } elseif ($Scenario -eq 'commit_status_proof') { $commitMeta.ciUrl } else { $meta.ciUrl }
         Check ($result.selectedCommit -eq $sha -and [IO.Path]::IsPathRooted($result.targetExe) -and $result.ciUrl -eq $expectedCiUrl) 'Updater result metadata differs.'
     }
 }
-foreach ($scenario in @('no_published_update','up_to_date','older_ancestor','staged_waiting_for_app_close','installed_for_next_launch','upstream_sync','already_staged')) {
+foreach ($scenario in @('no_published_update','up_to_date','older_ancestor','staged_waiting_for_app_close','installed_for_next_launch','upstream_sync','commit_status_proof','already_staged')) {
     Reset-FlowManifest
     if ($scenario -eq 'up_to_date') {
         $record = Read-UpdateJson $manifest
@@ -132,4 +150,4 @@ foreach ($scenario in @('no_published_update','up_to_date','older_ancestor','sta
 }
 Check ((Get-Content -LiteralPath $book -Raw) -eq 'Synthetic user work; never overwrite.') 'Flow changed the document.'
 Check ((Get-Content -LiteralPath (Join-Path $profile 'sentinel.txt') -Raw) -eq 'Synthetic existing settings; never overwrite.') 'Flow changed profile settings.'
-'PASS: next-launch promotion, live refusal, read-only validation/environment, scheduled-task spec, nested settings, launch/update shortcut setup, all one-line updater JSON outcomes including upstream-sync proof, older ancestor and staged recheck; no binaries started or network/provider requests sent.'
+'PASS: next-launch promotion, live refusal, read-only validation/environment, scheduled-task specs, nested settings, launch/update shortcut setup, all one-line updater JSON outcomes including upstream-sync and commit-status proofs, older ancestor and staged recheck; no binaries started or network/provider requests sent.'
