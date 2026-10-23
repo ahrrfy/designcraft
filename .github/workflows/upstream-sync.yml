@@ -79,6 +79,26 @@ jobs:
             exit 0
           fi
           git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
+          if [ -s "$RUNNER_TEMP/upstream-conflicts.txt" ] && ! grep -qvE '^(\.github/workflows/[^/]+\.yml|Cargo\.lock)$' "$RUNNER_TEMP/upstream-conflicts.txt"; then
+            while IFS= read -r wf_path; do
+              case "$wf_path" in
+                .github/workflows/*.yml)
+                  if git cat-file -e "HEAD:$wf_path" 2>/dev/null; then
+                    git checkout --ours -- "$wf_path"
+                    git add -- "$wf_path"
+                  else
+                    git rm -f -- "$wf_path"
+                  fi
+                  ;;
+              esac
+            done < "$RUNNER_TEMP/upstream-conflicts.txt"
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
+            if [ ! -s "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
+              git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
+              printf 'state=ready_for_ci\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
           conflict_count="$(wc -l < "$RUNNER_TEMP/upstream-conflicts.txt" | tr -d '[:space:]')"
           if [ "$conflict_count" = "1" ] && grep -qx 'Cargo.lock' "$RUNNER_TEMP/upstream-conflicts.txt"; then
             git checkout --ours Cargo.lock

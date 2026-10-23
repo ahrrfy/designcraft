@@ -113,7 +113,8 @@ pub fn prepare(s: &Session, p: &Value) -> Result<PreparedPrint> {
 }
 
 fn prepare_with_printers(s: &Session, p: &Value, printers: impl FnOnce() -> Vec<craft_print::Printer>) -> Result<PreparedPrint> {
-    let allowed = ["printer", "copies", "pages", "spreads", "marks", "bleed", "standard", "minPpi", "scaling", "duplex", "grayscale", "dryRun", "created"];
+    let allowed =
+        ["printer", "copies", "pages", "spreads", "marks", "bleed", "standard", "minPpi", "scaling", "duplex", "grayscale", "dryRun", "created"];
     let object = p.as_object().ok_or_else(|| bad("file.preparePrint", "parameters must be an object"))?;
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(bad("file.preparePrint", "unsupported preparation parameter"));

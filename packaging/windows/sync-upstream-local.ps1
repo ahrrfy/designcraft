@@ -213,12 +213,24 @@ try {
                         git merge --no-ff --no-commit $upstreamSha
                         if ($LASTEXITCODE -ne 0) {
                             $conflicts = @(git diff --name-only --diff-filter=U)
-                            if ($conflicts.Count -eq 1 -and $conflicts[0] -eq 'Cargo.lock') {
-                                git checkout --ours Cargo.lock
-                                $env:CARGO_TARGET_DIR = $targetDir
-                                cargo update --workspace
-                                if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock workspace refresh failed.' }
-                                git add Cargo.lock
+                            $autoResolvable = $conflicts.Count -gt 0 -and @($conflicts | Where-Object { $_ -ne 'Cargo.lock' -and $_ -cnotmatch '^\.github/workflows/[^/]+\.yml$' }).Count -eq 0
+                            if ($autoResolvable) {
+                                foreach ($wfPath in @($conflicts | Where-Object { $_ -cmatch '^\.github/workflows/[^/]+\.yml$' })) {
+                                    git cat-file -e ("HEAD:" + $wfPath) 2>$null
+                                    if ($LASTEXITCODE -eq 0) {
+                                        git checkout --ours -- $wfPath
+                                        git add -- $wfPath
+                                    } else {
+                                        git rm -f -- $wfPath | Out-Null
+                                    }
+                                }
+                                if ($conflicts -contains 'Cargo.lock') {
+                                    git checkout --ours Cargo.lock
+                                    $env:CARGO_TARGET_DIR = $targetDir
+                                    cargo update --workspace
+                                    if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock workspace refresh failed.' }
+                                    git add Cargo.lock
+                                }
                             } else {
                                 git merge --abort
                                 throw ("Upstream $shortUp requires manual conflict resolution: " + ($conflicts -join ', '))
