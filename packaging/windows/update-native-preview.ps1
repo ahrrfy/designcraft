@@ -217,10 +217,12 @@ try {
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $headers = @{ 'User-Agent' = 'Smart-Design-Updater'; 'Accept' = 'application/vnd.github+json' }
-    $releases = @(Invoke-RestMethod -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers $headers -TimeoutSec 45)
+    # Unroll explicitly: Windows PowerShell 5.1 Invoke-RestMethod writes JSON arrays with NoEnumerate.
+    $rawReleases = Invoke-RestMethod -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers $headers -TimeoutSec 45
+    $releases = @($rawReleases | ForEach-Object { $_ })
     $release = $releases | Where-Object { -not $_.draft -and $_.tag_name -cmatch '^v[0-9]+\.[0-9]+\.[0-9]+-ai[0-9A-Za-z.-]*$' -and @($_.assets | Where-Object name -eq 'update.json').Count -eq 1 } | Sort-Object published_at -Descending | Select-Object -First 1
     if ($null -eq $release) { Write-PreviewUpdateResult 'no_published_update' $null $null $null; return }
-    $asset = $release.assets | Where-Object name -eq 'update.json'
+    $asset = @($release.assets | Where-Object name -eq 'update.json')[0]
     if ($asset.size -gt 1048576 -or $asset.browser_download_url -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/v[0-9A-Za-z.-]+/update\.json$') { throw 'Invalid update metadata asset.' }
     $metaPath = Join-Path $root 'downloaded-update.json'
     Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $metaPath -TimeoutSec 45

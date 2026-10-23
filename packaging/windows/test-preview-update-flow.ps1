@@ -91,14 +91,21 @@ function Invoke-FlowScenario([string]$Scenario) {
         param($Uri, $Headers, $TimeoutSec)
         if ($Scenario -eq 'already_staged') { throw 'A staged update must retain its ready result without a network request.' }
         if ($Uri -like '*/releases?*') {
-            if ($Scenario -eq 'no_published_update') { return @() }
-            return [pscustomobject]@{
-                draft=$false; tag_name='v0.12.0-ai25'; published_at='2026-10-23T00:00:00Z'
+            if ($Scenario -eq 'no_published_update') { Write-Output -NoEnumerate @(); return }
+            $candidate = [pscustomobject]@{
+                draft=$false; tag_name='v0.12.0-ai.bffea26327cf'; published_at='2026-10-23T20:03:00Z'
                 assets=@(
-                    [pscustomobject]@{name='update.json'; size=1000; browser_download_url='https://github.com/ahrrfy/designcraft/releases/download/v0.12.0-ai25/update.json'},
-                    [pscustomobject]@{name=$meta.archive.name; size=$meta.archive.size; browser_download_url=('https://github.com/ahrrfy/designcraft/releases/download/v0.12.0-ai25/' + $meta.archive.name)}
+                    [pscustomobject]@{name='update.json'; size=1000; browser_download_url='https://github.com/ahrrfy/designcraft/releases/download/v0.12.0-ai.bffea26327cf/update.json'},
+                    [pscustomobject]@{name=$meta.archive.name; size=$meta.archive.size; browser_download_url=('https://github.com/ahrrfy/designcraft/releases/download/v0.12.0-ai.bffea26327cf/' + $meta.archive.name)}
                 )
             }
+            $legacy = [pscustomobject]@{
+                draft=$false; tag_name='v0.9.0-ai.1'; published_at='2026-10-18T00:00:00Z'
+                assets=@()
+            }
+            # Match Windows PowerShell 5.1 Invoke-RestMethod non-enumerated JSON array output.
+            Write-Output -NoEnumerate @($candidate, $legacy)
+            return
         }
         if ($Uri -like '*/commits/*/status') {
             return [pscustomobject]@{sha=$sha; statuses=@([pscustomobject]@{context='Windows quality gates'; state='success'; creator=[pscustomobject]@{login='ahrrfy'}})}
