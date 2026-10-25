@@ -1386,7 +1386,11 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
         {
             let s_val = obj.get("start").and_then(Value::as_f64);
             let e_val = obj.get("end").and_then(Value::as_f64);
-            if s_val.is_some_and(|v| v <= 1.0) && e_val.is_some_and(|v| v <= 1.0 && v > 0.0) {
+            let unit_opacities = (s_val.is_some() || e_val.is_some())
+                && s_val.is_none_or(|v| (0.0..=1.0).contains(&v))
+                && e_val.is_none_or(|v| (0.0..=1.0).contains(&v))
+                && (s_val.unwrap_or(0.0) > 0.0 || e_val.unwrap_or(0.0) > 0.0);
+            if unit_opacities {
                 if let Some(sv) = s_val {
                     obj.insert("start".into(), json!(sv * 100.0));
                 }

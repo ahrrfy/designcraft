@@ -171,6 +171,11 @@ fn set(d: &mut Dialog, path: &[&str], value: Value) {
         v = &mut v[*k];
     }
     v[*last] = value;
+    if path == ["gradientFeather", "angle"]
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.remove("vector");
+    }
 }
 
 /// A distance in the document's unit (stored in points).
@@ -202,10 +207,33 @@ fn percent(ui: &mut egui::Ui, d: &mut Dialog, path: &[&str]) {
     }
 }
 
+fn gradient_feather_angle(d: &Dialog) -> f64 {
+    if let Some(gf) = d.fields.get("fx").and_then(|f| f.get("gradientFeather"))
+        && !gf.get("radial").and_then(Value::as_bool).unwrap_or(false)
+        && let Some([x0, y0, x1, y1]) = gf.get("vector").and_then(Value::as_array).map(Vec::as_slice)
+        && let (Some(x0), Some(y0), Some(x1), Some(y1)) = (x0.as_f64(), y0.as_f64(), x1.as_f64(), y1.as_f64())
+    {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        if dx.is_finite() && dy.is_finite() && dx.hypot(dy) > 1e-6 {
+            return (-dy).atan2(dx).to_degrees();
+        }
+    }
+    num(d, &["gradientFeather", "angle"])
+}
+
 fn angle(ui: &mut egui::Ui, d: &mut Dialog, path: &[&str], enabled: bool, global: f64) {
-    let mut v = if enabled { num(d, path) } else { global };
+    let mut v = if !enabled {
+        global
+    } else if path == ["gradientFeather", "angle"] {
+        gradient_feather_angle(d)
+    } else {
+        num(d, path)
+    };
+    if v.is_finite() && !(-180.0..=180.0).contains(&v) {
+        v = (v + 180.0).rem_euclid(360.0) - 180.0;
+    }
     let r = ui.add_enabled(enabled, egui::DragValue::new(&mut v).range(-180.0..=180.0).suffix("°").max_decimals(1));
-    if r.changed() {
+    if r.changed() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
         set(d, path, json!(v));
     }
 }
@@ -236,9 +264,9 @@ fn swatch(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, path: &[&str]) {
         .session
         .active()
         .map_or_else(Vec::new, |st| st.doc.swatches.iter().filter(|w| !w.hidden || w.name == cur).map(|w| w.name.clone()).collect());
-    egui::ComboBox::from_id_salt(("fx_swatch", path.join("."))).selected_text(&cur).width(150.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(("fx_swatch", path.join("."))).selected_text(crate::rtl::widget(ui, &cur)).width(150.0).show_ui(ui, |ui| {
         for n in names {
-            if ui.selectable_label(n == cur, &n).clicked() {
+            if ui.selectable_label(n == cur, crate::rtl::widget(ui, &n)).clicked() {
                 set(d, path, json!(n));
             }
         }
@@ -283,9 +311,9 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
             grid("t").show(ui, |ui| {
                 row(ui, "Mode:");
                 let cur = d.fields.get("blend").and_then(Value::as_str).unwrap_or("Normal").to_string();
-                egui::ComboBox::from_id_salt("fx_blend").selected_text(tr(&cur)).width(150.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("fx_blend").selected_text(crate::rtl::widget(ui, tr(&cur))).width(150.0).show_ui(ui, |ui| {
                     for m in designcraft_color::BlendMode::ALL {
-                        if ui.selectable_label(m.label() == cur, tr(m.label())).clicked() {
+                        if ui.selectable_label(m.label() == cur, crate::rtl::widget(ui, tr(m.label()))).clicked() {
                             d.fields.insert("blend".into(), json!(m.label()));
                         }
                     }
@@ -351,9 +379,9 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                         serde_json::to_value(m).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
                     };
                     let shown = designcraft_color::BlendMode::ALL.iter().find(|m| label(m) == cur).map_or("Screen", |m| m.label());
-                    egui::ComboBox::from_id_salt("fx_glow_mode").selected_text(tr(shown)).width(150.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fx_glow_mode").selected_text(crate::rtl::widget(ui, tr(shown))).width(150.0).show_ui(ui, |ui| {
                         for m in designcraft_color::BlendMode::ALL {
-                            if ui.selectable_label(label(&m) == cur, tr(m.label())).clicked() {
+                            if ui.selectable_label(label(&m) == cur, crate::rtl::widget(ui, tr(m.label()))).clicked() {
                                 set(d, &["innerGlow", "mode"], json!(label(&m)));
                             }
                         }
@@ -379,23 +407,23 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                     ui.end_row();
                     row(ui, "Technique:");
                     let cur = d.fields.get("fx").and_then(|f| f["innerGlow"]["technique"].as_str()).unwrap_or("softer").to_string();
-                    egui::ComboBox::from_id_salt("fx_technique").selected_text(tr(if cur == "precise" { "Precise" } else { "Softer" })).show_ui(
-                        ui,
-                        |ui| {
+                    egui::ComboBox::from_id_salt("fx_technique")
+                        .selected_text(crate::rtl::widget(ui, tr(if cur == "precise" { "Precise" } else { "Softer" })))
+                        .show_ui(ui, |ui| {
                             for (v, l) in [("softer", "Softer"), ("precise", "Precise")] {
-                                if ui.selectable_label(cur == v, tr(l)).clicked() {
+                                if ui.selectable_label(cur == v, crate::rtl::widget(ui, tr(l))).clicked() {
                                     set(d, &["innerGlow", "technique"], json!(v));
                                 }
                             }
-                        },
-                    );
+                        });
                     ui.end_row();
                     row(ui, "Source:");
                     let mut center = d.fields.get("fx").is_some_and(|f| f["innerGlow"]["center"].as_bool().unwrap_or(false));
                     let label = |c: bool| tr(if c { "Center" } else { "Edge" });
-                    egui::ComboBox::from_id_salt("fx_source").selected_text(label(center)).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fx_source").selected_text(crate::rtl::widget(ui, label(center))).show_ui(ui, |ui| {
                         for c in [false, true] {
-                            if ui.selectable_value(&mut center, c, label(c)).clicked() {
+                            let w = crate::rtl::widget(ui, label(c));
+                            if ui.selectable_value(&mut center, c, w).clicked() {
                                 set(d, &["innerGlow", "center"], json!(c));
                             }
                         }
@@ -474,9 +502,9 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                     "rounded" => "Rounded",
                     _ => "Diffused",
                 };
-                egui::ComboBox::from_id_salt("fx_corners").selected_text(tr(shown)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("fx_corners").selected_text(crate::rtl::widget(ui, tr(shown))).show_ui(ui, |ui| {
                     for (v, l) in [("sharp", "Sharp"), ("rounded", "Rounded"), ("diffused", "Diffused")] {
-                        if ui.selectable_label(cur == v, tr(l)).clicked() {
+                        if ui.selectable_label(cur == v, crate::rtl::widget(ui, tr(l))).clicked() {
                             set(d, &["featherOptions", "corners"], json!(v));
                         }
                     }
@@ -523,9 +551,10 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                 row(ui, "Type:");
                 let mut radial = d.fields.get("fx").is_some_and(|f| f["gradientFeather"]["radial"].as_bool().unwrap_or(false));
                 let label = |r: bool| tr(if r { "Radial" } else { "Linear" });
-                egui::ComboBox::from_id_salt("fx_gtype").selected_text(label(radial)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("fx_gtype").selected_text(crate::rtl::widget(ui, label(radial))).show_ui(ui, |ui| {
                     for r in [false, true] {
-                        if ui.selectable_value(&mut radial, r, label(r)).clicked() {
+                        let w = crate::rtl::widget(ui, label(r));
+                        if ui.selectable_value(&mut radial, r, w).clicked() {
                             set(d, &["gradientFeather", "radial"], json!(r));
                         }
                     }
@@ -557,7 +586,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
         crate::rtl::label(ui, tr("Settings for:"));
         // Stroke, Fill and Text levels aren't in the document model yet: the object only.
         ui.add_enabled_ui(false, |ui| {
-            egui::ComboBox::from_id_salt("fx_level").selected_text(tr("Object")).width(110.0).show_ui(ui, |_| {});
+            egui::ComboBox::from_id_salt("fx_level").selected_text(crate::rtl::widget(ui, tr("Object"))).width(110.0).show_ui(ui, |_| {});
         });
     });
     ui.add_space(6.0);
@@ -584,7 +613,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
                             }
                         }
                     }
-                    if ui.selectable_label(page == key, tr(label)).clicked() {
+                    if ui.selectable_label(page == key, crate::rtl::widget(ui, tr(label))).clicked() {
                         d.fields.insert("page".into(), json!(key));
                         if let Some(f) = d.fields.get_mut("fx") {
                             turn_on(f, key);
@@ -738,5 +767,221 @@ mod tests {
         let p = params(d);
         assert_eq!(p["effects"]["dropShadow"]["on"], true, "chosen from the menu: on");
         assert_eq!(summary("en", d), "OBJECT: Normal 100%; Drop Shadow");
+    }
+
+    #[test]
+    fn the_effects_dialog_shapes_arabic_sidebar_and_combobox_labels() {
+        let (mut app, _) = app_with_frame();
+        app.ui.language = "ar".into();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx, "ar");
+        fn check(ctx: &egui::Context, s: egui::epaint::Shape, count: &mut usize) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    let logical = t.galley.job.text.as_str();
+                    if logical.chars().any(designcraft_fonts::is_rtl) {
+                        *count += 1;
+                        assert!(crate::rtl::matches_rtl_layout(ctx, &t.galley), "Arabic text `{logical}` bypassed rtl::widget/rtl::label shaping");
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.into_iter().for_each(|s| check(ctx, s, count)),
+                _ => {}
+            }
+        }
+        for page in [
+            "transparency",
+            "dropShadow",
+            "innerShadow",
+            "outerGlow",
+            "innerGlow",
+            "bevel",
+            "satin",
+            "feather",
+            "directionalFeather",
+            "gradientFeather",
+        ] {
+            open(&mut app, page);
+            let mut arabic_galleys = 0usize;
+            for pass in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                    max_texture_side: Some(8192),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(&mut app, ui.ctx()));
+                out.textures_delta.clear();
+                if pass == 1 {
+                    arabic_galleys = 0;
+                    for c in out.shapes {
+                        check(&ctx, c.shape, &mut arabic_galleys);
+                    }
+                }
+            }
+            assert!(arabic_galleys >= 12, "page {page} rendered too few shaped Arabic galleys: {arabic_galleys}");
+            crate::dialogs::cancel(&mut app);
+        }
+
+        // Also sweep secondary modal dialogs (Preferences, Find/Change text & object modes, Export PDF, Place PDF).
+        let secondary_dialogs = [
+            Dialog::new("preferences", json!({})),
+            Dialog::new("findChange", json!({"objectMode": false})),
+            Dialog::new("findChange", json!({"objectMode": true, "status": "Not found."})),
+            Dialog::new("pdfExport", json!({})),
+            Dialog::new("pdfImport", json!({"path": "عينة.pdf", "pages": 4, "page": 1, "crop": "crop"})),
+        ];
+        for dlg in secondary_dialogs {
+            let dlg_id = dlg.id.clone();
+            app.ui.dialog = Some(dlg);
+            let mut arabic_galleys = 0usize;
+            for pass in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                    max_texture_side: Some(8192),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(&mut app, ui.ctx()));
+                out.textures_delta.clear();
+                if pass == 1 {
+                    arabic_galleys = 0;
+                    for c in out.shapes {
+                        check(&ctx, c.shape, &mut arabic_galleys);
+                    }
+                }
+            }
+            assert!(arabic_galleys >= 5, "dialog {dlg_id} rendered too few shaped Arabic galleys: {arabic_galleys}");
+            crate::dialogs::cancel(&mut app);
+        }
+
+        // Also sweep Data Merge panel in Arabic mode (including Multiple Records spacing fields).
+        let _ = app.run("data.options", json!({"recordsPerPage": "multiple"}));
+        let mut dm_galleys = 0usize;
+        for pass in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                max_texture_side: Some(8192),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| crate::panels::datamerge::show(&mut app, ui));
+            out.textures_delta.clear();
+            if pass == 1 {
+                dm_galleys = 0;
+                for c in out.shapes {
+                    check(&ctx, c.shape, &mut dm_galleys);
+                }
+            }
+        }
+        assert!(dm_galleys >= 8, "Data Merge rendered too few shaped Arabic galleys: {dm_galleys}");
+    }
+
+    #[test]
+    fn gradient_feather_vector_survives_dialog_edits_and_clears_when_angle_changes() {
+        let (mut app, id) = app_with_frame();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx, "en");
+        let fx = |app: &DesignApp| app.session.doc().unwrap().doc.item(designcraft_doc::ItemId(id)).unwrap().effects.clone();
+
+        // Seed an out-of-range angle (270°) followed by a non-axis-aligned dragged vector so both
+        // linear vector angle display and DragValue range clamping are exercised on passive frames.
+        app.run("object.gradientFeather", json!({"ids": [id], "angle": 270.0})).unwrap();
+        app.run("object.gradientFeather", json!({"ids": [id], "from": [120, 130], "to": [247, 203]})).unwrap();
+        let expected_vec = Some([120.0, 130.0, 247.0, 203.0]);
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec);
+
+        // 1. Changing Drop Shadow in the Effects dialog preserves the dragged gradient feather vector.
+        open(&mut app, "dropShadow");
+        frame(&mut app, &ctx);
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec, "live preview on Drop Shadow must keep dragged vector");
+        if let Some(d) = app.ui.dialog.as_mut() {
+            set(d, &["dropShadow", "distance"], json!(14.0));
+        }
+        frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert!(fx(&app).drop_shadow.on && (fx(&app).drop_shadow.distance - 14.0).abs() < 1e-6);
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec);
+
+        // 2. Confirming unchanged settings on Transparency preserves the dragged vector.
+        open(&mut app, "transparency");
+        frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec);
+
+        // 3. Opening on Gradient Feather and editing Start Opacity (without touching Angle)
+        // displays the vector's angle (-29.9°) and preserves the dragged vector.
+        open(&mut app, "gradientFeather");
+        let texts = frame(&mut app, &ctx);
+        assert!(texts.iter().any(|t| t.trim() == "-29.9"), "dialog should show dragged vector angle: {texts:?}");
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec, "passive render of Gradient Feather page must keep vector");
+        if let Some(d) = app.ui.dialog.as_mut() {
+            set(d, &["gradientFeather", "start"], json!(0.75));
+        }
+        frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert!((fx(&app).gradient_feather.start - 0.75).abs() < 1e-6);
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec);
+
+        // 4. Editing Angle in the Effects dialog (including real pointer drag on the Angle DragValue)
+        // clears `vector` in Preview, Cancel restores it, and Confirm commits `vector == None`.
+        open(&mut app, "gradientFeather");
+        let mut angle_pos = None;
+        for _ in 0..2 {
+            let input =
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(&mut app, ui.ctx()));
+            out.textures_delta.clear();
+            fn find_text(s: egui::epaint::Shape, target: &str, found: &mut Option<egui::Pos2>) {
+                match s {
+                    egui::epaint::Shape::Text(t) if t.galley.text().trim() == target => {
+                        *found = Some(t.pos + t.galley.rect.center().to_vec2());
+                    }
+                    egui::epaint::Shape::Vec(v) => v.into_iter().for_each(|s| find_text(s, target, found)),
+                    _ => {}
+                }
+            }
+            for c in out.shapes {
+                find_text(c.shape, "-29.9", &mut angle_pos);
+            }
+        }
+        let drag_start = angle_pos.expect("Angle DragValue galley position");
+        let drag_end = drag_start + egui::vec2(45.0, 0.0);
+        for events in [
+            vec![
+                egui::Event::PointerMoved(drag_start),
+                egui::Event::PointerButton { pos: drag_start, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            ],
+            vec![egui::Event::PointerMoved(drag_end)],
+            vec![egui::Event::PointerButton { pos: drag_end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(&mut app, ui.ctx()));
+            out.textures_delta.clear();
+        }
+        frame(&mut app, &ctx);
+        assert_eq!(fx(&app).gradient_feather.vector, None, "dragging Angle widget must clear vector in preview");
+        crate::dialogs::cancel(&mut app);
+        assert_eq!(fx(&app).gradient_feather.vector, expected_vec, "Cancel must restore dragged vector");
+
+        open(&mut app, "gradientFeather");
+        frame(&mut app, &ctx);
+        if let Some(d) = app.ui.dialog.as_mut() {
+            set(d, &["gradientFeather", "angle"], json!(60.0));
+        }
+        frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(fx(&app).gradient_feather.vector, None);
+        assert!((fx(&app).gradient_feather.angle - 60.0).abs() < 1e-6);
+
+        // 5. Radial dragged vector with out-of-range stored angle (270°) also survives passive
+        // rendering on the Gradient Feather page without spurious DragValue clamp clearing it.
+        app.run("object.gradientFeather", json!({"ids": [id], "radial": true, "angle": 270.0})).unwrap();
+        app.run("object.gradientFeather", json!({"ids": [id], "radial": true, "from": [200, 200], "to": [280, 200]})).unwrap();
+        assert_eq!(fx(&app).gradient_feather.vector, Some([200.0, 200.0, 280.0, 200.0]));
+        open(&mut app, "gradientFeather");
+        frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(fx(&app).gradient_feather.vector, Some([200.0, 200.0, 280.0, 200.0]));
     }
 }

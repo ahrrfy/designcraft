@@ -102,9 +102,12 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     }
     if options.records == "one" {
         let mut one = options.one.max(1);
-        if ui.add(egui::DragValue::new(&mut one).range(1..=max_record).prefix(format!("{} ", tr(&lang, "Record")))).changed() {
-            let _ = app.run("data.options", json!({"one": one}));
-        }
+        ui.horizontal(|ui| {
+            crate::rtl::label(ui, egui::RichText::new(tr(&lang, "Record")).color(t.text));
+            if ui.add(egui::DragValue::new(&mut one).range(1..=max_record)).changed() {
+                let _ = app.run("data.options", json!({"one": one}));
+            }
+        });
     }
     if options.records == "range" {
         let mut range = options.range.clone();
@@ -135,13 +138,19 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             let _ = app.run("data.options", json!({"insets": insets}));
         }
         let mut column_spacing = options.column_spacing;
-        if ui.add(egui::DragValue::new(&mut column_spacing).speed(1.0).prefix(format!("{} ", tr(&lang, "Column spacing")))).changed() {
-            let _ = app.run("data.options", json!({"columnSpacing": column_spacing}));
-        }
+        ui.horizontal(|ui| {
+            crate::rtl::label(ui, egui::RichText::new(tr(&lang, "Column spacing")).color(t.text));
+            if ui.add(egui::DragValue::new(&mut column_spacing).speed(1.0)).changed() {
+                let _ = app.run("data.options", json!({"columnSpacing": column_spacing}));
+            }
+        });
         let mut row_spacing = options.row_spacing;
-        if ui.add(egui::DragValue::new(&mut row_spacing).speed(1.0).prefix(format!("{} ", tr(&lang, "Row spacing")))).changed() {
-            let _ = app.run("data.options", json!({"rowSpacing": row_spacing}));
-        }
+        ui.horizontal(|ui| {
+            crate::rtl::label(ui, egui::RichText::new(tr(&lang, "Row spacing")).color(t.text));
+            if ui.add(egui::DragValue::new(&mut row_spacing).speed(1.0)).changed() {
+                let _ = app.run("data.options", json!({"rowSpacing": row_spacing}));
+            }
+        });
     }
     if let Some(fitting) = choice(
         ui,
@@ -166,10 +175,13 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         let _ = app.run("data.options", json!({"linkImages": link_images}));
     }
     let mut limit = options.limit.unwrap_or(0);
-    if ui.add(egui::DragValue::new(&mut limit).range(0..=100_000).prefix(format!("{} ", tr(&lang, "Limit")))).changed() {
-        let value = if limit == 0 { Value::Null } else { json!(limit) };
-        let _ = app.run("data.options", json!({"limit": value}));
-    }
+    ui.horizontal(|ui| {
+        crate::rtl::label(ui, egui::RichText::new(tr(&lang, "Limit")).color(t.text));
+        if ui.add(egui::DragValue::new(&mut limit).range(0..=100_000)).changed() {
+            let value = if limit == 0 { Value::Null } else { json!(limit) };
+            let _ = app.run("data.options", json!({"limit": value}));
+        }
+    });
     ui.add_space(6.0);
     if ui.button(w(ui, &lang, "Create Merged Document…")).clicked() {
         let _ = app.run("data.merge", json!({}));
@@ -187,9 +199,9 @@ fn select_source(app: &mut DesignApp) {
 fn choice(ui: &mut egui::Ui, id: &str, current: &str, options: &[(&str, &str)], lang: &str) -> Option<String> {
     let label = options.iter().find(|(value, _)| *value == current).map(|(_, text)| tr(lang, text)).unwrap_or(current);
     let mut picked = None;
-    egui::ComboBox::from_id_salt(id).selected_text(label).width(ui.available_width().min(200.0)).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(id).selected_text(crate::rtl::widget(ui, label)).width(ui.available_width().min(200.0)).show_ui(ui, |ui| {
         for (value, text) in options {
-            if ui.selectable_label(*value == current, tr(lang, text)).clicked() {
+            if ui.selectable_label(*value == current, w(ui, lang, text)).clicked() {
                 picked = Some((*value).to_string());
             }
         }

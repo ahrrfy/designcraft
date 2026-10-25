@@ -1,7 +1,9 @@
 //! Optional advisory pixel review. This module never calls a provider or grants publication authority.
 use designcraft_ai_providers::{GeneratedImage, GenerationRequest, ImageInput};
+#[cfg(test)]
 use designcraft_ai_types::ProviderKind;
 use designcraft_ai_types::protocol::{AiSettings, ImagePlacement};
+use designcraft_ai_types::supports_gemini_image_review;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -36,44 +38,7 @@ pub(crate) fn enabled(settings: &AiSettings) -> bool {
 }
 
 fn supports_review(settings: &AiSettings) -> bool {
-    if settings.text_model.provider != ProviderKind::Gemini {
-        return false;
-    }
-    let model = settings.text_model.model.strip_prefix("models/").unwrap_or(&settings.text_model.model);
-    // Text-output Gemini families with image input. Media, embedding, TTS and
-    // Live models are excluded even when their names share a family prefix.
-    // https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
-    [
-        "gemini-flash",
-        "gemini-flash-lite",
-        "gemini-pro",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-pro",
-        "gemini-3-flash",
-        "gemini-3-pro",
-        "gemini-3.1-flash",
-        "gemini-3.1-pro",
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3.5-pro",
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
-        "gemini-3.6-pro",
-        "gemini-3.8-flash",
-        "gemini-3.8-pro",
-    ]
-    .iter()
-    .any(|family| {
-        model == *family
-            || model.strip_prefix(family).is_some_and(|suffix| {
-                suffix == "-latest"
-                    || suffix.strip_prefix("-preview").is_some_and(|date| {
-                        date.is_empty() || (date.starts_with('-') && date.bytes().skip(1).all(|c| c.is_ascii_digit() || c == b'-'))
-                    })
-                    || suffix.strip_prefix('-').is_some_and(|version| version.len() == 3 && version.bytes().all(|c| c.is_ascii_digit()))
-            })
-    })
+    supports_gemini_image_review(settings.text_model.provider, &settings.text_model.model)
 }
 
 /// Build a bounded request for the selected text model; the caller owns usage admission and cancellation.

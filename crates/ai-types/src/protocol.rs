@@ -387,6 +387,8 @@ pub struct SkillCard {
     pub approved: bool,
     #[serde(default)]
     pub automatically_validated: bool,
+    #[serde(default)]
+    pub trusted_source: bool,
     pub active: bool,
     pub enabled: bool,
     pub compatible: bool,

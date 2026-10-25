@@ -217,30 +217,36 @@ pub fn contributors_ui(ui: &mut egui::Ui, lang: &str) {
     let id = egui::Id::new("credits_view");
     let mut v = ui.data_mut(|d| d.get_temp::<View>(id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        ui.label(tr(lang, "Show"));
+        crate::rtl::label(ui, tr(lang, "Show"));
         for m in NameMode::ALL {
-            if ui.selectable_label(v.names == m, tr(lang, m.label())).clicked() {
+            if ui.selectable_label(v.names == m, crate::rtl::widget(ui, tr(lang, m.label()))).clicked() {
                 v.names = m;
             }
         }
         ui.separator();
-        ui.label(tr(lang, "Sort"));
-        egui::ComboBox::from_id_salt("credits_sort").selected_text(tr(lang, v.key.label().0)).show_ui(ui, |ui| {
+        crate::rtl::label(ui, tr(lang, "Sort"));
+        egui::ComboBox::from_id_salt("credits_sort").selected_text(crate::rtl::widget(ui, tr(lang, v.key.label().0))).show_ui(ui, |ui| {
             for k in SortKey::ALL {
-                if ui.selectable_label(v.key == k, tr(lang, k.label().0)).clicked() {
+                if ui.selectable_label(v.key == k, crate::rtl::widget(ui, tr(lang, k.label().0))).clicked() {
                     v.key = k;
                     v.ascending = k.default_ascending();
                 }
             }
         });
-        if ui.button(if v.ascending { "▲" } else { "▼" }).on_hover_text(tr(lang, "Reverse the order")).clicked() {
+        if ui
+            .button(if v.ascending { "▲" } else { "▼" })
+            .on_hover_ui(|ui| {
+                crate::rtl::label(ui, tr(lang, "Reverse the order"));
+            })
+            .clicked()
+        {
             v.ascending = !v.ascending;
         }
         ui.separator();
-        if ui.selectable_label(!v.table, tr(lang, "Grab bag")).clicked() {
+        if ui.selectable_label(!v.table, crate::rtl::widget(ui, tr(lang, "Grab bag"))).clicked() {
             v.table = false;
         }
-        if ui.selectable_label(v.table, tr(lang, "Table")).clicked() {
+        if ui.selectable_label(v.table, crate::rtl::widget(ui, tr(lang, "Table"))).clicked() {
             v.table = true;
         }
     });
@@ -248,11 +254,11 @@ pub fn contributors_ui(ui: &mut egui::Ui, lang: &str) {
     let totals = tr(lang, "{contributors} contributors · {commits} commits")
         .replace("{contributors}", &list.len().to_string())
         .replace("{commits}", &group(TOTAL_COMMITS));
-    ui.label(RichText::new(totals).small().weak());
+    crate::rtl::label(ui, RichText::new(totals).small().weak());
     ui.separator();
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         if list.is_empty() {
-            ui.label(tr(lang, "No contributor data was built into this copy."));
+            crate::rtl::label(ui, tr(lang, "No contributor data was built into this copy."));
         } else if v.table {
             table(ui, &list, &mut v, lang);
         } else {
@@ -274,7 +280,13 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View, lang: &str) {
         for k in SortKey::ALL {
             let arrow = if v.key == k { if v.ascending { " ▲" } else { " ▼" } } else { "" };
             let header = format!("{}{arrow}", tr_context(lang, k.label().1, "contributors"));
-            if ui.button(RichText::new(header).strong()).on_hover_text(tr(lang, k.label().0)).clicked() {
+            if ui
+                .button(crate::rtl::widget(ui, RichText::new(header).strong()))
+                .on_hover_ui(|ui| {
+                    crate::rtl::label(ui, tr(lang, k.label().0));
+                })
+                .clicked()
+            {
                 if v.key == k {
                     v.ascending = !v.ascending;
                 } else {
@@ -303,14 +315,14 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View, lang: &str) {
 /// About ▸ Models: AI models credited in Co-Authored-By trailers.
 pub fn models_ui(ui: &mut egui::Ui, lang: &str) {
     if MODELS.is_empty() {
-        ui.label(tr(lang, "No model credits were built into this copy."));
+        crate::rtl::label(ui, tr(lang, "No model credits were built into this copy."));
         return;
     }
     let assisted: u64 = MODELS.iter().map(|m| m.commits).max().unwrap_or(0).max(1);
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         egui::Grid::new("credits_models").striped(true).num_columns(6).show(ui, |ui| {
             for h in ["Company", "Model", "Version", "Commits", "% of all commits", "Lines +/−"] {
-                ui.label(RichText::new(tr(lang, h)).strong());
+                crate::rtl::label(ui, RichText::new(tr(lang, h)).strong());
             }
             ui.end_row();
             for m in MODELS {

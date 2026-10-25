@@ -116,6 +116,10 @@ foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
   $p = Join-Path $Root $f
   if (Test-Path $p) { Copy-Item $p $Portable }
 }
+$SkillsDir = Join-Path $Root 'skills'
+if (Test-Path $SkillsDir) {
+  Copy-Item $SkillsDir (Join-Path $Portable 'skills') -Recurse
+}
 # Builds made with craft-fonts (CRAFT_FONTS_DIR) embed its fonts: ship their licences.
 if ($env:CRAFT_FONTS_DIR) {
   foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -ErrorAction SilentlyContinue) {

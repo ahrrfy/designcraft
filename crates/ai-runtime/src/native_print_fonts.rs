@@ -90,10 +90,13 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
                 let (weight, italic) = fonts.traits_of(&attrs.font_family, &attrs.font_style);
                 let style = binding_style(font, &fonts, weight >= 600.0, italic)?;
                 let face = fonts.face(&font.family, &style);
-                // Symbols are left for the separate explicit symbol-font repair pass.
-                if let Some(ch) =
-                    text.chars().find(|&ch| ch != '\u{061c}' && (ch.is_alphabetic() || ch.is_numeric() || is_arabic(ch)) && face.glyph_for(ch) == 0)
-                {
+                // Symbols and covered Arabic honorific ligatures/signs are left for the separate explicit fallback-font repair pass.
+                if let Some(ch) = text.chars().find(|&ch| {
+                    ch != '\u{061c}'
+                        && (ch.is_alphabetic() || ch.is_numeric() || is_arabic(ch))
+                        && face.glyph_for(ch) == 0
+                        && !(crate::native_layout::is_fallback_symbol_or_honorific(ch) && crate::native_layout::has_fallback_glyph(&fonts, ch))
+                }) {
                     return Err(format!("Requested print font '{} {}' lacks supplied character {ch}; copy was preserved", font.family, style));
                 }
                 let merge = ranges.last().is_some_and(|(_, previous_end, previous_style)| *previous_end == start && *previous_style == style);
@@ -137,6 +140,11 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
 
 fn is_arabic(ch: char) -> bool {
     matches!(ch,'\u{0600}'..='\u{06ff}'|'\u{0750}'..='\u{077f}'|'\u{08a0}'..='\u{08ff}'|'\u{fb50}'..='\u{fdff}'|'\u{fe70}'..='\u{feff}')
+}
+
+#[cfg(test)]
+fn has_fallback_glyph(fonts: &designcraft_fonts::ScopedFonts<'_>, ch: char) -> bool {
+    crate::native_layout::has_fallback_glyph(fonts, ch)
 }
 
 fn binding_style(font: &AvailablePrintFont, fonts: &designcraft_fonts::ScopedFonts<'_>, bold: bool, italic: bool) -> Result<String, String> {
@@ -298,5 +306,55 @@ mod tests {
         assert_eq!(plan.commands[3].params["swatch"], "C=0 M=0 Y=100 K=0");
         assert_eq!(plan.commands[4].params["swatch"], "[Paper]");
         assert_eq!(notes.iter().filter(|n| n["kind"] == "nativeSwatchFallback").count(), 3);
+    }
+
+    #[test]
+    fn arabic_honorifics_pass_print_font_binding_when_fallback_exists_while_missing_letters_fail() {
+        let Some(family) = fonts() else { return };
+        let db = designcraft_fonts::FontDb::global();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","facingPages":false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let scoped = db.scoped(base.doc.font_scope);
+        if !has_fallback_glyph(&scoped, '\u{fdfa}') || !has_fallback_glyph(&scoped, '\u{fdfd}') {
+            return;
+        }
+        let copy = "قَالَ النَّبِيُّ ﷺ وبسم الله ﷽";
+        let bold_end = copy.find(" وبسم").unwrap();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Islamic honorifics in Tahoma",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"rect": [50, 60, 520, 140], "content": "text", "text": copy, "caret": false}},
+                {"command": "type.para", "params": {"attrs": {"direction": "rightToLeft", "align": "right"}}},
+                {"command": "type.char", "params": {"attrs": {"fontFamily": family, "fontStyle": "Regular", "size": 16, "leading": {"kind": "points", "value": 24}}}},
+                {"command": "text.select", "params": {"story": "$0.story", "anchor": 0, "focus": bold_end}},
+                {"command": "type.char", "params": {"attrs": {"fontStyle": "Bold"}}}
+            ]
+        }))
+        .unwrap();
+        let contract = PrintContract { english_fonts: vec![family.clone()], arabic_fonts: vec![family.clone()], ..Default::default() };
+        apply(&mut plan, &base, &session.prefs, &contract).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        crate::native_layout::prepare(&mut plan, &base, &session.prefs, &cancel).unwrap();
+        let mut verified = Session::new();
+        verified.prefs = session.prefs.clone();
+        verified.add_document(base.clone());
+        verified.execute("production.apply", &json!({"commands": plan.commands, "outputMode": "native_only", "requirePreflight": true})).unwrap();
+
+        // An Arabic Extended-A letter (U+08B5) lacking coverage in Tahoma must still be rejected strictly if unprintable.
+        if db.face(&family, "Regular").glyph_for('\u{08b5}') == 0 {
+            let mut missing_letter_plan: ProductionPlan = serde_json::from_value(json!({
+                "title": "Missing ordinary Arabic letter",
+                "images": [],
+                "commands": [
+                    {"command": "frame.create", "params": {"rect": [50, 60, 420, 120], "content": "text", "text": "كلمة \u{08b5}", "caret": false}}
+                ]
+            }))
+            .unwrap();
+            let snapshot = serde_json::to_value(&missing_letter_plan).unwrap();
+            assert!(apply(&mut missing_letter_plan, &base, &session.prefs, &contract).is_err());
+            assert_eq!(serde_json::to_value(&missing_letter_plan).unwrap(), snapshot);
+        }
     }
 }

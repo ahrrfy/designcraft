@@ -100,14 +100,27 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
         return Err("Expand illustration placements before mapping facing pages".into());
     }
     let mut mapped = plan.clone();
-    let mut result_pages: Vec<Option<usize>> = Vec::with_capacity(plan.commands.len());
+    let mut result_pages: Vec<StepPages> = Vec::with_capacity(plan.commands.len());
     let mut selected: Vec<usize> = Vec::new();
     for (index, action) in mapped.commands.iter_mut().enumerate() {
         let params = action.params.as_object_mut().ok_or("Facing-page command parameters must be an object")?;
-        let creation = matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create");
+        let qr_creation = action.command == "object.qrCode" && params.contains_key("rect");
+        let thread_creation = action.command == "text.thread" && params.contains_key("rect");
+        let creation = matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") || qr_creation || thread_creation;
         let standalone_image = action.command == "file.place" && !params.contains_key("frame");
-        let mut result_page = None;
+        let mut step_pages = StepPages::default();
         if creation || standalone_image {
+            if thread_creation {
+                match (params.get("from"), params.get("to")) {
+                    (Some(from_val), None) => {
+                        step_pages.from = Some(single_target_page(from_val, &result_pages, index, actual)?);
+                    }
+                    (None, Some(to_val)) => {
+                        step_pages.to = Some(single_target_page(to_val, &result_pages, index, actual)?);
+                    }
+                    _ => return Err("Projected text.thread with rect requires exactly one of from or to".into()),
+                }
+            }
             let absolute = params.get("spread").and_then(Value::as_u64).ok_or("Every projected object requires an absolute page spread")?;
             let absolute = usize::try_from(absolute).map_err(|_| "Projected page index is too large")?;
             let (spread, page) = page_location(actual, absolute)?;
@@ -139,7 +152,28 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
                 translate_number(x, page.x)?;
             }
             selected = vec![absolute];
-            result_page = Some(absolute);
+            if thread_creation {
+                if step_pages.from.is_some() {
+                    step_pages.to = Some(absolute);
+                } else {
+                    step_pages.from = Some(absolute);
+                }
+            } else {
+                step_pages.id = Some(absolute);
+            }
+        } else if action.command == "file.place" {
+            let frame_val = params.get("frame").ok_or("Projected file.place requires frame")?;
+            let page = single_target_page(frame_val, &result_pages, index, actual)?;
+            selected = vec![page];
+            step_pages.id = Some(page);
+        } else if action.command == "text.thread" {
+            let from_val = params.get("from").ok_or("Projected text.thread requires from")?;
+            let to_val = params.get("to").ok_or("Projected text.thread requires to")?;
+            let from_page = single_target_page(from_val, &result_pages, index, actual)?;
+            let to_page = single_target_page(to_val, &result_pages, index, actual)?;
+            selected = vec![to_page];
+            step_pages.from = Some(from_page);
+            step_pages.to = Some(to_page);
         } else if action.command == "selection.set" {
             let pages = target_pages(params.get("ids"), &result_pages, index, actual)?;
             if params.get("add").and_then(Value::as_bool) != Some(true) {
@@ -150,18 +184,71 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
                     selected.push(page);
                 }
             }
-        } else if action.command == "object.group" || action.command == "transform.set" {
+        } else if matches!(action.command.as_str(), "object.group" | "object.pathfinder" | "object.makeCompoundPath") {
             let pages = match params.get("ids") {
                 Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
                 None => selected.clone(),
             };
-            if action.command == "object.group" {
-                if pages.len() != 1 {
-                    return Err("Projected groups must remain on one absolute page".into());
-                }
-                selected = pages.clone();
-                result_page = pages.first().copied();
-            } else if params.contains_key("x") {
+            if pages.len() != 1 {
+                return Err("Projected groups must remain on one absolute page".into());
+            }
+            selected = pages.clone();
+            step_pages.id = pages.first().copied();
+        } else if action.command == "object.ungroup" {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if pages.len() != 1 {
+                return Err("Projected ungrouped objects must remain on one absolute page".into());
+            }
+            selected = pages;
+        } else if matches!(action.command.as_str(), "object.releaseCompoundPath" | "edit.stepAndRepeat") {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if pages.len() != 1 {
+                return Err("Projected compound or repeated objects must remain on one absolute page".into());
+            }
+            selected = pages.clone();
+            step_pages.ids = pages.first().copied();
+        } else if action.command == "object.qrCode" {
+            params.remove("spread");
+            let page = *selected.first().ok_or("Projected object.qrCode without rect requires a selected target")?;
+            selected = vec![page];
+            step_pages.id = Some(page);
+        } else if matches!(action.command.as_str(), "object.align" | "object.distribute") {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if pages.len() != 1 {
+                return Err("Projected alignment or distribution cannot combine different pages".into());
+            }
+            if action.command == "object.align" && params.get("to").and_then(Value::as_str) == Some("spread") {
+                params.insert("to".into(), json!("page"));
+            }
+        } else if action.command == "transform.move" {
+            if params.contains_key("toSpread") {
+                return Err("Projected transform.move cannot move objects across spreads".into());
+            }
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if pages.len() == 1 {
+                step_pages.ids = pages.first().copied();
+            }
+            if params.get("copy").and_then(Value::as_bool) == Some(true) {
+                selected = pages;
+            }
+        } else if action.command == "transform.set" {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if params.contains_key("x") || params.contains_key("bounds") {
                 let absolute = *pages.first().ok_or("Absolute transform has no projected target page")?;
                 if pages.iter().any(|page| *page != absolute) {
                     return Err("Absolute transforms cannot combine different projected pages".into());
@@ -182,11 +269,87 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
                 if let Some(x) = params.get_mut("x") {
                     translate_number(x, page.x + canonical_base - base.x)?;
                 }
+                if let Some(bounds) = params.get_mut("bounds") {
+                    translate_array(bounds, 4, &[0, 2], page.x)?;
+                }
             }
+        } else if matches!(action.command.as_str(), "object.gradient" | "object.gradientFeather")
+            && (params.contains_key("from") || params.contains_key("to"))
+        {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            let absolute = *pages.first().ok_or("Projected gradient vector has no target page")?;
+            if pages.iter().any(|page| *page != absolute) {
+                return Err("Projected gradient vectors cannot combine different projected pages".into());
+            }
+            let (_, page) = page_location(actual, absolute)?;
+            for key in ["from", "to"] {
+                if let Some(point) = params.get_mut(key) {
+                    translate_array(point, 2, &[0], page.x)?;
+                }
+            }
+        } else if action.command == "object.effects"
+            && params
+                .get("effects")
+                .and_then(|e| e.get("gradientFeather"))
+                .and_then(Value::as_object)
+                .is_some_and(|gf| gf.contains_key("from") || gf.contains_key("to") || gf.get("vector").is_some_and(|v| !v.is_null()))
+        {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            let absolute = *pages.first().ok_or("Projected effects gradientFeather vector has no target page")?;
+            if pages.iter().any(|page| *page != absolute) {
+                return Err("Projected effects gradientFeather vectors cannot combine different projected pages".into());
+            }
+            let (_, page) = page_location(actual, absolute)?;
+            if let Some(gf) =
+                params.get_mut("effects").and_then(Value::as_object_mut).and_then(|e| e.get_mut("gradientFeather")).and_then(Value::as_object_mut)
+            {
+                if let Some(mut vec_val) = gf.remove("vector")
+                    && !vec_val.is_null()
+                {
+                    translate_array(&mut vec_val, 4, &[], 0.0)?;
+                    if let Some(arr) = vec_val.as_array()
+                        && arr.len() == 4
+                    {
+                        gf.entry("from").or_insert_with(|| json!([arr[0].clone(), arr[1].clone()]));
+                        gf.entry("to").or_insert_with(|| json!([arr[2].clone(), arr[3].clone()]));
+                    }
+                }
+                if gf.contains_key("from") != gf.contains_key("to") {
+                    return Err("Projected effects gradientFeather requires both from and to endpoints".into());
+                }
+                for key in ["from", "to"] {
+                    if let Some(point) = gf.get_mut(key) {
+                        translate_array(point, 2, &[0], page.x)?;
+                    }
+                }
+            }
+        } else if matches!(action.command.as_str(), "style.object.create" | "style.object.edit")
+            && [params.get("effects").and_then(|e| e.get("gradientFeather")), params.get("gradientFeather")].into_iter().flatten().any(|gf| {
+                gf.as_object().is_some_and(|o| o.contains_key("from") || o.contains_key("to") || o.get("vector").is_some_and(|v| !v.is_null()))
+            })
+        {
+            return Err(
+                "Projected object styles cannot bind page-local gradientFeather endpoints across facing pages; use angle or object.gradientFeather"
+                    .into(),
+            );
         }
-        result_pages.push(result_page);
+        result_pages.push(step_pages);
     }
     Ok(mapped)
+}
+
+#[derive(Clone, Copy, Default)]
+struct StepPages {
+    id: Option<usize>,
+    from: Option<usize>,
+    to: Option<usize>,
+    ids: Option<usize>,
 }
 
 fn page_location(actual: &DocState, absolute: usize) -> Result<(usize, &doc::Page), String> {
@@ -195,38 +358,60 @@ fn page_location(actual: &DocState, absolute: usize) -> Result<(usize, &doc::Pag
     Ok((spread, page))
 }
 
-fn target_pages(ids: Option<&Value>, results: &[Option<usize>], current: usize, actual: &DocState) -> Result<Vec<usize>, String> {
-    let ids = ids.and_then(Value::as_array).ok_or("Projected targets must be an ID array")?;
-    if ids.len() > 1024 {
-        return Err("Projected target count exceeds its limit".into());
-    }
-    let mut pages = Vec::new();
-    for id in ids {
-        let page = if let Some(reference) = id.as_str() {
-            let reference = reference.strip_prefix("${").and_then(|text| text.strip_suffix('}')).or_else(|| reference.strip_prefix('$'));
-            let (step, field) = reference.and_then(|text| text.split_once('.')).ok_or("Invalid projected result reference")?;
-            let step = step.parse::<usize>().map_err(|_| "Invalid projected result index")?;
-            if step >= current || field != "id" {
-                return Err("Projected object targets must reference an earlier object ID".into());
-            }
-            results.get(step).copied().flatten().ok_or("Projected reference has no target page")?
-        } else if let Some(id) = id.as_u64() {
-            let location = actual.doc.find(doc::ItemId(id)).ok_or("Projected literal target does not exist")?;
-            let doc::SpreadRef::Doc(spread) = location.spread else {
-                return Err("Projected transforms cannot target parent items".into());
-            };
-            let spread_ref = actual.doc.spreads.get(spread).ok_or("Projected target spread disappeared")?;
-            let item = actual.doc.item(doc::ItemId(id)).ok_or("Projected target disappeared")?;
-            let page = spread_ref.page_at_x(item.bounds().center().x).ok_or("Projected target page disappeared")?;
-            actual.doc.first_page_of_spread(spread).checked_add(page).ok_or("Projected target page overflow")?
+fn single_target_page(id: &Value, results: &[StepPages], current: usize, actual: &DocState) -> Result<usize, String> {
+    if let Some(reference) = id.as_str() {
+        let reference = reference.strip_prefix("${").and_then(|text| text.strip_suffix('}')).or_else(|| reference.strip_prefix('$'));
+        let (step, field) = reference.and_then(|text| text.split_once('.')).ok_or("Invalid projected result reference")?;
+        let step = if step == "last" {
+            current.checked_sub(1).ok_or("Projected object targets must reference an earlier object ID")?
         } else {
-            return Err("Projected targets require object IDs or result references".into());
+            step.parse::<usize>().map_err(|_| "Invalid projected result index")?
         };
-        if !pages.contains(&page) {
-            pages.push(page);
+        if step >= current {
+            return Err("Projected object targets must reference an earlier object ID".into());
         }
+        let step_pages = results.get(step).ok_or("Projected reference has no target page")?;
+        let root_field = field.split('.').next().unwrap_or(field);
+        let resolved = match root_field {
+            "id" => step_pages.id,
+            "ids" => step_pages.ids,
+            "from" => step_pages.from,
+            "to" => step_pages.to,
+            _ => return Err("Projected object targets must reference an earlier object ID".into()),
+        };
+        resolved.ok_or_else(|| "Projected reference has no target page".into())
+    } else if let Some(id) = id.as_u64() {
+        let location = actual.doc.find(doc::ItemId(id)).ok_or("Projected literal target does not exist")?;
+        let doc::SpreadRef::Doc(spread) = location.spread else {
+            return Err("Projected transforms cannot target parent items".into());
+        };
+        let spread_ref = actual.doc.spreads.get(spread).ok_or("Projected target spread disappeared")?;
+        let item = actual.doc.item(doc::ItemId(id)).ok_or("Projected target disappeared")?;
+        let page = spread_ref.page_at_x(item.bounds().center().x).ok_or("Projected target page disappeared")?;
+        actual.doc.first_page_of_spread(spread).checked_add(page).ok_or_else(|| "Projected target page overflow".into())
+    } else {
+        Err("Projected targets require object IDs or result references".into())
     }
-    Ok(pages)
+}
+
+fn target_pages(ids: Option<&Value>, results: &[StepPages], current: usize, actual: &DocState) -> Result<Vec<usize>, String> {
+    match ids {
+        Some(Value::Array(items)) => {
+            if items.len() > 1024 {
+                return Err("Projected target count exceeds its limit".into());
+            }
+            let mut pages = Vec::new();
+            for id in items {
+                let page = single_target_page(id, results, current, actual)?;
+                if !pages.contains(&page) {
+                    pages.push(page);
+                }
+            }
+            Ok(pages)
+        }
+        Some(single @ (Value::String(_) | Value::Number(_))) => Ok(vec![single_target_page(single, results, current, actual)?]),
+        _ => Err("Projected targets must be an ID array".into()),
+    }
 }
 
 fn translate_array(value: &mut Value, count: usize, indices: &[usize], dx: f64) -> Result<(), String> {
@@ -321,6 +506,14 @@ pub(crate) fn validate_mapped_result(before: &DocState, after: &DocState, scope:
     normalized.assets = before.doc.assets.clone();
     normalized.next_id = before.doc.next_id;
     normalized.modified = before.doc.modified;
+    if normalized.swatches.len() >= before.doc.swatches.len()
+        && normalized.swatches.get(..before.doc.swatches.len()) == Some(before.doc.swatches.as_slice())
+        && normalized.swatches.get(before.doc.swatches.len()..).is_some_and(|extra| {
+            extra.iter().all(|s| !s.named && s.hidden && matches!(s.value, designcraft_engine::doc::color::SwatchValue::Gradient { .. }))
+        })
+    {
+        normalized.swatches.truncate(before.doc.swatches.len());
+    }
     if &normalized != before.doc.as_ref() {
         return Err("Facing batch changed global styles, swatches, layers or document settings".into());
     }
@@ -581,5 +774,321 @@ mod tests {
         extra.add_document(after.clone());
         extra.execute("frame.create", &json!({"spread":2,"rect":[420,30,520,130]})).unwrap();
         assert!(validate_mapped_result(&before, extra.doc().unwrap(), scope).is_err());
+    }
+
+    #[test]
+    fn maps_qr_threaded_gradient_and_repeated_copy_ids_on_facing_spreads() {
+        let mut session = book(6, true);
+        let before = session.doc().unwrap().clone();
+        let scope = crate::worker::BatchScope { start: 1, count: 2 };
+        let tiny_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let plan = ProductionPlan {
+            title: "Rich facing batch".into(),
+            images: vec![],
+            commands: vec![
+                action("frame.create", json!({"spread":1,"content":"text","rect":[20,30,180,90],"text":"Threaded start"})),
+                action("text.thread", json!({"from":"$0.id","spread":2,"rect":[20,30,180,90]})),
+                action("transform.set", json!({"ids":["$1.to"],"x":24})),
+                action("object.qrCode", json!({"spread":1,"rect":[200,30,270,100],"content":"https://example.org"})),
+                action("transform.set", json!({"ids":["$3.id"],"x":205})),
+                action("frame.create", json!({"spread":1,"content":"unassigned","rect":[20,120,180,200]})),
+                action(
+                    "object.gradient",
+                    json!({
+                        "ids":["$5.id"],
+                        "kind":"linear",
+                        "from":[20,120],
+                        "to":[180,120],
+                        "stops":[{"color":"#1E3A8A","location":0},{"color":"#E0F2FE","location":100}]
+                    }),
+                ),
+                action("frame.create", json!({"spread":2,"content":"graphic","rect":[20,120,80,180]})),
+                action("file.place", json!({"frame":"$7.id","base64":tiny_png,"name":"dot.png"})),
+                action("transform.move", json!({"ids":["$7.id"],"dx":80,"dy":0,"copy":true})),
+                action("transform.set", json!({"ids":"$9.ids","width":55,"height":55})),
+            ],
+        };
+        let mapped = map_plan(&plan, &before).unwrap();
+        assert_eq!(mapped.commands[1].params["spread"], 1);
+        assert_eq!(mapped.commands[1].params["rect"], json!([20.0, 30, 180.0, 90]));
+        assert_eq!(mapped.commands[2].params["x"], 24.0);
+        assert_eq!(mapped.commands[3].params["spread"], 1);
+        assert_eq!(mapped.commands[3].params["rect"], json!([600.0, 30, 670.0, 100]));
+        assert_eq!(mapped.commands[4].params["x"], 605.0);
+        assert_eq!(mapped.commands[6].params["from"], json!([420.0, 120]));
+        assert_eq!(mapped.commands[6].params["to"], json!([580.0, 120]));
+        session.execute("production.apply", &json!({"commands":mapped.commands,"outputMode":"native_with_images","requirePreflight":false})).unwrap();
+        let after = session.doc().unwrap().clone();
+        validate_mapped_result(&before, &after, scope).unwrap();
+    }
+
+    #[test]
+    fn maps_dotted_ids_last_refs_selected_qr_and_page_local_spread_alignment() {
+        let mut session = book(6, true);
+        let before = session.doc().unwrap().clone();
+        let scope = crate::worker::BatchScope { start: 1, count: 2 };
+        let plan = ProductionPlan {
+            title: "Dotted, last, rect-less QR, and spread align".into(),
+            images: vec![],
+            commands: vec![
+                action("frame.create", json!({"spread":1,"content":"unassigned","rect":[30,40,90,100]})),
+                action("edit.stepAndRepeat", json!({"ids":["$0.id"],"count":2,"dx":70,"dy":0})),
+                action("transform.set", json!({"ids":["$1.ids.0"],"x":105})),
+                action("frame.create", json!({"spread":2,"content":"unassigned","rect":[40,140,120,220]})),
+                action("object.qrCode", json!({"type":"email","to":"teacher@example.org","subject":"Quiz","body":"Page 3"})),
+                action("transform.set", json!({"ids":["$last.id"],"x":45})),
+                action("object.align", json!({"ids":["$3.id"],"edge":"right","to":"spread"})),
+            ],
+        };
+        let mapped = map_plan(&plan, &before).unwrap();
+        assert_eq!(mapped.commands[2].params["x"], 505.0, "$1.ids.0 on RTL page 1 (x=400) translates by +400");
+        assert_eq!(mapped.commands[5].params["x"], 45.0, "$last.id on RTL page 2 (x=0) stays at 45");
+        assert_eq!(mapped.commands[6].params["to"], "page", "draft spread alignment must stay on its projected page");
+        session.execute("production.apply", &json!({"commands":mapped.commands,"outputMode":"native_only","requirePreflight":false})).unwrap();
+        let after = session.doc().unwrap().clone();
+        validate_mapped_result(&before, &after, scope).unwrap();
+        let aligned_qr_frame = after.doc.spreads[1].items.iter().find(|it| it.bounds().y0 == 140.0).unwrap();
+        assert!((aligned_qr_frame.bounds().x1 - 400.0).abs() < 0.01, "aligned to right edge of page 2 (x=0..400), not full spread (0..800)");
+
+        // Cross-page alignment and $ungroup.ids must fail cleanly before touching the live document.
+        let cross_align = ProductionPlan {
+            title: "Cross-page align".into(),
+            images: vec![],
+            commands: vec![
+                action("frame.create", json!({"spread":1,"rect":[20,30,80,90]})),
+                action("frame.create", json!({"spread":2,"rect":[20,30,80,90]})),
+                action("object.align", json!({"ids":["$0.id","$1.id"],"edge":"top"})),
+            ],
+        };
+        assert!(map_plan(&cross_align, &before).is_err());
+
+        let ungroup_ids = ProductionPlan {
+            title: "Ungroup null result".into(),
+            images: vec![],
+            commands: vec![
+                action("frame.create", json!({"spread":1,"rect":[20,30,80,90]})),
+                action("frame.create", json!({"spread":1,"rect":[90,30,150,90]})),
+                action("object.group", json!({"ids":["$0.id","$1.id"]})),
+                action("object.ungroup", json!({"ids":["$2.id"]})),
+                action("transform.set", json!({"ids":"$3.ids","x":25})),
+            ],
+        };
+        assert!(map_plan(&ungroup_ids, &before).is_err());
+    }
+
+    #[test]
+    fn object_effects_gradient_feather_endpoints_translate_per_facing_page_and_styles_reject_page_local_vectors() {
+        for rtl in [false, true] {
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"width": 400, "height": 500, "pages": 3, "facingPages": true})).unwrap();
+            if rtl {
+                session.execute("layout.documentSetup", &json!({"binding": "rightToLeft"})).unwrap();
+            }
+            let before = session.doc().unwrap().clone();
+            let scope = crate::worker::BatchScope { start: 1, count: 2 };
+            let plan = ProductionPlan {
+                title: "Facing spread object.effects gradientFeather".into(),
+                images: vec![],
+                commands: vec![
+                    action("frame.create", json!({"spread": 1, "content": "unassigned", "rect": [40, 60, 240, 160]})),
+                    action(
+                        "object.effects",
+                        json!({"ids": ["$0.id"], "effects": {"gradientFeather": {"on": true, "start": 1.0, "end": 0.1, "from": [40, 60], "to": [240, 160]}}}),
+                    ),
+                    action("frame.create", json!({"spread": 2, "content": "unassigned", "rect": [50, 80, 250, 180]})),
+                    action(
+                        "object.effects",
+                        json!({"ids": ["$2.id"], "effects": {"gradientFeather": {"on": true, "start": 0.9, "end": 0.0, "from": [50, 80], "to": [250, 180]}}}),
+                    ),
+                ],
+            };
+            let mapped = map_plan(&plan, &before).unwrap();
+            // On 400pt-wide facing spread 1 (pages 1 & 2):
+            // LTR: page 1 is left (x=0), page 2 is right (x=400).
+            // RTL: page 1 is right (x=400), page 2 is left (x=0).
+            let (p1_x, p2_x) = if rtl { (400.0, 0.0) } else { (0.0, 400.0) };
+            assert_eq!(mapped.commands[1].params["effects"]["gradientFeather"]["from"], json!([40.0 + p1_x, 60]));
+            assert_eq!(mapped.commands[1].params["effects"]["gradientFeather"]["to"], json!([240.0 + p1_x, 160]));
+            assert_eq!(mapped.commands[3].params["effects"]["gradientFeather"]["from"], json!([50.0 + p2_x, 80]));
+            assert_eq!(mapped.commands[3].params["effects"]["gradientFeather"]["to"], json!([250.0 + p2_x, 180]));
+
+            let applied = session
+                .execute("production.apply", &json!({"commands": mapped.commands, "outputMode": "native_only", "requirePreflight": true}))
+                .unwrap();
+            let after = session.doc().unwrap().clone();
+            validate_mapped_result(&before, &after, scope).unwrap();
+            // Both items must store feather endpoints in item-local path space matching feather_bounds()!
+            for idx in [0usize, 2usize] {
+                let id = doc::ItemId(applied["results"][idx]["id"].as_u64().unwrap());
+                let it = after.doc.item(id).unwrap();
+                let fb = it.feather_bounds();
+                let vec = it.effects.gradient_feather.vector.unwrap();
+                assert!(
+                    (vec[0] - fb.x0).abs() < 1e-4 && (vec[1] - fb.y0).abs() < 1e-4 && (vec[2] - fb.x1).abs() < 1e-4 && (vec[3] - fb.y1).abs() < 1e-4,
+                    "vec={vec:?} fb={fb:?}"
+                );
+            }
+            // Also verify rotated item inverse-transforms spread-space endpoints via item_xf.inverse().
+            let rot_plan = ProductionPlan {
+                title: "Rotated facing item gradientFeather".into(),
+                images: vec![],
+                commands: vec![
+                    action("frame.create", json!({"spread": 2, "content": "unassigned", "rect": [60, 100, 160, 200]})),
+                    action("transform.rotate", json!({"ids": ["$0.id"], "angle": 90.0})),
+                    action(
+                        "object.effects",
+                        json!({"ids": ["$0.id"], "effects": {"gradientFeather": {"on": true, "from": [60, 150], "to": [160, 150]}}}),
+                    ),
+                ],
+            };
+            let rot_mapped = map_plan(&rot_plan, &after).unwrap();
+            let rot_applied = session
+                .execute("production.apply", &json!({"commands": rot_mapped.commands, "outputMode": "native_only", "requirePreflight": true}))
+                .unwrap();
+            let rot_id = doc::ItemId(rot_applied["results"][0]["id"].as_u64().unwrap());
+            let rot_item = session.doc().unwrap().doc.item(rot_id).unwrap();
+            let rot_vec = rot_item.effects.gradient_feather.vector.unwrap();
+            let p_start = rot_item.xf * designcraft_geom::Point::new(rot_vec[0], rot_vec[1]);
+            let p_end = rot_item.xf * designcraft_geom::Point::new(rot_vec[2], rot_vec[3]);
+            assert!((p_start.x - (60.0 + p2_x)).abs() < 1e-4 && (p_start.y - 150.0).abs() < 1e-4, "p_start={p_start:?}");
+            assert!((p_end.x - (160.0 + p2_x)).abs() < 1e-4 && (p_end.y - 150.0).abs() < 1e-4, "p_end={p_end:?}");
+
+            // Cross-page object.effects gradientFeather and style.object.create endpoints must reject cleanly.
+            let cross = ProductionPlan {
+                title: "Cross-page effects".into(),
+                images: vec![],
+                commands: vec![
+                    action("frame.create", json!({"spread": 1, "rect": [40, 60, 140, 120]})),
+                    action("frame.create", json!({"spread": 2, "rect": [40, 60, 140, 120]})),
+                    action(
+                        "object.effects",
+                        json!({"ids": ["$0.id", "$1.id"], "effects": {"gradientFeather": {"on": true, "from": [40, 60], "to": [140, 120]}}}),
+                    ),
+                ],
+            };
+            assert!(map_plan(&cross, &before).is_err());
+
+            let style_vec = ProductionPlan {
+                title: "Style page-local feather".into(),
+                images: vec![],
+                commands: vec![action(
+                    "style.object.create",
+                    json!({"name": "CardFade", "effects": {"gradientFeather": {"on": true, "from": [40, 60], "to": [140, 120]}}}),
+                )],
+            };
+            assert!(map_plan(&style_vec, &before).is_err());
+
+            for (cmd, params) in [
+                ("style.object.create", json!({"name": "TopFade", "gradientFeather": {"on": true, "from": [40, 60], "to": [140, 120]}})),
+                (
+                    "style.object.edit",
+                    json!({"name": "[Basic Graphics Frame]", "effects": {"gradientFeather": {"on": true, "from": [40, 60], "to": [140, 120]}}}),
+                ),
+                ("style.object.edit", json!({"name": "[Basic Graphics Frame]", "gradientFeather": {"on": true, "vector": [40, 60, 140, 120]}})),
+            ] {
+                let bad_plan = ProductionPlan { title: "Bad style feather".into(), images: vec![], commands: vec![action(cmd, params.clone())] };
+                assert!(map_plan(&bad_plan, &before).is_err(), "{cmd} should fail in map_plan");
+                assert!(session.execute(cmd, &params).is_err(), "{cmd} should fail in direct Session::execute");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_rotated_sheared_group_gradient_feather_and_unit_zero_end_scale_and_export_cleanly() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width": 400, "height": 500, "pages": 3, "facingPages": true})).unwrap();
+        session.execute("layout.documentSetup", &json!({"binding": "rightToLeft"})).unwrap();
+        let before = session.doc().unwrap().clone();
+
+        // 1. `production.apply` with `object.gradientFeather` `start: 1.0, end: 0.0` must scale `start`
+        // to 100% (1.0), NOT leave it unscaled so `paths.rs` divides by 100 to 0.01 (99% invisible).
+        let unit_plan = ProductionPlan {
+            title: "Unit 1.0 -> 0.0 gradientFeather".into(),
+            images: vec![],
+            commands: vec![
+                action("frame.create", json!({"spread": 1, "content": "unassigned", "rect": [40, 40, 240, 140]})),
+                action("object.fill", json!({"ids": ["$0.id"], "swatch": "[Black]"})),
+                action("object.gradientFeather", json!({"ids": ["$0.id"], "on": true, "start": 1.0, "end": 0.0, "from": [40, 90], "to": [240, 90]})),
+            ],
+        };
+        let unit_mapped = map_plan(&unit_plan, &before).unwrap();
+        let unit_applied = session
+            .execute("production.apply", &json!({"commands": unit_mapped.commands, "outputMode": "native_only", "requirePreflight": true}))
+            .unwrap();
+        let unit_id = doc::ItemId(unit_applied["results"][0]["id"].as_u64().unwrap());
+        let unit_gf = &session.doc().unwrap().doc.item(unit_id).unwrap().effects.gradient_feather;
+        assert!((unit_gf.start - 1.0).abs() < 1e-5 && unit_gf.end.abs() < 1e-5, "unit_gf={unit_gf:?}");
+
+        // 2. Nested rotated + sheared group hierarchy on RTL facing page 1 (spread x offset = +400):
+        // build inner + outer groups, rotate + shear the outer group, then apply `object.effects`
+        // `gradientFeather` via `map_plan` on the leaf frame and verify round-trip transform,
+        // rendered pixel alpha gradient, and PDF export.
+        let leaf_a = session.execute("frame.create", &json!({"spread": 1, "content": "unassigned", "rect": [460, 180, 620, 280]})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        session.execute("object.fill", &json!({"ids": [leaf_a], "swatch": "[Black]"})).unwrap();
+        let leaf_b = session.execute("frame.create", &json!({"spread": 1, "content": "unassigned", "rect": [460, 300, 520, 340]})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let inner_g = session.execute("object.group", &json!({"ids": [leaf_a, leaf_b]})).unwrap()["id"].as_u64().unwrap();
+        session.execute("transform.rotate", &json!({"ids": [inner_g], "angle": 25.0})).unwrap();
+        let helper = session.execute("frame.create", &json!({"spread": 1, "content": "unassigned", "rect": [640, 180, 680, 220]})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let outer_g = session.execute("object.group", &json!({"ids": [inner_g, helper]})).unwrap()["id"].as_u64().unwrap();
+        session.execute("transform.set", &json!({"ids": [outer_g], "rotation": -15.0, "shear": 12.0})).unwrap();
+
+        let grouped_state = session.doc().unwrap().clone();
+        let loc = grouped_state.doc.find(doc::ItemId(leaf_a)).unwrap();
+        assert_eq!(loc.path.len(), 3, "leaf must be nested two groups deep");
+        let full_xf = grouped_state.doc.parent_xf(&loc) * grouped_state.doc.item(doc::ItemId(leaf_a)).unwrap().xf;
+        let center_spread = full_xf * grouped_state.doc.item(doc::ItemId(leaf_a)).unwrap().inner_bounds().center();
+        // Convert spread x back to page-local draft x on RTL page 1 (page.x == 400.0):
+        let draft_x0 = center_spread.x - 400.0 - 40.0;
+        let draft_x1 = center_spread.x - 400.0 + 40.0;
+        let draft_y = center_spread.y;
+
+        let nested_plan = ProductionPlan {
+            title: "Nested rotated+sheared group leaf feather".into(),
+            images: vec![],
+            commands: vec![action(
+                "object.effects",
+                json!({
+                    "ids": [leaf_a],
+                    "effects": {"gradientFeather": {"on": true, "start": 1.0, "end": 0.0, "from": [draft_x0, draft_y], "to": [draft_x1, draft_y]}}
+                }),
+            )],
+        };
+        let nested_mapped = map_plan(&nested_plan, &grouped_state).unwrap();
+        session
+            .execute("production.apply", &json!({"commands": nested_mapped.commands, "outputMode": "native_only", "requirePreflight": false}))
+            .unwrap();
+
+        let final_state = session.doc().unwrap();
+        let leaf_item = final_state.doc.item(doc::ItemId(leaf_a)).unwrap();
+        let vec = leaf_item.effects.gradient_feather.vector.unwrap();
+        let world_start = full_xf * designcraft_geom::Point::new(vec[0], vec[1]);
+        let world_end = full_xf * designcraft_geom::Point::new(vec[2], vec[3]);
+        assert!((world_start.x - (draft_x0 + 400.0)).abs() < 1e-4 && (world_start.y - draft_y).abs() < 1e-4, "world_start={world_start:?}");
+        assert!((world_end.x - (draft_x1 + 400.0)).abs() < 1e-4 && (world_end.y - draft_y).abs() < 1e-4, "world_end={world_end:?}");
+
+        // Render RTL page 1 (absolute page index 1) and verify dark pixels at start fade toward white paper at end.
+        let mut renderer = designcraft_render::Renderer::new();
+        let rendered = renderer.render_page(&final_state.doc, &session.cache, 1, 1.0, false, &designcraft_render::RenderOptions::default()).unwrap();
+        let px_at = |x: f64, y: f64| -> [u8; 4] {
+            let x = (x.round() as u32).clamp(0, rendered.width - 1);
+            let y = (y.round() as u32).clamp(0, rendered.height - 1);
+            let idx = ((y * rendered.width + x) * 4) as usize;
+            rendered.pixels[idx..idx + 4].try_into().unwrap()
+        };
+        let px_start = px_at(draft_x0, draft_y);
+        let px_end = px_at(draft_x1, draft_y);
+        assert!(px_start[0] < px_end[0], "opaque start pixel {px_start:?} must be darker than feathered end pixel {px_end:?}");
+
+        // Also verify PDF export succeeds cleanly with nested transformed gradientFeather.
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("nested-facing-feather.pdf");
+        session.execute("file.exportPdf", &json!({"path": pdf_path})).unwrap();
+        assert!(std::fs::metadata(&pdf_path).unwrap().len() > 500);
     }
 }

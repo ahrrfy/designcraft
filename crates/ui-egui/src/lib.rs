@@ -1073,6 +1073,9 @@ impl DesignApp {
     }
 
     fn import_file(&mut self, file: ImportedFile) -> Result<Value, String> {
+        if file.request.purpose == "ai_target_document" {
+            return ai::open_target_document_bytes(self, &file.name, &file.bytes);
+        }
         let lower = file.name.to_ascii_lowercase();
         if let Some(kind) = file.request.purpose.strip_prefix("styles") {
             self.activate_import_target(&file.request)?;
@@ -1147,6 +1150,7 @@ impl DesignApp {
             if self.fonts_lang != self.ui.language || (!self.fonts_system && theme::system_fonts_ready()) {
                 self.fonts_system = theme::install_fonts(ctx, &self.ui.language);
                 self.fonts_lang = self.ui.language.clone();
+                ctx.request_repaint();
             }
             self.fonts_ready = true;
         }

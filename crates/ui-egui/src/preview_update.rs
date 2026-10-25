@@ -326,8 +326,15 @@ impl PreviewUpdate {
                     .unwrap_or("unavailable")
             };
             ui.horizontal_wrapped(|ui| {
-                crate::rtl::label(ui, format!("{} v{} · {active}", text("Updates", "التحديثات"), env!("CARGO_PKG_VERSION")))
-                    .on_hover_text(text("Updates and version · active source commit", "التحديثات والإصدار · معرّف المصدر النشط"));
+                let header = if arabic {
+                    format!("التحديثات {} · {}", crate::rtl::ltr(format!("v{}", env!("CARGO_PKG_VERSION"))), crate::rtl::ltr(active))
+                } else {
+                    format!("Updates v{} · {active}", env!("CARGO_PKG_VERSION"))
+                };
+                crate::rtl::label(ui, header).on_hover_ui(|ui| {
+                    crate::rtl::label(ui, text("Updates and version · active source commit", "التحديثات والإصدار · معرّف المصدر النشط"));
+                });
+                ui.label("·");
                 crate::rtl::label(
                     ui,
                     match status {
@@ -341,10 +348,15 @@ impl PreviewUpdate {
                         _ => text("Launcher unavailable", "المشغّل غير متاح"),
                     },
                 )
-                .on_hover_text(text(
-                    "Last successful check; launch through the Windows launcher to enable checks. Errors leave version status unconfirmed.",
-                    "نتيجة آخر فحص ناجح؛ افتح عبر مشغّل ويندوز لتفعيل الفحص. عند الخطأ تبقى حالة الإصدار غير مؤكدة.",
-                ));
+                .on_hover_ui(|ui| {
+                    crate::rtl::label(
+                        ui,
+                        text(
+                            "Last successful check; launch through the Windows launcher to enable checks. Errors leave version status unconfirmed.",
+                            "نتيجة آخر فحص ناجح؛ افتح عبر مشغّل ويندوز لتفعيل الفحص. عند الخطأ تبقى حالة الإصدار غير مؤكدة.",
+                        ),
+                    );
+                });
                 check = ui
                     .add_enabled(self.enabled(), egui::Button::new(crate::rtl::widget(ui, text("Check & Stage Update", "فحص وتجهيز التحديث"))))
                     .clicked();

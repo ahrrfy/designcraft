@@ -399,6 +399,11 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 rfd::AsyncFileDialog::new().add_filter("Shortcut set (text)", &["txt"])
             } else if request.purpose == "place" {
                 rfd::AsyncFileDialog::new().add_filter("Graphics", IMAGE_EXTS)
+            } else if request.purpose == "ai_target_document" {
+                rfd::AsyncFileDialog::new().add_filter(
+                    "Editable & Importable Documents",
+                    &["designcraft", "idml", "indd", "indt", "pdf", "docx", "rtf", "txt", "md", "xlsx"],
+                )
             } else {
                 rfd::AsyncFileDialog::new().add_filter("DesignCraft, IDML or InDesign", DOC_EXTS)
             };

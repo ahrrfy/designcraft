@@ -552,7 +552,7 @@ pub fn icon_toggle_sized(ui: &mut Ui, icon: &str, on: bool, tip: &str, size: egu
 /// An InDesign checkbox: 12 pt rounded box, white check, label.
 pub fn checkbox(ui: &mut Ui, on: &mut bool, label: &str) -> Response {
     let t = Tokens::get(ui.ctx());
-    let g = ui.painter().layout_no_wrap(label.to_string(), label_font(), t.text);
+    let g = crate::rtl::plain(ui.ctx(), label, label_font(), t.text);
     let (r, mut resp) = ui.allocate_exact_size(vec2(18.0 + g.size().x, FIELD_H), Sense::click());
     let b = Rect::from_center_size(pos2(r.min.x + 6.5, r.center().y), vec2(12.0, 12.0));
     if *on {

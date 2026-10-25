@@ -189,6 +189,17 @@ trait Provider {
     ) -> Result<GenerationResponse, String>;
     fn images(&self, selection: &ModelSelection, key: Option<&str>, request: &ImageRequest, cancel: &AtomicBool) -> Result<ImageResponse, String>;
     fn models(&self, selection: &ModelSelection, key: Option<&str>, cancel: &AtomicBool) -> Result<Vec<String>, String>;
+    fn model_infos(&self, selection: &ModelSelection, key: Option<&str>, cancel: &AtomicBool) -> Result<Vec<providers::ModelInfo>, String> {
+        self.models(selection, key, cancel)
+            .map(|ids| ids.into_iter().map(|id| providers::ModelInfo { id, supports_generate_content: None }).collect())
+    }
+}
+pub(crate) fn filter_discovered_models(provider: ProviderKind, models: Vec<providers::ModelInfo>) -> Vec<String> {
+    models
+        .into_iter()
+        .filter(|model| provider != ProviderKind::Gemini || model.supports_generate_content != Some(false))
+        .map(|model| model.id)
+        .collect()
 }
 struct HttpProvider;
 impl Provider for HttpProvider {
@@ -205,7 +216,10 @@ impl Provider for HttpProvider {
         providers::generate_images(selection, key, request, cancel)
     }
     fn models(&self, selection: &ModelSelection, key: Option<&str>, cancel: &AtomicBool) -> Result<Vec<String>, String> {
-        providers::list_models(selection, key, cancel).map(|models| models.into_iter().map(|model| model.id).collect())
+        self.model_infos(selection, key, cancel).map(|models| filter_discovered_models(selection.provider, models))
+    }
+    fn model_infos(&self, selection: &ModelSelection, key: Option<&str>, cancel: &AtomicBool) -> Result<Vec<providers::ModelInfo>, String> {
+        providers::list_models(selection, key, cancel)
     }
 }
 struct Runner<'a> {
@@ -334,12 +348,16 @@ impl Runner<'_> {
                 validate_batch_plan(&plan, scope)?;
                 crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
             }
+            if let Some(contract) = &self.print {
+                self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
+            }
             self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
             validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
             image_command_budget(&plan, profile)?;
             Ok::<_, String>(())
         })();
         if let Err(error) = valid {
+            check_cancel(self.cancel)?;
             self.cache_notice(format!("Cached plan no longer fits this document: {error}"))?;
             return Ok(None);
         }
@@ -558,7 +576,11 @@ impl Runner<'_> {
                 self.progress("Discovering selected provider models", 0.1)?;
                 let key = selected_key(self.keys, &selection);
                 let reservation = self.ledger.reserve(0, 0, selection.provider, false, None)?;
-                let result = guarded(|| self.provider.models(&selection, key.as_ref().map(providers::SecretString::expose), self.cancel));
+                let result = guarded(|| {
+                    self.provider
+                        .model_infos(&selection, key.as_ref().map(providers::SecretString::expose), self.cancel)
+                        .map(|models| filter_discovered_models(selection.provider, models))
+                });
                 // Discovery has no token usage field; do not invent a reported zero.
                 self.ledger.record(reservation, None);
                 check_cancel(self.cancel)?;
@@ -814,12 +836,13 @@ impl Runner<'_> {
             resources: request.settings.resources.clone(),
         };
         let cache_key = self.plan_key(request, &generation, base)?;
+        let required_min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi());
         if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog, geometry_profile)? {
             if let Some(profile) = geometry_profile {
                 crate::design::check_image_slots(base, &plan.images, profile)?;
             }
             let text_scope = if plan.images.is_empty() { scope } else { None };
-            simulate_styled(&plan, base, prefs, request.settings.output_mode, self.cancel, text_scope, geometry_check)?;
+            simulate_styled_with_ppi(&plan, base, prefs, request.settings.output_mode, self.cancel, text_scope, geometry_check, required_min_ppi)?;
             if self.planning_only {
                 return Ok(plan);
             }
@@ -832,7 +855,7 @@ impl Runner<'_> {
                 geometry_profile,
                 opened_document.then_some(base),
             )?;
-            simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check)?;
+            simulate_styled_with_ppi(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check, required_min_ppi)?;
             self.audit_print(&expanded, base, prefs)?;
             return Ok(expanded);
         }
@@ -907,17 +930,26 @@ impl Runner<'_> {
                     // Validate native typography before spending on images. Page completeness
                     // is checked on the final illustrated draft, since a page can be image-only.
                     let text_scope = if raw_plan.images.is_empty() { scope } else { None };
-                    let text_check = simulate_styled(&raw_plan, base, prefs, request.settings.output_mode, self.cancel, text_scope, geometry_check);
+                    let text_check = simulate_styled_with_ppi(
+                        &raw_plan,
+                        base,
+                        prefs,
+                        request.settings.output_mode,
+                        self.cancel,
+                        text_scope,
+                        geometry_check,
+                        required_min_ppi,
+                    );
                     if let Err(error) = text_check {
                         (previous, error)
                     } else {
-                        self.cache_plan(cache_key.as_deref(), &raw_plan)?;
                         if self.planning_only {
+                            self.cache_plan(cache_key.as_deref(), &raw_plan)?;
                             return Ok(raw_plan);
                         }
                         // Image failures fail the whole task. Never publish a partially illustrated layout.
                         let expanded = self.expand_images_with_geometry(
-                            raw_plan,
+                            raw_plan.clone(),
                             &request.settings,
                             &mut image_cache,
                             &mut image_bytes,
@@ -926,9 +958,20 @@ impl Runner<'_> {
                             opened_document.then_some(base),
                         )?;
                         self.progress("Validating commands and print preflight on a private document", 0.85)?;
-                        match simulate_styled(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check) {
+                        match simulate_styled_with_ppi(
+                            &expanded,
+                            base,
+                            prefs,
+                            request.settings.output_mode,
+                            self.cancel,
+                            scope,
+                            geometry_check,
+                            required_min_ppi,
+                        )
+                        .and_then(|()| self.audit_print(&expanded, base, prefs))
+                        {
                             Ok(()) => {
-                                self.audit_print(&expanded, base, prefs)?;
+                                self.cache_plan(cache_key.as_deref(), &raw_plan)?;
                                 check_cancel(self.cancel)?;
                                 return Ok(expanded);
                             }
@@ -1052,7 +1095,8 @@ impl Runner<'_> {
             if plans.len() >= MAX_REVIEW_PAGES as usize {
                 return Err("Review plan count exceeds its bounded page limit".into());
             }
-            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
+            let min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":min_ppi}))
                 .map_err(|e| e.to_string())?;
             plans.push((plan, scope));
             next = next.checked_add(scope.count).ok_or("Internal generic review range overflow")?;
@@ -1075,6 +1119,8 @@ impl Runner<'_> {
         scratch.add_document(base.clone());
         let mut expanded_plans = Vec::with_capacity(plans.len());
         plan_bytes = 0;
+        let required_min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi());
+        let min_ppi = required_min_ppi.unwrap_or(150.0);
         for (plan, scope) in plans {
             check_cancel(self.cancel)?;
             let plan = self.expand_images_with_geometry(plan, &request.settings, &mut cached, &mut cached_bytes, profile, geometry_profile, None)?;
@@ -1084,7 +1130,7 @@ impl Runner<'_> {
                 .filter(|bytes| *bytes <= MAX_GROUP_PLAN_BYTES)
                 .ok_or("Expanded review plans exceed the 256-MiB limit")?;
             self.progress(&format!("Validating commands and print preflight for page {}", u64::from(scope.start) + 1), 0.8)?;
-            simulate_styled(
+            simulate_styled_with_ppi(
                 &plan,
                 scratch.doc().map_err(|e| e.to_string())?,
                 prefs,
@@ -1092,10 +1138,14 @@ impl Runner<'_> {
                 self.cancel,
                 Some(scope),
                 geometry_check,
+                required_min_ppi,
             )?;
             self.audit_print(&plan, scratch.doc().map_err(|e| e.to_string())?, prefs)?;
             scratch
-                .execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"requirePreflight":true}))
+                .execute(
+                    "production.apply",
+                    &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"requirePreflight":true,"minPpi":min_ppi}),
+                )
                 .map_err(|e| e.to_string())?;
             expanded_plans.push(plan);
         }
@@ -1339,12 +1389,22 @@ impl Runner<'_> {
         prefs: Prefs,
         scope: BatchScope,
     ) -> Result<Product, String> {
+        let required_min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi());
         let raw = self.template_content(&request, &context, style, &base, &prefs, scope)?;
         let profile = style.design_profile.as_ref().ok_or("Missing pinned design profile")?;
         let expanded = self.expand_images(raw, &request.settings, &mut BTreeMap::new(), &mut 0, Some(profile))?;
         self.audit_print(&expanded, &base, &prefs)?;
         self.progress("Checking editable native pages and preparing proofs", 0.85)?;
-        simulate_styled(&expanded, &base, &prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
+        simulate_styled_with_ppi(
+            &expanded,
+            &base,
+            &prefs,
+            request.settings.output_mode,
+            self.cancel,
+            Some(scope),
+            GeometryCheck::Profile(profile),
+            required_min_ppi,
+        )?;
         check_cancel(self.cancel)?;
         if context.get("batch_scope").is_some() {
             let proofs = batch_proofs_with_layout(&expanded, &base, &prefs, &request.settings, &request.prompt, self.cancel, scope)?;
@@ -1413,6 +1473,7 @@ impl Runner<'_> {
             images: vec![],
             resources: request.settings.resources.clone(),
         };
+        let required_min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi());
         let cache_key = self.plan_key(request, &generation, base)?;
         if let Some(plan) = self.cached_plan(
             cache_key.as_deref(),
@@ -1424,30 +1485,78 @@ impl Runner<'_> {
             &designcraft_engine::cmd::production::catalog(),
             Some(profile),
         )? {
-            match validate_template_family_sequence(&plan, style, previous.clone(), scope, &families, &request.prompt) {
-                Ok(()) => {
-                    crate::design::check_image_slots(base, &plan.images, profile)?;
-                    simulate_styled(&plan, base, prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
-                    return Ok(plan);
+            let cached_valid = (|| {
+                validate_template_family_sequence(&plan, style, previous.clone(), scope, &families, &request.prompt)?;
+                crate::design::check_image_slots(base, &plan.images, profile)?;
+                simulate_styled_with_ppi(
+                    &plan,
+                    base,
+                    prefs,
+                    request.settings.output_mode,
+                    self.cancel,
+                    Some(scope),
+                    GeometryCheck::Profile(profile),
+                    required_min_ppi,
+                )
+            })();
+            match cached_valid {
+                Ok(()) => return Ok(plan),
+                Err(error) => {
+                    check_cancel(self.cancel)?;
+                    self.cache_notice(format!("Ignored stale cached template plan: {error}"))?;
                 }
-                Err(error) => self.cache_notice(format!("Ignored cached family sequence: {error}"))?,
             }
         }
-        let response = self.generate(&request.settings.text_model, &generation)?;
-        // Exactly one content-planning request. Native command assembly/validation is local.
-        self.progress("Compiling page content into native engine commands locally", 0.45)?;
-        let mut raw = crate::template_plan::compile_for_brief(&response.text, style, scope, request.settings.output_mode, &request.prompt)?;
-        validate_template_family_sequence(&raw, style, previous, scope, &families, &request.prompt)?;
-        prepare_editorial_plan(&mut raw, &request.prompt, &context, None)?;
-        if let Some(contract) = &self.print {
-            self.diagnostics(crate::native_print_fonts::apply(&mut raw, base, prefs, contract)?)?;
+        let original_prompt = generation.prompt.clone();
+        let mut generation = generation;
+        let repairs = if request.settings.allow_paid_repairs { request.settings.budget.repair_attempts.min(4) } else { 0 };
+        for attempt in 0..=repairs {
+            let response = self.generate(&request.settings.text_model, &generation)?;
+            self.progress("Compiling page content into native engine commands locally", 0.45)?;
+            let mut step_notes = Vec::new();
+            let validation: Result<ProductionPlan, String> = (|| {
+                let mut raw = crate::template_plan::compile_for_brief(&response.text, style, scope, request.settings.output_mode, &request.prompt)?;
+                validate_template_family_sequence(&raw, style, previous.clone(), scope, &families, &request.prompt)?;
+                prepare_editorial_plan(&mut raw, &request.prompt, &context, None)?;
+                if let Some(contract) = &self.print {
+                    step_notes.extend(crate::native_print_fonts::apply(&mut raw, base, prefs, contract)?);
+                }
+                step_notes.extend(crate::native_layout::prepare(&mut raw, base, prefs, self.cancel)?);
+                validate_previous_body_layout(&raw, base, prefs, Some(scope), &request.prompt)?;
+                crate::design::check_image_slots(base, &raw.images, profile)?;
+                simulate_styled_with_ppi(
+                    &raw,
+                    base,
+                    prefs,
+                    request.settings.output_mode,
+                    self.cancel,
+                    Some(scope),
+                    GeometryCheck::Profile(profile),
+                    required_min_ppi,
+                )?;
+                Ok(raw)
+            })();
+            match validation {
+                Ok(raw) => {
+                    if !step_notes.is_empty() {
+                        self.diagnostics(step_notes)?;
+                    }
+                    self.cache_plan(cache_key.as_deref(), &raw)?;
+                    return Ok(raw);
+                }
+                Err(error) => {
+                    let mut diag = step_notes;
+                    diag.push(json!({"kind": "templateContentValidation", "attempt": attempt, "error": error}));
+                    self.diagnostics(diag)?;
+                    if attempt == repairs {
+                        return Err(error);
+                    }
+                    self.progress(&format!("Repairing template page content before purchasing images (attempt {})", attempt + 1), 0.48)?;
+                    generation.prompt = template_repair_prompt(&original_prompt, &response.text, &error)?;
+                }
+            }
         }
-        self.diagnostics(crate::native_layout::prepare(&mut raw, base, prefs, self.cancel)?)?;
-        validate_previous_body_layout(&raw, base, prefs, Some(scope), &request.prompt)?;
-        crate::design::check_image_slots(base, &raw.images, profile)?;
-        simulate_styled(&raw, base, prefs, request.settings.output_mode, self.cancel, Some(scope), GeometryCheck::Profile(profile))?;
-        self.cache_plan(cache_key.as_deref(), &raw)?;
-        Ok(raw)
+        Err("Template content planning exhausted bounded repair attempts".into())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1461,6 +1570,8 @@ impl Runner<'_> {
         review: BatchScope,
         total_pages: u32,
     ) -> Result<Product, String> {
+        let required_min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi());
+        let min_ppi = required_min_ppi.unwrap_or(150.0);
         let end = review_end(review)?;
         if usize::try_from(end).map_err(|_| "Invalid review page range")? > base.doc.spreads.len() {
             return Err("Review page range exceeds the native document".into());
@@ -1492,7 +1603,7 @@ impl Runner<'_> {
             if pending.len() >= usize::try_from(MAX_REVIEW_PAGES).map_err(|_| "Invalid review plan limit")? {
                 return Err("Review plan count exceeds its bounded page limit".into());
             }
-            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
+            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":min_ppi}))
                 .map_err(|e| e.to_string())?;
             pending.push((plan, scope));
             next = next.checked_add(scope.count).ok_or("Internal template page range overflow")?;
@@ -1526,7 +1637,7 @@ impl Runner<'_> {
             check_cancel(self.cancel)?;
             let plan = self.expand_images(plan, &request.settings, &mut cached, &mut cached_bytes, Some(profile))?;
             self.audit_print(&plan, scratch.doc().map_err(|e| e.to_string())?, &prefs)?;
-            simulate_styled(
+            simulate_styled_with_ppi(
                 &plan,
                 scratch.doc().map_err(|e| e.to_string())?,
                 &prefs,
@@ -1534,11 +1645,12 @@ impl Runner<'_> {
                 self.cancel,
                 Some(scope),
                 GeometryCheck::Profile(profile),
+                required_min_ppi,
             )?;
             let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
             plan_bytes =
                 plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
-            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
+            scratch.execute("production.apply", &json!({"commands":plan.commands,"outputMode":request.settings.output_mode,"label":plan.title,"requirePreflight":true,"minPpi":min_ppi}))
                 .map_err(|e| e.to_string())?;
             plans.push(plan);
         }
@@ -2075,46 +2187,213 @@ fn validate_previous_body_layout(
     prepare_editorial_plan(&mut combined, prompt, &json!({}), Some(BatchScope { start: first, count: end.saturating_sub(first) }))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StoryKey {
+    Step(usize),
+    Literal(u64),
+}
+
+fn resolve_story_key(param: Option<&Value>, current_index: usize) -> Option<StoryKey> {
+    if let Some(id) = param.and_then(Value::as_u64) {
+        return Some(StoryKey::Literal(id));
+    }
+    let reference = param.and_then(Value::as_str)?;
+    let body = reference.strip_prefix("${").and_then(|s| s.strip_suffix('}')).or_else(|| reference.strip_prefix('$'))?;
+    let (_, path) = body.split_once('.')?;
+    if path != "story" {
+        return None;
+    }
+    reference_source(reference, current_index).map(StoryKey::Step)
+}
+
+fn strip_arabic_vowels_with_byte_map(text: &mut String) -> Option<Vec<usize>> {
+    if !text.chars().any(arabic_vowel_mark) {
+        return None;
+    }
+    let mut map = vec![0usize; text.len().saturating_add(1)];
+    let mut stripped = String::with_capacity(text.len());
+    for (byte_idx, ch) in text.char_indices() {
+        let new_pos = stripped.len();
+        for slot in map.iter_mut().skip(byte_idx).take(ch.len_utf8()) {
+            *slot = new_pos;
+        }
+        if !arabic_vowel_mark(ch) {
+            stripped.push(ch);
+        }
+    }
+    if let Some(last) = map.last_mut() {
+        *last = stripped.len();
+    }
+    *text = stripped;
+    Some(map)
+}
+
 /// Local editorial checks run before image reservations on either production path.
 fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Value, scope: Option<BatchScope>) -> Result<(), String> {
     let lower = prompt.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
-    let explicitly_plain = has(&[
-        "دون تشكيل",
-        "بدون تشكيل",
-        "بلا تشكيل",
-        "غير مشكول",
-        "بدون الحركات",
-        "دون الحركات",
-        "تقليل التشكيل",
-        "أزل التشكيل",
-        "إزالة التشكيل",
-        "حذف التشكيل",
-        "without diacritics",
-        "no diacritics",
-        "remove diacritics",
-        "remove vowel marks",
-        "unvocalized",
-    ]);
-    let plain = explicitly_plain
-        || (!prompt.chars().any(arabic_vowel_mark)
-            && !context_has_vocalized_copy(context)
-            && !has(&[
-                "مشكول",
-                "التشكيل الكامل",
-                "مع التشكيل",
-                "بالتشكيل",
-                "بالحركات",
-                "حركات الحروف",
-                "fully vocalized",
-                "with diacritics",
-                "phonics",
-            ]));
+    let explicit_removal = has(&["أزل التشكيل", "إزالة التشكيل", "حذف التشكيل", "remove diacritics", "remove vowel marks"]);
+    let explicitly_plain = explicit_removal
+        || has(&[
+            "دون تشكيل",
+            "بدون تشكيل",
+            "بلا تشكيل",
+            "غير مشكول",
+            "بدون الحركات",
+            "دون الحركات",
+            "تقليل التشكيل",
+            "without diacritics",
+            "no diacritics",
+            "unvocalized",
+        ]);
+    let has_vocalization_request =
+        has(&["مشكول", "التشكيل الكامل", "مع التشكيل", "بالتشكيل", "بالحركات", "حركات الحروف", "fully vocalized", "with diacritics", "phonics"]);
+    let parsed_script = crate::script_contract::parse(prompt)?;
+    let script_requires_verbatim_vocalization = parsed_script
+        .as_ref()
+        .is_some_and(|s| s.pages.iter().any(|p| p.arabic_print_copy.as_deref().is_some_and(|c| c.chars().any(arabic_vowel_mark))));
+    let script_has_vocalized_copy = parsed_script.as_ref().is_some_and(|s| {
+        s.pages.iter().any(|p| {
+            p.title.chars().any(arabic_vowel_mark)
+                || p.arabic_print_copy.as_deref().is_some_and(|c| c.chars().any(arabic_vowel_mark))
+                || (p.arabic_print_copy.is_none()
+                    && p.full_script
+                        .lines()
+                        .filter(|line| {
+                            let trimmed = line.trim();
+                            !trimmed.contains("Illustration Prompt") && Some(trimmed) != p.illustration_prompt.as_deref().map(str::trim)
+                        })
+                        .any(|line| line.chars().any(arabic_vowel_mark)))
+        })
+    });
+    let plain = if script_requires_verbatim_vocalization {
+        false
+    } else if explicit_removal {
+        true
+    } else if script_has_vocalized_copy {
+        false
+    } else if parsed_script.is_some() {
+        explicitly_plain || (!context_has_vocalized_copy(context) && !has_vocalization_request)
+    } else {
+        explicitly_plain || (!prompt.chars().any(arabic_vowel_mark) && !context_has_vocalized_copy(context) && !has_vocalization_request)
+    };
     if plain {
         plan.title.retain(|c| !arabic_vowel_mark(c));
-        for action in &mut plan.commands {
-            if let Some(Value::String(text)) = action.params.get_mut("text") {
-                text.retain(|c| !arabic_vowel_mark(c));
+        let mut story_maps: BTreeMap<StoryKey, Vec<usize>> = BTreeMap::new();
+        let mut active_text_story: Option<StoryKey> = None;
+        for (idx, action) in plan.commands.iter_mut().enumerate() {
+            match action.command.as_str() {
+                "frame.create" if action.params.get("content").and_then(Value::as_str) == Some("text") => {
+                    if let Some(Value::String(text)) = action.params.get_mut("text") {
+                        if let Some(map) = strip_arabic_vowels_with_byte_map(text) {
+                            story_maps.insert(StoryKey::Step(idx), map);
+                        } else {
+                            story_maps.remove(&StoryKey::Step(idx));
+                        }
+                    }
+                    active_text_story =
+                        if action.params.get("caret").and_then(Value::as_bool) == Some(false) { None } else { Some(StoryKey::Step(idx)) };
+                }
+                "story.setText" => {
+                    let key = resolve_story_key(action.params.get("story"), idx);
+                    let maybe_map =
+                        if let Some(Value::String(text)) = action.params.get_mut("text") { strip_arabic_vowels_with_byte_map(text) } else { None };
+                    if let Some(key) = key {
+                        if let Some(map) = maybe_map {
+                            story_maps.insert(key, map);
+                        } else {
+                            story_maps.remove(&key);
+                        }
+                    }
+                }
+                "text.thread" => {
+                    if let Some(from_str) = action.params.get("from").and_then(Value::as_str)
+                        && let Some(src) = reference_source(from_str, idx)
+                        && let Some(existing) = story_maps.get(&StoryKey::Step(src)).cloned()
+                    {
+                        story_maps.insert(StoryKey::Step(idx), existing);
+                    }
+                    active_text_story = None;
+                }
+                "story.replaceRange" => {
+                    let key = resolve_story_key(action.params.get("story"), idx);
+                    let old_start = action.params.get("start").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok());
+                    let old_end = action.params.get("end").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok()).or(old_start);
+                    let orig_repl_len = action.params.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0);
+                    let repl_map = if let Some(Value::String(text)) = action.params.get_mut("text") {
+                        strip_arabic_vowels_with_byte_map(text).unwrap_or_else(|| (0..=text.len()).collect())
+                    } else {
+                        vec![0usize]
+                    };
+                    let stripped_repl_len = repl_map.last().copied().unwrap_or(0);
+                    if let Some(key) = key {
+                        if let Some(map) = story_maps.get(&key).cloned() {
+                            let map_offset = |pos: usize| map.get(pos).copied().unwrap_or_else(|| map.last().copied().unwrap_or(0));
+                            if let Some(s) = old_start {
+                                action.params["start"] = json!(map_offset(s));
+                            }
+                            if action.params.get("end").is_some()
+                                && let Some(e) = old_end
+                            {
+                                action.params["end"] = json!(map_offset(e));
+                            }
+                            if let (Some(s), Some(e)) = (old_start, old_end)
+                                && s <= e
+                                && e < map.len()
+                            {
+                                let mapped_start = map_offset(s);
+                                let mapped_end = map_offset(e);
+                                let mut next_map = Vec::with_capacity(s.saturating_add(orig_repl_len).saturating_add(map.len().saturating_sub(e)));
+                                if let Some(prefix) = map.get(..s) {
+                                    next_map.extend_from_slice(prefix);
+                                }
+                                for r in &repl_map {
+                                    next_map.push(mapped_start.saturating_add(*r));
+                                }
+                                if let Some(suffix) = map.get(e.saturating_add(1)..) {
+                                    for tail in suffix {
+                                        next_map.push(mapped_start.saturating_add(stripped_repl_len).saturating_add(tail.saturating_sub(mapped_end)));
+                                    }
+                                }
+                                story_maps.insert(key, next_map);
+                            } else {
+                                story_maps.remove(&key);
+                            }
+                        } else if orig_repl_len != stripped_repl_len {
+                            story_maps.remove(&key);
+                        }
+                    }
+                }
+                "text.select" => {
+                    let key = resolve_story_key(action.params.get("story"), idx);
+                    active_text_story = key;
+                    if let Some(map) = key.and_then(|k| story_maps.get(&k)) {
+                        for field in ["anchor", "focus"] {
+                            if let Some(slot) = action.params.get_mut(field)
+                                && let Some(old_offset) = slot.as_u64()
+                            {
+                                let mapped = usize::try_from(old_offset)
+                                    .ok()
+                                    .and_then(|pos| map.get(pos).copied())
+                                    .unwrap_or_else(|| map.last().copied().unwrap_or(0));
+                                *slot = json!(mapped);
+                            }
+                        }
+                    }
+                }
+                "text.insert" | "table.insert" => {
+                    if let Some(Value::String(text)) = action.params.get_mut("text") {
+                        text.retain(|c| !arabic_vowel_mark(c));
+                    }
+                    if let Some(key) = active_text_story {
+                        story_maps.remove(&key);
+                    }
+                }
+                _ => {
+                    if let Some(Value::String(text)) = action.params.get_mut("text") {
+                        text.retain(|c| !arabic_vowel_mark(c));
+                    }
+                }
             }
         }
     }
@@ -2300,9 +2579,10 @@ fn compact_catalog(catalog: &Value) -> Result<Value, String> {
 fn native_result_contract(command: &str) -> Option<Value> {
     Some(match command {
         "frame.create" => json!({"id":"ItemId","story":"StoryId only when content=text"}),
-        "line.create" | "path.create" | "object.group" | "object.pathfinder" | "object.makeCompoundPath" | "object.qrCode" => {
+        "line.create" | "path.create" | "object.group" | "object.pathfinder" | "object.makeCompoundPath" => {
             json!({"id":"ItemId"})
         }
+        "object.qrCode" => json!({"id":"ItemId","content":"string"}),
         "object.releaseCompoundPath" => json!({"ids":"ItemId[]"}),
         "edit.stepAndRepeat" => json!({"created":"integer","ids":"ItemId[]"}),
         "file.place" => json!({"id":"ItemId","asset":"AssetId"}),
@@ -2314,7 +2594,7 @@ fn native_result_contract(command: &str) -> Option<Value> {
         }
         "list.define" => json!({"lists":"array"}),
         "swatch.create" => json!({"name":"string"}),
-        "object.gradient" => json!({"swatch":"string","kind":"string"}),
+        "object.gradient" => json!({"swatch":"string","kind":"string","stops":"array"}),
         "transform.move" => json!({"moved":"integer","ids":"ItemId[]"}),
         "edit.clear" => json!({"deleted":"integer"}),
         "find.change" => json!({"count":"integer"}),
@@ -2402,8 +2682,14 @@ fn native_result_shape(action: &EngineAction) -> Value {
 fn validate_identifier_references(actions: &[EngineAction]) -> Result<(), String> {
     let mut results = Vec::with_capacity(actions.len());
     for (index, action) in actions.iter().enumerate() {
-        for key in ["ids", "frame", "story", "table", "from", "to"] {
-            let Some(value) = action.params.get(key) else { continue };
+        let keys: &[&str] = match action.command.as_str() {
+            "text.thread" => &["ids", "frame", "story", "table", "from", "to"],
+            "object.matchAttributes" => &["ids", "frame", "story", "table", "from"],
+            _ => &["ids", "frame", "story", "table"],
+        };
+        for key in keys {
+            let Some(value) = action.params.get(*key) else { continue };
+            let is_array = value.is_array();
             let values: Vec<_> = match value {
                 Value::Array(values) => values.iter().collect(),
                 value => vec![value],
@@ -2444,15 +2730,36 @@ fn validate_identifier_references(actions: &[EngineAction]) -> Result<(), String
                     .ok_or("Invalid native result reference")?;
                 let Some((_, path)) = body.split_once('.') else { continue };
                 let field = path.split('.').next().ok_or("Invalid native result field")?;
+                let has_sub_index = path.contains('.');
                 let contract = native_result_contract(&source.command).ok_or("Unknown native result contract")?;
                 let kind = contract.get(field).and_then(Value::as_str).unwrap_or("");
-                let expected = match key {
+                let expected = match *key {
                     "story" => "StoryId",
                     "table" => "TableId",
                     _ => "ItemId",
                 };
                 if !kind.starts_with(expected) {
                     return Err(format!("step {index} ({}), {key}: {reference} from {} is not a {expected}", action.command, source.command));
+                }
+                let resolves_to_array = kind.ends_with("[]") && !has_sub_index;
+                if *key == "ids" {
+                    if is_array && resolves_to_array {
+                        return Err(format!(
+                            "step {index} ({}), ids: {reference} from {} is already an ItemId[] array; pass \"{reference}\" directly or index an element like {reference}.0",
+                            action.command, source.command
+                        ));
+                    }
+                    if !is_array && !resolves_to_array {
+                        return Err(format!(
+                            "step {index} ({}), ids: scalar {reference} from {} must be wrapped in an array [\"{reference}\"]",
+                            action.command, source.command
+                        ));
+                    }
+                } else if is_array || resolves_to_array {
+                    return Err(format!(
+                        "step {index} ({}), {key}: {reference} from {} resolves to an array, expected a single {expected}",
+                        action.command, source.command
+                    ));
                 }
             }
         }
@@ -2557,6 +2864,23 @@ fn repair_prompt(original: &str, previous: &str, error: &str) -> Result<String, 
         MAX_PROMPT,
     )
 }
+fn template_repair_prompt(original: &str, previous: &str, error: &str) -> Result<String, String> {
+    let rejected_content = if previous.len() > 8192 {
+        let end = previous.floor_char_boundary(8192);
+        format!("{}...[truncated {} bytes]", &previous[..end], previous.len() - end)
+    } else {
+        previous.to_owned()
+    };
+    bounded_json(
+        &json!({
+            "original_request_and_document": original,
+            "rejected_template_content": rejected_content,
+            "validation_error": error,
+            "instruction": "Return corrected template content JSON matching the declared schema. Shorten any text slot whose rendered copy caused overset text so every pill, badge, header, and activity box fits cleanly without truncating meaning, fix any invalid slot or repeated page family, and preserve language, educational content, and output mode."
+        }),
+        MAX_PROMPT,
+    )
+}
 #[cfg(test)]
 fn simulate(plan: &ProductionPlan, base: &DocState, prefs: &Prefs, mode: OutputMode, cancel: &AtomicBool) -> Result<(), String> {
     simulate_scoped(plan, base, prefs, mode, cancel, None)
@@ -2574,6 +2898,7 @@ fn simulate_scoped(
 }
 
 /// Independently verify an ordered partition of one human review on a private draft.
+#[cfg(test)]
 pub(crate) fn simulate_group_scoped(
     plans: &[ProductionPlan],
     base: &DocState,
@@ -2582,6 +2907,35 @@ pub(crate) fn simulate_group_scoped(
     cancel: &AtomicBool,
     scope: BatchScope,
 ) -> Result<(), String> {
+    simulate_group_scoped_with_ppi(plans, base, prefs, mode, cancel, scope, None)
+}
+
+pub(crate) fn ensure_no_new_low_resolution(preflight: &Value, base: &DocState, required_min_ppi: Option<f64>) -> Result<(), String> {
+    let Some(req_ppi) = required_min_ppi else {
+        return Ok(());
+    };
+    let new_low = preflight.get("issues").and_then(Value::as_array).into_iter().flatten().any(|issue| {
+        issue.get("kind").and_then(Value::as_str) == Some("lowResolution")
+            && issue.get("item").and_then(Value::as_u64).is_some_and(|id| base.doc.item(designcraft_engine::doc::ItemId(id)).is_none())
+    });
+    if new_low {
+        return Err(format!(
+            "Generated artwork does not meet the requested {req_ppi} PPI at its actual placement size; no low-resolution pages were published"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn simulate_group_scoped_with_ppi(
+    plans: &[ProductionPlan],
+    base: &DocState,
+    prefs: &Prefs,
+    mode: OutputMode,
+    cancel: &AtomicBool,
+    scope: BatchScope,
+    required_min_ppi: Option<f64>,
+) -> Result<(), String> {
+    let min_ppi = required_min_ppi.unwrap_or(150.0);
     let end = review_end(scope)?;
     if plans.is_empty() || plans.len() > MAX_REVIEW_PAGES as usize {
         return Err("Review group must contain 1 to 1000 bounded native plans".into());
@@ -2602,7 +2956,11 @@ pub(crate) fn simulate_group_scoped(
             .ok_or("Review plans exceed the 256-MiB limit")?;
         let mut last = None;
         for action in &plan.commands {
-            if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.qrCode") {
+            if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create")
+                || (action.command == "object.qrCode" && action.params.get("rect").is_some())
+                || (action.command == "text.thread" && action.params.get("rect").is_some())
+                || (action.command == "file.place" && action.params.get("frame").is_none())
+            {
                 let page = action
                     .params
                     .get("spread")
@@ -2620,7 +2978,10 @@ pub(crate) fn simulate_group_scoped(
         validate_batch_plan(plan, chunk)?;
         let before = scratch.doc().map_err(|e| e.to_string())?.clone();
         scratch
-            .execute("production.apply", &json!({"commands":plan.commands,"outputMode":mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
+            .execute(
+                "production.apply",
+                &json!({"commands":plan.commands,"outputMode":mode,"label":plan.title,"requirePreflight":true,"minPpi":min_ppi}),
+            )
             .map_err(|e| e.to_string())?;
         validate_batch_result(&before, scratch.doc().map_err(|e| e.to_string())?, chunk)?;
         next = chunk_end;
@@ -2629,40 +2990,7 @@ pub(crate) fn simulate_group_scoped(
         return Err("Internal review parts do not cover every requested review page".into());
     }
     validate_batch_result(base, scratch.doc().map_err(|e| e.to_string())?, scope)?;
-    check_cancel(cancel)
-}
-
-fn simulate_styled(
-    plan: &ProductionPlan,
-    base: &DocState,
-    prefs: &Prefs,
-    mode: OutputMode,
-    cancel: &AtomicBool,
-    scope: Option<BatchScope>,
-    geometry: GeometryCheck<'_>,
-) -> Result<(), String> {
-    check_cancel(cancel)?;
-    if let Some(scope) = scope {
-        validate_batch_plan(plan, scope)?;
-    }
-    let mut scratch = Session::new();
-    scratch.prefs = prefs.clone();
-    scratch.add_document(base.clone());
-    scratch
-        .execute("production.apply", &json!({"commands":plan.commands,"outputMode":mode,"label":plan.title,"requirePreflight":true,"minPpi":150}))
-        .map_err(|e| e.to_string())?;
-    check_cancel(cancel)?;
-    if let Some(scope) = scope {
-        validate_batch_result(base, scratch.doc().map_err(|e| e.to_string())?, scope)?;
-    }
-    match geometry {
-        GeometryCheck::Engine => {}
-        GeometryCheck::Profile(profile) => crate::design::check_geometry(Some(base), scratch.doc().map_err(|e| e.to_string())?, profile)?,
-        GeometryCheck::OpenedDocument { allow_geometry_edits } => {
-            check_opened_document_geometry_with_policy(base, scratch.doc().map_err(|e| e.to_string())?, allow_geometry_edits)?
-        }
-    }
-    let preflight = scratch.execute("preflight.run", &json!({})).map_err(|e| e.to_string())?;
+    let preflight = scratch.execute("preflight.run", &json!({"minPpi": min_ppi})).map_err(|e| e.to_string())?;
     if preflight.get("errors").and_then(Value::as_u64).ok_or("Invalid print-preflight response")? > 0 {
         let errors: Vec<_> = preflight
             .get("issues")
@@ -2675,6 +3003,70 @@ fn simulate_styled(
             .collect();
         return Err(format!("Print-preflight errors: {}", bounded_json(&json!(errors), 16 * 1024)?));
     }
+    ensure_no_new_low_resolution(&preflight, base, required_min_ppi)?;
+    check_cancel(cancel)
+}
+
+#[cfg(test)]
+fn simulate_styled(
+    plan: &ProductionPlan,
+    base: &DocState,
+    prefs: &Prefs,
+    mode: OutputMode,
+    cancel: &AtomicBool,
+    scope: Option<BatchScope>,
+    geometry: GeometryCheck<'_>,
+) -> Result<(), String> {
+    simulate_styled_with_ppi(plan, base, prefs, mode, cancel, scope, geometry, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_styled_with_ppi(
+    plan: &ProductionPlan,
+    base: &DocState,
+    prefs: &Prefs,
+    mode: OutputMode,
+    cancel: &AtomicBool,
+    scope: Option<BatchScope>,
+    geometry: GeometryCheck<'_>,
+    required_min_ppi: Option<f64>,
+) -> Result<(), String> {
+    let min_ppi = required_min_ppi.unwrap_or(150.0);
+    check_cancel(cancel)?;
+    if let Some(scope) = scope {
+        validate_batch_plan(plan, scope)?;
+    }
+    let mut scratch = Session::new();
+    scratch.prefs = prefs.clone();
+    scratch.add_document(base.clone());
+    scratch
+        .execute("production.apply", &json!({"commands":plan.commands,"outputMode":mode,"label":plan.title,"requirePreflight":true,"minPpi":min_ppi}))
+        .map_err(|e| e.to_string())?;
+    check_cancel(cancel)?;
+    if let Some(scope) = scope {
+        validate_batch_result(base, scratch.doc().map_err(|e| e.to_string())?, scope)?;
+    }
+    match geometry {
+        GeometryCheck::Engine => {}
+        GeometryCheck::Profile(profile) => crate::design::check_geometry(Some(base), scratch.doc().map_err(|e| e.to_string())?, profile)?,
+        GeometryCheck::OpenedDocument { allow_geometry_edits } => {
+            check_opened_document_geometry_with_policy(base, scratch.doc().map_err(|e| e.to_string())?, allow_geometry_edits)?
+        }
+    }
+    let preflight = scratch.execute("preflight.run", &json!({"minPpi": min_ppi})).map_err(|e| e.to_string())?;
+    if preflight.get("errors").and_then(Value::as_u64).ok_or("Invalid print-preflight response")? > 0 {
+        let errors: Vec<_> = preflight
+            .get("issues")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|issue| issue.get("severity").and_then(Value::as_str) == Some("error"))
+            .take(32)
+            .cloned()
+            .collect();
+        return Err(format!("Print-preflight errors: {}", bounded_json(&json!(errors), 16 * 1024)?));
+    }
+    ensure_no_new_low_resolution(&preflight, base, required_min_ppi)?;
     check_cancel(cancel)
 }
 
@@ -2760,8 +3152,19 @@ pub(crate) fn validate_batch_plan(plan: &ProductionPlan, scope: BatchScope) -> R
         if action.command == "text.thread" && action.params.get("autoflow").and_then(Value::as_bool) == Some(true) {
             return Err("Command text.thread cannot autoflow pages in a page-isolated batch".into());
         }
-        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.qrCode")
+        if action.command == "transform.move"
+            && let Some(target_spread) = action.params.get("toSpread")
+        {
+            let page = target_spread.as_u64().ok_or("Batch transform.move toSpread must be an integer page index")?;
+            if page < u64::from(scope.start) || page >= u64::from(end) {
+                return Err("Batch transform.move targets a page outside its approved range".into());
+            }
+            produced_pages.insert(page);
+        }
+        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create")
+            || (action.command == "object.qrCode" && action.params.get("rect").is_some())
             || (action.command == "text.thread" && action.params.get("rect").is_some())
+            || (action.command == "file.place" && action.params.get("frame").is_none())
         {
             let page = action.params.get("spread").and_then(Value::as_u64).ok_or("Every batch object needs an explicit native spread")?;
             if page < u64::from(scope.start) || page >= u64::from(end) {
@@ -2773,8 +3176,10 @@ pub(crate) fn validate_batch_plan(plan: &ProductionPlan, scope: BatchScope) -> R
             return Err("Batch must establish its own native object before formatting or selecting".into());
         }
         if let Some(params) = action.params.as_object() {
-            for key in ["ids", "frame", "story", "table", "from", "to"] {
-                if let Some(value) = params.get(key) {
+            let keys: &[&str] =
+                if action.command == "text.thread" { &["ids", "frame", "story", "table", "from", "to"] } else { &["ids", "frame", "story", "table"] };
+            for key in keys {
+                if let Some(value) = params.get(*key) {
                     let refs: Vec<_> = match value {
                         Value::Array(items) => items.iter().collect(),
                         value => vec![value],
@@ -2787,7 +3192,11 @@ pub(crate) fn validate_batch_plan(plan: &ProductionPlan, scope: BatchScope) -> R
                             .or_else(|| reference.strip_prefix('$'))
                             .ok_or("Literal IDs are forbidden in page-isolated batches")?;
                         let (step, _) = body.split_once('.').ok_or("Invalid batch result reference")?;
-                        let step = step.parse::<usize>().map_err(|_| "Invalid batch result index")?;
+                        let step = if step == "last" {
+                            index.checked_sub(1).ok_or("Batch result reference must name an earlier action")?
+                        } else {
+                            step.parse::<usize>().map_err(|_| "Invalid batch result index")?
+                        };
                         if step >= index {
                             return Err("Batch result reference must name an earlier action".into());
                         }
@@ -2891,11 +3300,12 @@ fn batch_proofs_with_layout(
     cancel: &AtomicBool,
     scope: BatchScope,
 ) -> Result<Vec<ProofArtifact>, String> {
+    let min_ppi = crate::print_contract::PrintContract::from_prompt(brief)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
     let mut scratch = Session::new();
     scratch.prefs = prefs.clone();
     scratch.add_document(base.clone());
     scratch
-        .execute("production.apply", &json!({"commands":plan.commands,"outputMode":settings.output_mode,"requirePreflight":true}))
+        .execute("production.apply", &json!({"commands":plan.commands,"outputMode":settings.output_mode,"requirePreflight":true,"minPpi":min_ppi}))
         .map_err(|e| e.to_string())?;
     review_proofs(&mut scratch, cancel, scope, settings, brief)
 }
@@ -7837,5 +8247,378 @@ mod tests {
             Some(BatchScope { start: 0, count: 1 }),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn vocalized_script_contract_preserves_diacritics_despite_plain_meta_phrases_and_enforces_min_ppi() {
+        let mut prompt = String::from("ملاحظة عامة: واجهة التعليمات بدون تشكيل خارج النص المعتمد.\n");
+        prompt.push_str("# PAGE 1 — حَدِيقَةُ الحُرُوفِ\n* **Arabic Print Copy**: لَوِّنِ الحَرْفَ المَطْلُوبَ\n");
+        let mut plan = ProductionPlan {
+            title: "حَدِيقَةُ الحُرُوفِ".into(),
+            commands: vec![EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread": 0, "rect": [72.0, 72.0, 320.0, 140.0], "content": "text", "text": "لَوِّنِ الحَرْفَ المَطْلُوبَ", "caret": false}),
+            }],
+            images: Vec::new(),
+        };
+        prepare_editorial_plan(&mut plan, &prompt, &json!({}), None).unwrap();
+        assert!(plan.title.chars().any(arabic_vowel_mark), "vocalized script title must keep tashkeel");
+        let body = plan.commands[0].params.get("text").and_then(Value::as_str).unwrap();
+        assert!(body.chars().any(arabic_vowel_mark), "vocalized script copy must keep tashkeel");
+
+        // Verify threaded frame creation on a second page satisfies simulate_group_scoped_with_ppi
+        // and PrintContract min_ppi (300 PPI) rejects a low-resolution placed raster image.
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages": 2, "facingPages": false})).unwrap();
+        let cancel = AtomicBool::new(false);
+        let group_plan = ProductionPlan {
+            title: "Two-page threaded chunk".into(),
+            commands: vec![
+                EngineAction {
+                    command: "frame.create".into(),
+                    params: json!({"spread": 0, "rect": [72.0, 72.0, 300.0, 140.0], "content": "text", "text": "Page 1", "caret": false}),
+                },
+                EngineAction { command: "text.thread".into(), params: json!({"from": "$0.id", "spread": 1, "rect": [72.0, 72.0, 300.0, 140.0]}) },
+            ],
+            images: Vec::new(),
+        };
+        simulate_group_scoped_with_ppi(
+            std::slice::from_ref(&group_plan),
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeOnly,
+            &cancel,
+            BatchScope { start: 0, count: 2 },
+            Some(300.0),
+        )
+        .unwrap();
+
+        // Create a 300x300 px PNG placed into a 144x144 pt (2x2 in = 150 PPI) frame:
+        // passes at 150 PPI, rejected at 300 PPI in both single-plan and review-group simulation!
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(300, 300, image::Rgba([40, 120, 200, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let img_plan = ProductionPlan {
+            title: "150 PPI image".into(),
+            commands: vec![
+                EngineAction {
+                    command: "frame.create".into(),
+                    params: json!({"spread": 0, "rect": [72.0, 72.0, 216.0, 216.0], "content": "graphic"}),
+                },
+                EngineAction { command: "file.place".into(), params: json!({"frame": "$0.id", "name": "hero.png", "base64": encoded}) },
+                EngineAction { command: "object.fit".into(), params: json!({"ids": ["$0.id"], "mode": "fillProportionally"}) },
+            ],
+            images: Vec::new(),
+        };
+        simulate_styled_with_ppi(
+            &img_plan,
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeWithImages,
+            &cancel,
+            Some(BatchScope { start: 0, count: 1 }),
+            GeometryCheck::Engine,
+            Some(150.0),
+        )
+        .unwrap();
+        let err = simulate_styled_with_ppi(
+            &img_plan,
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeWithImages,
+            &cancel,
+            Some(BatchScope { start: 0, count: 1 }),
+            GeometryCheck::Engine,
+            Some(300.0),
+        )
+        .unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("ppi") || err.contains("300"), "err={err}");
+
+        let group_err = simulate_group_scoped_with_ppi(
+            std::slice::from_ref(&img_plan),
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeWithImages,
+            &cancel,
+            BatchScope { start: 0, count: 1 },
+            Some(300.0),
+        )
+        .unwrap_err();
+        assert!(group_err.to_ascii_lowercase().contains("ppi") || group_err.contains("300"), "group_err={group_err}");
+    }
+
+    #[test]
+    fn batch_plan_and_identifier_checks_accept_non_thread_from_to_last_and_normalized_ids() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset": "A4", "pages": 2, "facingPages": false})).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Non-thread from/to, rect-less QR, stepAndRepeat, and $last",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 120.0, 240.0, 220.0], "content": "unassigned"}},
+                {
+                    "command": "object.gradient",
+                    "params": {
+                        "ids": "$0.id",
+                        "kind": "linear",
+                        "from": [72.0, 120.0],
+                        "to": [240.0, 220.0],
+                        "stops": [{"color": "#0F172A", "location": 0.0}, {"color": "#38BDF8", "location": 100.0}]
+                    }
+                },
+                {"command": "object.gradientFeather", "params": {"ids": ["$0.id"], "from": [72.0, 120.0], "to": [240.0, 220.0]}},
+                {"command": "object.arrange", "params": {"ids": ["$0.id"], "to": "front"}},
+                {"command": "object.align", "params": {"ids": ["$0.id"], "align": "center", "to": "margins"}},
+                {"command": "frame.create", "params": {"spread": 1, "rect": [72.0, 80.0, 152.0, 160.0], "content": "unassigned"}},
+                {"command": "object.qrCode", "params": {"type": "email", "to": "hello@example.org", "subject": "Check", "body": "OK"}},
+                {"command": "transform.set", "params": {"ids": ["$last.id"], "width": 84.0, "height": 84.0}},
+                {"command": "edit.stepAndRepeat", "params": {"ids": ["$5.id"], "count": 1, "dx": 110.0, "dy": 0.0}},
+                {"command": "object.opacity", "params": {"ids": ["$8.ids"], "opacity": 92.0}}
+            ]
+        }))
+        .unwrap();
+
+        let _ = crate::native_layout::prepare(&mut plan, session.doc().unwrap(), &session.prefs, &cancel).unwrap();
+        assert_eq!(plan.commands[1].params["ids"], json!(["$0.id"]));
+        assert_eq!(plan.commands[4].params["edge"], json!("hcenter"));
+        assert_eq!(plan.commands[9].params["ids"], json!("$8.ids"));
+
+        validate_batch_plan(&plan, BatchScope { start: 0, count: 2 }).unwrap();
+        simulate_group_scoped_with_ppi(
+            std::slice::from_ref(&plan),
+            session.doc().unwrap(),
+            &session.prefs,
+            OutputMode::NativeOnly,
+            &cancel,
+            BatchScope { start: 0, count: 2 },
+            Some(300.0),
+        )
+        .unwrap();
+
+        // Raw nested ItemId[] inside [...] or referencing null object.ungroup.ids must fail validation.
+        let nested_err = validate_identifier_references(&[
+            EngineAction { command: "frame.create".into(), params: json!({"spread": 0, "rect": [72.0, 72.0, 140.0, 140.0]}) },
+            EngineAction { command: "edit.stepAndRepeat".into(), params: json!({"ids": ["$0.id"], "count": 1, "dx": 80.0, "dy": 0.0}) },
+            EngineAction { command: "object.opacity".into(), params: json!({"ids": ["$1.ids"], "opacity": 80.0}) },
+        ])
+        .unwrap_err();
+        assert!(nested_err.contains("already an ItemId[] array"), "nested_err={nested_err}");
+
+        let ungroup_err = validate_identifier_references(&[
+            EngineAction { command: "frame.create".into(), params: json!({"spread": 0, "rect": [72.0, 72.0, 120.0, 120.0]}) },
+            EngineAction { command: "frame.create".into(), params: json!({"spread": 0, "rect": [130.0, 72.0, 180.0, 120.0]}) },
+            EngineAction { command: "object.group".into(), params: json!({"ids": ["$0.id", "$1.id"]}) },
+            EngineAction { command: "object.ungroup".into(), params: json!({"ids": ["$2.id"]}) },
+            EngineAction { command: "object.opacity".into(), params: json!({"ids": "$3.ids", "opacity": 80.0}) },
+        ])
+        .unwrap_err();
+        assert!(ungroup_err.contains("object.ungroup"), "ungroup_err={ungroup_err}");
+    }
+
+    #[test]
+    fn editorial_vocalization_policy_scopes_script_tanween_honors_removal_and_remaps_utf8_selections() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+
+        // Global instruction contains tanween ("أولاً", "كتاباً", "تعليمياً") plus "بدون تشكيل",
+        // while the PAGE 1 copy is unvocalized. Hallucinated tashkeel must be stripped AND
+        // subsequent UTF-8 byte offsets in text.select must remap cleanly to the second word!
+        let script_prompt = "أولاً: صمّم كتاباً تعليمياً واضحاً بدون تشكيل.\n# PAGE 1 — الغلاف\nTITLE_AR: مرحبا بالعالم\n";
+        let vocalized = "مَرْحَبًا بِالعَالَمِ";
+        let word_start = vocalized.find("بِالعَالَمِ").unwrap();
+        let word_end = vocalized.len();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Unvocalized script with styled second word",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 72.0, 420.0, 160.0], "content": "text", "text": vocalized}},
+                {"command": "text.select", "params": {"story": "$0.story", "anchor": word_start, "focus": word_end}},
+                {"command": "type.char", "params": {"attrs": {"size": 22.0}}}
+            ]
+        }))
+        .unwrap();
+
+        prepare_editorial_plan(&mut plan, script_prompt, &json!({}), Some(BatchScope { start: 0, count: 1 })).unwrap();
+        let stripped = plan.commands[0].params["text"].as_str().unwrap().to_string();
+        assert_eq!(stripped, "مرحبا بالعالم");
+        let new_anchor = plan.commands[1].params["anchor"].as_u64().unwrap() as usize;
+        let new_focus = plan.commands[1].params["focus"].as_u64().unwrap() as usize;
+        assert_eq!(&stripped[new_anchor..new_focus], "بالعالم");
+        session.execute("production.apply", &json!({"commands": plan.commands, "outputMode": "native_only"})).unwrap();
+        let story = session.doc().unwrap().doc.stories.values().next().unwrap();
+        assert_eq!(story.text, "مرحبا بالعالم");
+        assert_eq!(story.format_after(0).over.size, None);
+        assert_eq!(story.format_after(new_anchor.saturating_add(2)).over.size, Some(22.0));
+
+        // Explicit removal ("أزل التشكيل") must strip tashkeel even when the opened-document context had vowels.
+        let mut removal_plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Explicit diacritic removal",
+            "images": [],
+            "commands": [
+                {"command": "story.setText", "params": {"story": 1, "text": "عُنْوَانٌ جَدِيدٌ"}}
+            ]
+        }))
+        .unwrap();
+        prepare_editorial_plan(&mut removal_plan, "أزل التشكيل من العنوان واجعله بسيطاً", &json!({"existingText": "عُنْوَانٌ قَدِيمٌ"}), None).unwrap();
+        assert_eq!(removal_plan.commands[0].params["text"], json!("عنوان جديد"));
+    }
+
+    #[test]
+    fn template_content_paid_repair_loop_recovers_slot_overset_only_when_opted_in() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+
+        for allow_repairs in [false, true] {
+            let skill = text_fit_style();
+            let prompts_seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+            struct RepairingMock<'a> {
+                prompts: &'a RefCell<Vec<String>>,
+            }
+            impl Provider for RepairingMock<'_> {
+                fn generate(
+                    &self,
+                    _: &ModelSelection,
+                    _: Option<&str>,
+                    req: &GenerationRequest,
+                    _: &AtomicBool,
+                ) -> Result<GenerationResponse, String> {
+                    let mut seen = self.prompts.borrow_mut();
+                    seen.push(req.prompt.clone());
+                    let text = if seen.len() == 1 { "W".repeat(400) } else { "Write clearly.".to_owned() };
+                    Ok(GenerationResponse {
+                        text: json!({
+                            "title": "Rule",
+                            "pages": [{"page": 0, "family": "practice", "text": {"grammar-rule-1": text}, "illustrations": []}]
+                        })
+                        .to_string(),
+                        usage: Usage { input_tokens: Some(40), output_tokens: Some(25), ..Default::default() },
+                        error: None,
+                    })
+                }
+                fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                    Err("No images".into())
+                }
+                fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                    Err("No discovery".into())
+                }
+            }
+
+            let settings = AiSettings {
+                allow_paid_repairs: allow_repairs,
+                budget: BudgetSpec { token_limit: 500_000, max_requests: 8, repair_attempts: 2, ..Default::default() },
+                ..Default::default()
+            };
+            let request = TaskRequest {
+                prompt: "Create one clean grammar rule page".into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
+                export_directory: None,
+            };
+            let mut session = Session::new();
+            session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let provider = RepairingMock { prompts: &prompts_seen };
+            let result = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &provider,
+            }
+            .production(request, json!({}), catalog(), vec![skill], session.doc().unwrap().clone(), session.prefs.clone());
+
+            if !allow_repairs {
+                let err = result.err().expect("overset must fail when allow_paid_repairs is false");
+                assert!(err.contains("overset"), "err={err}");
+                assert_eq!(ledger.summary().requests, 1);
+                assert_eq!(prompts_seen.borrow().len(), 1);
+            } else {
+                let Product::Plan(plan) = result.expect("opt-in paid repair should recover overset template copy") else {
+                    panic!("Expected Product::Plan");
+                };
+                assert_eq!(plan.commands[0].params["text"], "Write clearly.");
+                assert_eq!(ledger.summary().requests, 2);
+                let captured = prompts_seen.borrow();
+                assert_eq!(captured.len(), 2);
+                assert!(captured[1].contains("rejected_template_content") && captured[1].contains("validation_error"));
+                assert!(captured[1].contains("overset"));
+                let diagnostics: Vec<_> = receiver.try_iter().collect();
+                assert!(!diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_discovery_excludes_non_generate_content_models_while_preserving_comfyui_and_unannotated_entries() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct DiscoveryMock;
+        impl Provider for DiscoveryMock {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                Err("No generation".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("No images".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Err("model_infos must be used by Work::Models".into())
+            }
+            fn model_infos(&self, selection: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<providers::ModelInfo>, String> {
+                match selection.provider {
+                    ProviderKind::Gemini => Ok(vec![
+                        providers::ModelInfo { id: "gemini-3.8-flash".into(), supports_generate_content: Some(true) },
+                        providers::ModelInfo { id: "gemini-3.1-flash-image".into(), supports_generate_content: Some(true) },
+                        providers::ModelInfo { id: "gemini-tuned-embed-only".into(), supports_generate_content: Some(false) },
+                        providers::ModelInfo { id: "imagen-3.0-generate-002".into(), supports_generate_content: Some(false) },
+                        providers::ModelInfo { id: "gemini-proxy-unannotated".into(), supports_generate_content: None },
+                    ]),
+                    ProviderKind::ComfyUi => {
+                        Ok(vec![providers::ModelInfo { id: "sdxl_base_1.0.safetensors".into(), supports_generate_content: Some(false) }])
+                    }
+                    _ => Ok(vec![providers::ModelInfo { id: "gpt-4.1-mini".into(), supports_generate_content: None }]),
+                }
+            }
+        }
+
+        let run_discovery = |provider: ProviderKind| -> Vec<String> {
+            let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
+            let (sender, _receiver) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let mock = DiscoveryMock;
+            let outcome = Runner {
+                cache_root: None,
+                print: None,
+                planning_only: false,
+                ledger: &mut ledger,
+                keys: &[],
+                cancel: &cancel,
+                sender: &sender,
+                provider: &mock,
+            }
+            .run(Work::Models(ModelSelection { provider, model: "probe".into(), endpoint: None }))
+            .expect("discovery should succeed");
+            let Product::Models(models) = outcome else {
+                panic!("Expected Product::Models");
+            };
+            models
+        };
+
+        assert_eq!(
+            run_discovery(ProviderKind::Gemini),
+            vec!["gemini-3.8-flash".to_owned(), "gemini-3.1-flash-image".to_owned(), "gemini-proxy-unannotated".to_owned()]
+        );
+        assert_eq!(run_discovery(ProviderKind::ComfyUi), vec!["sdxl_base_1.0.safetensors".to_owned()]);
+        assert_eq!(run_discovery(ProviderKind::OpenAi), vec!["gpt-4.1-mini".to_owned()]);
     }
 }
