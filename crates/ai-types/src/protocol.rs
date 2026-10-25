@@ -18,7 +18,7 @@ pub struct BudgetSpec {
 }
 impl Default for BudgetSpec {
     fn default() -> Self {
-        Self { token_limit: 64_000, max_output_tokens: 8192, max_requests: 4, repair_attempts: 1, max_cost_usd: None, rates: None }
+        Self { token_limit: 256_000, max_output_tokens: 8192, max_requests: 4, repair_attempts: 1, max_cost_usd: None, rates: None }
     }
 }
 /// User-configured rates, not a claim about a provider invoice.

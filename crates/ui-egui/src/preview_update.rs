@@ -41,6 +41,29 @@ fn short_commit(value: &str) -> &str {
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn discover_adjacent_launcher_layout(exe_path: &std::path::Path) -> (Option<String>, Option<PathBuf>) {
+    if !exe_path.is_absolute() {
+        return (None, None);
+    }
+    let Some(commit_dir) = exe_path.parent() else { return (None, None) };
+    let Some(versions_dir) = commit_dir.parent() else { return (None, None) };
+    let Some(managed_dir) = versions_dir.parent() else { return (None, None) };
+    let Some(outputs_dir) = managed_dir.parent() else { return (None, None) };
+    let Some(commit_str) = commit_dir.file_name().and_then(|name| name.to_str()).filter(|name| valid_commit(name)) else {
+        return (None, None);
+    };
+    let is_versions = versions_dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("versions"));
+    let is_managed = managed_dir.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("managed-updates"));
+    if !is_versions || !is_managed {
+        return (None, None);
+    }
+    let commit_sha = commit_str.to_ascii_lowercase();
+    let candidate = outputs_dir.join("current-gemini-integrated-trial.json");
+    let manifest = candidate.is_file().then_some(candidate);
+    (Some(commit_sha), manifest)
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn absolute_path(value: &str) -> bool {
     !value.contains(['\0', '\r', '\n']) && std::path::Path::new(value).is_absolute()
 }
@@ -164,6 +187,7 @@ impl UpdateResult {
 pub(crate) struct PreviewUpdate {
     manifest_path: Option<PathBuf>,
     manifest: Option<Manifest>,
+    exe_commit: Option<String>,
     #[cfg(target_os = "windows")]
     fingerprint: Option<(SystemTime, u64)>,
     #[cfg(target_os = "windows")]
@@ -226,6 +250,15 @@ impl PreviewUpdate {
             #[cfg(target_os = "windows")]
             {
                 self.manifest_path = std::env::var_os("DESIGNCRAFT_PREVIEW_MANIFEST").map(PathBuf::from).filter(|path| path.is_absolute());
+                if designcraft_engine::file_access::current().is_none()
+                    && let Ok(exe_path) = std::env::current_exe()
+                {
+                    let (discovered_commit, discovered_manifest) = discover_adjacent_launcher_layout(&exe_path);
+                    self.exe_commit = discovered_commit;
+                    if self.manifest_path.is_none() {
+                        self.manifest_path = discovered_manifest;
+                    }
+                }
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -310,7 +343,12 @@ impl PreviewUpdate {
         let text = |english, arabic_text| if arabic { arabic_text } else { english };
         let mut check = false;
         egui::Frame::new().stroke(egui::Stroke::new(1.0, tokens.field_border)).inner_margin(4.0).show(ui, |ui| {
-            let active = self.manifest.as_ref().map_or("unknown", |manifest| short_commit(&manifest.active_commit));
+            let active = self
+                .manifest
+                .as_ref()
+                .map(|manifest| short_commit(&manifest.active_commit))
+                .or_else(|| self.exe_commit.as_deref().map(short_commit))
+                .unwrap_or("unknown");
             let checking = self.running.load(Ordering::Acquire);
             let status = if checking {
                 "checking"
@@ -638,5 +676,29 @@ mod tests {
         assert!(state.error.is_none());
         assert!(!state.enabled());
         assert!(state.command(&json!({})).is_err());
+    }
+
+    #[test]
+    fn ai27_discover_adjacent_launcher_layout_handles_manifest_commit_only_and_non_managed_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let non_managed = temp.path().join("target").join("debug").join("deps").join("designcraft_ui_egui-abc.exe");
+        assert_eq!(super::discover_adjacent_launcher_layout(&non_managed), (None, None));
+
+        let invalid_sha = temp.path().join("outputs").join("managed-updates").join("versions").join("not-a-40-hex-sha").join("designcraft.exe");
+        assert_eq!(super::discover_adjacent_launcher_layout(&invalid_sha), (None, None));
+
+        let upper_sha = ACTIVE.to_ascii_uppercase();
+        let outputs_dir = temp.path().join("outputs");
+        let exe_path = outputs_dir.join("managed-updates").join("versions").join(&upper_sha).join("designcraft.exe");
+        std::fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
+        std::fs::write(&exe_path, b"stub").unwrap();
+
+        // Without manifest file: discovers active commit SHA (normalized lowercase), manifest is None.
+        assert_eq!(super::discover_adjacent_launcher_layout(&exe_path), (Some(ACTIVE.to_string()), None));
+
+        // With manifest file in <outputs>/current-gemini-integrated-trial.json: discovers both!
+        let manifest_file = outputs_dir.join("current-gemini-integrated-trial.json");
+        std::fs::write(&manifest_file, "{}").unwrap();
+        assert_eq!(super::discover_adjacent_launcher_layout(&exe_path), (Some(ACTIVE.to_string()), Some(manifest_file)));
     }
 }

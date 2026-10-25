@@ -99,7 +99,7 @@ pub(crate) enum Message {
     },
     Finished(Outcome),
     /// A batch returns the actual admission ledger, including conservative unknown charges.
-    FinishedWithLedger(Outcome, UsageLedger),
+    FinishedWithLedger(Outcome, Box<UsageLedger>),
 }
 pub(crate) struct Worker {
     pub receiver: Receiver<Message>,
@@ -172,7 +172,7 @@ fn spawn_inner(
             // cancel cannot hide an already committed file from the user's artifact report.
             let result = if cancellation.load(Ordering::Relaxed) && !external_export { Err("AI request cancelled".into()) } else { result };
             let outcome = Outcome { result, usage: ledger.summary() };
-            let message = if batched { Message::FinishedWithLedger(outcome, ledger) } else { Message::Finished(outcome) };
+            let message = if batched { Message::FinishedWithLedger(outcome, Box::new(ledger)) } else { Message::Finished(outcome) };
             let _ = sender.send(message);
         })
         .map_err(|_| "Cannot start AI worker thread".to_string())?;
@@ -575,7 +575,7 @@ impl Runner<'_> {
             Work::Models(selection) => {
                 self.progress("Discovering selected provider models", 0.1)?;
                 let key = selected_key(self.keys, &selection);
-                let reservation = self.ledger.reserve(0, 0, selection.provider, false, None)?;
+                let reservation = self.ledger.reserve_with_output(0, 0, selection.provider, false, None, Some(0))?;
                 let result = guarded(|| {
                     self.provider
                         .model_infos(&selection, key.as_ref().map(providers::SecretString::expose), self.cancel)
@@ -603,7 +603,8 @@ impl Runner<'_> {
             return Err("AI prompt exceeds the bounded context limit".into());
         }
         let key = selected_key(self.keys, selection);
-        let reservation = self.ledger.reserve(input, request.images.len(), selection.provider, false, None)?;
+        let reservation =
+            self.ledger.reserve_with_output(input, request.images.len(), selection.provider, false, None, Some(request.max_output_tokens))?;
         self.usage()?;
         let result = guarded(|| self.provider.generate(selection, key.as_ref().map(providers::SecretString::expose), request, self.cancel));
         self.ledger.record(reservation, result.as_ref().ok().map(|response| &response.usage));
@@ -1768,7 +1769,7 @@ fn project_image_requests(
                 if input > MAX_PROMPT {
                     return Err("Illustration review prompt exceeds the bounded context limit".into());
                 }
-                ledger.reserve(input, review.images.len(), settings.text_model.provider, false, None)?;
+                ledger.reserve_with_output(input, review.images.len(), settings.text_model.provider, false, None, Some(review.max_output_tokens))?;
             }
         }
     }

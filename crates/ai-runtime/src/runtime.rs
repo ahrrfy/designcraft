@@ -118,7 +118,7 @@ impl ProductionRunner {
                     if let (Some(s_time), Some(d_time)) = (settings_mtime, draft_mtime)
                         && s_time >= d_time
                     {
-                        draft.request.settings = settings.clone();
+                        apply_execution_settings_to_draft(draft, &settings);
                     } else if designcraft_ai_types::is_non_image_model(
                         draft.request.settings.image_model.provider,
                         &draft.request.settings.image_model.model,
@@ -343,12 +343,30 @@ impl ProductionRunner {
             AiRequest::RetryBatch { job_id } => self.retry_batch(session, &job_id)?,
             AiRequest::UpdateSettings(settings) => {
                 validate_settings(&settings)?;
-                write_json(&self.profile_access, &self.root.join("settings.json"), &settings)?;
-                if let Some(mut draft) = self.snapshot.production_draft.clone() {
-                    draft.request.settings = settings.clone();
-                    self.persist_production_draft(&draft)?;
-                    self.snapshot.production_draft = Some(draft);
+                let mut next_draft = self.snapshot.production_draft.clone();
+                if let Some(draft) = &mut next_draft {
+                    apply_execution_settings_to_draft(draft, &settings);
+                    validate_production_draft(draft)?;
                 }
+                let prev_batch = self.batch.clone();
+                let prev_snap_batch = self.snapshot.batch.clone();
+                self.sync_failed_batch_settings(&settings)?;
+                if let Err(error) = write_json(&self.profile_access, &self.root.join("settings.json"), &settings).and_then(|()| {
+                    if let Some(draft) = &next_draft {
+                        self.persist_production_draft(draft)?;
+                    }
+                    if let Some(job) = &self.batch
+                        && job.snapshot.status == "failed"
+                    {
+                        self.persist_batch(&job.snapshot)?;
+                    }
+                    Ok(())
+                }) {
+                    self.batch = prev_batch;
+                    self.snapshot.batch = prev_snap_batch;
+                    return Err(error);
+                }
+                self.snapshot.production_draft = next_draft;
                 self.snapshot.settings = settings;
                 self.refresh_credentials();
                 if self.snapshot.stage == "failed" {
@@ -946,7 +964,7 @@ impl ProductionRunner {
                     break;
                 }
                 Ok(worker::Message::FinishedWithLedger(outcome, ledger)) => {
-                    self.finish_batch(session, pending, outcome, ledger);
+                    self.finish_batch(session, pending, outcome, *ledger);
                     return;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -2332,7 +2350,23 @@ fn validate_production_draft(draft: &ProductionDraft) -> Result<(), String> {
     }
     Ok(())
 }
-fn require_text_model(settings: &AiSettings) -> Result<(), String> {
+fn apply_execution_settings_to_draft(draft: &mut ProductionDraft, settings: &AiSettings) {
+    let is_bound_book = draft.document_uid.is_some() || draft.document_path.is_some() || matches!(draft.request.target, TaskTarget::ContinueBook);
+    if is_bound_book {
+        draft.request.settings.budget = settings.budget.clone();
+        draft.request.settings.text_model = settings.text_model.clone();
+        draft.request.settings.image_model = settings.image_model.clone();
+        draft.request.settings.output_mode = settings.output_mode;
+        draft.request.settings.verify_generated_images = settings.verify_generated_images;
+        draft.request.settings.allow_paid_repairs = settings.allow_paid_repairs;
+        draft.request.settings.image_rates = settings.image_rates.clone();
+        draft.request.settings.comfy_workflow = settings.comfy_workflow.clone();
+        draft.request.settings.resources = settings.resources.clone();
+    } else {
+        draft.request.settings = settings.clone();
+    }
+}
+pub(crate) fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     if settings.text_model.model.trim().is_empty() {
         return Err("Choose a text model before starting generation".into());
     }
@@ -2344,7 +2378,7 @@ fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     }
     Ok(())
 }
-fn require_generation_models(settings: &AiSettings) -> Result<(), String> {
+pub(crate) fn require_generation_models(settings: &AiSettings) -> Result<(), String> {
     if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
         if settings.image_model.provider != ProviderKind::ComfyUi && settings.image_model.model.trim().is_empty() {
             return Err("Choose an image model before starting illustrated generation".into());
@@ -4925,6 +4959,8 @@ mod tests {
         let stale_ltr = AiSettings {
             facing_pages: false,
             right_to_left_binding: Some(false),
+            design_style: Some("kg-oxford-cambridge-style".into()),
+            pages_per_batch: 4,
             text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None },
             ..Default::default()
         };
@@ -4945,11 +4981,27 @@ mod tests {
         let draft_settings = runner.snapshot.production_draft.as_ref().unwrap().request.settings.clone();
         assert!(draft_settings.facing_pages);
         assert_eq!(draft_settings.right_to_left_binding, Some(true));
+        assert_eq!(draft_settings.design_style.as_deref(), Some("kg-oxford-cambridge-style"));
+        assert_eq!(draft_settings.pages_per_batch, 4);
 
         let mut healed_settings = draft_settings;
         healed_settings.text_model.model = "gemini-3.8-flash".into();
+        healed_settings.budget.token_limit = 512_000;
+        // Attempt to change bound-book structural fields in global settings: global settings change,
+        // while the bound book's `production_draft` preserves its pinned design_style, binding, and pagination!
+        healed_settings.design_style = Some("other-style".into());
+        healed_settings.facing_pages = false;
+        healed_settings.right_to_left_binding = Some(false);
+        healed_settings.pages_per_batch = 8;
         let after_update = runner.handle(&mut session, AiRequest::UpdateSettings(healed_settings.clone()));
-        assert_eq!(after_update.production_draft.as_ref().unwrap().request.settings.text_model.model, "gemini-3.8-flash");
+        let bound_draft_settings = &after_update.production_draft.as_ref().unwrap().request.settings;
+        assert_eq!(bound_draft_settings.text_model.model, "gemini-3.8-flash");
+        assert_eq!(bound_draft_settings.budget.token_limit, 512_000);
+        assert_eq!(bound_draft_settings.design_style.as_deref(), Some("kg-oxford-cambridge-style"));
+        assert!(bound_draft_settings.facing_pages);
+        assert_eq!(bound_draft_settings.right_to_left_binding, Some(true));
+        assert_eq!(bound_draft_settings.pages_per_batch, 4);
+        assert_eq!(after_update.settings.pages_per_batch, 8);
 
         // 5. Even if an older production-draft.json on disk has stale model settings with an older mtime than settings.json,
         // reopening ProductionRunner heals draft.request.settings from the newer settings.json.
