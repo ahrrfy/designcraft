@@ -163,6 +163,30 @@ impl ProductionRunner {
         Ok(())
     }
 
+    pub(super) fn sync_failed_batch_settings(&mut self, settings: &AiSettings) -> Result<(), String> {
+        if self.pending.is_some() {
+            return Ok(());
+        }
+        let Some(job) = self.batch.as_mut().filter(|job| job.snapshot.status == "failed") else {
+            return Ok(());
+        };
+        if let Some(ledger) = job.ledger.as_mut() {
+            ledger.update_budget(settings.budget.clone(), settings.image_rates.as_ref())?;
+            job.snapshot.cumulative_usage = ledger.summary();
+        }
+        job.task.settings.budget = settings.budget.clone();
+        job.task.settings.text_model = settings.text_model.clone();
+        job.task.settings.image_model = settings.image_model.clone();
+        job.task.settings.output_mode = settings.output_mode;
+        job.task.settings.verify_generated_images = settings.verify_generated_images;
+        job.task.settings.allow_paid_repairs = settings.allow_paid_repairs;
+        job.task.settings.image_rates = settings.image_rates.clone();
+        job.task.settings.comfy_workflow = settings.comfy_workflow.clone();
+        job.task.settings.resources = settings.resources.clone();
+        self.snapshot.batch = Some(job.snapshot.clone());
+        Ok(())
+    }
+
     pub(super) fn start_batches(
         &mut self,
         session: &mut Session,
@@ -332,6 +356,8 @@ impl ProductionRunner {
         if job.snapshot.job_id != id || !retry_candidate(job) || self.pending.is_some() {
             return Err("Only an unpublished failed group with its original admission ledger can be retried".into());
         }
+        crate::runtime::require_text_model(&job.task.settings)?;
+        crate::runtime::require_generation_models(&job.task.settings)?;
         ensure_publication_idle(session)?;
         let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
         let (base, mut context) = if let Some(uid) = job.snapshot.document_uid {
@@ -849,7 +875,7 @@ impl ProductionRunner {
         }
         result
     }
-    fn persist_batch(&self, snapshot: &BatchSnapshot) -> Result<(), String> {
+    pub(super) fn persist_batch(&self, snapshot: &BatchSnapshot) -> Result<(), String> {
         write_json(&self.profile_access, &self.root.join("batch-checkpoint.json"), snapshot)
     }
     fn export_finished_batch(&self, session: &mut Session, task: &TaskRequest, job_id: &str) -> Result<Vec<String>, String> {
@@ -1320,7 +1346,7 @@ mod tests {
         sender
             .send(worker::Message::FinishedWithLedger(
                 worker::Outcome { result: Ok(worker::Product::BatchGroup { plans, proofs }), usage: Default::default() },
-                ledger,
+                Box::new(ledger),
             ))
             .unwrap();
         runner.pending = Some(Pending {
@@ -2386,5 +2412,293 @@ mod tests {
             assert_eq!(done.stage, "completed", "msg={}", done.message);
             assert_eq!(session.active_index(), Some(0));
         }
+    }
+
+    #[test]
+    fn failed_batch_syncs_updated_budget_and_model_on_retry_while_retaining_cumulative_usage() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicU32::new(0));
+        let server_calls = calls.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                socket.set_nonblocking(false).map_err(|e| e.to_string())?;
+                socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+                socket.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let request_json = loop {
+                    if bytes.len() > 1024 * 1024 || Instant::now() >= deadline {
+                        return Err("Mock request exceeded bounds".into());
+                    }
+                    let count = socket.read(&mut chunk).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        return Err("Mock request ended early".into());
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n").map(|(h, b)| (h.to_owned(), b.to_owned())) {
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
+                            .ok_or("Missing mock Content-Length")?;
+                        if let Some(slice) = body.as_bytes().get(..length) {
+                            break serde_json::from_slice::<Value>(slice).map_err(|e| e.to_string())?;
+                        }
+                    }
+                };
+                let index = server_calls.fetch_add(1, Ordering::Relaxed);
+                let expected_model = if index == 0 { "batch-regression" } else { "gemini-3.8-flash" };
+                if request_json.get("model").and_then(Value::as_str) != Some(expected_model) {
+                    return Err(format!("Unexpected model on call {index}: {:?}", request_json.get("model")));
+                }
+                let plan = json!({
+                    "title": "Reviewed native book",
+                    "commands": [
+                        {"command": "frame.create", "params": {"spread": index, "rect": [50, 60, 200, 180], "content": "unassigned"}},
+                        {"command": "object.label", "params": {"ids": ["$0.id"], "label": format!("page-{}", index + 1)}}
+                    ],
+                    "images": []
+                });
+                let (in_tok, out_tok) = if index == 0 { (18_000u64, 2_000u64) } else { (4_000u64, 1_000u64) };
+                let reply = json!({
+                    "done": true,
+                    "message": {"content": plan.to_string()},
+                    "prompt_eval_count": in_tok,
+                    "eval_count": out_tok
+                })
+                .to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let mut request = task(endpoint.clone(), 1);
+        request.settings.budget.token_limit = 25_000;
+
+        let started = runner.handle(&mut session, AiRequest::Start(request.clone()));
+        assert!(started.busy, "{}", started.message);
+        let first = wait(&mut runner, &mut session);
+        assert_eq!(first.stage, "awaiting_human_proof", "{}", first.message);
+        let checkpoint = first.batch.as_ref().unwrap();
+        let job_id = checkpoint.job_id.clone();
+        assert_eq!(checkpoint.cumulative_usage.requests, 1);
+        assert_eq!(checkpoint.cumulative_usage.input_tokens, 18_000);
+        assert_eq!(checkpoint.cumulative_usage.output_tokens, 2_000);
+
+        // Approving batch 1 attempts batch 2, which fails immediately on max_requests == 1.
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint: checkpoint.checkpoint });
+        if approved.busy {
+            let _ = wait(&mut runner, &mut session);
+        }
+        let failed = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(failed.stage, "failed");
+        let failed_batch = failed.batch.as_ref().unwrap();
+        assert_eq!(failed_batch.status, "failed");
+        assert!(failed_batch.retryable);
+        assert_eq!(failed_batch.cumulative_usage.requests, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Retrying without UpdateSettings still fails and preserves cumulative usage.
+        let retry_unchanged = runner.handle(&mut session, AiRequest::RetryBatch { job_id: job_id.clone() });
+        if retry_unchanged.busy {
+            let _ = wait(&mut runner, &mut session);
+        }
+        let after_unchanged = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(after_unchanged.stage, "failed");
+        assert!(after_unchanged.message.to_ascii_lowercase().contains("request limit"), "msg={}", after_unchanged.message);
+        assert_eq!(after_unchanged.batch.as_ref().unwrap().cumulative_usage.requests, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Raising max_requests alone (keeping token_limit = 25_000) proves prior 20_000 charged_tokens were retained.
+        let mut partial_settings = request.settings.clone();
+        partial_settings.budget.max_requests = 2;
+        let saved_partial = runner.handle(&mut session, AiRequest::UpdateSettings(partial_settings));
+        assert_eq!(saved_partial.batch.as_ref().unwrap().status, "failed");
+        assert!(saved_partial.batch.as_ref().unwrap().retryable);
+        let retry_token_blocked = runner.handle(&mut session, AiRequest::RetryBatch { job_id: job_id.clone() });
+        if retry_token_blocked.busy {
+            let _ = wait(&mut runner, &mut session);
+        }
+        let after_token_blocked = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(after_token_blocked.stage, "failed");
+        assert!(after_token_blocked.message.to_ascii_lowercase().contains("token budget"), "msg={}", after_token_blocked.message);
+        assert_eq!(after_token_blocked.batch.as_ref().unwrap().cumulative_usage.input_tokens, 18_000);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Saving an empty or incompatible model via UpdateSettings must be rejected on RetryBatch without losing retryability!
+        let mut empty_model_settings = request.settings.clone();
+        empty_model_settings.budget.max_requests = 2;
+        empty_model_settings.budget.token_limit = 64_000;
+        empty_model_settings.text_model.model.clear();
+        runner.handle(&mut session, AiRequest::UpdateSettings(empty_model_settings));
+        let empty_retry = runner.handle(&mut session, AiRequest::RetryBatch { job_id: job_id.clone() });
+        assert_eq!(empty_retry.stage, "failed");
+        assert!(empty_retry.message.contains("Choose a text model"), "msg={}", empty_retry.message);
+        assert!(empty_retry.batch.as_ref().unwrap().retryable, "model readiness rejection must keep failed batch retryable");
+
+        let mut incompatible_img_settings = request.settings.clone();
+        incompatible_img_settings.budget.max_requests = 2;
+        incompatible_img_settings.budget.token_limit = 64_000;
+        incompatible_img_settings.text_model.model = "gemini-3.8-flash".into();
+        incompatible_img_settings.output_mode = designcraft_ai_types::OutputMode::NativeWithImages;
+        incompatible_img_settings.image_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        runner.handle(&mut session, AiRequest::UpdateSettings(incompatible_img_settings));
+        let incompatible_retry = runner.handle(&mut session, AiRequest::RetryBatch { job_id: job_id.clone() });
+        assert_eq!(incompatible_retry.stage, "failed");
+        assert!(incompatible_retry.message.contains("non-image model"), "msg={}", incompatible_retry.message);
+        assert!(incompatible_retry.batch.as_ref().unwrap().retryable);
+
+        // Raising token_limit + max_requests and switching model (while passing a different pages_per_batch) recovers cleanly.
+        let mut recovered_settings = request.settings.clone();
+        recovered_settings.budget.max_requests = 2;
+        recovered_settings.budget.token_limit = 64_000;
+        recovered_settings.text_model.model = "gemini-3.8-flash".into();
+        recovered_settings.pages_per_batch = 8;
+        runner.handle(&mut session, AiRequest::UpdateSettings(recovered_settings));
+        assert_eq!(runner.batch.as_ref().unwrap().task.settings.pages_per_batch, 1, "active job pagination must stay unchanged");
+
+        let retried = runner.handle(&mut session, AiRequest::RetryBatch { job_id });
+        assert!(retried.busy, "{}", retried.message);
+        let second = wait(&mut runner, &mut session);
+        assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
+        let done_batch = second.batch.as_ref().unwrap();
+        assert_eq!(done_batch.completed_pages, 2);
+        assert_eq!(done_batch.cumulative_usage.requests, 2);
+        assert_eq!(done_batch.cumulative_usage.input_tokens, 22_000);
+        assert_eq!(done_batch.cumulative_usage.output_tokens, 3_000);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn failed_remote_batch_mid_job_cost_cap_rejects_missing_rates_atomically_and_enforces_backfilled_usd_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset": "A4", "pages": 2, "facingPages": false})).unwrap();
+        session.execute("frame.create", &json!({"spread": 0, "rect": [40, 40, 200, 160]})).unwrap();
+        let doc = session.active().unwrap().clone();
+
+        let mut base_settings = AiSettings {
+            text_model: ModelSelection {
+                provider: ProviderKind::Gemini,
+                model: "gemini-3.8-flash".into(),
+                endpoint: Some("https://127.0.0.1:9/".into()),
+            },
+            pages_per_batch: 1,
+            ..Default::default()
+        };
+        base_settings.budget.token_limit = 256_000;
+        base_settings.budget.max_requests = 4;
+        runner.handle(&mut session, AiRequest::UpdateSettings(base_settings.clone()));
+
+        // Simulate a failed batch 2 where batch 1 ran remotely on Gemini without rates (10_000 input + 5_000 output tokens).
+        let mut ledger = UsageLedger::new(base_settings.budget.clone()).unwrap();
+        let r1 = ledger.reserve_with_output(3000, 0, ProviderKind::Gemini, false, None, Some(4096)).unwrap();
+        ledger.record(r1, Some(&designcraft_ai_providers::Usage { input_tokens: Some(10_000), output_tokens: Some(5_000), ..Default::default() }));
+        assert_eq!(ledger.summary().estimated_cost_usd, None);
+
+        let task_req = TaskRequest {
+            prompt: "Continue two-page book".into(),
+            settings: base_settings.clone(),
+            skill_ids: Vec::new(),
+            auto_select_skills: false,
+            target: TaskTarget::ContinueBook,
+            export_directory: None,
+        };
+        runner.save_production_draft(&session, &task_req).unwrap();
+        runner.bind_production_draft(&session, "job-usd-backfill").unwrap();
+
+        let snapshot = BatchSnapshot {
+            job_id: "job-usd-backfill".into(),
+            total_pages: 2,
+            pages_per_batch: 1,
+            current_batch: 2,
+            total_batches: 2,
+            completed_pages: 1,
+            status: "failed".into(),
+            retryable: true,
+            checkpoint: 1,
+            document_uid: Some(doc.uid),
+            document_revision: Some(doc.revision),
+            cumulative_usage: ledger.summary(),
+            elapsed_ms: 100,
+            batches: vec![BatchReport { batch: 2, page_start: 1, page_count: 1, status: "failed".into(), ..Default::default() }],
+        };
+        runner.snapshot.batch = Some(snapshot.clone());
+        runner.batch = Some(BatchJob {
+            task: task_req,
+            skills: Vec::new(),
+            roots: None,
+            ledger: Some(ledger),
+            before: UsageSummary::default(),
+            snapshot,
+            prefs: session.prefs.clone(),
+            publication_cache: session.cache.clone(),
+            publication_base: Some(doc),
+            retry_sequence: 0,
+        });
+
+        // 1. UpdateSettings with max_cost_usd but NO rates must fail BEFORE writing settings.json or production-draft.json!
+        let disk_settings_before = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        let disk_draft_before = std::fs::read_to_string(dir.path().join("production-draft.json")).unwrap();
+        let mut missing_rates = base_settings.clone();
+        missing_rates.budget.max_cost_usd = Some(0.10);
+        missing_rates.text_model.model = "should-not-persist".into();
+        let err_snap = runner.handle(&mut session, AiRequest::UpdateSettings(missing_rates));
+        assert_eq!(err_snap.stage, "failed");
+        assert!(err_snap.message.contains("Set rates"), "msg={}", err_snap.message);
+        assert_eq!(std::fs::read_to_string(dir.path().join("settings.json")).unwrap(), disk_settings_before);
+        assert_eq!(std::fs::read_to_string(dir.path().join("production-draft.json")).unwrap(), disk_draft_before);
+        assert_eq!(err_snap.settings.text_model.model, "gemini-3.8-flash");
+
+        // 2. Supplying rates + tight max_cost_usd ($0.08) backfills prior $0.07 cost onto cumulative_usage,
+        // and blocks RetryBatch BEFORE contacting the endpoint because next admission estimate exceeds remaining $0.01!
+        let mut tight_usd = base_settings;
+        tight_usd.budget.max_cost_usd = Some(0.08);
+        tight_usd.budget.rates = Some(designcraft_ai_types::protocol::TokenRates {
+            input_per_million: 2.0,
+            cached_input_per_million: 0.5,
+            output_per_million: 10.0,
+            cache_write_per_million: None,
+            image_per_request: None,
+            image_reserve_usd: None,
+        });
+        runner.store_session_key(&tight_usd.text_model, SecretString::new("test-key".into())).unwrap();
+        let saved_usd = runner.handle(&mut session, AiRequest::UpdateSettings(tight_usd));
+        let backfilled_usd = saved_usd.batch.as_ref().unwrap().cumulative_usage.estimated_cost_usd.expect("backfilled USD");
+        assert!((backfilled_usd - 0.07).abs() < 1e-10, "backfilled_usd={backfilled_usd}");
+
+        let retry_blocked = runner.handle(&mut session, AiRequest::RetryBatch { job_id: "job-usd-backfill".into() });
+        if retry_blocked.busy {
+            let _ = wait(&mut runner, &mut session);
+        }
+        let after_blocked = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(after_blocked.stage, "failed");
+        assert!(after_blocked.message.contains("monetary budget"), "msg={}", after_blocked.message);
     }
 }

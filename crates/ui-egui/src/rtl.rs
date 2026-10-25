@@ -29,7 +29,7 @@ fn may_have_rtl(text: &str) -> bool {
         })
 }
 
-fn has_rtl(text: &str) -> bool {
+pub(crate) fn has_rtl(text: &str) -> bool {
     may_have_rtl(text) && BidiInfo::new(text, None).has_rtl()
 }
 

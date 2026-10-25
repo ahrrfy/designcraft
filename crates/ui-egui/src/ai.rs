@@ -166,6 +166,12 @@ struct RequestEstimate {
     vision_allowance: u32,
 }
 
+#[derive(Clone, Copy)]
+struct TokenEstimate {
+    review_tokens: u64,
+    book_tokens: u64,
+}
+
 #[derive(Clone)]
 struct CompanionProof {
     path: String,
@@ -275,6 +281,163 @@ fn explicit_script_pages(brief: &str) -> Option<u32> {
         pages = number;
     }
     (pages > 0).then_some(pages)
+}
+
+pub(crate) fn is_retired_gemini_text_model(provider: ProviderKind, model: &str) -> bool {
+    if provider != ProviderKind::Gemini {
+        return false;
+    }
+    let normalized = model.trim().to_ascii_lowercase();
+    let name = normalized.strip_prefix("models/").unwrap_or(&normalized);
+    ["gemini-1.0", "gemini-1.5", "gemini-2.0", "gemini-2.5"].iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// Search-only normalization matching runtime style keyword matching; prompt text stays exact.
+fn normalize_skill_search_ui(text: &str) -> String {
+    let stripped = text
+        .chars()
+        .filter(|c| !matches!(*c, '\u{0610}'..='\u{061a}' | '\u{0640}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}'))
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let mut normalized = String::with_capacity(stripped.len().saturating_add(8));
+    let mut prev_arabic = None;
+    for ch in stripped.chars() {
+        let is_arabic = ('\u{0600}'..='\u{06ff}').contains(&ch);
+        let is_latin_or_digit = ch.is_ascii_alphanumeric();
+        if let Some(was_arabic) = prev_arabic
+            && ((was_arabic && is_latin_or_digit) || (!was_arabic && is_arabic))
+            && !normalized.ends_with(' ')
+        {
+            normalized.push(' ');
+        }
+        normalized.push(ch);
+        prev_arabic = if is_arabic {
+            Some(true)
+        } else if is_latin_or_digit {
+            Some(false)
+        } else {
+            None
+        };
+    }
+    normalized
+}
+
+/// Conservative natural-language total-page hint used only when no explicit `# PAGE N` script is authored.
+fn natural_prompt_pages(prompt: &str) -> Option<u32> {
+    if prompt.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES || prompt.contains('\0') {
+        return None;
+    }
+    let normalized: String = prompt
+        .chars()
+        .filter(|ch| !matches!(*ch, '\u{0610}'..='\u{061a}' | '\u{0640}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}'))
+        .map(|ch| match ch {
+            '\u{0660}'..='\u{0669}' => char::from_u32(u32::from('0').saturating_add(u32::from(ch).saturating_sub(0x0660))).unwrap_or(ch),
+            '\u{06F0}'..='\u{06F9}' => char::from_u32(u32::from('0').saturating_add(u32::from(ch).saturating_sub(0x06F0))).unwrap_or(ch),
+            _ => ch,
+        })
+        .collect();
+
+    let mut fenced = false;
+    let mut inline_candidate: Option<u32> = None;
+    for line in normalized.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        for header in
+            ["بعدد الصفحات", "عدد صفحات الكتاب", "عدد الصفحات", "إجمالي الصفحات", "اجمالي الصفحات", "page count", "total pages", "number of pages"]
+        {
+            if let Some(idx) = lower.find(header)
+                && let Some(after_header) = lower.get(idx.saturating_add(header.len())..)
+            {
+                let rest = after_header.trim_start_matches([' ', '\t', ':', '=', '-', '–', '—', '(', '[', '«']);
+                let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+                let next_char = rest.get(end..).and_then(|s| s.chars().next());
+                if end > 0
+                    && next_char != Some('.')
+                    && let Some(n) = rest.get(..end).and_then(|digits| digits.parse::<u32>().ok())
+                    && (2..=1000).contains(&n)
+                {
+                    return Some(n);
+                }
+            }
+        }
+        if inline_candidate.is_some() {
+            continue;
+        }
+        let mut cursor = 0usize;
+        while let Some(slice) = lower.get(cursor..) {
+            let Some(rel_start) = slice.find(|c: char| c.is_ascii_digit()) else {
+                break;
+            };
+            let start = cursor.saturating_add(rel_start);
+            let Some(from_digits) = lower.get(start..) else {
+                break;
+            };
+            let len = from_digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(from_digits.len());
+            let end = start.saturating_add(len);
+            cursor = end.max(cursor.saturating_add(1));
+
+            let before = lower.get(..start).unwrap_or("");
+            let prev_char = before.chars().next_back();
+            if prev_char.is_some_and(|c| c == '.' || c == '/' || c == '#' || c.is_ascii_alphabetic() || ('\u{0600}'..='\u{06ff}').contains(&c)) {
+                continue;
+            }
+            let before_unbracketed = before.trim_end_matches([' ', '\t', '(', '[', '«']);
+            if ["صفحة", "صفحه", "الصفحة", "الصفحه", "صفحات", "page", "pages"].iter().any(|p| before_unbracketed.ends_with(p))
+            {
+                continue;
+            }
+            if before_unbracketed.ends_with(['-', '–', '—'])
+                && before_unbracketed.trim_end_matches(['-', '–', '—', ' ', '\t']).chars().next_back().is_some_and(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+            let Some(number) = lower.get(start..end).and_then(|d| d.parse::<u32>().ok()).filter(|n| (2..=1000).contains(n)) else {
+                continue;
+            };
+            let Some(after) = lower.get(end..) else {
+                continue;
+            };
+            if after.starts_with('.') && after.get(1..).and_then(|s| s.chars().next()).is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let after_unbracketed = after.trim_start_matches([')', ']', '»']);
+            if let Some(hyphen_tail) = after_unbracketed.strip_prefix("-pages").or_else(|| after_unbracketed.strip_prefix("-page"))
+                && hyphen_tail.chars().next().is_none_or(|c| !c.is_alphabetic() && c != '_')
+            {
+                let tail_trimmed = hyphen_tail.trim_start_matches([' ', '\t', '-', '–', '—']);
+                if !["لكل", "في كل", "per ", "per\t"].iter().any(|p| tail_trimmed.starts_with(p)) {
+                    inline_candidate = Some(number);
+                    break;
+                }
+                continue;
+            }
+            let unit_rest = after_unbracketed.trim_start_matches([' ', '\t']);
+            for unit in ["صفحات", "صفحة", "صفحه", "pages", "page"] {
+                if let Some(tail) = unit_rest.strip_prefix(unit)
+                    && tail.chars().next().is_none_or(|c| !c.is_alphabetic() && c != '_')
+                {
+                    let tail_trimmed = tail.trim_start_matches([' ', '\t', '-', '–', '—']);
+                    let per_group =
+                        ["لكل", "في كل", "بالدفعة", "في الدفعة", "في المراجعة", "per ", "per\t"].iter().any(|p| tail_trimmed.starts_with(p));
+                    if !per_group {
+                        inline_candidate = Some(number);
+                        break;
+                    }
+                }
+            }
+            if inline_candidate.is_some() {
+                break;
+            }
+        }
+    }
+    inline_candidate
 }
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -895,6 +1058,66 @@ impl AiUiState {
         Some(text(arabic, en, ar))
     }
 
+    fn effective_design_profile(&self) -> Option<&designcraft_ai_types::DesignProfile> {
+        if let Some(id) = &self.settings.design_style {
+            return self
+                .snapshot
+                .skills
+                .iter()
+                .rev()
+                .filter(|card| &card.id == id && card.design_profile.is_some())
+                .max_by_key(|card| u8::from(card.enabled && card.compatible) * 2 + u8::from(card.active))
+                .and_then(|card| card.design_profile.as_ref());
+        }
+        if !self.automatic_skills {
+            return self
+                .selected_skills
+                .iter()
+                .filter_map(|id| {
+                    self.snapshot
+                        .skills
+                        .iter()
+                        .rev()
+                        .filter(|card| &card.id == id && card.enabled && card.compatible && card.design_profile.is_some())
+                        .max_by_key(|card| u8::from(card.active))
+                })
+                .find_map(|card| card.design_profile.as_ref());
+        }
+        if let Some(profile) = self
+            .selected_skills
+            .iter()
+            .filter_map(|id| {
+                self.snapshot
+                    .skills
+                    .iter()
+                    .rev()
+                    .find(|card| &card.id == id && card.enabled && card.compatible && card.active && card.design_profile.is_some())
+            })
+            .find_map(|card| card.design_profile.as_ref())
+        {
+            return Some(profile);
+        }
+        let lower = normalize_skill_search_ui(&self.prompt);
+        if lower.trim().is_empty() {
+            return None;
+        }
+        selectable_skill_cards(&self.snapshot.skills, true, false)
+            .into_iter()
+            .filter_map(|card| {
+                let profile = card.design_profile.as_ref()?;
+                let hits = profile
+                    .keywords
+                    .iter()
+                    .map(|word| normalize_skill_search_ui(word))
+                    .filter(|word| !word.is_empty() && lower.contains(word.as_str()))
+                    .count();
+                let bonus = usize::from(hits > 0 && card.id == "kg-oxford-cambridge-style") * 16;
+                (hits > 0).then_some((hits.saturating_add(bonus), card.id.as_str(), profile))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+            .map(|(_, _, profile)| profile)
+    }
+
     fn request_estimate(&self, documents: &[OpenDocument], active: Option<usize>) -> Option<RequestEstimate> {
         if (!self.new_document && !self.continue_book) || self.settings.pages_per_batch == 0 || self.prompt.trim().is_empty() {
             return None;
@@ -917,13 +1140,9 @@ impl AiUiState {
         let sources_per_page = if self.settings.output_mode == OutputMode::NativeOnly {
             0
         } else {
-            self.settings
-                .design_style
-                .as_ref()
-                .and_then(|id| self.snapshot.skills.iter().rev().find(|card| &card.id == id))
-                .and_then(|card| card.design_profile.as_ref())
+            self.effective_design_profile()
                 .map(|profile| profile.page_families.iter().map(|family| family.image_slots.len()).max().unwrap_or(0))
-                .map_or(1, |sources| u32::try_from(sources.min(8)).unwrap_or(8))
+                .map_or(1, |sources| u32::try_from(sources.clamp(1, 8)).unwrap_or(8))
         };
         let image_allowance = review_pages.saturating_mul(sources_per_page);
         let vision_allowance = if self.settings.verify_generated_images { image_allowance } else { 0 };
@@ -936,6 +1155,42 @@ impl AiUiState {
             scripted: scripted_pages.is_some(),
             image_allowance,
             vision_allowance,
+        })
+    }
+
+    fn token_estimate(&self, documents: &[OpenDocument], active: Option<usize>) -> Option<TokenEstimate> {
+        let estimate = self.request_estimate(documents, active)?;
+        let profile = self.effective_design_profile();
+        let overhead_bytes: u64 = if profile.is_some() {
+            96_000
+        } else if self.automatic_skills || !self.selected_skills.is_empty() {
+            180_000
+        } else {
+            48_000
+        };
+        let prompt_bytes = u64::try_from(self.prompt.len()).unwrap_or(u64::MAX);
+        let text_per_page = prompt_bytes
+            .saturating_add(overhead_bytes)
+            .div_ceil(3)
+            .saturating_add(1024)
+            .saturating_add(u64::from(self.settings.budget.max_output_tokens));
+        let sources_per_page = estimate.image_allowance.checked_div(estimate.review_pages).map_or(0, u64::from);
+        let vision_per_page = if self.settings.output_mode == OutputMode::NativeWithImages {
+            let workflow_tokens = self.settings.comfy_workflow.as_ref().map_or(0, |v| u64::try_from(v.to_string().len()).unwrap_or(0).div_ceil(3));
+            let image_call_tokens = 8_192u64.saturating_add(1_024).saturating_add(4_096).saturating_add(workflow_tokens);
+            let review_call_tokens = if self.settings.verify_generated_images {
+                8_192u64.saturating_add(1_024).saturating_add(4_096).saturating_add(u64::from(self.settings.budget.max_output_tokens.min(4096)))
+            } else {
+                0
+            };
+            sources_per_page.saturating_mul(image_call_tokens.saturating_add(review_call_tokens))
+        } else {
+            0
+        };
+        let per_page_tokens = text_per_page.saturating_add(vision_per_page);
+        Some(TokenEstimate {
+            review_tokens: per_page_tokens.saturating_mul(u64::from(estimate.review_pages)).clamp(256, 4_000_000),
+            book_tokens: per_page_tokens.saturating_mul(u64::from(estimate.remaining_pages)).clamp(256, 4_000_000),
         })
     }
 
@@ -2180,7 +2435,8 @@ fn production_recovery(
         return;
     }
     if let Some(draft) = &s.snapshot.production_draft
-        && matches!(draft.request.target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook)
+        && (matches!(draft.request.target, TaskTarget::ContinueBook)
+            || (matches!(draft.request.target, TaskTarget::NewA4 { .. }) && (draft.document_uid.is_some() || draft.document_path.is_some())))
     {
         let selected = saved_book_document(draft, documents, *activate_document).filter(|document| document.continuable);
         ui.horizontal_wrapped(|ui| {
@@ -2212,12 +2468,21 @@ fn production_recovery(
         && batch.retryable
         && batch.job_id == draft.id
     {
-        label(
-            ui,
-            a,
-            "Retry keeps this task's original settings and cumulative usage. To change the brief, model or limits, prepare Continue and press Produce for a new task.",
-            "تحتفظ إعادة المحاولة بإعدادات المهمة الأصلية واستخدامها التراكمي. لتغيير التعليمات أو النموذج أو الحدود، جهّز الاستكمال واضغط إنتاج لبدء مهمة جديدة.",
-        );
+        if batch.completed_pages == 0 {
+            label(
+                ui,
+                a,
+                "Adjust limits or settings below, then Retry this group or start fresh.",
+                "ارفع الحدود أو عدّل الإعدادات، ثم أعد محاولة هذه المجموعة أو ابدأ إنتاجاً جديداً.",
+            );
+        } else {
+            label(
+                ui,
+                a,
+                "Retry keeps cumulative usage, pinned style, and pagination while applying updated budget limits and compatible model selections. To change the brief, style, or batch size, prepare Continue and press Produce.",
+                "تحتفظ إعادة المحاولة بالاستخدام التراكمي والنمط المثبّت وتقسيم الدفعات مع تطبيق حدود الميزانية والنماذج المتوافقة المحدّثة. لتغيير التعليمات أو النمط أو حجم الدفعة، جهّز الاستكمال واضغط إنتاج.",
+            );
+        }
         let unpublished_new_book = matches!(draft.request.target, TaskTarget::NewA4 { .. })
             && batch.completed_pages == 0
             && batch.document_uid.is_none()
@@ -2234,6 +2499,19 @@ fn production_recovery(
             .clicked()
         {
             requests.push(AiRequest::RetryBatch { job_id: batch.job_id.clone() });
+        }
+    }
+    if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "failed" && batch.completed_pages == 0) && !s.snapshot.busy {
+        let can_start_fresh = production_blocking_issue(s, available, documents, *activate_document, a).is_none();
+        if ui
+            .add_enabled(
+                can_start_fresh,
+                egui::Button::new(rtl::widget(ui, text(a, "Start fresh with current settings", "بدء إنتاج جديد بالإعدادات الحالية"))),
+            )
+            .clicked()
+        {
+            s.clear_failure_alert();
+            requests.push(AiRequest::Start(s.production_task()));
         }
     }
 }
@@ -2360,13 +2638,14 @@ fn render_diagnostic_alert_banner(
                     }
                     DiagnosticAlertKind::TokenBudget => {
                         if ui.button(rtl::widget(ui, text(a, "Raise Token Limit", "رفع سقف الرموز تلقائياً"))).clicked() {
-                            s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).clamp(256_000, 4_000_000);
+                            let estimated = s.token_estimate(documents, activate_document).map_or(0, |est| est.book_tokens.max(est.review_tokens));
+                            s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).max(estimated).clamp(256_000, 4_000_000);
                             requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                             s.clear_failure_alert();
                         }
                     }
                     DiagnosticAlertKind::PageCountMismatch => {
-                        if let Some(script_pages) = explicit_script_pages(&s.prompt)
+                        if let Some(script_pages) = explicit_script_pages(&s.prompt).or_else(|| natural_prompt_pages(&s.prompt))
                             && ui.button(rtl::widget(ui, text(a, "Match Page Count to Script", "مطابقة عدد الصفحات مع السكربت"))).clicked()
                         {
                             s.new_document = true;
@@ -2414,6 +2693,33 @@ fn selectable_skill_cards(skills: &[SkillCard], include_design_profiles: bool, r
         }
     }
     chosen
+}
+
+fn production_blocking_issue(s: &AiUiState, available: bool, documents: &[OpenDocument], active: Option<usize>, a: bool) -> Option<&'static str> {
+    let script_conflict_issue = explicit_script_pages(&s.prompt).and_then(|script_pages| {
+        let mismatch = if s.new_document {
+            s.pages != script_pages
+        } else if s.continue_book {
+            documents
+                .iter()
+                .find(|document| Some(document.index) == active)
+                .is_some_and(|document| u32::try_from(document.pages).ok() != Some(script_pages))
+        } else {
+            false
+        };
+        mismatch.then_some(text(
+            a,
+            "Explicit PAGE script count must match the target book page count.",
+            "يجب أن يطابق عدد صفحات التعليمات الصريحة (PAGE) عدد صفحات الكتاب المستهدف.",
+        ))
+    });
+    let continuation_issue =
+        (s.continue_book && !documents.iter().any(|document| Some(document.index) == active && document.continuable)).then_some(text(
+            a,
+            "Select a book with completed opening pages and remaining blank pages, or choose Edit current document.",
+            "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر تحرير المستند الحالي.",
+        ));
+    s.production_issue(available, active.is_some(), a).or(continuation_issue).or(script_conflict_issue)
 }
 
 fn production(
@@ -2501,6 +2807,26 @@ fn production(
                 );
             }
         }
+        if s.active_diagnostic_alert().map(|alert| alert.kind) != Some(DiagnosticAlertKind::InvalidModel)
+            && is_retired_gemini_text_model(s.settings.text_model.provider, &s.settings.text_model.model)
+        {
+            ui.horizontal_wrapped(|ui| {
+                rtl::label(
+                    ui,
+                    egui::RichText::new(text(
+                        a,
+                        "Selected Gemini model series is retired and may return HTTP 404. Switch to gemini-3.8-flash before producing.",
+                        "سلسلة نموذج Gemini المختارة متقاعدة وقد تعيد خطأ HTTP 404. انتقل إلى gemini-3.8-flash قبل الإنتاج.",
+                    ))
+                    .color(ui.visuals().warn_fg_color),
+                );
+                if ui.button(rtl::widget(ui, text(a, "Use gemini-3.8-flash", "استخدام gemini-3.8-flash"))).clicked() {
+                    s.settings.text_model.model = "gemini-3.8-flash".into();
+                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                    s.clear_failure_alert();
+                }
+            });
+        }
         label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
         ui.horizontal_wrapped(|ui| {
             label(ui, a, "Design style", "نمط التصميم");
@@ -2536,16 +2862,21 @@ fn production(
         });
         // Keep room for the compact update row and the production action. Long
         // briefs remain complete and scroll inside their own seven-row composer.
+        let prompt_rtl = if s.prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.prompt) };
         egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(128.0).show(ui, |ui| {
             ui.add(
-                egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(rtl::widget(
-                    ui,
-                    text(
-                        a,
-                        "Describe your design, audience and desired result...",
-                        "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
-                    ),
-                )),
+                egui::TextEdit::multiline(&mut s.prompt)
+                    .desired_rows(7)
+                    .desired_width(f32::INFINITY)
+                    .horizontal_align(if prompt_rtl { egui::Align::Max } else { egui::Align::Min })
+                    .hint_text(rtl::widget(
+                        ui,
+                        text(
+                            a,
+                            "Describe your design, audience and desired result...",
+                            "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
+                        ),
+                    )),
             );
         });
         rtl::label(
@@ -2565,7 +2896,7 @@ fn production(
                 format!(
                     "{} {} {}",
                     text(a, "Conservative input budget reservation starts at", "يبدأ حجز ميزانية الإدخال التحفظي من"),
-                    s.prompt.len().saturating_add(1024),
+                    s.prompt.len().div_ceil(3).saturating_add(1024),
                     text(
                         a,
                         "tokens; skill/document context is additional. Actual usage comes from the provider.",
@@ -2732,6 +3063,31 @@ fn production(
                     }
                 });
             }
+        } else if s.new_document
+            && let Some(detected) = natural_prompt_pages(&s.prompt)
+            && s.pages != detected
+        {
+            ui.horizontal_wrapped(|ui| {
+                rtl::label(
+                    ui,
+                    egui::RichText::new(if a {
+                        format!("يذكر الوصف {detected} صفحة، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
+                    } else {
+                        format!("Prompt mentions {detected} pages, while New document is set to {} pages.", s.pages)
+                    })
+                    .color(ui.visuals().warn_fg_color),
+                );
+                let match_label = if a {
+                    format!("مطابقة عدد صفحات المستند مع الوصف ({detected} صفحة)")
+                } else {
+                    format!("Match document pages to prompt ({detected} pages)")
+                };
+                if ui.button(rtl::widget(ui, &match_label)).clicked() {
+                    s.pages = detected;
+                    s.restored_target_unconfirmed = false;
+                    s.clear_failure_alert();
+                }
+            });
         }
         if s.automatic_skills {
             label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
@@ -2769,12 +3125,33 @@ fn production(
             "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
         );
         if let Some(estimate) = s.request_estimate(documents, *activate_document) {
+            let tokens = s.token_estimate(documents, *activate_document);
             if estimate.remaining_pages > estimate.review_pages {
                 rtl::label(ui, format!("{}: {} · {} {} · {} {}", text(a, "Remaining book requests (estimate, before repairs)", "طلبات بقية الكتاب (تقدير قبل الإصلاحات)"),
                     estimate.book_allowance, estimate.remaining_pages, text(a, "pages", "صفحة"), estimate.remaining_groups, text(a, "review groups", "مجموعات مراجعة")));
-                if s.settings.budget.max_requests < estimate.book_allowance && ui.add_enabled(estimate.book_allowance <= MAX_REQUEST_ALLOWANCE,
-                    egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for remaining book", "ضبط حصة الطلبات لبقية الكتاب")))).clicked() {
-                    s.settings.budget.max_requests = estimate.book_allowance;
+                let need_book_requests = s.settings.budget.max_requests < estimate.book_allowance;
+                let need_book_tokens = tokens.is_some_and(|t| s.settings.budget.token_limit < t.book_tokens);
+                if need_book_requests || need_book_tokens {
+                    ui.horizontal_wrapped(|ui| {
+                        if need_book_requests
+                            && ui
+                                .add_enabled(
+                                    estimate.book_allowance <= MAX_REQUEST_ALLOWANCE,
+                                    egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for remaining book", "ضبط حصة الطلبات لبقية الكتاب"))),
+                                )
+                                .clicked()
+                        {
+                            s.settings.budget.max_requests = estimate.book_allowance;
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                        }
+                        if let Some(t) = tokens
+                            && s.settings.budget.token_limit < t.book_tokens
+                            && ui.button(rtl::widget(ui, text(a, "Set token limit for remaining book", "ضبط سقف الرموز لبقية الكتاب"))).clicked()
+                        {
+                            s.settings.budget.token_limit = t.book_tokens;
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                        }
+                    });
                 }
             }
             rtl::label(
@@ -2846,38 +3223,40 @@ fn production(
                     .clicked()
                 {
                     s.settings.budget.max_requests = estimate.allowance();
+                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                 }
                 if estimate.allowance() > MAX_REQUEST_ALLOWANCE {
                     label(ui, a, "This provisional estimate exceeds the 10,000-request task ceiling.", "يتجاوز هذا التقدير الأولي سقف المهمة البالغ ١٠٬٠٠٠ طلب.");
                 }
             }
+            if let Some(tokens) = tokens
+                && s.settings.budget.token_limit < tokens.review_tokens
+            {
+                rtl::label(
+                    ui,
+                    egui::RichText::new(if a {
+                        format!(
+                            "سقف الرموز الحالي ({}) أقل من التقدير التحفظي لهذه المراجعة ({}).",
+                            s.settings.budget.token_limit, tokens.review_tokens
+                        )
+                    } else {
+                        format!(
+                            "Configured token limit ({}) is below the conservative estimate for this review ({}).",
+                            s.settings.budget.token_limit, tokens.review_tokens
+                        )
+                    })
+                    .color(ui.visuals().warn_fg_color),
+                );
+                if ui
+                    .button(rtl::widget(ui, text(a, "Set token limit for this review", "ضبط سقف الرموز لهذه المراجعة")))
+                    .clicked()
+                {
+                    s.settings.budget.token_limit = tokens.review_tokens;
+                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                }
+            }
         }
-        let script_conflict_issue = explicit_script_pages(&s.prompt)
-            .and_then(|script_pages| {
-                let mismatch = if s.new_document {
-                    s.pages != script_pages
-                } else if s.continue_book {
-                    documents
-                        .iter()
-                        .find(|document| Some(document.index) == *activate_document)
-                        .is_some_and(|document| u32::try_from(document.pages).ok() != Some(script_pages))
-                } else {
-                    false
-                };
-                mismatch.then_some(text(
-                    a,
-                    "Explicit PAGE script count must match the target book page count.",
-                    "يجب أن يطابق عدد صفحات التعليمات الصريحة (PAGE) عدد صفحات الكتاب المستهدف.",
-                ))
-            });
-        let continuation_issue = (s.continue_book
-            && !documents.iter().any(|document| Some(document.index) == *activate_document && document.continuable))
-        .then_some(text(
-            a,
-            "Select a book with completed opening pages and remaining blank pages, or choose Edit current document.",
-            "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر تحرير المستند الحالي.",
-        ));
-        let issue = s.production_issue(available, activate_document.is_some(), a).or(continuation_issue).or(script_conflict_issue);
+        let issue = production_blocking_issue(s, available, documents, *activate_document, a);
         if let Some(reason) = issue {
             rtl::label(ui, reason);
         }
@@ -6136,5 +6515,313 @@ mod tests {
         reopened_failed.snapshot.stage = "idle".into();
         reopened_failed.snapshot.message = "AI settings saved; API keys remain outside settings and reports".into();
         assert!(reopened_failed.active_diagnostic_alert().is_none());
+    }
+
+    #[test]
+    fn ai27_preflight_natural_arabic_pages_retired_gemini_token_limits_and_persisted_allowances() {
+        use egui_kittest::kittest::Queryable;
+
+        // 1. Pure natural_prompt_pages parser handles Arabic-Indic digits, headers, English "-page"/"pages",
+        //    and ignores page references ("انظر صفحة 5", "see page 2") and per-batch counts ("4 pages per review").
+        assert_eq!(natural_prompt_pages("تصميم كتاب من ٤٨ صفحة رياض أطفال"), Some(48));
+        assert_eq!(natural_prompt_pages("عدد الصفحات: ٢٤"), Some(24));
+        assert_eq!(natural_prompt_pages("Design a 32-page workbook"), Some(32));
+        assert_eq!(natural_prompt_pages("Create an illustrated guide of 16 pages."), Some(16));
+        assert_eq!(natural_prompt_pages("انظر صفحة 5 وصفحة 6 لمزيد من التفاصيل"), None);
+        assert_eq!(natural_prompt_pages("See page 2 and 4 pages per review"), None);
+        assert_eq!(natural_prompt_pages("```\n48 pages\n```\nانظر صفحة 3"), None);
+
+        // 2. Natural Arabic prompt with s.pages = 8 shows mismatch button & updates s.pages = 48,
+        //    proactive retired gemini-2.5-flash warning switches to gemini-3.8-flash and emits UpdateSettings,
+        //    proactive token limit button updates ONLY token_limit + emits UpdateSettings without mutating max_requests,
+        //    and "Set request allowance for this review" persists UpdateSettings without mutating token_limit.
+        let mut state = AiUiState {
+            prompt: "تصميم كتاب من ٤٨ صفحة رياض أطفال".into(), new_document: true, pages: 8, ..Default::default()
+        };
+        state.settings.text_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None };
+        state.settings.pages_per_batch = 6;
+        state.settings.budget.token_limit = 32_000;
+        assert_eq!(state.settings.budget.max_requests, 4);
+
+        let mut panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1300.0, 1400.0))
+            .build_ui_state(|ui, (state, requests)| production(ui, state, false, true, &[], &mut None, requests), (state, Vec::new()));
+        panel.run_steps(3);
+
+        // Match document pages to prompt (48 pages)
+        panel.get_by_label("Match document pages to prompt (48 pages)").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.pages, 48);
+        assert!(panel.query_by_label("Match document pages to prompt (48 pages)").is_none());
+
+        // Proactive retired Gemini model switch
+        panel.get_by_label("Use gemini-3.8-flash").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.text_model.model, "gemini-3.8-flash");
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.text_model.model == "gemini-3.8-flash"));
+        assert!(panel.query_by_label("Use gemini-3.8-flash").is_none());
+
+        // Proactive token limit button updates ONLY token_limit (not max_requests!) and emits UpdateSettings
+        panel.state_mut().1.clear();
+        panel.get_by_label("Set token limit for this review").click();
+        panel.run_steps(3);
+        let raised_review_tokens = panel.state().0.settings.budget.token_limit;
+        assert!(raised_review_tokens > 32_000);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 4, "token limit button must never mutate max_requests");
+        assert!(matches!(
+            panel.state().1.last(),
+            Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == raised_review_tokens && s.budget.max_requests == 4
+        ));
+
+        // Request allowance button persists UpdateSettings without mutating token_limit
+        panel.state_mut().1.clear();
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 6);
+        assert_eq!(panel.state().0.settings.budget.token_limit, raised_review_tokens, "request allowance button must leave token_limit untouched");
+        assert!(matches!(
+            panel.state().1.last(),
+            Some(AiRequest::UpdateSettings(s)) if s.budget.max_requests == 6 && s.budget.token_limit == raised_review_tokens
+        ));
+
+        // Recovery UX when completed_pages == 0 offers accurate guidance + Start fresh with current settings
+        panel.state_mut().1.clear();
+        panel.state_mut().0.snapshot.production_draft = Some(designcraft_ai_types::protocol::ProductionDraft {
+            id: "failed-zero".into(),
+            request: panel.state().0.production_task(),
+            document_uid: None,
+            document_path: None,
+            document_title: "Untitled".into(),
+        });
+        panel.state_mut().0.snapshot.batch = Some(BatchSnapshot {
+            job_id: "failed-zero".into(),
+            status: "failed".into(),
+            retryable: true,
+            completed_pages: 0,
+            total_pages: 8,
+            pages_per_batch: 2,
+            ..Default::default()
+        });
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Adjust limits or settings below, then Retry this group or start fresh.").is_some());
+        assert!(
+            panel.query_by_label("Open and select the saved book with remaining blank pages.").is_none(),
+            "unpublished NewA4 failure with no document_uid/document_path must not prompt to open a non-existent saved book"
+        );
+        panel.get_by_label("Start fresh with current settings").click();
+        panel.run_steps(3);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::Start(TaskRequest { target: TaskTarget::NewA4 { pages: 48 }, .. }))));
+    }
+
+    #[test]
+    fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natural_pages_edges() {
+        use egui_kittest::kittest::Queryable;
+
+        // 1. Fix 5: natural_prompt_pages edge cases (harakat/tatweel, attached units, brackets, singular "page", and negative rejections).
+        assert_eq!(natural_prompt_pages("٤٨صفحة"), Some(48));
+        assert_eq!(natural_prompt_pages("48صفحة"), Some(48));
+        assert_eq!(natural_prompt_pages("48pages"), Some(48));
+        assert_eq!(natural_prompt_pages("عدد الصفحات: (٤٨)"), Some(48));
+        assert_eq!(natural_prompt_pages("عَدَدُ الصَّفَحَاتِ: [٤٨]"), Some(48));
+        assert_eq!(natural_prompt_pages("كتاب من (48) صَفْحَة"), Some(48));
+        assert_eq!(natural_prompt_pages("كتاب من ٤٨ صَفْحَـــةً رياض أطفال"), Some(48));
+        assert_eq!(natural_prompt_pages("create a 48 page workbook"), Some(48));
+
+        assert_eq!(natural_prompt_pages("page 48"), None);
+        assert_eq!(natural_prompt_pages("انظر صفحة 5"), None);
+        assert_eq!(natural_prompt_pages("انظر صَفْحَة (5)"), None);
+        assert_eq!(natural_prompt_pages("48 pages per review"), None);
+        assert_eq!(natural_prompt_pages("v2.48"), None);
+        assert_eq!(natural_prompt_pages("v2.48 pages"), None);
+
+        // 2. Fix 1a: Automatic-style KG illustrated prompt with `kg-oxford-cambridge-style` in `snapshot.skills`
+        //    estimates `sources_per_page == 2`, manual `selected_skills` resolves profile, and 0-slot profile clamps to >= 1.
+        let kg_manifest: Value = serde_json::from_str(include_str!("../../../skills/kg-oxford-cambridge-style/designcraft.json")).unwrap();
+        let kg_profile: designcraft_ai_types::DesignProfile = serde_json::from_value(kg_manifest["design_profile"].clone()).unwrap();
+        let kg_card = SkillCard {
+            design_profile: Some(kg_profile.clone()),
+            id: "kg-oxford-cambridge-style".into(),
+            name: kg_profile.name.clone(),
+            description: "International KG style".into(),
+            revision: "rev-1".into(),
+            approved: true,
+            automatically_validated: true,
+            trusted_source: true,
+            active: true,
+            enabled: true,
+            compatible: true,
+        };
+
+        let mut kg_state = AiUiState {
+            prompt: "تصميم كتاب منهج رياض أطفال دولي مصور من 8 صفحات".into(),
+            new_document: true,
+            pages: 8,
+            automatic_skills: true,
+            ..Default::default()
+        };
+        kg_state.settings.output_mode = OutputMode::NativeWithImages;
+        kg_state.settings.pages_per_batch = 2;
+        kg_state.settings.design_style = None; // "Automatic from the request"
+        kg_state.snapshot.skills = vec![kg_card.clone()];
+
+        let auto_est = kg_state.request_estimate(&[], None).unwrap();
+        assert_eq!(auto_est.review_pages, 2);
+        assert_eq!(auto_est.image_allowance, 4, "automatic KG Oxford/Cambridge style must estimate 2 image sources per page");
+
+        // Manual skill selection (`automatic_skills == false`) also resolves selected style card
+        kg_state.automatic_skills = false;
+        kg_state.selected_skills.insert("kg-oxford-cambridge-style".into());
+        kg_state.prompt = "Generic brief without style keywords".into();
+        let manual_est = kg_state.request_estimate(&[], None).unwrap();
+        assert_eq!(manual_est.image_allowance, 4);
+
+        // Pinned active style in `selected_skills` with `automatic_skills == true` and generic prompt resolves profile
+        kg_state.automatic_skills = true;
+        kg_state.pages = 4;
+        kg_state.prompt = "Create a 4-page activity book".into();
+        let pinned_auto_est = kg_state.request_estimate(&[], None).unwrap();
+        assert_eq!(pinned_auto_est.review_pages, 2);
+        assert_eq!(
+            pinned_auto_est.image_allowance, 4,
+            "automatic_skills == true with active style in selected_skills must resolve that pinned style even on a generic prompt"
+        );
+        kg_state.pages = 8;
+        kg_state.automatic_skills = false;
+
+        // Zero-image-slot profile under NativeWithImages clamps sources_per_page to >= 1 (never 0)
+        let mut zero_slot_profile = kg_profile;
+        for family in &mut zero_slot_profile.page_families {
+            family.image_slots.clear();
+        }
+        let mut zero_slot_card = kg_card;
+        zero_slot_card.design_profile = Some(zero_slot_profile);
+        kg_state.snapshot.skills = vec![zero_slot_card];
+        let clamped_est = kg_state.request_estimate(&[], None).unwrap();
+        assert_eq!(clamped_est.image_allowance, 2, "0-slot profile in NativeWithImages must clamp sources_per_page to 1");
+
+        // 3. Fix 1b: Single-page review with `verify_generated_images` + skill overhead NEVER under-estimates `reserve_with_output`.
+        let mut single_generic = AiUiState {
+            prompt: "Create an illustrated science worksheet.".into(),
+            new_document: true,
+            pages: 1,
+            automatic_skills: true,
+            ..Default::default()
+        };
+        single_generic.settings.output_mode = OutputMode::NativeWithImages;
+        single_generic.settings.verify_generated_images = true;
+        single_generic.settings.pages_per_batch = 1;
+        single_generic.settings.budget.max_output_tokens = 8192;
+        let tok_est = single_generic.token_estimate(&[], None).unwrap();
+        // Exact worst-case ledger `reserve_with_output` sum for 1-page generic multi-skill + 1 image + 1 vision review:
+        // text call (up to 176 KiB context + prompt): (180_224 + prompt.len()).div_ceil(3) + 1024 + 8192
+        // image call (~6 KiB prompt/style): 2000 + 1024 + 8192 = 11_216
+        // vision review call (~6 KiB prompt/schema, 1 image, max_output=4096): 2000 + 1024 + 8192 + 4096 = 15_312
+        let text_reserved = (176 * 1024u64 + single_generic.prompt.len() as u64).div_ceil(3) + 1024 + 8192;
+        let image_reserved = 2000u64 + 1024 + 8192;
+        let review_reserved = 2000u64 + 1024 + 8192 + 4096;
+        assert!(
+            tok_est.review_tokens >= text_reserved + image_reserved + review_reserved,
+            "review_tokens ({}) must never be smaller than actual reserve_with_output ({})",
+            tok_est.review_tokens,
+            text_reserved + image_reserved + review_reserved
+        );
+
+        // 4. Fix 4: Bound failed batch with `completed_pages > 0` shows saved book instructions + accurate Retry/Continue copy (EN + AR).
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages": 4, "facingPages": false})).unwrap();
+        session.execute("frame.create", &json!({"spread": 0, "rect": [20, 20, 100, 80]})).unwrap();
+        let doc = session.active().unwrap();
+        let req = continuation_request(TaskTarget::ContinueBook);
+        let mut snap = saved_production_snapshot(&req, doc);
+        snap.batch = Some(BatchSnapshot {
+            job_id: "saved-book".into(),
+            status: "failed".into(),
+            retryable: true,
+            completed_pages: 1,
+            total_pages: 4,
+            pages_per_batch: 1,
+            document_uid: Some(doc.uid),
+            document_revision: Some(doc.revision),
+            ..Default::default()
+        });
+        let mut rec_state = AiUiState::default();
+        rec_state.accept(snap);
+        let docs = vec![OpenDocument::from_document(0, doc)];
+        let mut en_panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1300.0, 1000.0))
+            .build_ui_state(|ui, (s, reqs)| production(ui, s, false, true, &docs, &mut Some(0), reqs), (rec_state.clone(), Vec::new()));
+        en_panel.run_steps(3);
+        assert!(en_panel.query_by_label("Prepare saved book continuation").is_some());
+        assert!(
+            en_panel
+                .query_by_label(
+                    "Retry keeps cumulative usage, pinned style, and pagination while applying updated budget limits and compatible model selections. To change the brief, style, or batch size, prepare Continue and press Produce."
+                )
+                .is_some()
+        );
+
+        let docs_ar = vec![OpenDocument::from_document(0, doc)];
+        let mut ar_fonts_ready = false;
+        let mut ar_panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1000.0)).build_ui_state(
+            move |ui, (s, reqs)| {
+                if !ar_fonts_ready {
+                    crate::theme::install_fonts(ui.ctx(), "ar");
+                    ar_fonts_ready = true;
+                    return;
+                }
+                production(ui, s, true, true, &docs_ar, &mut Some(0), reqs);
+            },
+            (rec_state, Vec::new()),
+        );
+        ar_panel.run_steps(3);
+        assert!(ar_panel.query_by_label("تجهيز استكمال الكتاب المحفوظ").is_some());
+        assert!(
+            ar_panel
+                .query_by_label(
+                    "تحتفظ إعادة المحاولة بالاستخدام التراكمي والنمط المثبّت وتقسيم الدفعات مع تطبيق حدود الميزانية والنماذج المتوافقة المحدّثة. لتغيير التعليمات أو النمط أو حجم الدفعة، جهّز الاستكمال واضغط إنتاج."
+                )
+                .is_some()
+        );
+
+        // 5. Unpublished `NewA4` draft (`document_uid: None, document_path: None`) omits `"Prepare saved book continuation"`,
+        //    whereas restored unsaved `ContinueBook` draft (`document_uid: None, document_path: None`, `restored_target_unconfirmed = true`)
+        //    renders `"Prepare saved book continuation"` and enables `"Produce"` once clicked on a continuable open document.
+        let mut unpub_snap = saved_production_snapshot(&continuation_request(TaskTarget::NewA4 { pages: 8 }), doc);
+        if let Some(d) = &mut unpub_snap.production_draft {
+            d.document_uid = None;
+            d.document_path = None;
+        }
+        let mut unpub_state = AiUiState::default();
+        unpub_state.accept(unpub_snap);
+        let docs_restored = vec![OpenDocument::from_document(0, doc)];
+        let mut unpub_panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1300.0, 1000.0))
+            .build_ui_state(|ui, (s, reqs)| production(ui, s, false, true, &docs_restored, &mut Some(0), reqs), (unpub_state, Vec::new()));
+        unpub_panel.run_steps(3);
+        assert!(
+            unpub_panel.query_by_label("Prepare saved book continuation").is_none(),
+            "unpublished NewA4 draft with no document_uid/document_path must omit Prepare saved book continuation"
+        );
+
+        let mut restored_cont_snap = saved_production_snapshot(&continuation_request(TaskTarget::ContinueBook), doc);
+        if let Some(d) = &mut restored_cont_snap.production_draft {
+            d.document_uid = None;
+            d.document_path = None;
+        }
+        let mut restored_cont_state = AiUiState::default();
+        restored_cont_state.accept(restored_cont_snap);
+        assert!(restored_cont_state.restored_target_unconfirmed);
+        let docs_cont = vec![OpenDocument::from_document(0, doc)];
+        let mut cont_panel = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1300.0, 1000.0))
+            .build_ui_state(|ui, (s, reqs)| production(ui, s, false, true, &docs_cont, &mut Some(0), reqs), (restored_cont_state, Vec::new()));
+        cont_panel.run_steps(3);
+        assert!(cont_panel.query_by_label("Choose the target book or prepare its remaining pages before producing the saved request.").is_some());
+        cont_panel.get_by_label("Prepare saved book continuation").click();
+        cont_panel.run_steps(3);
+        assert!(!cont_panel.state().0.restored_target_unconfirmed);
+        cont_panel.get_by_label("Produce").click();
+        cont_panel.run_steps(3);
+        assert!(matches!(cont_panel.state().1.last(), Some(AiRequest::Start(TaskRequest { target: TaskTarget::ContinueBook, .. }))));
     }
 }
