@@ -14,7 +14,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let id = egui::Id::new("new_note_text");
     let mut draft: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     let mut layouter = crate::rtl::text_edit_layouter(true, None, None);
-    ui.add(
+    crate::rtl::show_text_edit(
+        ui,
         egui::TextEdit::multiline(&mut draft)
             .hint_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Note text")))
             .desired_rows(2)

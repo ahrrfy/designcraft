@@ -60,14 +60,16 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
                         crate::rtl::editable_layout(ui, buf.as_str(), wrap_width, story_font.clone(), ui.visuals().text_color(), true)
                     };
-                    let out = egui::TextEdit::multiline(&mut text)
-                        .font(story_font.clone())
-                        .horizontal_align(if story_rtl { egui::Align::Max } else { egui::Align::Min })
-                        .layouter(&mut layouter)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(20)
-                        .frame(egui::Frame::NONE)
-                        .show(ui);
+                    let out = crate::rtl::show_text_edit(
+                        ui,
+                        egui::TextEdit::multiline(&mut text)
+                            .font(story_font.clone())
+                            .horizontal_align(if story_rtl { egui::Align::Max } else { egui::Align::Min })
+                            .layouter(&mut layouter)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(20)
+                            .frame(egui::Frame::NONE),
+                    );
                     let r = out.response;
                     let starts = paragraph_start_offsets(out.galley.rows.iter().map(|row| (row.pos.y, row.ends_with_newline)));
                     for (i, y) in starts.into_iter().enumerate() {

@@ -58,33 +58,33 @@ pub fn is_non_text_model(model: &str) -> bool {
         return true;
     }
     model.split(|c: char| !c.is_ascii_alphanumeric()).any(|component| {
-        component.starts_with("gemma")
-            || matches!(
-                component,
-                "image"
-                    | "images"
-                    | "imagen"
-                    | "banana"
-                    | "omni"
-                    | "flux"
-                    | "sdxl"
-                    | "diffusion"
-                    | "rerank"
-                    | "tts"
-                    | "audio"
-                    | "embed"
-                    | "embedding"
-                    | "embeddings"
-                    | "live"
-                    | "realtime"
-                    | "transcribe"
-                    | "moderation"
-                    | "veo"
-                    | "sora"
-                    | "lyria"
-                    | "aqa"
-                    | "whisper"
-            )
+        matches!(
+            component,
+            "image"
+                | "images"
+                | "imagen"
+                | "banana"
+                | "omni"
+                | "flux"
+                | "sdxl"
+                | "diffusion"
+                | "rerank"
+                | "tts"
+                | "audio"
+                | "embed"
+                | "embedding"
+                | "embeddings"
+                | "embeddinggemma"
+                | "live"
+                | "realtime"
+                | "transcribe"
+                | "moderation"
+                | "veo"
+                | "sora"
+                | "lyria"
+                | "aqa"
+                | "whisper"
+        )
     })
 }
 
@@ -138,6 +138,7 @@ pub fn is_non_image_model(provider: ProviderKind, model: &str) -> bool {
             "embed"
                 | "embedding"
                 | "embeddings"
+                | "embeddinggemma"
                 | "moderation"
                 | "rerank"
                 | "transcribe"
@@ -270,6 +271,7 @@ mod tests {
             "gemini-tuned-embed-only",
             "nomic-embed-text",
             "mxbai-embed-large:latest",
+            "embeddinggemma:300m",
             "omni-moderation-latest",
             "gpt-4o-realtime-preview",
             "gpt-4o-transcribe",
@@ -281,10 +283,14 @@ mod tests {
             assert!(is_non_image_model(ProviderKind::OpenAi, non_gen), "expected {non_gen} to be classified non-image");
             assert!(is_non_image_model(ProviderKind::Gemini, non_gen), "expected {non_gen} to be classified non-image");
         }
-        for non_text in
-            ["gemini-nano-banana-2.1", "qwen2.5-omni-7b", "gemma-3-12b-it", "gemma2:9b", "flux.1-schnell", "sdxl-lightning", "stable-diffusion-3.5"]
-        {
+        for non_text in ["gemini-nano-banana-2.1", "qwen2.5-omni-7b", "flux.1-schnell", "sdxl-lightning", "stable-diffusion-3.5"] {
             assert!(is_non_text_model(non_text), "expected {non_text} to be classified non-text");
+        }
+        for gemma_text in ["gemma-3-12b-it", "gemma-3-27b-it", "gemma2:9b", "gemma3:12b", "google/gemma-3-27b-it"] {
+            assert!(!is_non_text_model(gemma_text), "expected {gemma_text} to be allowed as a text model");
+            assert!(is_non_image_model(ProviderKind::Ollama, gemma_text));
+            assert!(is_non_image_model(ProviderKind::OpenAi, gemma_text));
+            assert!(is_non_image_model(ProviderKind::Gemini, gemma_text));
         }
         assert!(!is_non_text_model("embedded-layout-helper"));
         assert!(!is_non_text_model("imaginative-writer-7b"));

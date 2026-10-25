@@ -84,23 +84,23 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
     let hint = crate::rtl::widget(ui, egui::RichText::new(crate::i18n::tr(&lang, "Search")).color(t.text_dim));
     let field = egui::Rect::from_min_max(r.min + vec2(19.0, 0.0), r.max - vec2(3.0, 0.0));
     let mut search_layouter = crate::rtl::text_edit_layouter(false, Some(egui::FontId::proportional(11.0)), Some(t.text));
-    let resp = ui
-        .put(
-            field,
-            egui::TextEdit::singleline(&mut st.query)
-                .id(id)
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::ZERO)
-                .font(egui::FontId::proportional(11.0))
-                .text_color(t.text)
-                .hint_text(hint)
-                .desired_width(field.width())
-                .vertical_align(egui::Align::Center)
-                .layouter(&mut search_layouter)
-                // Return runs the highlighted match instead of leaving the field.
-                .return_key(None),
-        )
-        .on_hover_text(crate::i18n::tr(&lang, "Search commands"));
+    let resp = crate::rtl::put_text_edit(
+        ui,
+        field,
+        egui::TextEdit::singleline(&mut st.query)
+            .id(id)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .font(egui::FontId::proportional(11.0))
+            .text_color(t.text)
+            .hint_text(hint)
+            .desired_width(field.width())
+            .vertical_align(egui::Align::Center)
+            .layouter(&mut search_layouter)
+            // Return runs the highlighted match instead of leaving the field.
+            .return_key(None),
+    )
+    .on_hover_text(crate::i18n::tr(&lang, "Search commands"));
     if resp.changed() {
         st.highlight = 0;
         st.open = true;

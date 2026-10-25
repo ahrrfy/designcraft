@@ -579,7 +579,11 @@ fn rename_field(ui: &mut Ui, r: Rect, key: RenameKey) -> Option<Option<String>> 
         return None;
     }
     let mut layouter = crate::rtl::text_edit_layouter(false, Some(egui::FontId::proportional(11.0)), None);
-    let edit = ui.put(r, egui::TextEdit::singleline(&mut text).font(egui::FontId::proportional(11.0)).margin(vec2(2.0, 1.0)).layouter(&mut layouter));
+    let edit = crate::rtl::put_text_edit(
+        ui,
+        r,
+        egui::TextEdit::singleline(&mut text).font(egui::FontId::proportional(11.0)).margin(vec2(2.0, 1.0)).layouter(&mut layouter),
+    );
     if !edit.has_focus() && !edit.lost_focus() {
         edit.request_focus();
     }

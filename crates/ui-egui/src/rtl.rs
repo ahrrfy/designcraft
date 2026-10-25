@@ -1,6 +1,6 @@
 //! Interface text bidi & Arabic shaping: read-only galleys (`widget`, `label`, `plain`) and
-//! logical-cursor-normalized editable galleys (`editable_layout`) for `egui::TextEdit`.
-use egui::text::{LayoutJob, TextWrapping};
+//! visual-cursor-mapped editable galleys (`editable_layout`, `show_text_edit`) for `egui::TextEdit`.
+use egui::text::{CCursor, CCursorRange, CharIndex, LayoutJob, TextWrapping};
 use egui::{Align, Align2, Color32, FontFamily, FontId, Galley, Pos2, Rect, WidgetText};
 use std::{collections::HashMap, ops::Range, sync::Arc};
 use unicode_bidi::{BidiClass, BidiInfo, bidi_class};
@@ -115,27 +115,49 @@ fn is_bidi_isolate_control(c: char) -> bool {
     matches!(c, '\u{2066}'..='\u{2069}')
 }
 
+fn is_zero_width_control_grapheme(gr: &str) -> bool {
+    !gr.is_empty() && gr.chars().all(|c| is_bidi_isolate_control(c) || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{FEFF}'))
+}
+
 fn is_symbol_fallback(c: char) -> bool {
     matches!(c, '\u{2190}'..='\u{2BFF}' | '\u{1F000}'..='\u{1FAFF}')
 }
 
-/// Reorder directional runs, not characters: the shaper needs logical Arabic to join letters.
-fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>, has_arabic_fonts: (bool, bool)) -> LayoutJob {
+#[derive(Clone, Debug)]
+struct VisualPiece {
+    /// Byte subrange within `job.text` covered by this visual piece.
+    logical_range: Range<usize>,
+    /// Whether this piece flows right-to-left visually.
+    rtl: bool,
+    /// Index into the returned `LayoutJob::sections`, or `None` when the piece held only isolate controls.
+    section_index: Option<usize>,
+}
+
+/// Reorder directional runs in visual left-to-right order while recording the exact logical byte
+/// subrange and visual section index of every piece so editable layouts can map shaped glyphs back
+/// to logical character indices.
+fn visual_line_with_pieces(
+    job: &LayoutJob,
+    bidi: &BidiInfo<'_>,
+    line: Range<usize>,
+    has_arabic_fonts: (bool, bool),
+) -> (LayoutJob, Vec<VisualPiece>) {
     let mut visual = LayoutJob { break_on_newline: false, ..Default::default() };
+    let mut mapped_pieces = Vec::new();
     if line.is_empty() {
         if let Some(section) =
             job.sections.iter().find(|s| usize::from(s.byte_range.start) <= line.start && line.start <= usize::from(s.byte_range.end))
         {
             visual.append("", 0.0, section.format.clone());
         }
-        return visual;
+        return (visual, mapped_pieces);
     }
     let Some(para) = bidi.paragraphs.iter().find(|p| p.range.start <= line.start && line.start < p.range.end) else {
         // Preserve the font/height for an empty line.
         if let Some(section) = job.sections.first() {
             visual.append("", 0.0, section.format.clone());
         }
-        return visual;
+        return (visual, mapped_pieces);
     };
     let (levels, runs) = bidi.visual_runs(para, line);
     for run in runs {
@@ -165,43 +187,47 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>, has_ara
                     format.font_id.family = FontFamily::Proportional;
                 }
             }
-            let Some(raw) = job.text.get(range) else {
+            let Some(raw) = job.text.get(range.clone()) else {
                 continue;
             };
-            let cleaned: std::borrow::Cow<'_, str> = if raw.chars().any(is_bidi_isolate_control) {
-                std::borrow::Cow::Owned(raw.chars().filter(|c| !is_bidi_isolate_control(*c)).collect())
-            } else {
-                std::borrow::Cow::Borrowed(raw)
-            };
-            let text = cleaned.as_ref();
-            if text.is_empty() {
-                continue;
-            }
-            if rtl && !text.chars().any(designcraft_fonts::is_rtl) {
-                // Neutral-only RTL runs have no script for the shaper to infer a direction.
-                // Apply UBA L4 mirroring here; Arabic runs are mirrored by the shaper.
-                let neutral: String = text.chars().rev().map(|c| unicode_bidi_mirroring::get_mirrored(c).unwrap_or(c)).collect();
-                visual.append(&neutral, section.leading_space, format);
-            } else if rtl && text.chars().any(is_symbol_fallback) {
+            if rtl && raw.chars().any(is_symbol_fallback) {
                 // Emoji/symbol fallback faces split an epaint section in logical left-to-right
                 // order; reverse those sub-runs so leading RTL icons stay on the visual right.
-                let mut pieces: Vec<(usize, usize, bool)> = Vec::new();
-                for (idx, ch) in text.char_indices() {
-                    let sym = is_symbol_fallback(ch);
+                let mut sub_pieces: Vec<(usize, usize, bool)> = Vec::new();
+                for (idx, ch) in raw.char_indices() {
                     let end = idx + ch.len_utf8();
-                    if let Some(last) = pieces.last_mut()
+                    if is_bidi_isolate_control(ch)
+                        && let Some(last) = sub_pieces.last_mut()
+                    {
+                        last.1 = end;
+                        continue;
+                    }
+                    let sym = is_symbol_fallback(ch);
+                    if let Some(last) = sub_pieces.last_mut()
                         && last.2 == sym
                     {
                         last.1 = end;
                     } else {
-                        pieces.push((idx, end, sym));
+                        sub_pieces.push((idx, end, sym));
                     }
                 }
                 let mut lead = section.leading_space;
-                for (start, end, sym) in pieces.into_iter().rev() {
-                    let Some(sub) = text.get(start..end) else {
+                for (sub_start, sub_end, sym) in sub_pieces.into_iter().rev() {
+                    let logical_sub = (range.start + sub_start)..(range.start + sub_end);
+                    let Some(raw_sub) = job.text.get(logical_sub.clone()) else {
                         continue;
                     };
+                    let cleaned: std::borrow::Cow<'_, str> = if raw_sub.chars().any(is_bidi_isolate_control) {
+                        std::borrow::Cow::Owned(raw_sub.chars().filter(|c| !is_bidi_isolate_control(*c)).collect())
+                    } else {
+                        std::borrow::Cow::Borrowed(raw_sub)
+                    };
+                    let sub = cleaned.as_ref();
+                    if sub.is_empty() {
+                        mapped_pieces.push(VisualPiece { logical_range: logical_sub, rtl: true, section_index: None });
+                        continue;
+                    }
+                    let sec_idx = visual.sections.len();
                     if sym {
                         let mut sym_format = format.clone();
                         sym_format.font_id.family = FontFamily::Proportional;
@@ -213,14 +239,39 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>, has_ara
                     } else {
                         visual.append(sub, lead, format.clone());
                     }
+                    mapped_pieces.push(VisualPiece { logical_range: logical_sub, rtl: true, section_index: Some(sec_idx) });
                     lead = 0.0;
                 }
             } else {
-                visual.append(text, section.leading_space, format);
+                let cleaned: std::borrow::Cow<'_, str> = if raw.chars().any(is_bidi_isolate_control) {
+                    std::borrow::Cow::Owned(raw.chars().filter(|c| !is_bidi_isolate_control(*c)).collect())
+                } else {
+                    std::borrow::Cow::Borrowed(raw)
+                };
+                let text = cleaned.as_ref();
+                if text.is_empty() {
+                    mapped_pieces.push(VisualPiece { logical_range: range, rtl, section_index: None });
+                    continue;
+                }
+                let sec_idx = visual.sections.len();
+                if rtl && !text.chars().any(designcraft_fonts::is_rtl) {
+                    // Neutral-only RTL runs have no script for the shaper to infer a direction.
+                    // Apply UBA L4 mirroring here; Arabic runs are mirrored by the shaper.
+                    let neutral: String = text.chars().rev().map(|c| unicode_bidi_mirroring::get_mirrored(c).unwrap_or(c)).collect();
+                    visual.append(&neutral, section.leading_space, format);
+                } else {
+                    visual.append(text, section.leading_space, format);
+                }
+                mapped_pieces.push(VisualPiece { logical_range: range, rtl, section_index: Some(sec_idx) });
             }
         }
     }
-    visual
+    (visual, mapped_pieces)
+}
+
+/// Reorder directional runs, not characters: the shaper needs logical Arabic to join letters.
+fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>, has_arabic_fonts: (bool, bool)) -> LayoutJob {
+    visual_line_with_pieces(job, bidi, line, has_arabic_fonts).0
 }
 
 const MAX_CACHED_LABELS: usize = 256;
@@ -398,8 +449,233 @@ fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
     Arc::new(galley)
 }
 
-/// Lay out text for an editable [`egui::TextEdit`] while preserving both visual RTL run/word order
-/// and `epaint`'s strict 1-glyph-per-`char` cursor/selection invariants.
+/// Partition `shaped_glyphs` into slices corresponding 1-to-1 with `visual_job.sections`.
+fn section_glyph_ranges(ctx: &egui::Context, visual_job: &LayoutJob, total_glyphs: usize) -> Vec<Range<usize>> {
+    let sec_count = visual_job.sections.len();
+    if sec_count == 0 {
+        return Vec::new();
+    }
+    if sec_count == 1 {
+        return std::iter::once(0..total_glyphs).collect();
+    }
+    let mut out = Vec::with_capacity(sec_count);
+    let mut cursor = 0usize;
+    for (idx, sec) in visual_job.sections.iter().enumerate() {
+        if idx + 1 == sec_count {
+            out.push(cursor..total_glyphs);
+            break;
+        }
+        let slice = visual_job.text.get(usize::from(sec.byte_range.start)..usize::from(sec.byte_range.end)).unwrap_or("");
+        let mut single = LayoutJob { break_on_newline: false, ..Default::default() };
+        single.append(slice, 0.0, sec.format.clone());
+        let len = ctx.fonts_mut(|fonts| fonts.layout_job(single)).rows.first().map_or(0, |r| r.glyphs.len());
+        let next = cursor.saturating_add(len).min(total_glyphs);
+        out.push(cursor..next);
+        cursor = next;
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+struct ShapedCluster {
+    chr: char,
+    lx: f32,
+    rx: f32,
+}
+
+fn subdivide_span(seg_lx: f32, seg_rx: f32, count: usize, rtl: bool) -> Vec<(f32, f32)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let step = (seg_rx - seg_lx).max(0.0) / (count as f32);
+    (0..count)
+        .map(|i| {
+            if rtl {
+                let r = if i == 0 { seg_rx } else { seg_rx - (i as f32) * step };
+                let l = if i + 1 == count { seg_lx } else { seg_rx - ((i + 1) as f32) * step };
+                (l, r)
+            } else {
+                let l = if i == 0 { seg_lx } else { seg_lx + (i as f32) * step };
+                let r = if i + 1 == count { seg_rx } else { seg_lx + ((i + 1) as f32) * step };
+                (l, r)
+            }
+        })
+        .collect()
+}
+
+fn map_segment_spans(g_chars: &[char], clusters: &[ShapedCluster], rtl: bool, fallback_lx: f32, fallback_rx: f32) -> Vec<(f32, f32)> {
+    let wg = g_chars.len();
+    let wc = clusters.len();
+    if wg == 0 {
+        return Vec::new();
+    }
+    if wg == wc {
+        return clusters.iter().map(|c| (c.lx, c.rx)).collect();
+    }
+    if wg > wc && wc > 0 {
+        let mut spans = vec![(0.0_f32, 0.0_f32); wg];
+        let (mut g_lo, mut g_hi) = (0usize, wg);
+        let (mut c_lo, mut c_hi) = (0usize, wc);
+        while (c_hi - c_lo) > 1 && (g_hi - g_lo) > 1 && g_chars.get(g_hi - 1) == clusters.get(c_hi - 1).map(|c| &c.chr) {
+            if let (Some(dst), Some(src)) = (spans.get_mut(g_hi - 1), clusters.get(c_hi - 1)) {
+                *dst = (src.lx, src.rx);
+            }
+            g_hi -= 1;
+            c_hi -= 1;
+        }
+        while (c_hi - c_lo) > 1 && (g_hi - g_lo) > 1 && g_chars.get(g_lo) == clusters.get(c_lo).map(|c| &c.chr) {
+            if let (Some(dst), Some(src)) = (spans.get_mut(g_lo), clusters.get(c_lo)) {
+                *dst = (src.lx, src.rx);
+            }
+            g_lo += 1;
+            c_lo += 1;
+        }
+        let rem_g = g_hi - g_lo;
+        let rem_c = c_hi - c_lo;
+        let mid_slice = clusters.get(c_lo..c_hi).unwrap_or(&[]);
+        if rem_g == rem_c {
+            for (offset, src) in mid_slice.iter().enumerate() {
+                if let Some(dst) = spans.get_mut(g_lo + offset) {
+                    *dst = (src.lx, src.rx);
+                }
+            }
+        } else {
+            let seg_lx = mid_slice.iter().map(|c| c.lx).fold(fallback_lx, f32::min);
+            let seg_rx = mid_slice.iter().map(|c| c.rx).fold(fallback_rx, f32::max);
+            for (offset, sp) in subdivide_span(seg_lx, seg_rx, rem_g, rtl).into_iter().enumerate() {
+                if let Some(dst) = spans.get_mut(g_lo + offset) {
+                    *dst = sp;
+                }
+            }
+        }
+        return spans;
+    }
+    let (seg_lx, seg_rx) = if wc > 0 {
+        let lx = clusters.iter().map(|c| c.lx).fold(f32::INFINITY, f32::min);
+        let rx = clusters.iter().map(|c| c.rx).fold(f32::NEG_INFINITY, f32::max);
+        (lx, rx.max(lx))
+    } else {
+        (fallback_lx, fallback_rx.max(fallback_lx))
+    };
+    subdivide_span(seg_lx, seg_rx, wg, rtl)
+}
+
+/// Map the shaped visual glyphs of one BiDi piece back onto its logical characters:
+/// - Adjacent shaped clusters form a watertight visual partition (`right_k == left_{k+1}`), so
+///   combining marks (`advance_width = 0.0`) sit on the exact inter-cluster boundary with zero jump.
+/// - Multi-word runs split on ASCII spaces so Arabic ligatures (`لا`, `اللَّهِ`, `اللازم`) subdivide
+///   only the ligated cluster(s) inside that word while every unligated letter keeps its exact
+///   shaped visual width.
+fn map_piece_to_logical_glyphs(
+    piece_str: &str,
+    rtl: bool,
+    sec_glyphs: &[egui::epaint::text::Glyph],
+    fallback_x: f32,
+    next_bound_x: Option<f32>,
+    tmpl: egui::epaint::text::Glyph,
+    end_vtx: u32,
+) -> (Vec<egui::epaint::text::Glyph>, f32) {
+    let pos_glyphs: Vec<&egui::epaint::text::Glyph> = sec_glyphs.iter().filter(|g| g.advance_width > 0.0).collect();
+    let mut pos_clusters = Vec::with_capacity(pos_glyphs.len());
+    for (k, g) in pos_glyphs.iter().enumerate() {
+        let lx = g.pos.x;
+        let rx = if let Some(next_g) = pos_glyphs.get(k + 1) {
+            next_g.pos.x.max(lx)
+        } else if let Some(bound) = next_bound_x {
+            bound.max(lx)
+        } else {
+            (g.pos.x + g.advance_width).max(lx)
+        };
+        pos_clusters.push(ShapedCluster { chr: g.chr, lx, rx });
+    }
+    let piece_left = pos_clusters.first().map_or_else(|| sec_glyphs.first().map_or(fallback_x, |g| g.pos.x), |c| c.lx);
+    let piece_right = pos_clusters.last().map_or(next_bound_x.unwrap_or(piece_left).max(piece_left), |c| c.rx);
+
+    let graphemes: Vec<&str> = piece_str.graphemes(true).collect();
+    let vis_indices: Vec<usize> = graphemes.iter().enumerate().filter_map(|(i, gr)| (!is_zero_width_control_grapheme(gr)).then_some(i)).collect();
+    let g_chars: Vec<char> = vis_indices.iter().map(|&idx| graphemes.get(idx).and_then(|gr| gr.chars().next()).unwrap_or('\0')).collect();
+
+    let logical_clusters: Vec<ShapedCluster> = if rtl { pos_clusters.into_iter().rev().collect() } else { pos_clusters };
+
+    let g_spaces: Vec<usize> = g_chars.iter().enumerate().filter_map(|(i, &ch)| (ch == ' ').then_some(i)).collect();
+    let c_spaces: Vec<usize> = logical_clusters.iter().enumerate().filter_map(|(i, c)| (c.chr == ' ').then_some(i)).collect();
+
+    let vis_spans: Vec<(f32, f32)> = if !g_spaces.is_empty() && g_spaces.len() == c_spaces.len() {
+        let mut all = Vec::with_capacity(g_chars.len());
+        let mut g_prev = 0usize;
+        let mut c_prev = 0usize;
+        for (&gs, &cs) in g_spaces.iter().zip(c_spaces.iter()) {
+            let word_g = g_chars.get(g_prev..gs).unwrap_or(&[]);
+            let word_c = logical_clusters.get(c_prev..cs).unwrap_or(&[]);
+            let sp_c = logical_clusters.get(cs).copied().unwrap_or(ShapedCluster { chr: ' ', lx: piece_left, rx: piece_right });
+            let word_fb = if rtl { sp_c.rx } else { sp_c.lx };
+            all.extend(map_segment_spans(word_g, word_c, rtl, word_fb, word_fb));
+            all.push((sp_c.lx, sp_c.rx));
+            g_prev = gs + 1;
+            c_prev = cs + 1;
+        }
+        let tail_g = g_chars.get(g_prev..).unwrap_or(&[]);
+        let tail_c = logical_clusters.get(c_prev..).unwrap_or(&[]);
+        let tail_fb = if rtl { piece_left } else { piece_right };
+        all.extend(map_segment_spans(tail_g, tail_c, rtl, tail_fb, tail_fb));
+        all
+    } else {
+        map_segment_spans(&g_chars, &logical_clusters, rtl, piece_left, piece_right)
+    };
+
+    let mut out = Vec::with_capacity(piece_str.chars().count());
+    let mut cursor_x = if rtl { piece_right } else { piece_left };
+    let mut vis_cursor = 0usize;
+
+    for gr in graphemes {
+        if is_zero_width_control_grapheme(gr) {
+            for ch in gr.chars() {
+                let mut g = tmpl;
+                g.chr = ch;
+                g.pos.x = cursor_x;
+                g.advance_width = 0.0;
+                g.uv_rect = Default::default();
+                g.first_vertex = end_vtx;
+                out.push(g);
+            }
+            continue;
+        }
+        let (lx, rx) = vis_spans.get(vis_cursor).copied().unwrap_or((cursor_x, cursor_x));
+        vis_cursor += 1;
+        let w = (rx - lx).max(0.0);
+        let mut chars = gr.chars();
+        if let Some(base_ch) = chars.next() {
+            let mut g = tmpl;
+            g.chr = base_ch;
+            if rtl {
+                g.pos.x = rx;
+                g.advance_width = -w;
+            } else {
+                g.pos.x = lx;
+                g.advance_width = w;
+            }
+            g.uv_rect = Default::default();
+            g.first_vertex = end_vtx;
+            out.push(g);
+        }
+        let trailing_x = if rtl { lx } else { rx };
+        for mark_ch in chars {
+            let mut g = tmpl;
+            g.chr = mark_ch;
+            g.pos.x = trailing_x;
+            g.advance_width = 0.0;
+            g.uv_rect = Default::default();
+            g.first_vertex = end_vtx;
+            out.push(g);
+        }
+        cursor_x = trailing_x;
+    }
+
+    (out, piece_right)
+}
+
+/// Lay out text for an editable [`egui::TextEdit`] while preserving visual RTL run/word order,
+/// exact 1-glyph-per-`char` counts, and real visual glyph positions for logical cursors.
 pub fn editable_layout(ui: &egui::Ui, text: &str, wrap_width: f32, font_id: FontId, text_color: Color32, multiline: bool) -> Arc<Galley> {
     if !has_rtl(text) {
         let job = if multiline {
@@ -453,35 +729,83 @@ pub fn editable_layout(ui: &egui::Ui, text: &str, wrap_width: f32, font_id: Font
     if job.text.ends_with('\n') {
         ranges.push((start..start, false));
     }
-    let lines: Vec<Arc<Galley>> = ranges.iter().map(|(range, _)| shape(range.clone())).collect();
+
+    let mut line_meta: Vec<(LayoutJob, Vec<VisualPiece>)> = Vec::with_capacity(ranges.len());
+    let mut lines: Vec<Arc<Galley>> = Vec::with_capacity(ranges.len());
+    for (range, _) in &ranges {
+        let (visual_job, pieces) = visual_line_with_pieces(&job, &bidi, range.clone(), has_arabic_fonts);
+        let shaped = ctx.fonts_mut(|fonts| fonts.layout_job(visual_job.clone()));
+        line_meta.push((visual_job, pieces));
+        lines.push(shaped);
+    }
+
     let mut galley = Galley::concat(original, &lines, ctx.pixels_per_point());
     let fallback_glyph = galley.rows.iter().find_map(|r| r.glyphs.first().copied()).or_else(|| {
         ctx.fonts_mut(|fonts| fonts.layout_no_wrap(" ".to_owned(), font_id, text_color)).rows.first().and_then(|r| r.glyphs.first().copied())
     });
     let width = galley.rect.width();
     galley.mesh_bounds = Rect::NOTHING;
-    for (placed, (range, hard_nl)) in galley.rows.iter_mut().zip(ranges.iter()) {
+    for ((placed, (range, hard_nl)), (visual_job, pieces)) in galley.rows.iter_mut().zip(ranges.iter()).zip(line_meta.iter()) {
         placed.pos.x += width - placed.size.x;
         placed.ends_with_newline = *hard_nl;
         galley.mesh_bounds |= placed.visuals.mesh_bounds.translate(placed.pos.to_vec2());
         let slice = job.text.get(range.clone()).unwrap_or("");
-        let chars: Vec<char> = slice.chars().collect();
+        let chars: Vec<(usize, char)> = slice.char_indices().collect();
         let row = Arc::make_mut(&mut placed.row);
         if chars.is_empty() {
             row.glyphs.clear();
         } else if let Some(tmpl) = row.glyphs.first().copied().or(fallback_glyph) {
-            let n = chars.len();
-            let step = if n > 0 { row.size.x / (n as f32) } else { 0.0 };
+            let shaped_glyphs = row.glyphs.clone();
+            let sec_ranges = section_glyph_ranges(ctx, visual_job, shaped_glyphs.len());
             let end_vtx = u32::try_from(row.visuals.glyph_vertex_range.end).unwrap_or(u32::MAX);
-            let mut normalized = Vec::with_capacity(n);
-            for (idx, ch) in chars.into_iter().enumerate() {
-                let mut g = tmpl;
-                g.chr = ch;
-                g.pos.x = (idx as f32) * step;
-                g.advance_width = step;
-                g.uv_rect = Default::default();
-                g.first_vertex = end_vtx;
-                normalized.push(g);
+            let mut byte_to_char = HashMap::with_capacity(chars.len() + 1);
+            for (ci, (byte_off, _)) in chars.iter().enumerate() {
+                byte_to_char.insert(range.start + *byte_off, ci);
+            }
+            byte_to_char.insert(range.end, chars.len());
+
+            let mut slots: Vec<Option<egui::epaint::text::Glyph>> = vec![None; chars.len()];
+            let mut running_visual_x = 0.0_f32;
+            for (pi, piece) in pieces.iter().enumerate() {
+                let sec_slice = piece.section_index.and_then(|si| sec_ranges.get(si)).and_then(|r| shaped_glyphs.get(r.clone())).unwrap_or(&[]);
+                let next_bound_x = pieces
+                    .get(pi + 1..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .find_map(|np| {
+                        let ns = np.section_index.and_then(|si| sec_ranges.get(si)).and_then(|r| shaped_glyphs.get(r.clone()))?;
+                        ns.iter().find(|g| g.advance_width > 0.0).or_else(|| ns.first()).map(|g| g.pos.x)
+                    })
+                    .or_else(|| (!sec_slice.is_empty()).then_some(row.size.x));
+                let piece_tmpl = sec_slice.first().copied().unwrap_or(tmpl);
+                let piece_str = job.text.get(piece.logical_range.clone()).unwrap_or("");
+                let (mapped, next_x) =
+                    map_piece_to_logical_glyphs(piece_str, piece.rtl, sec_slice, running_visual_x, next_bound_x, piece_tmpl, end_vtx);
+                running_visual_x = next_x;
+                if let Some(&char_start) = byte_to_char.get(&piece.logical_range.start) {
+                    for (offset, glyph) in mapped.into_iter().enumerate() {
+                        if let Some(slot) = slots.get_mut(char_start + offset) {
+                            *slot = Some(glyph);
+                        }
+                    }
+                }
+            }
+
+            let mut normalized = Vec::with_capacity(chars.len());
+            let mut last_x = row.size.x;
+            for ((_, ch), slot) in chars.into_iter().zip(slots) {
+                if let Some(g) = slot {
+                    last_x = g.pos.x + g.advance_width;
+                    normalized.push(g);
+                } else {
+                    let mut g = tmpl;
+                    g.chr = ch;
+                    g.pos.x = last_x;
+                    g.advance_width = 0.0;
+                    g.uv_rect = Default::default();
+                    g.first_vertex = end_vtx;
+                    normalized.push(g);
+                }
             }
             row.glyphs = normalized;
         }
@@ -499,6 +823,223 @@ pub fn text_edit_layouter(
         let text_color = color_override.unwrap_or_else(|| ui.visuals().text_color());
         editable_layout(ui, text.as_str(), wrap_width, font_id, text_color, multiline)
     }
+}
+
+/// Hit-test a galley-local coordinate against real BiDi visual glyph bounds, returning
+/// `(insertion_caret_cursor, word_or_line_anchor_cursor)`.
+pub(crate) fn bidi_hit_pos(galley: &Galley, pos: egui::Vec2) -> (CCursor, CCursor) {
+    if !has_rtl(galley.text()) {
+        let c = galley.cursor_from_pos(pos);
+        return (c, c);
+    }
+    const VMARGIN: f32 = 5.0;
+    if let Some(first_row) = galley.rows.first()
+        && pos.y < first_row.min_y() - VMARGIN
+    {
+        let b = galley.begin();
+        return (b, b);
+    }
+    if let Some(last_row) = galley.rows.last()
+        && last_row.max_y() + VMARGIN < pos.y
+    {
+        let e = galley.end();
+        return (e, e);
+    }
+
+    let mut best_y_dist = f32::INFINITY;
+    let mut best = (CCursor::default(), CCursor::default());
+    let mut row_char_start = 0usize;
+
+    for placed in &galley.rows {
+        let min_y = placed.min_y();
+        let max_y = placed.max_y();
+        let within_y = min_y <= pos.y && pos.y <= max_y;
+        let y_dist = (min_y - pos.y).abs().min((max_y - pos.y).abs());
+        if within_y || y_dist < best_y_dist {
+            best_y_dist = y_dist;
+            let rel_x = pos.x - placed.pos.x;
+            let glyphs = &placed.row.glyphs;
+            let row_len = glyphs.len();
+
+            // Group each base glyph with its trailing zero-advance combining/control glyphs.
+            let mut clusters: Vec<(usize, usize, f32, f32, bool)> = Vec::new();
+            let mut idx = 0usize;
+            while let Some(g) = glyphs.get(idx) {
+                if g.advance_width == 0.0 {
+                    idx += 1;
+                    continue;
+                }
+                let rtl = g.advance_width < 0.0;
+                let vis_left = g.pos.x.min(g.max_x());
+                let vis_right = g.pos.x.max(g.max_x());
+                let mut end = idx + 1;
+                while let Some(next) = glyphs.get(end) {
+                    if next.advance_width == 0.0 {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                clusters.push((idx, end, vis_left, vis_right, rtl));
+                idx = end;
+            }
+
+            best = if let Some(&(start_col, end_col, vis_left, vis_right, rtl)) = clusters.iter().min_by(|a, b| {
+                let da = if rel_x < a.2 {
+                    a.2 - rel_x
+                } else if rel_x > a.3 {
+                    rel_x - a.3
+                } else {
+                    0.0
+                };
+                let db = if rel_x < b.2 {
+                    b.2 - rel_x
+                } else if rel_x > b.3 {
+                    rel_x - b.3
+                } else {
+                    0.0
+                };
+                da.total_cmp(&db)
+            }) {
+                let mid = 0.5 * (vis_left + vis_right);
+                let caret_col = if rtl {
+                    if rel_x > mid { start_col } else { end_col }
+                } else if rel_x < mid {
+                    start_col
+                } else {
+                    end_col
+                };
+                let prefer_next_row = caret_col < row_len;
+                (
+                    CCursor { index: CharIndex(row_char_start + caret_col), prefer_next_row },
+                    CCursor { index: CharIndex(row_char_start + start_col), prefer_next_row: true },
+                )
+            } else {
+                let c = CCursor { index: CharIndex(row_char_start), prefer_next_row: true };
+                (c, c)
+            };
+
+            if within_y {
+                return best;
+            }
+        }
+        row_char_start += placed.char_count_including_newline().0;
+    }
+
+    best
+}
+
+/// Cursor at the given galley-local position, aware of RTL and mixed-BiDi glyph positions.
+#[cfg(test)]
+fn bidi_cursor_from_pos(galley: &Galley, pos: egui::Vec2) -> CCursor {
+    bidi_hit_pos(galley, pos).0
+}
+
+fn select_word_range(text: &str, anchor: CCursor) -> CCursorRange {
+    if text.is_empty() {
+        return CCursorRange::one(anchor);
+    }
+    let target = anchor.index.0;
+    let mut line_char_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let has_nl = line.ends_with('\n');
+        let content = if has_nl { &line[..line.len() - 1] } else { line };
+        let content_chars = content.chars().count();
+        let line_char_end = line_char_start + content_chars;
+        if target <= line_char_end || !has_nl {
+            let mut cur = line_char_start;
+            for (_, word) in content.split_word_bound_indices() {
+                let wlen = word.chars().count();
+                let wend = cur + wlen;
+                if target < wend {
+                    return CCursorRange::two(CCursor::new(cur), CCursor::new(wend));
+                }
+                cur = wend;
+            }
+            return CCursorRange::one(CCursor::new(line_char_end));
+        }
+        line_char_start = line_char_end + usize::from(has_nl);
+    }
+    CCursorRange::one(anchor)
+}
+
+fn select_line_range(text: &str, anchor: CCursor) -> CCursorRange {
+    if text.is_empty() {
+        return CCursorRange::one(anchor);
+    }
+    let target = anchor.index.0;
+    let mut line_char_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+        let line_char_end = line_char_start + line_chars;
+        if target < line_char_end {
+            return CCursorRange::two(CCursor::new(line_char_start), CCursor::new(line_char_end));
+        }
+        line_char_start = line_char_end;
+    }
+    CCursorRange::two(CCursor::new(line_char_start), CCursor::new(text.chars().count()))
+}
+
+fn apply_bidi_pointer_interaction(ui: &egui::Ui, out: &mut egui::text_edit::TextEditOutput) {
+    if !has_rtl(out.galley.text()) {
+        return;
+    }
+    let Some(pointer_pos) = out.response.interact_pointer_pos() else {
+        return;
+    };
+    let painted_origin = out.galley_pos - egui::vec2(out.galley.rect.left(), 0.0);
+    let local_pos = pointer_pos - painted_origin;
+    let (caret_cursor, word_cursor) = bidi_hit_pos(&out.galley, local_pos);
+
+    let new_range = if out.response.double_clicked() {
+        Some(select_word_range(out.galley.text(), word_cursor))
+    } else if out.response.triple_clicked() {
+        Some(select_line_range(out.galley.text(), word_cursor))
+    } else if out.response.sense.senses_drag() {
+        if out.response.hovered() && ui.input(|i| i.pointer.any_pressed()) {
+            if ui.input(|i| i.modifiers.shift) {
+                if let Some(mut existing) = out.state.cursor.range(&out.galley) {
+                    existing.primary = caret_cursor;
+                    Some(existing)
+                } else {
+                    Some(CCursorRange::one(caret_cursor))
+                }
+            } else {
+                Some(CCursorRange::one(caret_cursor))
+            }
+        } else if ui.is_being_dragged(out.response.id) {
+            out.state.cursor.range(&out.galley).map(|mut existing| {
+                existing.primary = caret_cursor;
+                existing
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(range) = new_range {
+        if out.state.cursor.char_range() != Some(range) {
+            out.state.cursor.set_char_range(Some(range));
+            out.state.clone().store(ui.ctx(), out.response.id);
+            ui.ctx().request_repaint();
+        }
+        out.cursor_range = out.state.cursor.range(&out.galley);
+    }
+}
+
+/// Show a [`egui::TextEdit`] while mapping pointer clicks, drags, and word selections onto true
+/// visual BiDi glyph bounds when RTL text is present.
+pub fn show_text_edit(ui: &mut egui::Ui, edit: egui::TextEdit<'_>) -> egui::text_edit::TextEditOutput {
+    let mut out = edit.show(ui);
+    apply_bidi_pointer_interaction(ui, &mut out);
+    out
+}
+
+/// Place a [`egui::TextEdit`] inside `max_rect` (like [`egui::Ui::put`]) with BiDi pointer cursor mapping.
+pub fn put_text_edit(ui: &mut egui::Ui, max_rect: Rect, edit: egui::TextEdit<'_>) -> egui::Response {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(max_rect), |ui| show_text_edit(ui, edit)).inner.response.response
 }
 
 #[cfg(test)]
@@ -819,28 +1360,158 @@ mod tests {
     }
 
     #[test]
-    fn editable_layout_preserves_arabic_word_order_cursor_counts_and_selection_safety() {
+    fn editable_layout_maps_cursors_to_visual_glyphs_combining_marks_and_bidi_clicks() {
         with_fonts(|ctx| {
             let sample = "بِسْمِ اللَّهِ الرَّحْمَنِ\nسطر ثانٍ 123 مع نص عربي طويل للالتفاف التلقائي\n";
             egui::Area::new(egui::Id::new("rtl-editable-test")).show(ctx, |ui| {
-                let mut galley = editable_layout(ui, sample, 140.0, FontId::proportional(14.0), Color32::WHITE, true);
+                let mut galley = editable_layout(ui, sample, 180.0, FontId::proportional(14.0), Color32::WHITE, true);
                 assert_eq!(galley.job.text, sample);
-                // Exact char count across soft-wrapped + hard-newline + combining-mark rows!
-                assert_eq!(galley.end().index, egui::text::CharIndex(sample.chars().count()));
-                // Visual mesh has vertices (non-empty shaped Arabic glyphs) and finite bounds.
+                // Exact char count across soft-wrapped + hard-newline + combining-mark rows.
+                assert_eq!(galley.end().index, CharIndex(sample.chars().count()));
                 assert!(galley.rows[0].visuals.mesh.vertices.len() >= 4);
                 assert!(galley.rect.is_finite());
                 assert!(galley.mesh_bounds.is_finite());
                 // Soft-wrapped rows must NOT pretend to have hard '\n'; only explicit '\n' rows do.
                 let hard_newlines = galley.rows.iter().filter(|r| r.ends_with_newline).count();
                 assert_eq!(hard_newlines, 2);
-                // Arbitrary selection highlight never panics or corrupts vertices.
-                let range = egui::text_selection::CCursorRange::two(
-                    egui::text::CCursor::new(2),
-                    egui::text::CCursor::new(sample.chars().count().saturating_sub(3)),
+
+                // First logical char ('ب' at index 0) is displayed on the visual right, NOT at x == 0.
+                let first_row = &galley.rows[0];
+                let caret_0 = galley.pos_from_cursor(CCursor::new(0)).min.x;
+                assert!(
+                    (caret_0 - (first_row.pos.x + first_row.size.x)).abs() < 0.5,
+                    "logical char 0 belongs at visual right edge: caret_0={caret_0}, right={}",
+                    first_row.pos.x + first_row.size.x
                 );
-                egui::text_selection::visuals::paint_text_selection(&mut galley, ui.visuals(), &range, None);
+                // Combining marks ('ِ' at index 1, 'ْ' at index 3, 'ِ' at index 5) consume zero advance.
+                assert_eq!(first_row.glyphs[1].advance_width, 0.0, "kasra must have zero advance");
+                assert_eq!(first_row.glyphs[3].advance_width, 0.0, "sukun must have zero advance");
+                assert_eq!(first_row.glyphs[5].advance_width, 0.0, "kasra must have zero advance");
+                assert!((first_row.glyphs[1].pos.x - first_row.glyphs[2].pos.x).abs() < 1e-3);
+
+                // Mixed BiDi + lam-alef ligature line: "ملف PDF لا جديد"
+                let mixed = "ملف PDF لا جديد";
+                let mixed_galley = editable_layout(ui, mixed, f32::INFINITY, FontId::proportional(15.0), Color32::WHITE, false);
+                assert_eq!(mixed_galley.end().index, CharIndex(mixed.chars().count()));
+                let m_row = &mixed_galley.rows[0];
+                let center_of = |idx: usize| m_row.pos.x + m_row.glyphs[idx].logical_rect().center().x;
+                // Visual order left-to-right: "جديد" (11..15) < "لا" (8..10) < "PDF" (4..7) < "ملف" (0..3).
+                assert!(center_of(14) < center_of(11), "Arabic 'جديد' flows RTL on the left");
+                assert!(center_of(11) < center_of(9) && center_of(9) < center_of(8), "lam-alef ligature splits RTL ('ا' left of 'ل')");
+                assert!(center_of(8) < center_of(4) && center_of(4) < center_of(6), "Latin 'PDF' flows LTR in the middle");
+                assert!(center_of(6) < center_of(2) && center_of(2) < center_of(0), "Arabic 'ملف' flows RTL on the right");
+
+                // Clicking on displayed characters targets the exact displayed logical index/word.
+                let y = m_row.rect().center().y;
+                let click_meem = bidi_cursor_from_pos(&mixed_galley, egui::vec2(center_of(0) + 2.0, y));
+                assert_eq!(click_meem.index, CharIndex(0));
+                let (_, word_jadid) = bidi_hit_pos(&mixed_galley, egui::vec2(center_of(12), y));
+                let selected_jadid = select_word_range(mixed, word_jadid);
+                assert_eq!(selected_jadid.slice_str(mixed), "جديد");
+                let (_, word_pdf) = bidi_hit_pos(&mixed_galley, egui::vec2(center_of(5), y));
+                assert_eq!(select_word_range(mixed, word_pdf).slice_str(mixed), "PDF");
+                let (_, word_malaf) = bidi_hit_pos(&mixed_galley, egui::vec2(center_of(1), y));
+                assert_eq!(select_word_range(mixed, word_malaf).slice_str(mixed), "ملف");
+
+                // Arbitrary and full-range selection highlights never panic or corrupt vertices.
+                for (a, b) in [(2, sample.chars().count().saturating_sub(3)), (0, sample.chars().count())] {
+                    let range = CCursorRange::two(CCursor::new(a), CCursor::new(b));
+                    egui::text_selection::visuals::paint_text_selection(&mut galley, ui.visuals(), &range, None);
+                }
             });
         });
+
+        // End-to-end TextEdit test: clicking the leftmost displayed word ("جديد") in "ملف جديد"
+        // and typing inserts at "جديد", NOT at logical index 0 ("ملف").
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::theme::font_definitions(designcraft_fonts::CRAFT_FONTS, "ar"));
+        let mut buf = "ملف جديد".to_owned();
+        let mut jadid_left_click_pos = Pos2::ZERO;
+        let screen = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 400.0)));
+        ctx.run_ui(egui::RawInput { screen_rect: screen, max_texture_side: Some(8192), ..Default::default() }, |ui| {
+            let mut layouter = text_edit_layouter(false, Some(FontId::proportional(16.0)), None);
+            let out = show_text_edit(
+                ui,
+                egui::TextEdit::singleline(&mut buf)
+                    .id(egui::Id::new("rtl-click-field"))
+                    .horizontal_align(Align::Max)
+                    .desired_width(240.0)
+                    .layouter(&mut layouter),
+            );
+            let painted_origin = out.galley_pos - egui::vec2(out.galley.rect.left(), 0.0);
+            let last_char_left = painted_origin.x + out.galley.rows[0].pos.x + out.galley.rows[0].glyphs[7].max_x();
+            let mid_y = painted_origin.y + out.galley.rows[0].rect().center().y;
+            jadid_left_click_pos = Pos2::new(last_char_left + 0.5, mid_y);
+        })
+        .textures_delta
+        .clear();
+
+        // Frame 2: click at the visual left edge (after 'د' of "جديد", logical index 8).
+        let mut clicked_cursor = None;
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: screen,
+                max_texture_side: Some(8192),
+                focused: true,
+                events: vec![
+                    egui::Event::PointerMoved(jadid_left_click_pos),
+                    egui::Event::PointerButton {
+                        pos: jadid_left_click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let mut layouter = text_edit_layouter(false, Some(FontId::proportional(16.0)), None);
+                let out = show_text_edit(
+                    ui,
+                    egui::TextEdit::singleline(&mut buf)
+                        .id(egui::Id::new("rtl-click-field"))
+                        .horizontal_align(Align::Max)
+                        .desired_width(240.0)
+                        .layouter(&mut layouter),
+                );
+                clicked_cursor = out.cursor_range.map(|r| r.primary.index);
+            },
+        )
+        .textures_delta
+        .clear();
+        assert_eq!(clicked_cursor, Some(CharIndex(8)));
+
+        // Frame 3: release mouse button and type "!" — must append at index 8 ("ملف جديد!"), not index 0.
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: screen,
+                max_texture_side: Some(8192),
+                focused: true,
+                events: vec![
+                    egui::Event::PointerButton {
+                        pos: jadid_left_click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Text("!".into()),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let mut layouter = text_edit_layouter(false, Some(FontId::proportional(16.0)), None);
+                show_text_edit(
+                    ui,
+                    egui::TextEdit::singleline(&mut buf)
+                        .id(egui::Id::new("rtl-click-field"))
+                        .horizontal_align(Align::Max)
+                        .desired_width(240.0)
+                        .layouter(&mut layouter),
+                );
+            },
+        )
+        .textures_delta
+        .clear();
+        assert_eq!(buf, "ملف جديد!");
     }
 }

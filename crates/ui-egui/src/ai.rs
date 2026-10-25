@@ -1725,7 +1725,8 @@ fn field(ui: &mut egui::Ui, arabic: bool, en: &str, ar: &str, value: &mut String
     label(ui, arabic, en, ar);
     let field_rtl = if value.trim().is_empty() { arabic } else { rtl::has_rtl(value) };
     let mut layouter = bidi_layouter(false);
-    ui.add(
+    rtl::show_text_edit(
+        ui,
         egui::TextEdit::singleline(value)
             .desired_width(f32::INFINITY)
             .horizontal_align(if field_rtl { egui::Align::Max } else { egui::Align::Min })
@@ -3079,7 +3080,8 @@ fn production(
         let prompt_rtl = if s.prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.prompt) };
         egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
             let mut layouter = bidi_layouter(true);
-            ui.add(
+            rtl::show_text_edit(
+                ui,
                 egui::TextEdit::multiline(&mut s.prompt)
                     .desired_rows(4)
                     .desired_width(f32::INFINITY)
@@ -3191,7 +3193,7 @@ fn production(
                     "ملف المستند (.designcraft أو .idml أو .indd أو .indt أو .pdf أو .docx أو .rtf أو .txt أو .md أو .xlsx)",
                 );
                 let mut open_path_layouter = bidi_layouter(false);
-                ui.add(egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0).layouter(&mut open_path_layouter));
+                rtl::show_text_edit(ui, egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0).layouter(&mut open_path_layouter));
                 if button(ui, a, "Open path", "فتح المسار") {
                     s.open_target_document_requested = true;
                 }
@@ -4426,7 +4428,10 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
             }
             label(ui, a, "SKILL.md — edits create a new draft", "SKILL.md — التعديل ينشئ مسودة جديدة");
             let mut skill_md_layouter = bidi_layouter(true);
-            ui.add(egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY).layouter(&mut skill_md_layouter));
+            rtl::show_text_edit(
+                ui,
+                egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY).layouter(&mut skill_md_layouter),
+            );
             label(ui, a, "Manifest JSON", "ملف الوصف JSON");
             ui.add(egui::TextEdit::multiline(&mut s.manifest_json).code_editor().desired_rows(5).desired_width(f32::INFINITY));
             let clean = s.skill_md == r.skill_md && s.manifest_json == r.manifest_json;
@@ -4489,7 +4494,8 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         );
         let skill_rtl = if s.skill_prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.skill_prompt) };
         let mut skill_layouter = bidi_layouter(true);
-        ui.add(
+        rtl::show_text_edit(
+            ui,
             egui::TextEdit::multiline(&mut s.skill_prompt)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
@@ -4498,7 +4504,10 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
         );
         label(ui, a, "Reference paths (one per line)", "مسارات المراجع (مسار في كل سطر)");
         let mut references_layouter = bidi_layouter(true);
-        ui.add(egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY).layouter(&mut references_layouter));
+        rtl::show_text_edit(
+            ui,
+            egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY).layouter(&mut references_layouter),
+        );
         ui.horizontal_wrapped(|ui| {
             let ready = !s.skill_prompt.trim().is_empty()
                 && !s.settings.text_model.model.trim().is_empty()

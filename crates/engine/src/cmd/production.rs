@@ -1542,10 +1542,156 @@ struct OpaqueOccluder<'a> {
     spread_index: usize,
     forced_page: Option<usize>,
     paint_order: usize,
+    has_opaque_fill: bool,
+    eff_opacity: f32,
+    asset_ptr: Option<*const Vec<u8>>,
+}
+
+enum GraphicAlpha {
+    FullyOpaque,
+    Raster { alpha: Vec<u8>, width: u32, height: u32 },
+    TransparentOrUnknown,
+}
+
+fn summarize_alpha_plane(alpha: Vec<u8>, width: u32, height: u32) -> GraphicAlpha {
+    if alpha.is_empty() || alpha.iter().all(|&a| a < 230) {
+        GraphicAlpha::TransparentOrUnknown
+    } else if alpha.iter().all(|&a| a == 255) {
+        GraphicAlpha::FullyOpaque
+    } else {
+        GraphicAlpha::Raster { alpha, width, height }
+    }
+}
+
+fn classify_graphic_alpha(asset: &designcraft_doc::Asset) -> GraphicAlpha {
+    if designcraft_doc::media_kind(&asset.mime).is_some() {
+        return GraphicAlpha::FullyOpaque;
+    }
+    let bytes = asset.data.as_slice();
+    if bytes.is_empty() || designcraft_images::is_pdf(bytes) {
+        return GraphicAlpha::TransparentOrUnknown;
+    }
+    if asset.mime.eq_ignore_ascii_case("image/jpeg") || bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return GraphicAlpha::FullyOpaque;
+    }
+    if designcraft_images::is_svg(bytes) {
+        let Some((rgba, width, height)) = designcraft_images::render_svg(bytes, 256) else {
+            return GraphicAlpha::TransparentOrUnknown;
+        };
+        if width == 0 || height == 0 {
+            return GraphicAlpha::TransparentOrUnknown;
+        }
+        let alpha: Vec<u8> = rgba.chunks_exact(4).map(|px| px.get(3).copied().unwrap_or(0)).collect();
+        return summarize_alpha_plane(alpha, width, height);
+    }
+    let Some((w, h)) = designcraft_images::pixel_size(bytes) else {
+        return GraphicAlpha::TransparentOrUnknown;
+    };
+    if w == 0 || h == 0 || u64::from(w).saturating_mul(u64::from(h)) > MAX_IMAGE_PIXELS {
+        return GraphicAlpha::TransparentOrUnknown;
+    }
+    let Some(rgba) = designcraft_images::decode_rgba(bytes) else {
+        return GraphicAlpha::TransparentOrUnknown;
+    };
+    let (width, height) = rgba.dimensions();
+    if width == 0 || height == 0 {
+        return GraphicAlpha::TransparentOrUnknown;
+    }
+    let alpha: Vec<u8> = rgba.pixels().map(|px| px.0[3]).collect();
+    summarize_alpha_plane(alpha, width, height)
+}
+
+fn graphic_opaque_area_in_rect(
+    doc: &designcraft_doc::Document,
+    occ: &OpaqueOccluder<'_>,
+    inter: designcraft_geom::Rect,
+    alpha_cache: &mut std::collections::HashMap<designcraft_doc::AssetId, GraphicAlpha>,
+) -> f64 {
+    use designcraft_geom::{Point, Shape as _};
+    let area = inter.width().max(0.0) * inter.height().max(0.0);
+    if area <= 0.0 {
+        return 0.0;
+    }
+    let Some(g) = occ.item.drawn_graphic(&doc.assets) else {
+        return 0.0;
+    };
+    if !(g.size.0.is_finite() && g.size.1.is_finite() && g.size.0 > 0.0 && g.size.1 > 0.0) {
+        return 0.0;
+    }
+    let Some(asset) = doc.assets.get(&g.asset) else {
+        return 0.0;
+    };
+    let alpha_info = alpha_cache.entry(g.asset).or_insert_with(|| classify_graphic_alpha(asset));
+    if matches!(alpha_info, GraphicAlpha::TransparentOrUnknown) {
+        return 0.0;
+    }
+    let frame_xf = occ.parent * occ.item.xf;
+    let frame_det = frame_xf.determinant();
+    let g_det = g.xf.determinant();
+    if !(frame_det.is_finite() && frame_det.abs() > 1e-9 && g_det.is_finite() && g_det.abs() > 1e-9) {
+        return 0.0;
+    }
+    let fc = frame_xf.as_coeffs();
+    let gc = g.xf.as_coeffs();
+    let axis_aligned_rect = occ.item.shape == designcraft_doc::Shape::Rectangle
+        && g.clip.is_none()
+        && fc[1].abs() <= 1e-6
+        && fc[2].abs() <= 1e-6
+        && gc[1].abs() <= 1e-6
+        && gc[2].abs() <= 1e-6;
+    if matches!(alpha_info, GraphicAlpha::FullyOpaque) && axis_aligned_rect {
+        return area;
+    }
+    let to_frame = frame_xf.inverse();
+    let to_graphic = g.xf.inverse();
+    let inner = occ.item.inner_bounds();
+    let frame_bez = (occ.item.shape != designcraft_doc::Shape::Rectangle).then(|| occ.item.path.to_bezpath());
+    let clip = g.clip_region();
+    const GRID: usize = 16;
+    let mut opaque_hits = 0usize;
+    for gy in 0..GRID {
+        let sy = inter.y0 + ((gy as f64 + 0.5) / GRID as f64) * inter.height();
+        for gx in 0..GRID {
+            let sx = inter.x0 + ((gx as f64 + 0.5) / GRID as f64) * inter.width();
+            let p_frame = to_frame * Point::new(sx, sy);
+            if !inner.contains(p_frame) {
+                continue;
+            }
+            if let Some(bez) = &frame_bez
+                && bez.winding(p_frame) == 0
+            {
+                continue;
+            }
+            if let Some((clip_path, even_odd)) = &clip {
+                let w = clip_path.winding(p_frame);
+                let inside = if *even_odd { w % 2 != 0 } else { w != 0 };
+                if !inside {
+                    continue;
+                }
+            }
+            let p_graphic = to_graphic * p_frame;
+            if !(p_graphic.x >= 0.0 && p_graphic.x < g.size.0 && p_graphic.y >= 0.0 && p_graphic.y < g.size.1) {
+                continue;
+            }
+            let a = match alpha_info {
+                GraphicAlpha::FullyOpaque => 255u8,
+                GraphicAlpha::Raster { alpha, width, height } => {
+                    let px = ((p_graphic.x / g.size.0) * f64::from(*width)).floor().clamp(0.0, f64::from(width.saturating_sub(1))) as usize;
+                    let py = ((p_graphic.y / g.size.1) * f64::from(*height)).floor().clamp(0.0, f64::from(height.saturating_sub(1))) as usize;
+                    alpha.get(py.saturating_mul(*width as usize).saturating_add(px)).copied().unwrap_or(0)
+                }
+                GraphicAlpha::TransparentOrUnknown => 0u8,
+            };
+            if (f32::from(a) / 255.0) * occ.eff_opacity >= 0.9 {
+                opaque_hits = opaque_hits.saturating_add(1);
+            }
+        }
+    }
+    area * (opaque_hits as f64 / (GRID * GRID) as f64)
 }
 
 fn layout_scene(s: &Session) -> Result<(Vec<LayoutFrame<'_>>, Vec<OpaqueOccluder<'_>>)> {
-    use designcraft_doc::{Content, ItemLoc, Shape, SpreadRef};
+    use designcraft_doc::{ItemLoc, Shape, SpreadRef};
     use designcraft_geom::Affine;
     let d = &s.doc()?.doc;
     // Validate the complete tree before any location lookup; imported hidden groups count too.
@@ -1705,10 +1851,16 @@ fn layout_scene(s: &Session) -> Result<(Vec<LayoutFrame<'_>>, Vec<OpaqueOccluder
                 && eff_normal_blend
             {
                 let has_opaque_fill = !item.fill.is_none() && item.fill.tint.is_finite() && item.fill.tint >= 0.9;
+                let drawn_graphic = (!has_opaque_fill).then(|| item.drawn_graphic(&d.assets)).flatten();
+                let asset_ptr = drawn_graphic
+                    .as_ref()
+                    .and_then(|g| d.assets.get(&g.asset))
+                    .filter(|a| !a.data.is_empty() || designcraft_doc::media_kind(&a.mime).is_some())
+                    .map(|a| std::sync::Arc::as_ptr(&a.data));
                 let occ_bounds = if has_opaque_fill {
                     Some(parent.transform_rect_bbox(item.bounds()))
-                } else if let Content::Graphic(g) = &item.content {
-                    g.shown_bounds(item.inner_bounds()).map(|r| (parent * item.xf).transform_rect_bbox(r))
+                } else if let Some(g) = &drawn_graphic {
+                    asset_ptr.and_then(|_| g.shown_bounds(item.inner_bounds()).map(|r| (parent * item.xf).transform_rect_bbox(r)))
                 } else {
                     None
                 };
@@ -1716,7 +1868,18 @@ fn layout_scene(s: &Session) -> Result<(Vec<LayoutFrame<'_>>, Vec<OpaqueOccluder
                     && bounds.width() > 0.0
                     && bounds.height() > 0.0
                 {
-                    occluders.push(OpaqueOccluder { item, loc, parent, bounds, spread_index: si, forced_page, paint_order });
+                    occluders.push(OpaqueOccluder {
+                        item,
+                        loc,
+                        parent,
+                        bounds,
+                        spread_index: si,
+                        forced_page,
+                        paint_order,
+                        has_opaque_fill,
+                        eff_opacity,
+                        asset_ptr,
+                    });
                 }
             }
         }
@@ -1748,9 +1911,14 @@ fn check_text_layout(original: &Session, draft: &Session) -> Result<()> {
     let occluder_changed: Vec<_> = after_occluders
         .iter()
         .map(|occ| {
-            previous_occluders
-                .get(&(occ.item.id, occ.spread_index, occ.forced_page))
-                .is_none_or(|old| old.item != occ.item || old.parent != occ.parent || old.bounds != occ.bounds)
+            previous_occluders.get(&(occ.item.id, occ.spread_index, occ.forced_page)).is_none_or(|old| {
+                old.item != occ.item
+                    || old.parent != occ.parent
+                    || old.bounds != occ.bounds
+                    || old.has_opaque_fill != occ.has_opaque_fill
+                    || (old.eff_opacity - occ.eff_opacity).abs() > 1e-4
+                    || old.asset_ptr != occ.asset_ptr
+            })
         })
         .collect();
     let mut issues = Vec::new();
@@ -1778,6 +1946,8 @@ fn check_text_layout(original: &Session, draft: &Session) -> Result<()> {
             break;
         }
     }
+    let draft_doc = &draft.doc()?.doc;
+    let mut alpha_cache = std::collections::HashMap::new();
     if issues.len() < 32 {
         for (i, frame) in after.iter().enumerate() {
             let b = frame.bounds;
@@ -1805,19 +1975,24 @@ fn check_text_layout(original: &Session, draft: &Session) -> Result<()> {
                     continue;
                 }
                 let o = occ.bounds;
-                let ix = (b.x1.min(o.x1) - b.x0.max(o.x0)).max(0.0);
-                let iy = (b.y1.min(o.y1) - b.y0.max(o.y0)).max(0.0);
+                let inter = designcraft_geom::Rect::new(b.x0.max(o.x0), b.y0.max(o.y0), b.x1.min(o.x1), b.y1.min(o.y1));
+                let ix = inter.width().max(0.0);
+                let iy = inter.height().max(0.0);
                 if ix > MIN_OCCLUSION_DIM_PT && iy > MIN_OCCLUSION_DIM_PT && ix * iy >= MIN_OCCLUSION_RATIO * frame_area {
-                    issues.push(json!({
-                        "kind": "textOccludedByObject",
-                        "item": frame.item.id.0,
-                        "occludingItem": occ.item.id.0,
-                        "page": frame.page + 1,
-                        "bounds": [b.x0, b.y0, b.x1, b.y1],
-                        "occluderBounds": [o.x0, o.y0, o.x1, o.y1],
-                    }));
-                    if issues.len() >= 32 {
-                        break;
+                    let opaque_area =
+                        if occ.has_opaque_fill { ix * iy } else { graphic_opaque_area_in_rect(draft_doc, occ, inter, &mut alpha_cache) };
+                    if opaque_area >= MIN_OCCLUSION_RATIO * frame_area {
+                        issues.push(json!({
+                            "kind": "textOccludedByObject",
+                            "item": frame.item.id.0,
+                            "occludingItem": occ.item.id.0,
+                            "page": frame.page + 1,
+                            "bounds": [b.x0, b.y0, b.x1, b.y1],
+                            "occluderBounds": [o.x0, o.y0, o.x1, o.y1],
+                        }));
+                        if issues.len() >= 32 {
+                            break;
+                        }
                     }
                 }
             }
@@ -2882,5 +3057,47 @@ mod tests {
         let err_arrange = s.execute("production.apply", &bring_bg_to_front).unwrap_err();
         assert!(err_arrange.to_string().contains("textOccludedByObject"), "expected textOccludedByObject on arrange, got: {err_arrange}");
         assert!(Arc::ptr_eq(&before, &s.doc().unwrap().doc));
+
+        // A fully transparent PNG (alpha == 0) placed above text with no frame fill does not occlude text.
+        // 1x1 RGBA PNG [0, 0, 0, 0]:
+        let transparent_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=";
+        let transparent_overlay = json!({"outputMode":"native_with_images","requirePreflight":true,"minPpi":1,"commands":[
+            {"command":"frame.create","params":{"rect":[58,58,255,112],"content":"graphic"}},
+            {"command":"file.place","params":{"frame":"$0.id","name":"overlay-clear.png","base64":transparent_png}},
+            {"command":"object.fit","params":{"ids":["$0.id"],"mode":"fitContentToFrame"}}
+        ]});
+        s.execute("production.apply", &transparent_overlay).unwrap();
+
+        // A sparse cutout PNG (90% alpha == 0, 10% alpha == 255) placed above text also passes (<35% opaque area).
+        let sparse_png = "iVBORw0KGgoAAAANSUhEUgAAAAoAAAABCAYAAADn9T9+AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAQSURBVBhXY2AgAoiIiPwHAAHcATwojoEhAAAAAElFTkSuQmCC";
+        let sparse_overlay = json!({"outputMode":"native_with_images","requirePreflight":true,"minPpi":1,"commands":[
+            {"command":"frame.create","params":{"rect":[58,58,255,112],"content":"graphic"}},
+            {"command":"file.place","params":{"frame":"$0.id","name":"overlay-sparse.png","base64":sparse_png}},
+            {"command":"object.fit","params":{"ids":["$0.id"],"mode":"fitContentToFrame"}}
+        ]});
+        s.execute("production.apply", &sparse_overlay).unwrap();
+
+        let after_sparse = s.doc().unwrap().doc.clone();
+        // A dense mixed-alpha PNG (90% alpha == 255, 10% alpha == 0) covering >=35% of text bounds IS rejected.
+        let dense_png = "iVBORw0KGgoAAAANSUhEUgAAAAoAAAABCAYAAADn9T9+AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAARSURBVBhXYxAREflPCDMAAQDs8AsUSDJVGgAAAABJRU5ErkJggg==";
+        let dense_overlay = json!({"outputMode":"native_with_images","requirePreflight":true,"minPpi":1,"commands":[
+            {"command":"frame.create","params":{"rect":[58,58,255,112],"content":"graphic"}},
+            {"command":"file.place","params":{"frame":"$0.id","name":"overlay-dense.png","base64":dense_png}},
+            {"command":"object.fit","params":{"ids":["$0.id"],"mode":"fitContentToFrame"}}
+        ]});
+        let err_dense_png = s.execute("production.apply", &dense_overlay).unwrap_err();
+        assert!(err_dense_png.to_string().contains("textOccludedByObject"), "expected textOccludedByObject on dense PNG, got: {err_dense_png}");
+        assert!(Arc::ptr_eq(&after_sparse, &s.doc().unwrap().doc));
+
+        // A fully opaque PNG (alpha == 255) placed above text with no frame fill covering >=35% of text bounds IS rejected.
+        let opaque_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAANSURBVBhXY/jPwPAfAAUAAf+mXJtdAAAAAElFTkSuQmCC";
+        let opaque_overlay = json!({"outputMode":"native_with_images","requirePreflight":true,"minPpi":1,"commands":[
+            {"command":"frame.create","params":{"rect":[58,58,255,112],"content":"graphic"}},
+            {"command":"file.place","params":{"frame":"$0.id","name":"overlay-solid.png","base64":opaque_png}},
+            {"command":"object.fit","params":{"ids":["$0.id"],"mode":"fitContentToFrame"}}
+        ]});
+        let err_opaque_png = s.execute("production.apply", &opaque_overlay).unwrap_err();
+        assert!(err_opaque_png.to_string().contains("textOccludedByObject"), "expected textOccludedByObject on opaque PNG, got: {err_opaque_png}");
+        assert!(Arc::ptr_eq(&after_sparse, &s.doc().unwrap().doc));
     }
 }

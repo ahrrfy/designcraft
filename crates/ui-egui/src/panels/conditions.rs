@@ -83,7 +83,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let mut name: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     ui.horizontal(|ui| {
         let mut layouter = crate::rtl::text_edit_layouter(false, None, None);
-        ui.add(
+        crate::rtl::show_text_edit(
+            ui,
             egui::TextEdit::singleline(&mut name)
                 .hint_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New condition name")))
                 .desired_width(150.0)
