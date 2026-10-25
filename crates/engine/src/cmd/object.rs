@@ -2307,7 +2307,11 @@ fn effects_all(s: &mut Session, p: &Value) -> Result<Value> {
                 merge_json(&mut cur, patch);
                 let mut fx: designcraft_doc::Effects = serde_json::from_value(cur).map_err(|e| bad(ID, format!("effects: {e}")))?;
                 if let Some(gf_patch) = patch.get("gradientFeather") {
-                    if gf_patch.get("angle").and_then(Value::as_f64).is_some() && gf_patch.get("from").is_none() && gf_patch.get("to").is_none() {
+                    if gf_patch.get("angle").and_then(Value::as_f64).is_some()
+                        && gf_patch.get("vector").is_none_or(Value::is_null)
+                        && gf_patch.get("from").is_none_or(Value::is_null)
+                        && gf_patch.get("to").is_none_or(Value::is_null)
+                    {
                         fx.gradient_feather.vector = None;
                     }
                     if let (Some(xf), Some(a), Some(b)) = (item_xf, point_param(gf_patch, "from"), point_param(gf_patch, "to"))
@@ -5550,6 +5554,54 @@ mod glow_feather_options_tests {
         let d = designcraft_doc::Effects::default();
         assert_eq!((d.inner_glow.mode, d.inner_glow.technique), (designcraft_color::BlendMode::Screen, designcraft_doc::GlowTechnique::Softer));
         assert_eq!((d.feather_options.choke, d.feather_options.corners), (0.0, designcraft_doc::FeatherCorners::Diffused));
+    }
+
+    #[test]
+    fn object_effects_preserves_explicit_gradient_feather_vector_and_clears_on_angle_only_patch() {
+        let mut s = crate::Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let id = s.execute("frame.create", &json!({"rect": [100, 100, 300, 300]})).unwrap()["id"].as_u64().unwrap();
+        s.execute("object.gradientFeather", &json!({"ids": [id], "from": [120, 140], "to": [260, 220]})).unwrap();
+        let gf_of = |s: &crate::Session| s.doc().unwrap().doc.item(designcraft_doc::ItemId(id)).unwrap().effects.gradient_feather.clone();
+        assert_eq!(gf_of(&s).vector, Some([120.0, 140.0, 260.0, 220.0]));
+
+        // Full Effects snapshot (as sent by the Effects dialog, containing both `angle` and `vector`
+        // without `from`/`to`) preserves the dragged vector when editing another effect.
+        let mut snapshot = serde_json::to_value(&s.doc().unwrap().doc.item(designcraft_doc::ItemId(id)).unwrap().effects).unwrap();
+        snapshot["dropShadow"] = json!({"on": true, "distance": 12.0});
+        assert!(snapshot["gradientFeather"]["angle"].is_number() && snapshot["gradientFeather"]["vector"].is_array());
+        s.execute("object.effects", &json!({"ids": [id], "effects": snapshot})).unwrap();
+        let it = s.doc().unwrap().doc.item(designcraft_doc::ItemId(id)).unwrap().clone();
+        assert!(it.effects.drop_shadow.on && (it.effects.drop_shadow.distance - 12.0).abs() < 1e-6);
+        assert_eq!(it.effects.gradient_feather.vector, Some([120.0, 140.0, 260.0, 220.0]));
+
+        // Partial non-angle gradientFeather patch keeps the dragged vector.
+        s.execute("object.effects", &json!({"ids": [id], "effects": {"gradientFeather": {"start": 0.8, "end": 0.2}}})).unwrap();
+        let gf = gf_of(&s);
+        assert_eq!(gf.vector, Some([120.0, 140.0, 260.0, 220.0]));
+        assert!((gf.start - 0.8).abs() < 1e-6 && (gf.end - 0.2).abs() < 1e-6);
+
+        // Angle-only patch without `vector`/`from`/`to` clears the dragged vector.
+        s.execute("object.effects", &json!({"ids": [id], "effects": {"gradientFeather": {"angle": 45.0}}})).unwrap();
+        let gf = gf_of(&s);
+        assert_eq!(gf.vector, None);
+        assert!((gf.angle - 45.0).abs() < 1e-6);
+
+        // Spread-space `from`/`to` sets `vector` even alongside `angle`, and explicit null clears it.
+        s.execute(
+            "object.effects",
+            &json!({"ids": [id], "effects": {"gradientFeather": {"on": true, "angle": 15.0, "from": [130, 150], "to": [250, 230]}}}),
+        )
+        .unwrap();
+        assert_eq!(gf_of(&s).vector, Some([130.0, 150.0, 250.0, 230.0]));
+        s.execute(
+            "object.effects",
+            &json!({"ids": [id], "effects": {"gradientFeather": {"angle": -30.0, "vector": null, "from": null, "to": null}}}),
+        )
+        .unwrap();
+        let gf = gf_of(&s);
+        assert_eq!(gf.vector, None);
+        assert!((gf.angle + 30.0).abs() < 1e-6);
     }
 }
 
