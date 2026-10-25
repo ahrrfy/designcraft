@@ -44,7 +44,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     let mut open = true;
     let mut edit: Option<(usize, usize, String)> = None;
     let words = story.text.split_whitespace().count().to_string();
-    egui::Window::new(crate::i18n::tr(&app.ui.language, "Story Editor — {count} words").replace("{count}", &words))
+    egui::Window::new(crate::rtl::widget_ctx(ctx, crate::i18n::tr(&app.ui.language, "Story Editor — {count} words").replace("{count}", &words)))
         .id(egui::Id::new("story_editor"))
         .open(&mut open)
         .default_size(vec2(560.0, 520.0))

@@ -70,11 +70,19 @@ impl ProductionRunner {
         let vault = Vault::for_profile(&root)?;
         let mut registry = SkillRegistry::open(root.join("skills")).map_err(|e| e.to_string())?;
         registry.install_builtin_drafts().map_err(|e| e.to_string())?;
-        let settings = read_json(&profile_access, &root.join("settings.json"), 1024 * 1024)?
+        let mut settings = read_json(&profile_access, &root.join("settings.json"), 1024 * 1024)?
             .map(serde_json::from_value::<AiSettings>)
             .transpose()
             .map_err(|e| format!("AI settings: {e}"))?
             .unwrap_or_default();
+        let mut startup_warning = String::new();
+        if !settings.text_model.model.trim().is_empty() && designcraft_ai_types::is_non_text_model(&settings.text_model.model) {
+            startup_warning = format!(
+                "Cleared legacy non-text model '{}' from saved AI text settings; choose a text model for planning",
+                settings.text_model.model.trim()
+            );
+            settings.text_model.model.clear();
+        }
         validate_settings(&settings)?;
         let reports = read_json(&profile_access, &root.join("history.json"), 8 * 1024 * 1024)?
             .map(serde_json::from_value::<Vec<TaskReport>>)
@@ -87,10 +95,17 @@ impl ProductionRunner {
             .map_err(|e| format!("Print attempt history: {e}"))?
             .unwrap_or_default();
         let recovered_batch = batch::recover_snapshot(&profile_access, &root)?;
-        let (production_draft, draft_warning) = match read_json(&profile_access, &root.join("production-draft.json"), 2 * 1024 * 1024)
+        let settings_mtime = std::fs::metadata(root.join("settings.json")).and_then(|m| m.modified()).ok();
+        let draft_mtime = std::fs::metadata(root.join("production-draft.json")).and_then(|m| m.modified()).ok();
+        let (production_draft, mut draft_warning) = match read_json(&profile_access, &root.join("production-draft.json"), 2 * 1024 * 1024)
             .and_then(|value| value.map(serde_json::from_value::<ProductionDraft>).transpose().map_err(|e| e.to_string()))
-            .and_then(|draft| {
-                if let Some(draft) = &draft {
+            .and_then(|mut draft| {
+                if let Some(draft) = &mut draft {
+                    if !draft.request.settings.text_model.model.trim().is_empty()
+                        && designcraft_ai_types::is_non_text_model(&draft.request.settings.text_model.model)
+                    {
+                        draft.request.settings.text_model = settings.text_model.clone();
+                    }
                     validate_production_draft(draft)?;
                 }
                 Ok(draft)
@@ -100,17 +115,46 @@ impl ProductionRunner {
                     // UIDs are process-local. A saved path helps the human choose a book;
                     // neither it nor this draft authorizes publication or paid requests.
                     draft.document_uid = None;
+                    if let (Some(s_time), Some(d_time)) = (settings_mtime, draft_mtime)
+                        && s_time >= d_time
+                    {
+                        draft.request.settings = settings.clone();
+                    } else if designcraft_ai_types::is_non_image_model(
+                        draft.request.settings.image_model.provider,
+                        &draft.request.settings.image_model.model,
+                    ) && (settings.image_model.provider == ProviderKind::ComfyUi
+                        || (!settings.image_model.model.trim().is_empty()
+                            && !designcraft_ai_types::is_non_image_model(settings.image_model.provider, &settings.image_model.model)))
+                    {
+                        draft.request.settings.image_model = settings.image_model.clone();
+                    }
                 }
                 (draft, String::new())
             }
             Err(error) => (None, format!("Saved production instructions could not be restored: {error}")),
         };
+        if !startup_warning.is_empty() {
+            if draft_warning.is_empty() {
+                draft_warning = startup_warning;
+            } else {
+                draft_warning = format!("{startup_warning}; {draft_warning}");
+            }
+        }
+        let mut initial_stage = String::new();
+        if draft_warning.is_empty()
+            && recovered_batch.as_ref().is_some_and(|batch| batch.status == "failed")
+            && let Some(last_failed) = reports.last().filter(|report| report.status == "failed" && !report.message.trim().is_empty())
+        {
+            draft_warning = last_failed.message.clone();
+            initial_stage = "failed".into();
+        }
         let mut host = Self {
             root,
             profile_access,
             registry,
             snapshot: AiSnapshot {
                 available: true,
+                stage: initial_stage,
                 settings,
                 reports,
                 production_draft,
@@ -128,9 +172,114 @@ impl ProductionRunner {
             print_contracts: BTreeMap::new(),
             local_server: Default::default(),
         };
+        if let Some(dir) = std::env::var_os("DESIGNCRAFT_SKILLS_DIR").filter(|val| !val.is_empty())
+            && let Err(error) = host.install_portable_catalog(Path::new(&dir))
+        {
+            host.snapshot.skill_warnings.push(format!("Portable skills catalog warning: {error}"));
+        }
         host.refresh_catalog();
         host.refresh_credentials();
         Ok(host)
+    }
+
+    /// Install verified portable skill packages from the first discovered `skills/catalog.json`
+    /// directory (`DESIGNCRAFT_SKILLS_DIR`, adjacent to executable, or workspace `skills/` in debug
+    /// builds). Never searches the untrusted current working directory. Returns `Ok(0)` when absent.
+    pub fn install_default_portable_catalog(&mut self) -> Result<usize, String> {
+        let mut candidates = Vec::new();
+        if let Some(dir) = std::env::var_os("DESIGNCRAFT_SKILLS_DIR").filter(|val| !val.is_empty()) {
+            candidates.push(PathBuf::from(dir));
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            candidates.push(parent.join("skills"));
+        }
+        #[cfg(debug_assertions)]
+        candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
+        for dir in candidates {
+            let manifest = dir.join("catalog.json");
+            if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir())
+                && std::fs::symlink_metadata(&manifest).is_ok_and(|m| !m.file_type().is_symlink() && m.is_file())
+            {
+                return self.install_portable_catalog(&dir);
+            }
+        }
+        Ok(0)
+    }
+
+    /// Verify every listed file's SHA-256 digest and symlink-free path against `dir/catalog.json`
+    /// before importing each package as a draft into the profile's `SkillRegistry`.
+    pub fn install_portable_catalog(&mut self, dir: &Path) -> Result<usize, String> {
+        let dir_meta = std::fs::symlink_metadata(dir).map_err(|e| format!("skills catalog directory: {e}"))?;
+        if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+            return Err("Portable skills directory must be a non-symlink directory".into());
+        }
+        let catalog_bytes = read_catalog_file(&dir.join("catalog.json"), 2 * 1024 * 1024)?;
+        let manifest_sha = hex_sha256(&catalog_bytes);
+        let authentic_catalog = manifest_sha == hex_sha256(EMBEDDED_PORTABLE_CATALOG);
+        let provenance_source = if authentic_catalog { "Smart Design portable catalog" } else { "External portable catalog" };
+        let manifest: PortableCatalogManifest = serde_json::from_slice(&catalog_bytes).map_err(|e| format!("skills catalog.json: {e}"))?;
+        if manifest.schema_version != 1 {
+            return Err(format!("Unsupported portable skills catalog schema_version {}", manifest.schema_version));
+        }
+        if manifest.packages.len() > 256 {
+            return Err("Portable skills catalog exceeds the 256-package limit".into());
+        }
+        let mut imported = 0usize;
+        for pkg in manifest.packages {
+            let pkg_id = pkg.id.clone();
+            let outcome = (|| -> Result<(), String> {
+                validate_portable_package_id(&pkg.id)?;
+                if pkg.files.is_empty() || pkg.files.len() > 64 {
+                    return Err("package must declare 1 to 64 files".into());
+                }
+                let pkg_dir = dir.join(&pkg.id);
+                let pkg_meta = std::fs::symlink_metadata(&pkg_dir).map_err(|e| e.to_string())?;
+                if pkg_meta.file_type().is_symlink() || !pkg_meta.is_dir() {
+                    return Err("package path must be a non-symlink directory".into());
+                }
+                let mut files = designcraft_ai_skills::PackageFiles::new();
+                let mut total_bytes = 0usize;
+                for (rel_path, expected_sha) in &pkg.files {
+                    if expected_sha.len() != 64 || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+                        return Err(format!("invalid SHA-256 digest for {rel_path}"));
+                    }
+                    let full_path = resolve_portable_package_file(&pkg_dir, rel_path)?;
+                    let bytes = read_catalog_file(&full_path, 512 * 1024)?;
+                    total_bytes = total_bytes
+                        .checked_add(bytes.len())
+                        .filter(|sum| *sum <= 4 * 1024 * 1024)
+                        .ok_or_else(|| "package exceeds 4-MiB total size limit".to_string())?;
+                    let actual_sha = hex_sha256(&bytes);
+                    if actual_sha != *expected_sha {
+                        return Err(format!("SHA-256 mismatch for {rel_path}"));
+                    }
+                    files.insert(rel_path.clone(), bytes);
+                }
+                self.registry
+                    .import_files(
+                        files,
+                        Provenance { source: provenance_source.into(), author: None, license: None, source_sha256: Some(manifest_sha.clone()) },
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => imported = imported.saturating_add(1),
+                Err(error) => {
+                    if self.snapshot.skill_warnings.len() < 64 {
+                        self.snapshot.skill_warnings.push(format!(
+                            "Skipped portable skill {}: {}",
+                            pkg_id.chars().take(64).collect::<String>(),
+                            error.chars().take(512).collect::<String>()
+                        ));
+                    }
+                }
+            }
+        }
+        self.refresh_catalog();
+        Ok(imported)
     }
 
     pub fn handle(&mut self, session: &mut Session, request: AiRequest) -> AiSnapshot {
@@ -148,7 +297,16 @@ impl ProductionRunner {
         let failed_job = self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed") && self.pending.is_none();
         if self.batch.is_some()
             && !failed_job
-            && !matches!(request, AiRequest::Poll | AiRequest::Cancel | AiRequest::ApproveBatch { .. } | AiRequest::InspectSkill { .. })
+            && !matches!(
+                request,
+                AiRequest::Poll
+                    | AiRequest::Cancel
+                    | AiRequest::ApproveBatch { .. }
+                    | AiRequest::InspectSkill { .. }
+                    | AiRequest::RefreshCredentials
+                    | AiRequest::RefreshResources
+                    | AiRequest::ExportSkill { .. }
+            )
         {
             self.snapshot.message = "Finish reviewing or cancel the current production batch before another operation".into();
             return self.snapshot.clone();
@@ -160,7 +318,11 @@ impl ProductionRunner {
         if let Err(error) = self.dispatch(session, request) {
             self.snapshot.message = error;
             if !self.snapshot.busy {
-                self.snapshot.stage = "failed".into();
+                if self.batch.as_ref().is_some_and(|job| job.snapshot.status == "awaiting_human_proof") {
+                    self.snapshot.stage = "awaiting_human_proof".into();
+                } else {
+                    self.snapshot.stage = "failed".into();
+                }
             }
         }
         self.refresh_catalog();
@@ -182,8 +344,16 @@ impl ProductionRunner {
             AiRequest::UpdateSettings(settings) => {
                 validate_settings(&settings)?;
                 write_json(&self.profile_access, &self.root.join("settings.json"), &settings)?;
+                if let Some(mut draft) = self.snapshot.production_draft.clone() {
+                    draft.request.settings = settings.clone();
+                    self.persist_production_draft(&draft)?;
+                    self.snapshot.production_draft = Some(draft);
+                }
                 self.snapshot.settings = settings;
                 self.refresh_credentials();
+                if self.snapshot.stage == "failed" {
+                    self.snapshot.stage = "idle".into();
+                }
                 self.snapshot.message = "AI settings saved; API keys remain outside settings and reports".into();
             }
             AiRequest::SetApiKey { provider, key } => {
@@ -393,10 +563,10 @@ impl ProductionRunner {
     }
 
     fn start(&mut self, session: &mut Session, mut task: TaskRequest) -> Result<(), String> {
-        if matches!(task.target, TaskTarget::ContinueBook) {
+        if matches!(task.target, TaskTarget::ContinueBook | TaskTarget::CurrentDocument) {
             let current = session.doc().map_err(|e| e.to_string())?;
             task.settings.facing_pages |= current.doc.settings.facing_pages;
-            if current.doc.settings.facing_pages {
+            if current.doc.settings.facing_pages || current.doc.settings.right_to_left_binding {
                 task.settings.right_to_left_binding = Some(current.doc.settings.right_to_left_binding);
             }
         }
@@ -409,6 +579,7 @@ impl ProductionRunner {
         }
         self.save_production_draft(session, &task)?;
         require_text_model(&task.settings)?;
+        require_generation_models(&task.settings)?;
         let expected = match task.target {
             TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
             TaskTarget::ContinueBook => {
@@ -433,14 +604,7 @@ impl ProductionRunner {
             let pinned_ids = self.prepare_pinned_skills(session, &task.skill_ids)?;
             merge_pinned_and_automatic_skills(&pinned_ids, auto_ids, task.settings.design_style.as_deref())
         } else {
-            let mut ids = task.skill_ids.clone();
-            if let Some(id) = task.settings.design_style.as_deref() {
-                self.prepare_style(session, id)?;
-                if !ids.iter().any(|selected| selected == id) {
-                    ids.push(id.into());
-                }
-            }
-            ids
+            self.prepare_selected_skills(session, &task.skill_ids, task.settings.design_style.as_deref())?
         };
         if ids.len() > 8 {
             return Err("Select at most eight skills per task".into());
@@ -514,13 +678,7 @@ impl ProductionRunner {
             let pinned_ids = self.prepare_pinned_skills(session, &task.skill_ids)?;
             merge_pinned_and_automatic_skills(&pinned_ids, auto_ids, task.settings.design_style.as_deref())
         } else {
-            let mut ids = task.skill_ids.clone();
-            if let Some(style) = &task.settings.design_style
-                && !ids.contains(style)
-            {
-                ids.push(style.clone());
-            }
-            ids
+            self.prepare_selected_skills(session, &task.skill_ids, task.settings.design_style.as_deref())?
         };
         if ids.len() > 8 {
             return Err("Select at most eight skills per task".into());
@@ -541,6 +699,14 @@ impl ProductionRunner {
             if skill.design_profile.is_some() {
                 styles.push(skill);
             }
+        }
+        if styles.is_empty()
+            && task.auto_select_skills
+            && task.settings.design_style.is_none()
+            && let Some(fallback_id) = self.default_preview_style_id()
+        {
+            self.prepare_style(session, &fallback_id)?;
+            styles.push(self.registry.snapshot(&fallback_id, &[]).map_err(|error| error.to_string())?);
         }
         if styles.len() != 1 {
             return Err("Choose one compatible design style to preview its curriculum".into());
@@ -598,6 +764,10 @@ impl ProductionRunner {
         draft.document_path = current.path.clone();
         draft.document_title = current.title();
         draft.request.target = TaskTarget::ContinueBook;
+        draft.request.settings.facing_pages |= current.doc.settings.facing_pages;
+        if current.doc.settings.facing_pages || current.doc.settings.right_to_left_binding {
+            draft.request.settings.right_to_left_binding = Some(current.doc.settings.right_to_left_binding);
+        }
         self.persist_production_draft(&draft)?;
         self.snapshot.production_draft = Some(draft);
         Ok(())
@@ -924,12 +1094,26 @@ impl ProductionRunner {
                         file_access::check_write(Path::new(directory).join(format!("production-{}.{}", report.id, extension)))?;
                     }
                 }
+                let previous_active = session.active_index();
+                let mut switched_tab = false;
                 if let Some((uid, revision)) = expected {
-                    let current = session.doc().map_err(|e| e.to_string())?;
-                    if current.uid != uid || current.revision != revision {
+                    let Some(target_index) = session.documents().iter().position(|doc| doc.uid == uid) else {
                         return Err(
                             "The document changed during generation; result was not applied. Run the task again against the current document".into(),
                         );
+                    };
+                    let target = session.documents().get(target_index).ok_or("Target document disappeared")?;
+                    if target.interaction.is_some() || target.preview_stash.is_some() {
+                        return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
+                    }
+                    if target.revision != revision {
+                        return Err(
+                            "The document changed during generation; result was not applied. Run the task again against the current document".into(),
+                        );
+                    }
+                    if session.active_index() != Some(target_index) {
+                        session.set_active(target_index);
+                        switched_tab = true;
                     }
                 }
                 let runs = self.root.join("runs");
@@ -944,13 +1128,17 @@ impl ProductionRunner {
                     TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
                     TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages,"documentParams":page_params}),
                 };
-                write_json(
+                if let Err(err) = write_json(
                     &self.profile_access,
                     &trace,
                     &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"designStyle":report.design_style,"base":context,"plan":plan}),
-                )?;
+                ) {
+                    if switched_tab && let Some(index) = previous_active {
+                        session.set_active(index);
+                    }
+                    return Err(err);
+                }
                 report.artifacts.push(trace.to_string_lossy().into_owned());
-                let previous_active = session.active_index();
                 let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
                 let min_ppi =
                     crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
@@ -984,6 +1172,8 @@ impl ProductionRunner {
                             if let Some(index) = previous_active {
                                 session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
                             }
+                        } else if switched_tab && let Some(index) = previous_active {
+                            session.set_active(index);
                         }
                         return Err(error);
                     }
@@ -1237,6 +1427,7 @@ impl ProductionRunner {
                 let supported = &supported;
                 entry.revisions.into_iter().map(move |revision| {
                     let compatible = skill_is_compatible(&revision, supported);
+                    let trusted_source = is_trusted_catalog_provenance(&revision.provenance);
                     SkillCard {
                         design_profile: revision.manifest.design_profile.clone(),
                         id: entry.skill_id.clone(),
@@ -1246,6 +1437,7 @@ impl ProductionRunner {
                         revision: revision.revision,
                         approved: revision.status == RevisionStatus::Approved,
                         automatically_validated: revision.approval.as_ref().is_some_and(|approval| approval.automatic),
+                        trusted_source,
                         enabled: entry.enabled,
                         compatible,
                     }
@@ -1331,6 +1523,167 @@ impl ProductionRunner {
         self.snapshot.message = "Sample executed with native tools and passed preflight; review its preview before approving".into();
         Ok(())
     }
+
+    fn prepare_selected_skills(&mut self, session: &Session, skill_ids: &[String], style_id: Option<&str>) -> Result<Vec<String>, String> {
+        let mut ids = skill_ids.to_vec();
+        if let Some(style) = style_id {
+            let entry =
+                self.registry.catalog("").into_iter().find(|e| e.skill_id == style).ok_or_else(|| format!("Unknown design style: {style}"))?;
+            if !entry.enabled {
+                return Err(format!("Design style {style} is disabled"));
+            }
+            let latest = design_revision(&entry).ok_or("Design style has no revision")?;
+            let untrusted_draft = latest.status == RevisionStatus::Draft && !is_trusted_catalog_provenance(&latest.provenance);
+            if untrusted_draft {
+                if entry.active_revision.is_none() {
+                    return Err(format!("Skill {style} requires approval"));
+                }
+                let supported = supported_commands();
+                if !active_design_revision(&entry).is_some_and(|active| skill_is_compatible(active, &supported)) {
+                    return Err(format!("Design style {style} is incompatible or has no design profile"));
+                }
+            } else {
+                self.prepare_style(session, style)?;
+            }
+            if !ids.iter().any(|selected| selected == style) {
+                ids.push(style.to_owned());
+            }
+        }
+        let mut non_style_trusted = Vec::new();
+        for id in &ids {
+            let Some(entry) = self.registry.catalog("").into_iter().find(|e| &e.skill_id == id) else {
+                continue;
+            };
+            if entry.active_revision.is_some() || !entry.enabled {
+                continue;
+            }
+            let Some(revision) = entry.revisions.last() else {
+                continue;
+            };
+            if !is_trusted_catalog_provenance(&revision.provenance) {
+                continue;
+            }
+            if revision.manifest.design_profile.is_some() {
+                self.prepare_style(session, id)?;
+            } else {
+                non_style_trusted.push(id.clone());
+            }
+        }
+        if !non_style_trusted.is_empty() {
+            self.prepare_pinned_skills(session, &non_style_trusted)?;
+        }
+        Ok(ids)
+    }
+
+    fn default_preview_style_id(&self) -> Option<String> {
+        let supported = supported_commands();
+        let entries = self.registry.catalog("");
+        let has_compatible_profile = |entry: &designcraft_ai_skills::CatalogEntry| {
+            entry.enabled
+                && (design_revision(entry).is_some_and(|r| skill_is_compatible(r, &supported))
+                    || active_design_revision(entry).is_some_and(|r| skill_is_compatible(r, &supported)))
+        };
+        for preferred in ["kg-oxford-cambridge-style", "early-years-clear-style"] {
+            if entries.iter().any(|entry| entry.skill_id == preferred && has_compatible_profile(entry)) {
+                return Some(preferred.to_owned());
+            }
+        }
+        entries.into_iter().find(has_compatible_profile).map(|entry| entry.skill_id)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableCatalogManifest {
+    schema_version: u32,
+    packages: Vec<PortableCatalogPackage>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableCatalogPackage {
+    id: String,
+    files: BTreeMap<String, String>,
+}
+
+const EMBEDDED_PORTABLE_CATALOG: &[u8] = include_bytes!("../../../skills/catalog.json");
+
+fn is_trusted_catalog_provenance(provenance: &Provenance) -> bool {
+    provenance.source.starts_with("DesignCraft native builtin")
+        || (provenance.source == "Smart Design portable catalog"
+            && provenance.source_sha256.as_deref() == Some(hex_sha256(EMBEDDED_PORTABLE_CATALOG).as_str()))
+}
+
+fn validate_portable_package_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')) {
+        return Err("invalid portable package identifier".into());
+    }
+    let mut comps = Path::new(id).components();
+    if !matches!(comps.next(), Some(std::path::Component::Normal(_))) || comps.next().is_some() {
+        return Err("portable package identifier must be a single path segment".into());
+    }
+    Ok(())
+}
+
+fn resolve_portable_package_file(pkg_dir: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    if rel_path.is_empty() || rel_path.len() > 256 || rel_path.contains('\\') {
+        return Err(format!("invalid portable package file path: {rel_path}"));
+    }
+    let mut current = pkg_dir.to_path_buf();
+    let segments: Vec<_> = Path::new(rel_path).components().collect();
+    if segments.is_empty() || segments.len() > 8 {
+        return Err(format!("portable package file depth out of bounds: {rel_path}"));
+    }
+    for (idx, comp) in segments.iter().enumerate() {
+        let std::path::Component::Normal(seg) = comp else {
+            return Err(format!("non-normal portable package file path: {rel_path}"));
+        };
+        current.push(seg);
+        let meta = std::fs::symlink_metadata(&current).map_err(|e| format!("{rel_path}: {e}"))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("symlink forbidden in portable package path: {rel_path}"));
+        }
+        let is_last = idx + 1 == segments.len();
+        if is_last && !meta.is_file() {
+            return Err(format!("portable package entry is not a regular file: {rel_path}"));
+        }
+        if !is_last && !meta.is_dir() {
+            return Err(format!("portable package intermediate segment is not a directory: {rel_path}"));
+        }
+    }
+    Ok(current)
+}
+
+fn read_catalog_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err("catalog entry must be a regular non-symlink file".into());
+    }
+    if meta.len() > max_bytes {
+        return Err("catalog entry exceeds byte limit".into());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let limit = max_bytes.saturating_add(1);
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().min(64 * 1024)).unwrap_or(0));
+    file.take(limit).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if u64::try_from(buf.len()).map_or(true, |len| len > max_bytes) {
+        return Err("catalog entry grew past byte limit".into());
+    }
+    Ok(buf)
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let hi = char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0');
+        let lo = char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0');
+        out.push(hi);
+        out.push(lo);
+    }
+    out
 }
 
 /// Preserve immutable guidance and executable design profiles within the task
@@ -1988,6 +2341,32 @@ fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     }
     if designcraft_ai_types::is_non_text_model(&settings.text_model.model) {
         return Err("The selected text model is an image/media model; choose a text model for planning".into());
+    }
+    Ok(())
+}
+fn require_generation_models(settings: &AiSettings) -> Result<(), String> {
+    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+        if settings.image_model.provider != ProviderKind::ComfyUi && settings.image_model.model.trim().is_empty() {
+            return Err("Choose an image model before starting illustrated generation".into());
+        }
+        if settings.image_model.provider == ProviderKind::Ollama {
+            return Err("Ollama image generation is unsupported; choose an explicit image provider or switch Output Mode to Native Only".into());
+        }
+        if !settings.image_model.model.trim().is_empty()
+            && designcraft_ai_types::is_non_image_model(settings.image_model.provider, &settings.image_model.model)
+        {
+            return Err(
+                "The selected image model is a text/non-image model; choose a dedicated image generation model (such as gemini-3.1-flash-image or gpt-image-1) or switch Output Mode to Native Only"
+                    .into(),
+            );
+        }
+        if settings.verify_generated_images
+            && !designcraft_ai_types::supports_gemini_image_review(settings.text_model.provider, &settings.text_model.model)
+        {
+            return Err(
+                "Generated-image inspection requires a supported Gemini text model with image input; no provider or model fallback is enabled".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -4253,5 +4632,356 @@ mod tests {
         let child_entry = objects.iter().find(|entry| entry["id"].as_u64() == Some(g1)).expect("grouped child entry");
         assert_eq!(child_entry["parentGroup"].as_u64(), Some(group_id));
         assert_eq!(child_entry["content"].as_str(), Some("graphic"));
+    }
+
+    #[test]
+    fn portable_catalog_verifies_sha256_digests_and_enables_manual_and_default_previews() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let imported = runner.install_default_portable_catalog().unwrap();
+        assert!(imported >= 20, "expected workspace portable skills catalog to import, got {imported}");
+        assert!(runner.snapshot.skill_warnings.is_empty(), "warnings={:?}", runner.snapshot.skill_warnings);
+        assert!(runner.snapshot.skills.iter().any(|card| card.id == "kg-oxford-cambridge-style"));
+
+        // Repeat installation must be completely idempotent.
+        let count_before = runner.snapshot.skills.len();
+        let imported_again = runner.install_default_portable_catalog().unwrap();
+        assert_eq!(imported_again, imported);
+        assert_eq!(runner.snapshot.skills.len(), count_before);
+
+        // Tampered portable catalog file must be rejected by SHA-256 verification without crashing.
+        let tampered_dir = tempfile::tempdir().unwrap();
+        let pkg_dir = tampered_dir.path().join("tampered-skill");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("SKILL.md"), b"---\nname: tampered-skill\ndescription: tampered\n---\ntampered\n").unwrap();
+        std::fs::write(
+            tampered_dir.path().join("catalog.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "packages": [{
+                    "id": "tampered-skill",
+                    "files": {
+                        "SKILL.md": "0000000000000000000000000000000000000000000000000000000000000000"
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let tampered_imported = runner.install_portable_catalog(tampered_dir.path()).unwrap();
+        assert_eq!(tampered_imported, 0);
+        assert!(runner.snapshot.skill_warnings.iter().any(|w| w.contains("tampered-skill") && w.contains("SHA-256")));
+        assert!(!runner.snapshot.skills.iter().any(|card| card.id == "tampered-skill"));
+
+        // Automatic preview without style keywords falls back to a compatible design style cleanly.
+        let session = Session::new();
+        runner
+            .preview_production(
+                &session,
+                TaskRequest {
+                    prompt: "Create a 12-page classroom workbook".into(),
+                    settings: AiSettings::default(),
+                    skill_ids: Vec::new(),
+                    auto_select_skills: true,
+                    target: TaskTarget::NewA4 { pages: 12 },
+                    export_directory: None,
+                },
+            )
+            .unwrap();
+        assert!(runner.snapshot.production_preview.is_some());
+
+        // Manual skill selection on a fresh profile prepares trusted builtin/portable skills automatically,
+        // while still requiring explicit human approval for untrusted third-party drafts.
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let mut fresh_runner = ProductionRunner::open(fresh_dir.path()).unwrap();
+        fresh_runner.install_default_portable_catalog().unwrap();
+        fresh_runner
+            .preview_production(
+                &session,
+                TaskRequest {
+                    prompt: "Create an 8-page workbook".into(),
+                    settings: AiSettings::default(),
+                    skill_ids: vec!["early-years-clear-style".into(), "early-years-booklet-planning".into()],
+                    auto_select_skills: false,
+                    target: TaskTarget::NewA4 { pages: 8 },
+                    export_directory: None,
+                },
+            )
+            .unwrap();
+        assert!(fresh_runner.snapshot.production_preview.is_some());
+
+        let untrusted_manifest = designcraft_ai_skills::NativeManifest {
+            design_profile: None,
+            schema_version: 1,
+            skill_id: "untrusted-third-party".into(),
+            required_commands: vec!["frame.create".into()],
+            references: Vec::new(),
+            templates: vec!["templates/sample.json".into()],
+            sample_template: Some("templates/sample.json".into()),
+            external_tools: Vec::new(),
+            compatibility_notes: "Untrusted fixture".into(),
+        };
+        let skill_md = b"---\nname: untrusted-third-party\ndescription: third party\n---\nInstructions.\n".to_vec();
+        let manifest_bytes = serde_json::to_vec(&untrusted_manifest).unwrap();
+        let sample_bytes =
+            serde_json::to_vec(&json!([{"command": "frame.create", "params": {"rect": [54, 54, 140, 140], "content": "unassigned"}}])).unwrap();
+
+        // A self-consistent external portable catalog directory (whose catalog.json SHA-256 differs from
+        // the shipped Smart Design catalog) imports cleanly as a draft, but must NOT gain trusted auto-approval!
+        let external_catalog_dir = tempfile::tempdir().unwrap();
+        let external_pkg_dir = external_catalog_dir.path().join("untrusted-third-party");
+        std::fs::create_dir_all(external_pkg_dir.join("templates")).unwrap();
+        std::fs::write(external_pkg_dir.join("SKILL.md"), &skill_md).unwrap();
+        std::fs::write(external_pkg_dir.join("designcraft.json"), &manifest_bytes).unwrap();
+        std::fs::write(external_pkg_dir.join("templates/sample.json"), &sample_bytes).unwrap();
+        std::fs::write(
+            external_catalog_dir.path().join("catalog.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "packages": [{
+                    "id": "untrusted-third-party",
+                    "files": {
+                        "SKILL.md": hex_sha256(&skill_md),
+                        "designcraft.json": hex_sha256(&manifest_bytes),
+                        "templates/sample.json": hex_sha256(&sample_bytes),
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fresh_runner.install_portable_catalog(external_catalog_dir.path()).unwrap(), 1);
+        assert!(fresh_runner.snapshot.skills.iter().any(|c| c.id == "early-years-clear-style" && c.trusted_source));
+        assert!(fresh_runner.snapshot.skills.iter().any(|c| c.id == "untrusted-third-party" && !c.trusted_source));
+        let untrusted_err = fresh_runner
+            .preview_production(
+                &session,
+                TaskRequest {
+                    prompt: "Create an 8-page workbook".into(),
+                    settings: AiSettings::default(),
+                    skill_ids: vec!["early-years-clear-style".into(), "untrusted-third-party".into()],
+                    auto_select_skills: false,
+                    target: TaskTarget::NewA4 { pages: 8 },
+                    export_directory: None,
+                },
+            )
+            .unwrap_err();
+        assert!(untrusted_err.contains("active skill revision") || untrusted_err.contains("approval"), "err={untrusted_err}");
+
+        // An untrusted external design-style draft selected via settings.design_style in manual mode
+        // must also require explicit human approval rather than auto-activating via prepare_style.
+        let untrusted_style_manifest = designcraft_ai_skills::NativeManifest {
+            design_profile: Some(designcraft_ai_types::DesignProfile {
+                name: "Untrusted External Style".into(),
+                keywords: vec!["workbook".into()],
+                age_range: [5, 7],
+                page_mm: [210.0, 297.0],
+                margin_mm: 15.0,
+                palette: vec!["[Black]".into()],
+                typography: vec!["Readable native type".into()],
+                layout: vec!["Aligned tasks".into()],
+                pedagogy: vec!["Guided practice".into()],
+                illustration: vec!["Clean vector shapes".into()],
+                page_families: vec![designcraft_ai_types::PageFamily {
+                    id: "activity".into(),
+                    purpose: "Independent practice".into(),
+                    template: "templates/sample.json".into(),
+                    text_slots: Vec::new(),
+                    image_slots: Vec::new(),
+                }],
+                corrections: Vec::new(),
+            }),
+            schema_version: 1,
+            skill_id: "untrusted-external-style".into(),
+            required_commands: vec!["frame.create".into()],
+            references: Vec::new(),
+            templates: vec!["templates/sample.json".into()],
+            sample_template: Some("templates/sample.json".into()),
+            external_tools: Vec::new(),
+            compatibility_notes: "Untrusted external design style".into(),
+        };
+        let style_md = b"---\nname: untrusted-external-style\ndescription: third party style\n---\nInstructions.\n".to_vec();
+        let style_manifest_bytes = serde_json::to_vec(&untrusted_style_manifest).unwrap();
+        let style_pkg_dir = external_catalog_dir.path().join("untrusted-external-style");
+        std::fs::create_dir_all(style_pkg_dir.join("templates")).unwrap();
+        std::fs::write(style_pkg_dir.join("SKILL.md"), &style_md).unwrap();
+        std::fs::write(style_pkg_dir.join("designcraft.json"), &style_manifest_bytes).unwrap();
+        std::fs::write(style_pkg_dir.join("templates/sample.json"), &sample_bytes).unwrap();
+        std::fs::write(
+            external_catalog_dir.path().join("catalog.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "packages": [{
+                    "id": "untrusted-external-style",
+                    "files": {
+                        "SKILL.md": hex_sha256(&style_md),
+                        "designcraft.json": hex_sha256(&style_manifest_bytes),
+                        "templates/sample.json": hex_sha256(&sample_bytes),
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fresh_runner.install_portable_catalog(external_catalog_dir.path()).unwrap(), 1);
+        assert!(fresh_runner.snapshot.skills.iter().any(|c| c.id == "untrusted-external-style" && !c.trusted_source && !c.active));
+        let manual_style_settings = AiSettings { design_style: Some("untrusted-external-style".into()), ..Default::default() };
+        let style_err = fresh_runner
+            .preview_production(
+                &session,
+                TaskRequest {
+                    prompt: "Create an 8-page workbook".into(),
+                    settings: manual_style_settings,
+                    skill_ids: Vec::new(),
+                    auto_select_skills: false,
+                    target: TaskTarget::NewA4 { pages: 8 },
+                    export_directory: None,
+                },
+            )
+            .unwrap_err();
+        assert!(style_err.contains("requires approval"), "style_err={style_err}");
+        assert!(fresh_runner.snapshot.skills.iter().any(|c| c.id == "untrusted-external-style" && !c.active));
+    }
+
+    #[test]
+    fn start_rejects_mismatched_image_and_inspection_models_before_spending_requests_and_syncs_draft_and_rtl_binding() {
+        use designcraft_ai_types::{ModelSelection, OutputMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset": "A4", "pages": 4, "facingPages": true})).unwrap();
+        session.execute("layout.documentSetup", &json!({"binding": "rightToLeft"})).unwrap();
+
+        // 1. Text-only model in image_model slot with NativeWithImages must fail before spawning worker.
+        let bad_image_settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+            ..Default::default()
+        };
+        let snap1 = runner.handle(
+            &mut session,
+            AiRequest::Start(TaskRequest {
+                prompt: "Create an illustrated science page".into(),
+                settings: bad_image_settings,
+                skill_ids: Vec::new(),
+                auto_select_skills: false,
+                target: TaskTarget::CurrentDocument,
+                export_directory: None,
+            }),
+        );
+        assert_eq!(snap1.stage, "failed");
+        assert!(!snap1.busy && snap1.reports.is_empty());
+        assert!(snap1.message.contains("text/non-image model"), "msg={}", snap1.message);
+
+        // 2. Ollama in image_model slot with NativeWithImages must fail before spawning worker.
+        let ollama_image_settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::Ollama, model: "llava:latest".into(), endpoint: None },
+            ..Default::default()
+        };
+        let snap2 = runner.handle(
+            &mut session,
+            AiRequest::Start(TaskRequest {
+                prompt: "Create an illustrated science page".into(),
+                settings: ollama_image_settings,
+                skill_ids: Vec::new(),
+                auto_select_skills: false,
+                target: TaskTarget::CurrentDocument,
+                export_directory: None,
+            }),
+        );
+        assert_eq!(snap2.stage, "failed");
+        assert!(!snap2.busy && snap2.reports.is_empty());
+        assert!(snap2.message.contains("Ollama"), "msg={}", snap2.message);
+
+        // 3. verify_generated_images with non-Gemini (OpenAI) text_model must fail before spawning worker.
+        let bad_verify_settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            verify_generated_images: true,
+            text_model: ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-5.4".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image-preview".into(), endpoint: None },
+            ..Default::default()
+        };
+        let snap3 = runner.handle(
+            &mut session,
+            AiRequest::Start(TaskRequest {
+                prompt: "Create an illustrated science page".into(),
+                settings: bad_verify_settings,
+                skill_ids: Vec::new(),
+                auto_select_skills: false,
+                target: TaskTarget::CurrentDocument,
+                export_directory: None,
+            }),
+        );
+        assert_eq!(snap3.stage, "failed");
+        assert!(!snap3.busy && snap3.reports.is_empty());
+        assert!(snap3.message.contains("Gemini text model"), "msg={}", snap3.message);
+
+        // 4. bind_production_draft against an RTL facing-pages book must sync facing_pages & right_to_left_binding,
+        // and UpdateSettings must propagate updated settings into production-draft.json!
+        let stale_ltr = AiSettings {
+            facing_pages: false,
+            right_to_left_binding: Some(false),
+            text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None },
+            ..Default::default()
+        };
+        runner
+            .save_production_draft(
+                &session,
+                &TaskRequest {
+                    prompt: "Continue Arabic workbook".into(),
+                    settings: stale_ltr,
+                    skill_ids: Vec::new(),
+                    auto_select_skills: false,
+                    target: TaskTarget::ContinueBook,
+                    export_directory: None,
+                },
+            )
+            .unwrap();
+        runner.bind_production_draft(&session, "draft-rtl-bound").unwrap();
+        let draft_settings = runner.snapshot.production_draft.as_ref().unwrap().request.settings.clone();
+        assert!(draft_settings.facing_pages);
+        assert_eq!(draft_settings.right_to_left_binding, Some(true));
+
+        let mut healed_settings = draft_settings;
+        healed_settings.text_model.model = "gemini-3.8-flash".into();
+        let after_update = runner.handle(&mut session, AiRequest::UpdateSettings(healed_settings.clone()));
+        assert_eq!(after_update.production_draft.as_ref().unwrap().request.settings.text_model.model, "gemini-3.8-flash");
+
+        // 5. Even if an older production-draft.json on disk has stale model settings with an older mtime than settings.json,
+        // reopening ProductionRunner heals draft.request.settings from the newer settings.json.
+        let mut stale_draft = after_update.production_draft.unwrap();
+        stale_draft.request.settings.text_model.model = "gemini-2.5-flash".into();
+        write_json(&runner.profile_access, &dir.path().join("production-draft.json"), &stale_draft).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        write_json(&runner.profile_access, &dir.path().join("settings.json"), &healed_settings).unwrap();
+        let reopened = ProductionRunner::open(dir.path()).unwrap();
+        assert_eq!(reopened.snapshot.production_draft.as_ref().unwrap().request.settings.text_model.model, "gemini-3.8-flash");
+
+        // 6. Legacy saved media model in settings.json (Runs [084]-[087] gemini-3.1-flash-lite-image) must NOT brick
+        // ProductionRunner::open() on startup; it clears the invalid text slot with a warning and heals stale draft image_model.
+        let legacy_bad_settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-lite-image".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image".into(), endpoint: None },
+            ..Default::default()
+        };
+        let mut legacy_draft = reopened.snapshot.production_draft.clone().unwrap();
+        legacy_draft.request.settings.text_model.model = "gemini-3.1-flash-lite-image".into();
+        legacy_draft.request.settings.image_model =
+            ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        write_json(&reopened.profile_access, &dir.path().join("settings.json"), &legacy_bad_settings).unwrap();
+        write_json(&reopened.profile_access, &dir.path().join("production-draft.json"), &legacy_draft).unwrap();
+
+        let healed_open = ProductionRunner::open(dir.path()).unwrap();
+        assert!(healed_open.snapshot.available);
+        assert!(healed_open.snapshot.settings.text_model.model.is_empty());
+        assert!(healed_open.snapshot.message.contains("Cleared legacy non-text model"), "msg={}", healed_open.snapshot.message);
+        let healed_draft = healed_open.snapshot.production_draft.as_ref().unwrap();
+        assert!(healed_draft.request.settings.text_model.model.is_empty());
+        assert_eq!(healed_draft.request.settings.image_model.model, "gemini-3.1-flash-image");
     }
 }

@@ -238,6 +238,15 @@ fn open_filters(purpose: &str) -> &'static [OpenFilter] {
             OpenFilter { name: "Text (Word, RTF, plain, Excel)", extensions: &["docx", "rtf", "txt", "md", "xlsx"] },
             OpenFilter { name: "Video and sound", extensions: &["mp4", "m4v", "mov", "webm", "mp3", "m4a", "wav", "ogg"] },
         ],
+        "ai_target_document" => &[
+            OpenFilter {
+                name: "Editable & Importable Documents",
+                extensions: &["designcraft", "idml", "indd", "indt", "pdf", "docx", "rtf", "txt", "md", "xlsx"],
+            },
+            OpenFilter { name: "DesignCraft, IDML or InDesign", extensions: &["designcraft", "idml", "indd", "indt"] },
+            OpenFilter { name: "PDF & Office/Text (PDF, Word, RTF, Markdown, Excel)", extensions: &["pdf", "docx", "rtf", "txt", "md", "xlsx"] },
+            OpenFilter { name: "All files", extensions: &[ALL_FILES] },
+        ],
         _ => &[
             OpenFilter { name: "DesignCraft, IDML or InDesign", extensions: &["designcraft", "idml", "indd", "indt"] },
             OpenFilter { name: "DesignCraft", extensions: &["designcraft"] },
@@ -340,7 +349,16 @@ fn ai_service() -> Option<designcraft_ui_egui::AiFn> {
         }
         let root = profile::config_dir()?.join("AI");
         match designcraft_ai_runtime::ProductionRunner::open(root) {
-            Ok(mut runner) => Some(Box::new(move |session, request| runner.handle(session, request))),
+            Ok(mut runner) => {
+                // `ProductionRunner::open` already imports `DESIGNCRAFT_SKILLS_DIR` when set; only
+                // fall back to probing bundled/adjacent portable catalogs when that env var is unset.
+                if std::env::var_os("DESIGNCRAFT_SKILLS_DIR").is_none_or(|v| v.is_empty())
+                    && let Err(error) = runner.install_default_portable_catalog()
+                {
+                    log::warn!("AI portable skills catalog could not be loaded: {error}");
+                }
+                Some(Box::new(move |session, request| runner.handle(session, request)))
+            }
             Err(error) => {
                 log::error!("AI runtime initialization failed: {error}");
                 None
@@ -799,5 +817,15 @@ mod exit_recovery_tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn ai_target_document_filter_exposes_all_importable_and_native_formats() {
+        let primary = open_filters("ai_target_document")[0].extensions;
+        for ext in ["designcraft", "idml", "indd", "indt", "pdf", "docx", "rtf", "txt", "md", "xlsx"] {
+            assert!(primary.contains(&ext), "missing `{ext}` in ai_target_document filter");
+        }
+        let standard = open_filters("open")[0].extensions;
+        assert!(!standard.contains(&"pdf") && !standard.contains(&"docx"));
     }
 }

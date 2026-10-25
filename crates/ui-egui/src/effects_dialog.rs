@@ -236,9 +236,9 @@ fn swatch(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, path: &[&str]) {
         .session
         .active()
         .map_or_else(Vec::new, |st| st.doc.swatches.iter().filter(|w| !w.hidden || w.name == cur).map(|w| w.name.clone()).collect());
-    egui::ComboBox::from_id_salt(("fx_swatch", path.join("."))).selected_text(&cur).width(150.0).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(("fx_swatch", path.join("."))).selected_text(crate::rtl::widget(ui, &cur)).width(150.0).show_ui(ui, |ui| {
         for n in names {
-            if ui.selectable_label(n == cur, &n).clicked() {
+            if ui.selectable_label(n == cur, crate::rtl::widget(ui, &n)).clicked() {
                 set(d, path, json!(n));
             }
         }
@@ -283,9 +283,9 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
             grid("t").show(ui, |ui| {
                 row(ui, "Mode:");
                 let cur = d.fields.get("blend").and_then(Value::as_str).unwrap_or("Normal").to_string();
-                egui::ComboBox::from_id_salt("fx_blend").selected_text(tr(&cur)).width(150.0).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("fx_blend").selected_text(crate::rtl::widget(ui, tr(&cur))).width(150.0).show_ui(ui, |ui| {
                     for m in designcraft_color::BlendMode::ALL {
-                        if ui.selectable_label(m.label() == cur, tr(m.label())).clicked() {
+                        if ui.selectable_label(m.label() == cur, crate::rtl::widget(ui, tr(m.label()))).clicked() {
                             d.fields.insert("blend".into(), json!(m.label()));
                         }
                     }
@@ -351,9 +351,9 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                         serde_json::to_value(m).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
                     };
                     let shown = designcraft_color::BlendMode::ALL.iter().find(|m| label(m) == cur).map_or("Screen", |m| m.label());
-                    egui::ComboBox::from_id_salt("fx_glow_mode").selected_text(tr(shown)).width(150.0).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fx_glow_mode").selected_text(crate::rtl::widget(ui, tr(shown))).width(150.0).show_ui(ui, |ui| {
                         for m in designcraft_color::BlendMode::ALL {
-                            if ui.selectable_label(label(&m) == cur, tr(m.label())).clicked() {
+                            if ui.selectable_label(label(&m) == cur, crate::rtl::widget(ui, tr(m.label()))).clicked() {
                                 set(d, &["innerGlow", "mode"], json!(label(&m)));
                             }
                         }
@@ -379,23 +379,23 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                     ui.end_row();
                     row(ui, "Technique:");
                     let cur = d.fields.get("fx").and_then(|f| f["innerGlow"]["technique"].as_str()).unwrap_or("softer").to_string();
-                    egui::ComboBox::from_id_salt("fx_technique").selected_text(tr(if cur == "precise" { "Precise" } else { "Softer" })).show_ui(
-                        ui,
-                        |ui| {
+                    egui::ComboBox::from_id_salt("fx_technique")
+                        .selected_text(crate::rtl::widget(ui, tr(if cur == "precise" { "Precise" } else { "Softer" })))
+                        .show_ui(ui, |ui| {
                             for (v, l) in [("softer", "Softer"), ("precise", "Precise")] {
-                                if ui.selectable_label(cur == v, tr(l)).clicked() {
+                                if ui.selectable_label(cur == v, crate::rtl::widget(ui, tr(l))).clicked() {
                                     set(d, &["innerGlow", "technique"], json!(v));
                                 }
                             }
-                        },
-                    );
+                        });
                     ui.end_row();
                     row(ui, "Source:");
                     let mut center = d.fields.get("fx").is_some_and(|f| f["innerGlow"]["center"].as_bool().unwrap_or(false));
                     let label = |c: bool| tr(if c { "Center" } else { "Edge" });
-                    egui::ComboBox::from_id_salt("fx_source").selected_text(label(center)).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("fx_source").selected_text(crate::rtl::widget(ui, label(center))).show_ui(ui, |ui| {
                         for c in [false, true] {
-                            if ui.selectable_value(&mut center, c, label(c)).clicked() {
+                            let w = crate::rtl::widget(ui, label(c));
+                            if ui.selectable_value(&mut center, c, w).clicked() {
                                 set(d, &["innerGlow", "center"], json!(c));
                             }
                         }
@@ -474,9 +474,9 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                     "rounded" => "Rounded",
                     _ => "Diffused",
                 };
-                egui::ComboBox::from_id_salt("fx_corners").selected_text(tr(shown)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("fx_corners").selected_text(crate::rtl::widget(ui, tr(shown))).show_ui(ui, |ui| {
                     for (v, l) in [("sharp", "Sharp"), ("rounded", "Rounded"), ("diffused", "Diffused")] {
-                        if ui.selectable_label(cur == v, tr(l)).clicked() {
+                        if ui.selectable_label(cur == v, crate::rtl::widget(ui, tr(l))).clicked() {
                             set(d, &["featherOptions", "corners"], json!(v));
                         }
                     }
@@ -523,9 +523,10 @@ fn page_ui(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog, page: &str) {
                 row(ui, "Type:");
                 let mut radial = d.fields.get("fx").is_some_and(|f| f["gradientFeather"]["radial"].as_bool().unwrap_or(false));
                 let label = |r: bool| tr(if r { "Radial" } else { "Linear" });
-                egui::ComboBox::from_id_salt("fx_gtype").selected_text(label(radial)).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("fx_gtype").selected_text(crate::rtl::widget(ui, label(radial))).show_ui(ui, |ui| {
                     for r in [false, true] {
-                        if ui.selectable_value(&mut radial, r, label(r)).clicked() {
+                        let w = crate::rtl::widget(ui, label(r));
+                        if ui.selectable_value(&mut radial, r, w).clicked() {
                             set(d, &["gradientFeather", "radial"], json!(r));
                         }
                     }
@@ -557,7 +558,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
         crate::rtl::label(ui, tr("Settings for:"));
         // Stroke, Fill and Text levels aren't in the document model yet: the object only.
         ui.add_enabled_ui(false, |ui| {
-            egui::ComboBox::from_id_salt("fx_level").selected_text(tr("Object")).width(110.0).show_ui(ui, |_| {});
+            egui::ComboBox::from_id_salt("fx_level").selected_text(crate::rtl::widget(ui, tr("Object"))).width(110.0).show_ui(ui, |_| {});
         });
     });
     ui.add_space(6.0);
@@ -584,7 +585,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
                             }
                         }
                     }
-                    if ui.selectable_label(page == key, tr(label)).clicked() {
+                    if ui.selectable_label(page == key, crate::rtl::widget(ui, tr(label))).clicked() {
                         d.fields.insert("page".into(), json!(key));
                         if let Some(f) = d.fields.get_mut("fx") {
                             turn_on(f, key);
@@ -738,5 +739,109 @@ mod tests {
         let p = params(d);
         assert_eq!(p["effects"]["dropShadow"]["on"], true, "chosen from the menu: on");
         assert_eq!(summary("en", d), "OBJECT: Normal 100%; Drop Shadow");
+    }
+
+    #[test]
+    fn the_effects_dialog_shapes_arabic_sidebar_and_combobox_labels() {
+        let (mut app, _) = app_with_frame();
+        app.ui.language = "ar".into();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx, "ar");
+        fn check(ctx: &egui::Context, s: egui::epaint::Shape, count: &mut usize) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    let logical = t.galley.job.text.as_str();
+                    if logical.chars().any(designcraft_fonts::is_rtl) {
+                        *count += 1;
+                        assert!(crate::rtl::matches_rtl_layout(ctx, &t.galley), "Arabic text `{logical}` bypassed rtl::widget/rtl::label shaping");
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.into_iter().for_each(|s| check(ctx, s, count)),
+                _ => {}
+            }
+        }
+        for page in [
+            "transparency",
+            "dropShadow",
+            "innerShadow",
+            "outerGlow",
+            "innerGlow",
+            "bevel",
+            "satin",
+            "feather",
+            "directionalFeather",
+            "gradientFeather",
+        ] {
+            open(&mut app, page);
+            let mut arabic_galleys = 0usize;
+            for pass in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                    max_texture_side: Some(8192),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(&mut app, ui.ctx()));
+                out.textures_delta.clear();
+                if pass == 1 {
+                    arabic_galleys = 0;
+                    for c in out.shapes {
+                        check(&ctx, c.shape, &mut arabic_galleys);
+                    }
+                }
+            }
+            assert!(arabic_galleys >= 12, "page {page} rendered too few shaped Arabic galleys: {arabic_galleys}");
+            crate::dialogs::cancel(&mut app);
+        }
+
+        // Also sweep secondary modal dialogs (Preferences, Find/Change text & object modes, Export PDF, Place PDF).
+        let secondary_dialogs = [
+            Dialog::new("preferences", json!({})),
+            Dialog::new("findChange", json!({"objectMode": false})),
+            Dialog::new("findChange", json!({"objectMode": true, "status": "Not found."})),
+            Dialog::new("pdfExport", json!({})),
+            Dialog::new("pdfImport", json!({"path": "عينة.pdf", "pages": 4, "page": 1, "crop": "crop"})),
+        ];
+        for dlg in secondary_dialogs {
+            let dlg_id = dlg.id.clone();
+            app.ui.dialog = Some(dlg);
+            let mut arabic_galleys = 0usize;
+            for pass in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                    max_texture_side: Some(8192),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| crate::dialogs::show(&mut app, ui.ctx()));
+                out.textures_delta.clear();
+                if pass == 1 {
+                    arabic_galleys = 0;
+                    for c in out.shapes {
+                        check(&ctx, c.shape, &mut arabic_galleys);
+                    }
+                }
+            }
+            assert!(arabic_galleys >= 5, "dialog {dlg_id} rendered too few shaped Arabic galleys: {arabic_galleys}");
+            crate::dialogs::cancel(&mut app);
+        }
+
+        // Also sweep Data Merge panel in Arabic mode (including Multiple Records spacing fields).
+        let _ = app.run("data.options", json!({"recordsPerPage": "multiple"}));
+        let mut dm_galleys = 0usize;
+        for pass in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                max_texture_side: Some(8192),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| crate::panels::datamerge::show(&mut app, ui));
+            out.textures_delta.clear();
+            if pass == 1 {
+                dm_galleys = 0;
+                for c in out.shapes {
+                    check(&ctx, c.shape, &mut dm_galleys);
+                }
+            }
+        }
+        assert!(dm_galleys >= 8, "Data Merge rendered too few shaped Arabic galleys: {dm_galleys}");
     }
 }

@@ -14,6 +14,10 @@ $source = Join-Path $testRoot 'source'
 [IO.Directory]::CreateDirectory($source) | Out-Null
 [IO.Directory]::CreateDirectory((Join-Path $source 'font-licenses')) | Out-Null
 [IO.File]::WriteAllText((Join-Path $source 'font-licenses/LICENSE-MIT'), 'Synthetic redistribution notice without a file extension.')
+[IO.Directory]::CreateDirectory((Join-Path $source 'skills/sample-style/templates')) | Out-Null
+[IO.File]::WriteAllText((Join-Path $source 'skills/catalog.json'), '{"schema_version":1,"packages":[]}')
+[IO.File]::WriteAllText((Join-Path $source 'skills/sample-style/SKILL.md'), "---`nname: sample-style`ndescription: fixture`n---`nInstructions.`n")
+[IO.File]::WriteAllText((Join-Path $source 'skills/sample-style/templates/sample.json'), '[]')
 foreach ($name in @('designcraft.exe', 'designcraft-cli.exe')) { [IO.File]::WriteAllText((Join-Path $source $name), ('synthetic fixture, never executable: ' + $name)) }
 $sha = 'a' * 40
 Check ((Get-PreviewUpdateDecision ('b' * 40) $sha 'behind') -eq 'up_to_date') 'An older published ancestor was not reported as up to date.'
@@ -64,6 +68,8 @@ $meta = [pscustomobject]@{
 }
 $installed = Join-Path $testRoot 'installed'
 Expand-VerifiedUpdate $archive $installed $meta
+Check (Test-Path -LiteralPath (Join-Path $installed 'skills/catalog.json') -PathType Leaf) 'Portable skills catalog was not extracted.'
+Check ((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package.ps1') -Raw).Contains("Join-Path `$Portable 'skills'")) 'Portable ZIP packager does not stage skills/.'
 Reject { Expand-VerifiedUpdate $archive $installed $meta }
 $meta | Add-Member -NotePropertyName syncBaseCommit -NotePropertyValue $syncBase -Force
 Assert-UpdateMetadata $meta

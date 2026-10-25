@@ -540,16 +540,19 @@ impl Renderer {
             return;
         }
         let xf = parent * it.xf;
-        let vb = xf.transform_rect_bbox(it.inner_bounds()).inflate(it.stroke.extent() + 2.0, it.stroke.extent() + 2.0);
+        let ext = it.stroke.extent();
+        let pad = if ext.is_finite() { ext.max(0.0) } else { 0.0 } + 2.0;
+        let vb = xf.transform_rect_bbox(it.inner_bounds()).inflate(pad, pad);
         // A frame with items pasted into it draws like any other object (draw_body: fill, the items
         // clipped to the frame, stroke), so its effects apply to all of it.
         if !it.children().is_empty() && !it.has_nested_items() {
             // Groups: children carry their own transforms relative to the group.
             // Isolate Blending / Knockout: the group is its own layer (blend modes stop at it).
-            let layered = it.opacity < 0.999 || it.blend != DcBlend::Normal || it.isolate || it.knockout;
+            let opacity = if it.opacity.is_finite() { it.opacity.clamp(0.0, 1.0) } else { 1.0 };
+            let layered = opacity < 0.999 || it.blend != DcBlend::Normal || it.isolate || it.knockout;
             if layered {
                 ctx.set_transform(Affine::IDENTITY);
-                ctx.push_layer(None, Some(blend_mode(it.blend)), Some(it.opacity), None, None);
+                ctx.push_layer(None, Some(blend_mode(it.blend)), Some(opacity), None, None);
             }
             // Gradient feather: the group's objects drawn together, then faded as one.
             let feather = it.effects.gradient_feather.on && f.opts.quality != DisplayQuality::Fast;
@@ -598,10 +601,11 @@ impl Renderer {
         }
         self.stats.items += 1;
         let bp = if it.corners.is_none() { it.path.to_bezpath() } else { corners::apply(&it.path, &it.corners) };
-        let layered = it.opacity < 0.999 || it.blend != DcBlend::Normal;
+        let opacity = if it.opacity.is_finite() { it.opacity.clamp(0.0, 1.0) } else { 1.0 };
+        let layered = opacity < 0.999 || it.blend != DcBlend::Normal;
         if layered {
             ctx.set_transform(Affine::IDENTITY);
-            ctx.push_layer(None, Some(blend_mode(it.blend)), Some(it.opacity), None, None);
+            ctx.push_layer(None, Some(blend_mode(it.blend)), Some(opacity), None, None);
         }
         if effects {
             self.draw_item_fx(ctx, f, it, &bp, xf, page);
@@ -1032,12 +1036,13 @@ pub(crate) fn screen_color(rgb: [u8; 3], alpha: u8) -> peniko::Color {
 }
 
 pub fn color_of(c: &designcraft_color::Color, alpha: f32) -> peniko::Color {
+    let alpha = if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 0.0 };
     if let Some(p) = PLATE.with(|p| p.get()) {
         let cmyk = match *c {
             designcraft_color::Color::Cmyk { c, m, y, k } => [c, m, y, k],
             _ => c.to_cmyk_managed(designcraft_color::cms::Intent::RelativeColorimetric),
         };
-        let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let a = (alpha * 255.0).round() as u8;
         let ink = |i: usize| ((1.0 - cmyk[i].clamp(0.0, 1.0)) * 255.0).round() as u8;
         if p == 4 {
             return peniko::Color::from_rgba8(ink(0), ink(1), ink(2), a);
@@ -1052,7 +1057,7 @@ pub fn color_of(c: &designcraft_color::Color, alpha: f32) -> peniko::Color {
         && y <= 1e-3
         && k >= 0.999
     {
-        return peniko::Color::from_rgba8(0, 0, 0, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8);
+        return peniko::Color::from_rgba8(0, 0, 0, (alpha * 255.0).round() as u8);
     }
     let [r, g, b, a] = c.to_rgba8(alpha);
     peniko::Color::from_rgba8(r, g, b, a)

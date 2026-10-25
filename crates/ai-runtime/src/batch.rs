@@ -136,9 +136,11 @@ impl ProductionRunner {
         let Some(job) = self.batch.as_ref().filter(|job| job.snapshot.status == "awaiting_human_proof" && self.pending.is_none()) else {
             return Ok(());
         };
-        let Some(current) = session.active() else { return Ok(()) };
-        if Some(current.uid) != job.snapshot.document_uid
-            || Some(current.revision) == job.snapshot.document_revision
+        let Some(target_uid) = job.snapshot.document_uid else { return Ok(()) };
+        let Some(current) = session.documents().iter().find(|doc| doc.uid == target_uid) else { return Ok(()) };
+        if Some(current.revision) == job.snapshot.document_revision
+            || current.interaction.is_some()
+            || current.preview_stash.is_some()
             || !job.publication_base.as_ref().is_some_and(|published| {
                 Arc::ptr_eq(&published.doc, &current.doc)
                     && published.active_layer == current.active_layer
@@ -382,16 +384,29 @@ impl ProductionRunner {
         {
             return Err("Approval does not match the current unconsumed human proof checkpoint".into());
         }
+        self.refresh_unchanged_proof(session)?;
+        ensure_publication_idle(session)?;
+        if let Some(target_uid) = self.batch.as_ref().and_then(|job| job.snapshot.document_uid)
+            && let Some(target_doc) = session.documents().iter().find(|doc| doc.uid == target_uid)
+            && (target_doc.interaction.is_some() || target_doc.preview_stash.is_some())
+        {
+            return Err("Finish the current interaction, IME composition or preview before publishing AI production".to_string());
+        }
         let mut job = self.batch.take().ok_or("Batch checkpoint disappeared")?;
-        let validation = (|| {
+        let validation: Result<usize, String> = (|| {
             if !Arc::ptr_eq(&job.publication_cache, &session.cache) {
                 return Err("Font cache changed after proof generation; approval is invalid".to_string());
             }
             if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? {
                 return Err("Application preferences changed after proof generation; approval is invalid".to_string());
             }
-            let current = session.doc().map_err(|e| e.to_string())?;
-            if Some(current.uid) != job.snapshot.document_uid || Some(current.revision) != job.snapshot.document_revision {
+            let Some(target_index) = session.documents().iter().position(|doc| Some(doc.uid) == job.snapshot.document_uid) else {
+                return Err(
+                    "The book changed after proof generation; approval is invalid. Start a new task against the corrected document".to_string()
+                );
+            };
+            let current = session.documents().get(target_index).ok_or("Approved book disappeared")?;
+            if Some(current.revision) != job.snapshot.document_revision {
                 return Err(
                     "The book changed after proof generation; approval is invalid. Start a new task against the corrected document".to_string()
                 );
@@ -416,15 +431,49 @@ impl ProductionRunner {
                     return Err("Batch proof bytes changed after generation; approval is invalid".into());
                 }
             }
-            Ok(())
+            Ok(target_index)
         })();
-        if let Err(error) = validation {
-            job.snapshot.status = "failed".into();
-            self.snapshot.batch = Some(job.snapshot.clone());
-            self.snapshot.stage = "failed".into();
-            self.persist_batch(&job.snapshot)?;
-            return Err(error);
-        }
+        let target_index = match validation {
+            Ok(idx) => idx,
+            Err(error) => {
+                job.snapshot.status = "failed".into();
+                self.snapshot.batch = Some(job.snapshot.clone());
+                self.snapshot.stage = "failed".into();
+                let _ = self.persist_batch(&job.snapshot);
+                return Err(error);
+            }
+        };
+        let next_launch = if job.snapshot.completed_pages < job.snapshot.total_pages {
+            let prep: Result<(DocState, Value, u32), String> = (|| {
+                let target_doc = session.documents().get(target_index).ok_or("Approved book disappeared")?;
+                let mut base = crate::facing_pages::canonicalize(target_doc, &session.prefs)?;
+                base.selection = Default::default();
+                let mut projected = Session::new();
+                projected.prefs = session.prefs.clone();
+                projected.add_document(base.clone());
+                let mut next_job_view = job.clone();
+                if let Some(last) = next_job_view.snapshot.batches.last_mut() {
+                    last.status = "approved".into();
+                }
+                let context = batch_context(&projected, &next_job_view, &self.root)?;
+                let next_batch = job.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
+                Ok((base, context, next_batch))
+            })();
+            match prep {
+                Ok(ready) => Some(ready),
+                Err(error) => {
+                    job.snapshot.status = "failed".into();
+                    self.snapshot.batch = Some(job.snapshot.clone());
+                    self.snapshot.stage = "failed".into();
+                    let _ = self.persist_batch(&job.snapshot);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let unapproved_job = job.clone();
+        let unapproved_reports = self.snapshot.reports.clone();
         if let Some(last) = job.snapshot.batches.last_mut() {
             last.status = "approved".into();
         }
@@ -433,10 +482,19 @@ impl ProductionRunner {
             report.status = "approved".into();
             report.message = "Human approved the exact native/PDF/PNG proof checkpoint".into();
         }
-        // Record the human decision before any new network work can begin.
-        self.persist_batch(&job.snapshot)?;
-        write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports)?;
-        if job.snapshot.completed_pages == job.snapshot.total_pages {
+        // Record the human decision before mutating active tab or launching network work.
+        if let Err(io_err) =
+            self.persist_batch(&job.snapshot).and_then(|()| write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports))
+        {
+            self.snapshot.reports = unapproved_reports;
+            self.snapshot.batch = Some(unapproved_job.snapshot.clone());
+            self.batch = Some(unapproved_job);
+            return Err(io_err);
+        }
+        if session.active_index() != Some(target_index) {
+            session.set_active(target_index);
+        }
+        let Some((base, context, next_batch)) = next_launch else {
             job.snapshot.status = "completed".into();
             // Final proof approval is deliberately a local transition: no worker or provider call.
             let exported = file_access::confine(job.roots.as_ref(), || self.export_finished_batch(session, &job.task, &job.snapshot.job_id));
@@ -454,27 +512,11 @@ impl ProductionRunner {
                 write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports)?;
             }
             return exported.map(|_| ());
-        }
-        let mut base = crate::facing_pages::canonicalize(session.doc().map_err(|e| e.to_string())?, &session.prefs)?;
-        base.selection = Default::default();
-        let mut projected = Session::new();
-        projected.prefs = session.prefs.clone();
-        projected.add_document(base.clone());
-        let context = batch_context(&projected, &job, &self.root)?;
-        job.snapshot.current_batch = job.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
+        };
+        job.snapshot.current_batch = next_batch;
         // Consumes this exact approval before any next request is launched.
         job.snapshot.status = "running".into();
-        let prior = job.snapshot.clone();
-        if let Err(error) = self.launch_batch(job, base, context) {
-            if self.batch.is_none() {
-                let mut failed = prior;
-                failed.status = "failed".into();
-                self.snapshot.batch = Some(failed.clone());
-                self.persist_batch(&failed)?;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.launch_batch(job, base, context)
     }
 
     pub(super) fn cancel_batch(&mut self) {
@@ -690,18 +732,29 @@ impl ProductionRunner {
             created.history.undo.clear();
             created.history.redo.clear();
         }
+        let mut switched_tab = false;
         let result = (|| {
-            let current = session.doc().map_err(|e| e.to_string())?;
-            if !first
-                && (Some(current.uid) != job.snapshot.document_uid
-                    || !job.publication_base.as_ref().is_some_and(|original| {
-                        Arc::ptr_eq(&original.doc, &current.doc)
-                            && original.active_layer == current.active_layer
-                            && original.editing_parents == current.editing_parents
-                    }))
-            {
-                return Err("The book changed while its batch was generating; publication is refused".into());
+            if !first {
+                let Some(target_index) = session.documents().iter().position(|doc| Some(doc.uid) == job.snapshot.document_uid) else {
+                    return Err("The book changed while its batch was generating; publication is refused".into());
+                };
+                let target = session.documents().get(target_index).ok_or("Target book disappeared")?;
+                if target.interaction.is_some() || target.preview_stash.is_some() {
+                    return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
+                }
+                if !job.publication_base.as_ref().is_some_and(|original| {
+                    Arc::ptr_eq(&original.doc, &target.doc)
+                        && original.active_layer == target.active_layer
+                        && original.editing_parents == target.editing_parents
+                }) {
+                    return Err("The book changed while its batch was generating; publication is refused".into());
+                }
+                if session.active_index() != Some(target_index) {
+                    session.set_active(target_index);
+                    switched_tab = true;
+                }
             }
+            let current = session.doc().map_err(|e| e.to_string())?;
             let mut base = current.clone();
             base.selection = Default::default();
             let change_layout = job.task.settings.facing_pages && !base.doc.settings.facing_pages;
@@ -712,10 +765,18 @@ impl ProductionRunner {
             };
             let projected_base = facing.as_ref().unwrap_or(&base);
             let canonical = crate::facing_pages::canonicalize(projected_base, &job.prefs)?;
-            worker::simulate_group_scoped(plans, &canonical, &job.prefs, job.task.settings.output_mode, &AtomicBool::new(false), scope)?;
+            let required_min_ppi = crate::print_contract::PrintContract::from_prompt(&job.task.prompt)?.and_then(|contract| contract.min_image_ppi());
+            let min_ppi = required_min_ppi.unwrap_or(150.0);
+            worker::simulate_group_scoped_with_ppi(
+                plans,
+                &canonical,
+                &job.prefs,
+                job.task.settings.output_mode,
+                &AtomicBool::new(false),
+                scope,
+                required_min_ppi,
+            )?;
             let mapped: Vec<_> = plans.iter().map(|plan| crate::facing_pages::map_plan(plan, projected_base)).collect::<Result<_, _>>()?;
-            let min_ppi =
-                crate::print_contract::PrintContract::from_prompt(&job.task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
             let chunks = mapped.iter().map(|plan| json!({"commands":plan.commands,"label":plan.title})).collect::<Vec<_>>();
             let mut projected = Session::new();
             projected.prefs = job.prefs.clone();
@@ -727,6 +788,10 @@ impl ProductionRunner {
             }
             projected.execute("production.applyGroup", &group_params).map_err(|e| e.to_string())?;
             crate::facing_pages::validate_mapped_result(projected_base, projected.doc().map_err(|e| e.to_string())?, scope)?;
+            if required_min_ppi.is_some() {
+                let projected_preflight = projected.execute("preflight.run", &json!({"minPpi": min_ppi})).map_err(|e| e.to_string())?;
+                worker::ensure_no_new_low_resolution(&projected_preflight, &base, required_min_ppi)?;
+            }
             let uid = current.uid;
             let revision = current.revision;
             let directory_name = if job.retry_sequence == 0 {
@@ -775,6 +840,12 @@ impl ProductionRunner {
             if let Some(index) = previous {
                 session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
             }
+        } else if !first
+            && switched_tab
+            && result.is_err()
+            && let Some(index) = previous
+        {
+            session.set_active(index);
         }
         result
     }
@@ -2118,6 +2189,202 @@ mod tests {
             assert!(context["recentApprovedObjects"].to_string().contains("roots and leaves"));
             assert!(!context["recentApprovedBatchRanges"].to_string().contains("UNPUBLISHED"));
             assert!(serde_json::to_vec(&context).unwrap().len() < 48 * 1024);
+        }
+    }
+
+    #[test]
+    fn multi_tab_switching_preserves_batch_approval_and_publication_for_unchanged_target_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let book_uid = session.doc().unwrap().uid;
+        assert_eq!(runner.batch.as_ref().unwrap().snapshot.document_uid, Some(book_uid));
+
+        // Open a second scratch document tab and edit IT while the target book tab remains untouched.
+        session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+        session.execute("frame.create", &json!({"spread": 0, "rect": [72, 72, 240, 140], "content": "text", "text": "Scratch tab notes"})).unwrap();
+        let scratch_uid = session.doc().unwrap().uid;
+        assert_ne!(book_uid, scratch_uid);
+        assert_eq!(session.active_index(), Some(1));
+
+        // Refreshing unchanged proof while viewing the scratch tab must succeed because target book is intact.
+        runner.refresh_unchanged_proof(&session).unwrap();
+        let mut job = runner.batch.take().unwrap();
+
+        // Publishing batch 2 while viewing the scratch tab must activate the target book by uid and publish cleanly.
+        let plan = ProductionPlan {
+            title: "Page two".into(),
+            commands: vec![EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread": 1, "rect": [50, 50, 300, 140], "content": "text", "text": "Second batch published across tabs", "caret": false}),
+            }],
+            images: vec![],
+        };
+        let mut report = TaskReport {
+            design_style: None,
+            id: "multi-tab-publish".into(),
+            status: String::new(),
+            title: String::new(),
+            provider: ProviderKind::Ollama,
+            model: "mock".into(),
+            settings: Some(job.task.settings.clone()),
+            skills: vec![],
+            usage: Default::default(),
+            elapsed_ms: 0,
+            actions: 0,
+            issues: vec![],
+            artifacts: vec![],
+            message: String::new(),
+        };
+        let proofs = vec![
+            worker::ProofArtifact { name: "document.designcraft".into(), bytes: vec![1] },
+            worker::ProofArtifact { name: "proof.pdf".into(), bytes: vec![2] },
+            worker::ProofArtifact { name: "page-2.png".into(), bytes: vec![3] },
+        ];
+        runner
+            .publish_batch(
+                &mut session,
+                &mut job,
+                &[plan],
+                proofs,
+                worker::BatchScope { start: 1, count: 1 },
+                &mut BatchReport::default(),
+                &mut report,
+            )
+            .unwrap();
+        assert_eq!(session.doc().unwrap().uid, book_uid);
+        assert!(session.doc().unwrap().doc.stories.values().any(|s| s.text == "Second batch published across tabs"));
+        // Scratch tab remains intact in session.documents()[1].
+        assert_eq!(session.documents()[1].uid, scratch_uid);
+        assert!(session.documents()[1].doc.stories.values().any(|s| s.text == "Scratch tab notes"));
+    }
+
+    #[test]
+    fn approve_batch_rebinds_unchanged_revision_and_preserves_checkpoint_across_transient_busy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        // Mark as final batch so final approval completes locally without network IO.
+        if let Some(snap) = runner.batch.as_mut().map(|job| {
+            job.snapshot.completed_pages = job.snapshot.total_pages;
+            job.snapshot.clone()
+        }) {
+            runner.persist_batch(&snap).unwrap();
+            runner.snapshot.batch = Some(snap);
+        }
+        runner.snapshot.stage = "awaiting_human_proof".into();
+
+        // 1. Active preview_stash on the target book (doc 0) must reject transiently without consuming the checkpoint.
+        session.doc_mut().unwrap().bump_revision();
+        session.doc_mut().unwrap().preview_stash = Some(session.doc().unwrap().doc.clone());
+
+        let transient_snap = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint });
+        assert_eq!(transient_snap.stage, "awaiting_human_proof", "transient preview must not fail the checkpoint");
+        assert!(transient_snap.message.contains("Finish the current interaction, IME composition or preview"), "msg={}", transient_snap.message);
+        assert_eq!(runner.batch.as_ref().unwrap().snapshot.status, "awaiting_human_proof");
+        assert_eq!(transient_snap.batch.as_ref().unwrap().status, "awaiting_human_proof");
+        session.stop_data_preview();
+
+        // 2. Open a scratch tab (doc 1), start an uncommitted interaction on target book (doc 0),
+        // then switch to doc 1: ApproveBatch must still reject transiently without consuming the checkpoint!
+        session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+        assert_eq!(session.active_index(), Some(1));
+        session.set_active(0);
+        {
+            let st = session.doc_mut().unwrap();
+            st.interaction = Some(designcraft_engine::Interaction {
+                label: "drag".into(),
+                doc: st.doc.clone(),
+                selection: st.selection.clone(),
+                preview: None,
+                revision: st.revision,
+            });
+        }
+        session.set_active(1);
+        session.doc_mut().unwrap().preview_stash = Some(session.doc().unwrap().doc.clone());
+
+        let active_busy_snap = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint });
+        assert_eq!(active_busy_snap.stage, "awaiting_human_proof");
+        assert_eq!(runner.batch.as_ref().unwrap().snapshot.status, "awaiting_human_proof");
+
+        // Clear scratch tab preview_stash while target book (doc 0) still has uncommitted interaction:
+        session.stop_data_preview();
+        let target_busy_snap = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint });
+        assert_eq!(target_busy_snap.stage, "awaiting_human_proof");
+        assert!(target_busy_snap.message.contains("Finish the current interaction, IME composition or preview"));
+        assert_eq!(runner.batch.as_ref().unwrap().snapshot.status, "awaiting_human_proof");
+
+        // 3. Cancel uncommitted interaction on doc 0, bump revision (selection/navigation without Poll),
+        // switch back to scratch tab (doc 1), and approve directly: must rebind and complete cleanly!
+        session.set_active(0);
+        session.doc_mut().unwrap().interaction = None;
+        session.doc_mut().unwrap().bump_revision();
+        session.set_active(1);
+        let approved_snap = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+        assert_eq!(approved_snap.stage, "completed", "msg={}", approved_snap.message);
+        assert_eq!(approved_snap.batch.as_ref().unwrap().status, "completed");
+    }
+
+    #[test]
+    fn approve_batch_preserves_active_tab_and_state_consistency_on_proof_or_prep_failure_and_recovery_save() {
+        // 1. Tampered proof file on inactive Tab 0 must NOT switch active tab away from Tab 1.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(dir.path()).unwrap();
+            let mut session = Session::new();
+            let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+            assert_eq!(session.active_index(), Some(1));
+            std::fs::write(dir.path().join("fixture-proof.png"), b"tampered-bytes").unwrap();
+
+            let failed = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+            assert_eq!(failed.stage, "failed");
+            assert_eq!(failed.batch.as_ref().unwrap().status, "failed");
+            assert!(failed.message.contains("Batch proof bytes changed"));
+            assert_eq!(session.active_index(), Some(1), "failed approval must not switch the user's active tab");
+        }
+
+        // 2. Post-validation continuity overflow (`current_batch == u32::MAX`) must NOT leave snapshot.batch
+        // claiming `awaiting_human_proof` while `self.batch` is `None`, nor switch active tab.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(dir.path()).unwrap();
+            let mut session = Session::new();
+            let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            runner.batch.as_mut().unwrap().snapshot.current_batch = u32::MAX;
+            session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+            assert_eq!(session.active_index(), Some(1));
+
+            let failed = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+            assert_eq!(failed.stage, "failed");
+            assert_eq!(failed.batch.as_ref().unwrap().status, "failed", "snapshot.batch must not remain stuck on awaiting_human_proof");
+            assert_eq!(session.active_index(), Some(1));
+        }
+
+        // 3. Background `file.recovery.save` across open tabs must preserve unchanged proof approval.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let rec_dir = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(dir.path()).unwrap();
+            let mut session = Session::new();
+            let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+            if let Some(snap) = runner.batch.as_mut().map(|job| {
+                job.snapshot.completed_pages = job.snapshot.total_pages;
+                job.snapshot.clone()
+            }) {
+                runner.persist_batch(&snap).unwrap();
+                runner.snapshot.batch = Some(snap);
+            }
+            session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+            session.execute("frame.create", &json!({"spread": 0, "rect": [60, 60, 140, 120]})).unwrap();
+            session.execute("file.recovery.save", &json!({"dir": rec_dir.path()})).unwrap();
+            assert_eq!(session.active_index(), Some(1));
+
+            let done = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+            assert_eq!(done.stage, "completed", "msg={}", done.message);
+            assert_eq!(session.active_index(), Some(0));
         }
     }
 }

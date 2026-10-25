@@ -2297,6 +2297,7 @@ fn effects_all(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit(|d, _| {
         let mut changed = 0;
         for id in &ids {
+            let item_xf = d.find(*id).and_then(|loc| Some(d.parent_xf(&loc) * d.item(*id)?.xf));
             let Some(it) = d.item_mut(*id) else { continue };
             if it.locked {
                 continue;
@@ -2305,8 +2306,23 @@ fn effects_all(s: &mut Session, p: &Value) -> Result<Value> {
                 let mut cur = serde_json::to_value(&it.effects).map_err(|e| bad(ID, e.to_string()))?;
                 merge_json(&mut cur, patch);
                 let mut fx: designcraft_doc::Effects = serde_json::from_value(cur).map_err(|e| bad(ID, format!("effects: {e}")))?;
+                if let Some(gf_patch) = patch.get("gradientFeather") {
+                    if gf_patch.get("angle").and_then(Value::as_f64).is_some() && gf_patch.get("from").is_none() && gf_patch.get("to").is_none() {
+                        fx.gradient_feather.vector = None;
+                    }
+                    if let (Some(xf), Some(a), Some(b)) = (item_xf, point_param(gf_patch, "from"), point_param(gf_patch, "to"))
+                        && xf.determinant().is_finite()
+                        && xf.determinant().abs() > 1e-12
+                    {
+                        let inv = xf.inverse();
+                        let (a, b) = (inv * a, inv * b);
+                        if a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite() && (b - a).hypot() > 1e-6 {
+                            fx.gradient_feather.vector = Some([a.x, a.y, b.x, b.y]);
+                        }
+                    }
+                }
                 sanitize_effects(&mut fx)?;
-                it.effects = fx;
+                it.effects = fx.sanitized().map_err(|m| bad(ID, m))?;
             }
             if let Some(o) = opacity {
                 it.opacity = o;

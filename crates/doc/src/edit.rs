@@ -196,21 +196,18 @@ impl Document {
     /// The top-level item (group root) containing `id`.
     pub fn top_level_of(&self, id: ItemId) -> Option<ItemId> {
         let loc = self.find(id)?;
-        Some(self.spread(loc.spread)?.items[loc.top()].id)
+        Some(self.spread(loc.spread)?.items.get(*loc.path.first()?)?.id)
     }
 
     /// Spread-space transform of the parent group chain of the item at `loc` (identity at top level).
     pub fn parent_xf(&self, loc: &ItemLoc) -> designcraft_geom::Affine {
         let mut xf = designcraft_geom::Affine::IDENTITY;
         if let Some(sp) = self.spread(loc.spread) {
-            let mut items = &sp.items;
+            let mut items: &[Arc<Item>] = &sp.items;
             for &i in &loc.path[..loc.path.len().saturating_sub(1)] {
-                let it = &items[i];
+                let Some(it) = items.get(i) else { break };
                 xf *= it.xf;
-                items = match &it.content {
-                    Content::Group { items } => items,
-                    _ => break,
-                };
+                items = it.children();
             }
         }
         xf

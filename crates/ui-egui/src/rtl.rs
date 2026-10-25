@@ -44,6 +44,17 @@ pub fn widget(ui: &egui::Ui, text: impl Into<WidgetText>) -> WidgetText {
     WidgetText::Galley(layout(ui.ctx(), job))
 }
 
+/// Resolve window titles or headings where only `egui::Context` is available.
+pub fn widget_ctx(ctx: &egui::Context, text: impl Into<WidgetText>) -> WidgetText {
+    let text = text.into();
+    if !has_rtl(text.text()) {
+        return text;
+    }
+    let style = ctx.global_style();
+    let job = (*text.into_layout_job(&style, egui::FontSelection::Style(egui::TextStyle::Heading), Align::Center)).clone();
+    WidgetText::Galley(layout(ctx, job))
+}
+
 /// Labels are read-only: egui's LTR selection indices cannot map bidi glyph order.
 /// Accessibility still receives the original logical string through Galley::job.
 pub fn label(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> egui::Response {
@@ -72,6 +83,16 @@ pub fn isolate(text: &str) -> String {
     if text.chars().any(designcraft_fonts::is_rtl) { format!("\u{2068}{text}\u{2069}") } else { text.to_owned() }
 }
 
+/// Isolate a technical LTR token (`$0.03`, `8192 MiB / 16384 MiB`, URLs, versions) inside RTL UI copy.
+pub fn ltr(text: impl std::fmt::Display) -> String {
+    format!("\u{2066}{text}\u{2069}")
+}
+
+/// Force RTL paragraph base direction when an Arabic UI line begins with an isolated LTR token.
+pub fn rtl_paragraph(text: impl std::fmt::Display) -> String {
+    format!("\u{2067}{text}\u{2069}")
+}
+
 pub fn plain(ctx: &egui::Context, text: &str, font: FontId, color: Color32) -> Arc<Galley> {
     layout(ctx, LayoutJob::simple_singleline(text.to_owned(), font, color))
 }
@@ -88,6 +109,14 @@ pub fn paint(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, font: Fon
     let galley = plain(p.ctx(), text, font, color);
     let rect = anchor.anchor_rect(Rect::from_min_size(pos, galley.size()));
     p.galley(rect.min, galley, color);
+}
+
+fn is_bidi_isolate_control(c: char) -> bool {
+    matches!(c, '\u{2066}'..='\u{2069}')
+}
+
+fn is_symbol_fallback(c: char) -> bool {
+    matches!(c, '\u{2190}'..='\u{2BFF}' | '\u{1F000}'..='\u{1FAFF}')
 }
 
 /// Reorder directional runs, not characters: the shaper needs logical Arabic to join letters.
@@ -132,12 +161,52 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>) -> Layo
                     format.coords = egui::epaint::text::VariationCoords::new([(*b"wght", 600.0)]);
                 }
             }
-            let text = &job.text[range];
+            let raw = &job.text[range];
+            let cleaned: std::borrow::Cow<'_, str> = if raw.chars().any(is_bidi_isolate_control) {
+                std::borrow::Cow::Owned(raw.chars().filter(|c| !is_bidi_isolate_control(*c)).collect())
+            } else {
+                std::borrow::Cow::Borrowed(raw)
+            };
+            let text = cleaned.as_ref();
+            if text.is_empty() {
+                continue;
+            }
             if rtl && !text.chars().any(designcraft_fonts::is_rtl) {
                 // Neutral-only RTL runs have no script for the shaper to infer a direction.
                 // Apply UBA L4 mirroring here; Arabic runs are mirrored by the shaper.
                 let neutral: String = text.chars().rev().map(|c| unicode_bidi_mirroring::get_mirrored(c).unwrap_or(c)).collect();
                 visual.append(&neutral, section.leading_space, format);
+            } else if rtl && text.chars().any(is_symbol_fallback) {
+                // Emoji/symbol fallback faces split an epaint section in logical left-to-right
+                // order; reverse those sub-runs so leading RTL icons stay on the visual right.
+                let mut pieces: Vec<(usize, usize, bool)> = Vec::new();
+                for (idx, ch) in text.char_indices() {
+                    let sym = is_symbol_fallback(ch);
+                    let end = idx + ch.len_utf8();
+                    if let Some(last) = pieces.last_mut()
+                        && last.2 == sym
+                    {
+                        last.1 = end;
+                    } else {
+                        pieces.push((idx, end, sym));
+                    }
+                }
+                let mut lead = section.leading_space;
+                for (start, end, sym) in pieces.into_iter().rev() {
+                    let sub = &text[start..end];
+                    if sym {
+                        let mut sym_format = format.clone();
+                        sym_format.font_id.family = FontFamily::Proportional;
+                        let neutral: String = sub.chars().rev().map(|c| unicode_bidi_mirroring::get_mirrored(c).unwrap_or(c)).collect();
+                        visual.append(&neutral, lead, sym_format);
+                    } else if !sub.chars().any(designcraft_fonts::is_rtl) {
+                        let neutral: String = sub.chars().rev().map(|c| unicode_bidi_mirroring::get_mirrored(c).unwrap_or(c)).collect();
+                        visual.append(&neutral, lead, format.clone());
+                    } else {
+                        visual.append(sub, lead, format.clone());
+                    }
+                    lead = 0.0;
+                }
             } else {
                 visual.append(text, section.leading_space, format);
             }
@@ -209,6 +278,15 @@ fn layout(ctx: &egui::Context, job: LayoutJob) -> Arc<Galley> {
     let galley = layout_uncached(ctx, job);
     ctx.data_mut(|data| data.get_temp_mut_or_default::<LayoutCache>(id).insert(key, Arc::clone(&galley)));
     galley
+}
+
+#[cfg(test)]
+pub(crate) fn matches_rtl_layout(ctx: &egui::Context, galley: &Galley) -> bool {
+    let expected = layout_uncached(ctx, (*galley.job).clone());
+    let sig = |g: &Galley| -> Vec<(char, u32, u32, u32)> {
+        g.rows.iter().flat_map(|r| r.glyphs.iter().map(|gl| (gl.chr, gl.pos.x.to_bits(), gl.pos.y.to_bits(), gl.advance_width.to_bits()))).collect()
+    };
+    sig(galley) == sig(&expected)
 }
 
 fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
@@ -556,5 +634,66 @@ mod tests {
             assert_eq!(galley.rows.len(), 1);
             assert_eq!(galley.job.text, "ملف\nجديد");
         });
+    }
+
+    #[test]
+    fn ltr_and_rtl_isolates_order_currency_ratios_symbols_and_system_arabic_fallbacks() {
+        with_fonts(|ctx| {
+            // 1. Dollar currency after Arabic keeps '$' to the left of digits and digits to the left of Arabic.
+            let cost_line = format!("التكلفة التقديرية {}", ltr("$0.0398"));
+            let galley = plain(ctx, &cost_line, FontId::proportional(15.0), Color32::WHITE);
+            assert_eq!(galley.job.text, cost_line);
+            let vis = displayed(&galley);
+            assert!(!vis.chars().any(is_bidi_isolate_control), "{vis:?}");
+            let glyphs = &galley.rows[0].glyphs;
+            let x = |c| glyphs.iter().find(|g| g.chr == c && g.advance_width > 0.0).unwrap().pos.x;
+            assert!(x('$') < x('0') && x('0') < x('9') && x('9') < x('ة'), "currency order: {vis}");
+
+            // 2. Arabic status line starting with an LTR technical token flows right-to-left under rtl_paragraph.
+            let ram_line = rtl_paragraph(format!("{}: {} حرة / إجمالي", ltr("RAM"), ltr("8192 MiB / 16384 MiB")));
+            let ram_galley = plain(ctx, &ram_line, FontId::proportional(15.0), Color32::WHITE);
+            let ram_glyphs = &ram_galley.rows[0].glyphs;
+            let rx = |c| ram_glyphs.iter().find(|g| g.chr == c && g.advance_width > 0.0).unwrap().pos.x;
+            assert!(rx('ح') < rx('8') && rx('8') < rx('6') && rx('6') < rx('R'), "RTL paragraph order: {}", displayed(&ram_galley));
+
+            // 3. Leading warning symbol in an RTL label stays on the visual right of the Arabic title.
+            let alert_line = "⚠ تنبيه";
+            let alert_galley = plain(ctx, alert_line, FontId::proportional(15.0), Color32::WHITE);
+            assert_eq!(alert_galley.job.text, alert_line);
+            let alert_glyphs = &alert_galley.rows[0].glyphs;
+            let ax = |c| alert_glyphs.iter().find(|g| g.chr == c && g.advance_width > 0.0).unwrap().pos.x;
+            assert!(ax('ه') < ax('ت') && ax('ت') < ax('⚠'), "leading RTL symbol belongs on visual right: {}", displayed(&alert_galley));
+        });
+
+        // 4. Multi-word punctuated Arabic with a system Arab fallback (and empty CRAFT_FONTS) keeps RTL word order.
+        let bytes = designcraft_fonts::testing::font_mapping(
+            "DC System Arabic",
+            &[
+                ('ع', 'A'),
+                ('م', 'M'),
+                ('ل', 'L'),
+                ('ف', 'F'),
+                ('س', 'S'),
+                ('ت', 'T'),
+                ('ن', 'N'),
+                ('ج', 'J'),
+                ('د', 'D'),
+                ('ي', 'Y'),
+                (' ', ' '),
+                (':', ':'),
+            ],
+        )
+        .unwrap();
+        let system = [crate::theme::SystemFont::new("Arab", "DC System Arabic".into(), bytes, 0)];
+        let mut defs = crate::theme::font_definitions(&[], "ar");
+        crate::theme::add_system_fallbacks(&mut defs, &system, "ar");
+        let ctx = egui::Context::default();
+        ctx.set_fonts(defs);
+        ctx.begin_pass(egui::RawInput { max_texture_side: Some(8192), ..Default::default() });
+        let galley = plain(&ctx, "ملف: مستند جديد", FontId::proportional(15.0), Color32::WHITE);
+        let glyphs = &galley.rows[0].glyphs;
+        let gx = |c| glyphs.iter().find(|g| g.chr == c && g.advance_width > 0.0).unwrap().pos.x;
+        assert!(gx('ج') < gx('س') && gx('س') < gx('ف'), "multi-word Arabic must stay RTL without CRAFT_FONTS: {}", displayed(&galley));
+        ctx.end_pass().textures_delta.clear();
     }
 }

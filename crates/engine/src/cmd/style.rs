@@ -1476,6 +1476,13 @@ fn effects_param(cmd: &str, p: &Value, base: &Effects) -> Result<Option<Effects>
     if patch.is_empty() {
         return Ok(None);
     }
+    if patch
+        .get("gradientFeather")
+        .and_then(Value::as_object)
+        .is_some_and(|gf| gf.contains_key("from") || gf.contains_key("to") || gf.get("vector").is_some_and(|v| !v.is_null()))
+    {
+        return Err(bad(cmd, "object styles cannot store spread-space gradientFeather endpoints; use angle"));
+    }
     let mut v = serde_json::to_value(base).map_err(|e| bad(cmd, e.to_string()))?;
     merge_json(&mut v, Value::Object(patch), 0);
     let e: Effects = serde_json::from_value(v).map_err(|e| bad(cmd, format!("effects: {e}")))?;
@@ -1508,7 +1515,16 @@ fn create_object(s: &mut Session, p: &Value) -> Result<Value> {
         os.fill = Some(it.fill.clone());
         os.stroke = Some(it.stroke.clone());
         os.text_frame = it.text_frame().map(|t| t.options.clone());
-        os.effects = Some(it.effects.clone());
+        let mut fx = it.effects.clone();
+        if let Some([x0, y0, x1, y1]) = fx.gradient_feather.vector.take()
+            && !fx.gradient_feather.radial
+        {
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            if dx.is_finite() && dy.is_finite() && dx.hypot(dy) > 1e-6 {
+                fx.gradient_feather.angle = (-dy).atan2(dx).to_degrees();
+            }
+        }
+        os.effects = Some(fx);
     }
     if let Some(sw) = str_param(p, "fill") {
         os.fill = Some(designcraft_doc::Fill::swatch(sw));

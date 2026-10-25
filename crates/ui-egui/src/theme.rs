@@ -283,8 +283,11 @@ pub fn system_fonts_ready() -> bool {
 
 /// An installed font the UI falls back to for a script the built-in faces lack.
 pub(crate) struct SystemFont {
-    /// The ISO 15924 code of the script it is for ("Jpan", "Kore", "Taml"…).
+    /// The first ISO 15924 script code that selected this face ("Jpan", "Kore", "Taml"…).
     script: &'static str,
+    /// Whether this face was selected for an RTL UI script ("Arab" or "Hebr"), even if an earlier
+    /// script (e.g. "Thai" for Tahoma) already added the same family.
+    rtl: bool,
     family: String,
     /// The face as egui takes it, on the UI face's baseline. Shared: installing the fonts again
     /// (another interface language) doesn't copy the file.
@@ -294,7 +297,8 @@ pub(crate) struct SystemFont {
 impl SystemFont {
     pub(crate) fn new(script: &'static str, family: String, bytes: Vec<u8>, index: u32) -> Self {
         let tweak = baseline_tweak(&bytes, index);
-        SystemFont { script, family, data: Arc::new(FontData { index, tweak, ..FontData::from_owned(bytes) }) }
+        let rtl = matches!(script, "Arab" | "Hebr");
+        SystemFont { script, rtl, family, data: Arc::new(FontData { index, tweak, ..FontData::from_owned(bytes) }) }
     }
 }
 
@@ -339,6 +343,7 @@ const SYSTEM_UI_FONTS: &[(&str, char, &[&str])] = &[
     ("Khmr", 'ក', &["Khmer Sangam MN", "Leelawadee UI", "Khmer UI", "Noto Sans Khmer", "Khmer OS"]),
     ("Laoo", 'ກ', &["Lao Sangam MN", "Leelawadee UI", "Lao UI", "Noto Sans Lao", "Phetsarath OT"]),
     ("Mymr", 'က', &["Myanmar Sangam MN", "Myanmar Text", "Noto Sans Myanmar", "Padauk"]),
+    ("Arab", 'ع', &["SF Arabic", "Geeza Pro", "Segoe UI", "Tahoma", "Noto Sans Arabic", "Noto Sans Arabic UI", "DejaVu Sans"]),
     ("Hebr", 'א', &["Arial Hebrew", "Segoe UI", "Noto Sans Hebrew", "DejaVu Sans"]),
     ("Armn", 'Ա', &["Mshtakan", "Segoe UI", "Sylfaen", "Noto Sans Armenian", "DejaVu Sans"]),
     ("Geor", 'ა', &["Segoe UI", "Sylfaen", "Noto Sans Georgian", "DejaVu Sans"]),
@@ -379,7 +384,10 @@ fn installed_ui_fonts(db: &designcraft_fonts::FontDb, craft: &[designcraft_fonts
             (face.family.eq_ignore_ascii_case(family) && !face.data().is_empty() && face.covers(*sample)).then_some((family, face))
         });
         let Some((family, face)) = found else { continue };
-        if !faces.iter().any(|f| f.family.eq_ignore_ascii_case(family)) {
+        let is_rtl = matches!(*script, "Arab" | "Hebr");
+        if let Some(existing) = faces.iter_mut().find(|f| f.family.eq_ignore_ascii_case(family)) {
+            existing.rtl |= is_rtl;
+        } else {
             faces.push(SystemFont::new(script, (*family).to_string(), face.data().to_vec(), face.index()));
         }
     }
@@ -428,6 +436,7 @@ pub(crate) fn add_system_fallbacks(fonts: &mut FontDefinitions, system: &[System
     let first = cjk_script(lang);
     let preferred: Vec<String> = system.iter().filter(|f| f.script == first).map(name).collect();
     const CJK: [&str; 4] = ["Jpan", "Hans", "Hant", "Kore"];
+    let rtl_faces: Vec<String> = system.iter().filter(|f| f.rtl).map(name).collect();
     let rest: Vec<String> = CJK
         .iter()
         .filter(|s| **s != first)
@@ -436,11 +445,19 @@ pub(crate) fn add_system_fallbacks(fonts: &mut FontDefinitions, system: &[System
         .map(name)
         .collect();
     for (family, stack) in fonts.families.iter_mut() {
-        // The Arabic families keep their own order (see `font_definitions`).
+        // The Arabic families keep RTL faces ahead of `ui` (see `font_definitions`) so letters,
+        // spaces and punctuation shape as one unbroken right-to-left run without craft-fonts.
         let arabic = matches!(family, FontFamily::Name(n) if n.starts_with("arabic"));
-        let at = if arabic { stack.len() } else { stack.iter().position(|n| n.starts_with("craft-")).unwrap_or(stack.len()) };
-        stack.splice(at..at, preferred.iter().cloned());
-        stack.extend(rest.iter().cloned());
+        if arabic {
+            let lead = stack.iter().position(|n| !n.starts_with("craft-")).unwrap_or(stack.len());
+            stack.splice(lead..lead, rtl_faces.iter().cloned());
+            let tail: Vec<String> = preferred.iter().chain(rest.iter()).filter(|n| !rtl_faces.contains(n)).cloned().collect();
+            stack.extend(tail);
+        } else {
+            let at = stack.iter().position(|n| n.starts_with("craft-")).unwrap_or(stack.len());
+            stack.splice(at..at, preferred.iter().cloned());
+            stack.extend(rest.iter().cloned());
+        }
     }
 }
 
@@ -794,6 +811,60 @@ mod russian_font_tests {
             for character in &characters {
                 assert_ne!(face.glyph_for(*character), 0, "missing {character} in {name}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod arabic_font_tests {
+    #[test]
+    fn installed_arabic_faces_precede_ui_in_arabic_families_without_craft_fonts() {
+        let dir = std::env::temp_dir().join(format!("dc-ui-arabic-fonts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = designcraft_fonts::testing::font_mapping(
+            "Noto Sans Arabic",
+            &[('ع', 'A'), ('م', 'M'), ('ل', 'L'), ('ف', 'F'), ('ج', 'J'), ('د', 'D'), ('ي', 'Y'), (' ', ' '), (':', ':')],
+        )
+        .unwrap();
+        std::fs::write(dir.join("arabic.ttf"), &bytes).unwrap();
+        let db = designcraft_fonts::FontDb::with_font_dirs(vec![dir.clone()]);
+        let system = super::installed_ui_fonts(&db, &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(system.iter().map(|f| (f.script, f.family.as_str())).collect::<Vec<_>>(), [("Arab", "Noto Sans Arabic")]);
+
+        let mut defs = super::font_definitions(&[], "ar");
+        super::add_system_fallbacks(&mut defs, &system, "ar");
+        for (family, ui_name) in [("arabic", "ui"), ("arabic-semibold", "ui-semibold")] {
+            let stack = &defs.families[&egui::FontFamily::Name(family.into())];
+            let arab_at = stack.iter().position(|n| n == "system-Noto Sans Arabic").unwrap();
+            let ui_at = stack.iter().position(|n| n == ui_name).unwrap();
+            assert!(arab_at < ui_at, "{family}: {stack:?}");
+        }
+        // Proportional and semibold keep the Latin UI face first.
+        assert_eq!(defs.families[&egui::FontFamily::Proportional].first().map(String::as_str), Some("ui"));
+        assert_eq!(defs.families[&egui::FontFamily::Name("semibold".into())].first().map(String::as_str), Some("ui-semibold"));
+    }
+
+    #[test]
+    fn shared_multiscript_family_retains_rtl_priority_in_arabic_stacks() {
+        let dir = std::env::temp_dir().join(format!("dc-ui-tahoma-fonts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = designcraft_fonts::testing::font_with("Tahoma", &['ก', 'ع', ' ', ':']).unwrap();
+        std::fs::write(dir.join("tahoma.ttf"), &bytes).unwrap();
+        let db = designcraft_fonts::FontDb::with_font_dirs(vec![dir.clone()]);
+        let system = super::installed_ui_fonts(&db, &[]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].script, "Thai");
+        assert!(system[0].rtl, "Tahoma covers both Thai and Arabic, so rtl must remain true");
+
+        let mut defs = super::font_definitions(&[], "ar");
+        super::add_system_fallbacks(&mut defs, &system, "ar");
+        for (family, ui_name) in [("arabic", "ui"), ("arabic-semibold", "ui-semibold")] {
+            let stack = &defs.families[&egui::FontFamily::Name(family.into())];
+            let tahoma_at = stack.iter().position(|n| n == "system-Tahoma").unwrap();
+            let ui_at = stack.iter().position(|n| n == ui_name).unwrap();
+            assert!(tahoma_at < ui_at, "{family}: {stack:?}");
         }
     }
 }

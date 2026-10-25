@@ -1918,11 +1918,14 @@ fn preferences(app: &crate::DesignApp, ui: &mut egui::Ui, d: &mut Dialog, max_he
                     ui.horizontal(|ui| {
                         crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Default View:"));
                         egui::ComboBox::from_id_salt("pref_dq")
-                            .selected_text(match cur.as_str() {
-                                "fast" => crate::i18n::tr(&app.ui.language, "Fast"),
-                                "typical" => crate::i18n::tr(&app.ui.language, "Typical"),
-                                _ => crate::i18n::tr(&app.ui.language, "High Quality"),
-                            })
+                            .selected_text(crate::rtl::widget(
+                                ui,
+                                match cur.as_str() {
+                                    "fast" => crate::i18n::tr(&app.ui.language, "Fast"),
+                                    "typical" => crate::i18n::tr(&app.ui.language, "Typical"),
+                                    _ => crate::i18n::tr(&app.ui.language, "High Quality"),
+                                },
+                            ))
                             .show_ui(ui, |ui| {
                                 for (v, l) in [("fast", "Fast"), ("typical", "Typical"), ("high", "High Quality")] {
                                     if ui.selectable_label(cur == v, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, l))).clicked() {
@@ -2228,7 +2231,10 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                                     crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, label));
                                     let cur = d.s(key);
                                     egui::ComboBox::from_id_salt(key)
-                                        .selected_text(if cur.is_empty() { crate::i18n::tr(&app.ui.language, any) } else { cur.as_str() })
+                                        .selected_text(crate::rtl::widget(
+                                            ui,
+                                            if cur.is_empty() { crate::i18n::tr(&app.ui.language, any) } else { cur.as_str() },
+                                        ))
                                         .width(180.0)
                                         .show_ui(ui, |ui| {
                                             if ui
@@ -2238,7 +2244,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                                                 d.fields.insert(key.into(), json!(""));
                                             }
                                             for w in &swatches {
-                                                if ui.selectable_label(*w == cur, w).clicked() {
+                                                if ui.selectable_label(*w == cur, crate::rtl::widget(ui, w.as_str())).clicked() {
                                                     d.fields.insert(key.into(), json!(w));
                                                 }
                                             }
@@ -2248,7 +2254,10 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                                 crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Kind:"));
                                 let cur = d.s("objKind");
                                 egui::ComboBox::from_id_salt("objKind")
-                                    .selected_text(if cur.is_empty() { crate::i18n::tr(&app.ui.language, "(any)") } else { cur.as_str() })
+                                    .selected_text(crate::rtl::widget(
+                                        ui,
+                                        crate::i18n::tr(&app.ui.language, if cur.is_empty() { "(any)" } else { cur.as_str() }),
+                                    ))
                                     .show_ui(ui, |ui| {
                                         for v in ["", "text", "graphic", "shape", "line", "group"] {
                                             if ui
@@ -2274,7 +2283,12 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                             ui.horizontal(|ui| {
                                 if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Find All"))).clicked() {
                                     let n = app.run("find.objects", crit.clone()).ok().and_then(|r| r["ids"].as_array().map(Vec::len)).unwrap_or(0);
-                                    d.fields.insert("status".into(), json!(format!("{n} found")));
+                                    let msg = if app.ui.language == "ar" {
+                                        crate::i18n::tr(&app.ui.language, "{count} match(es)").replace("{count}", &n.to_string())
+                                    } else {
+                                        format!("{n} found")
+                                    };
+                                    d.fields.insert("status".into(), json!(msg));
                                 }
                                 if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Change All"))).clicked()
                                     && !d.s("objChangeFill").is_empty()
@@ -2282,10 +2296,15 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                                     let mut p = crit.clone();
                                     p["change"] = json!({"fill": d.s("objChangeFill")});
                                     let n = app.run("find.changeObjects", p).ok().and_then(|r| r["changed"].as_u64()).unwrap_or(0);
-                                    d.fields.insert("status".into(), json!(format!("{n} changed")));
+                                    let msg = if app.ui.language == "ar" {
+                                        crate::i18n::tr(&app.ui.language, "{count} replacement(s) made").replace("{count}", &n.to_string())
+                                    } else {
+                                        format!("{n} changed")
+                                    };
+                                    d.fields.insert("status".into(), json!(msg));
                                 }
                             });
-                            ui.label(d.s("status"));
+                            crate::rtl::label(ui, d.s("status"));
                         } else {
                             egui::Grid::new("fc").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                                 crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Find what:"));
@@ -2343,7 +2362,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                                 }
                             });
                             if let Some(st) = d.fields.get("status").and_then(Value::as_str) {
-                                ui.label(egui::RichText::new(st).color(crate::theme::Tokens::get(ui.ctx()).text_dim));
+                                crate::rtl::label(ui, egui::RichText::new(st).color(crate::theme::Tokens::get(ui.ctx()).text_dim));
                             }
                         }
                     }
@@ -2371,7 +2390,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     "preferences" => preferences(app, ui, &mut d, body_height),
                     "print" => print_dialog(app, ui, &mut d),
                     "pdfImport" => {
-                        ui.label(egui::RichText::new(if d.b("async") { d.s("name") } else { d.s("path") }).size(11.0));
+                        crate::rtl::label(ui, egui::RichText::new(if d.b("async") { d.s("name") } else { d.s("path") }).size(11.0));
                         ui.horizontal(|ui| {
                             crate::rtl::label(
                                 ui,
@@ -2393,7 +2412,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                             };
                             egui::ComboBox::from_id_salt("pdf_crop").selected_text(crate::rtl::widget(ui, label(&cur))).show_ui(ui, |ui| {
                                 for v in designcraft_doc::PdfCrop::ALL.map(designcraft_doc::PdfCrop::name) {
-                                    if ui.selectable_label(label(&cur) == label(v), label(v)).clicked() {
+                                    if ui.selectable_label(label(&cur) == label(v), crate::rtl::widget(ui, label(v))).clicked() {
                                         d.fields.insert("crop".into(), json!(v));
                                     }
                                 }

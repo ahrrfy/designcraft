@@ -821,8 +821,8 @@ pub fn status_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                     )
                 };
                 // As in InDesign, the count opens a menu that leads to the Preflight panel.
-                let menu = crate::menus::menu_button(ui, egui::RichText::new(count).font(small.clone()), |ui| {
-                    if ui.button(crate::i18n::tr(&app.ui.language, "Preflight Panel…")).clicked() {
+                let menu = crate::menus::menu_button(ui, crate::rtl::widget(ui, egui::RichText::new(count).font(small.clone())), |ui| {
+                    if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Preflight Panel…"))).clicked() {
                         show_preflight(app);
                         ui.close();
                     }

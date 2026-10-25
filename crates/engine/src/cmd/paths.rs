@@ -189,10 +189,13 @@ fn gradient_feather(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(v) = p.get("end").and_then(Value::as_f64) {
                 gf.end = (v / 100.0).clamp(0.0, 1.0) as f32;
             }
-            if let (Some(a), Some(b)) = (point_param(&p, "from"), point_param(&p, "to")) {
+            if let (Some(a), Some(b)) = (point_param(&p, "from"), point_param(&p, "to"))
+                && xf.determinant().is_finite()
+                && xf.determinant().abs() > 1e-12
+            {
                 let inv = xf.inverse();
                 let (a, b) = (inv * a, inv * b);
-                if (b - a).hypot() > 1e-6 {
+                if a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite() && (b - a).hypot() > 1e-6 {
                     gf.vector = Some([a.x, a.y, b.x, b.y]);
                 }
             }

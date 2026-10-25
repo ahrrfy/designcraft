@@ -1,11 +1,13 @@
 //! Session-only native production panel. UI actions use `dispatch` (the typed equivalent of
 //! `ai.request`); the injected host must enqueue work and return immediately.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::{DesignApp, rtl};
-use designcraft_ai_types::protocol::{AiRequest, AiSettings, AiSnapshot, BatchSnapshot, ProductionDraft, TaskRequest, TaskTarget, TokenRates};
-use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind};
+use designcraft_ai_types::protocol::{
+    AiRequest, AiSettings, AiSnapshot, BatchSnapshot, ProductionDraft, SkillCard, TaskRequest, TaskTarget, TokenRates,
+};
+use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind, is_non_image_model, supports_gemini_image_review};
 use serde_json::Value;
 
 const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
@@ -425,6 +427,7 @@ pub struct AiUiState {
     proof_document_version: Option<(u64, u64)>,
     proof_validation_requested: Option<(u64, u64)>,
     proof_document_matches: bool,
+    proof_facing_pages: Option<bool>,
     proof_binding: Option<bool>,
     proof_pair_view: bool,
     proof_full_resolution: bool,
@@ -440,6 +443,7 @@ pub struct AiUiState {
     local_comfy: ModelSelection,
     pending_models: Option<ModelSelection>,
     local_probe: Option<(ModelSelection, Vec<String>, String, bool)>,
+    discovered_models: BTreeMap<(ProviderKind, Option<String>), Vec<String>>,
     print_token: Option<String>,
     print_reviewed: bool,
     print_save_path: String,
@@ -509,6 +513,7 @@ impl Default for AiUiState {
             proof_document_version: None,
             proof_validation_requested: None,
             proof_document_matches: false,
+            proof_facing_pages: None,
             proof_binding: None,
             proof_pair_view: true,
             proof_full_resolution: false,
@@ -524,6 +529,7 @@ impl Default for AiUiState {
             local_comfy: ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: Some("http://127.0.0.1:8188".into()) },
             pending_models: None,
             local_probe: None,
+            discovered_models: BTreeMap::new(),
             print_token: None,
             print_reviewed: false,
             print_save_path: String::new(),
@@ -556,19 +562,24 @@ impl AiUiState {
         self.restored_target_unconfirmed = false;
     }
 
+    fn sync_settings(&mut self, settings: AiSettings) {
+        self.settings = settings;
+        // Reuse explicitly configured prices; restarting does not require the same setup again.
+        self.rates_confirmed =
+            self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
+        self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
+        self.workflow_error.clear();
+        if self.settings.text_model.provider == ProviderKind::Ollama {
+            self.local_ollama = self.settings.text_model.clone();
+        }
+        if self.settings.image_model.provider == ProviderKind::ComfyUi {
+            self.local_comfy = self.settings.image_model.clone();
+        }
+    }
+
     fn accept(&mut self, snapshot: AiSnapshot) {
         if !self.initialized && snapshot.available {
-            self.settings = snapshot.settings.clone();
-            // Reuse explicitly configured prices; restarting does not require the same setup again.
-            self.rates_confirmed =
-                self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
-            self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
-            if self.settings.text_model.provider == ProviderKind::Ollama {
-                self.local_ollama = self.settings.text_model.clone();
-            }
-            if self.settings.image_model.provider == ProviderKind::ComfyUi {
-                self.local_comfy = self.settings.image_model.clone();
-            }
+            self.sync_settings(snapshot.settings.clone());
             if let Some(draft) = &snapshot.production_draft {
                 self.load_production_request(&draft.request);
                 self.restored_target_unconfirmed = !self.new_document;
@@ -602,6 +613,7 @@ impl AiUiState {
             if !preserve_review {
                 self.proof_path = proof_display.as_ref().and_then(|key| key.pages().next()).map(|(path, _)| path.clone());
                 self.reviewed_proofs.clear();
+                self.proof_facing_pages = None;
                 self.proof_binding = None;
                 self.proof_loaded = None;
                 self.proof_texture = None;
@@ -616,6 +628,12 @@ impl AiUiState {
             && let Some(selection) = self.pending_models.take()
         {
             let success = snapshot.stage == "completed";
+            let key = (selection.provider, selection.endpoint.clone());
+            if success && !snapshot.models.is_empty() {
+                self.discovered_models.insert(key, snapshot.models.clone());
+            } else {
+                self.discovered_models.remove(&key);
+            }
             self.local_probe = Some((selection, if success { snapshot.models.clone() } else { Vec::new() }, snapshot.message.clone(), success));
         }
         let print_token = snapshot.print_proof.as_ref().map(|proof| proof.token.clone());
@@ -634,6 +652,14 @@ impl AiUiState {
             self.proof_document_version = document;
         }
         self.proof_document_matches = self.proof_key.as_ref().is_some_and(|key| Some(key.document) == document);
+        if !self.proof_document_matches {
+            self.proof_facing_pages = None;
+            self.proof_binding = None;
+        }
+    }
+
+    fn effective_proof_facing_pages(&self) -> bool {
+        self.proof_facing_pages.unwrap_or(false) || self.settings.facing_pages
     }
 
     fn can_review_selected_proof(&self) -> bool {
@@ -670,13 +696,14 @@ impl AiUiState {
     }
 
     fn companion_proof_path(&self) -> Option<&str> {
-        if !self.settings.facing_pages || !self.proof_pair_view {
+        if !self.effective_proof_facing_pages() || !self.proof_pair_view {
             return None;
         }
         let key = self.proof_display.as_ref()?;
         let selected = key.pages().position(|(path, _)| self.proof_path.as_deref() == Some(path.as_str()))?;
         let page = key.page_range.0.checked_add(u32::try_from(selected).ok()?)?;
-        let pair = facing_proof_pair(page, false)?;
+        let rtl = self.proof_binding.or(self.settings.right_to_left_binding).unwrap_or_else(|| automatic_proof_binding(&self.prompt, false));
+        let pair = facing_proof_pair(page, rtl)?;
         let companion = pair.into_iter().find(|candidate| *candidate != page)?;
         let index = companion.checked_sub(key.page_range.0)?;
         key.pages().nth(usize::try_from(index).ok()?).map(|(path, _)| path.as_str())
@@ -832,11 +859,32 @@ impl AiUiState {
                 "Choose the target book or prepare its remaining pages before producing the saved request.",
                 "اختر الكتاب المستهدف أو جهّز صفحاته المتبقية قبل إنتاج التعليمات المحفوظة.",
             )
+        } else if self.settings.output_mode == OutputMode::NativeWithImages && self.settings.image_model.provider == ProviderKind::Ollama {
+            (
+                "Ollama does not generate raster images here. Choose Gemini, OpenAI, or ComfyUI for the image model, or switch to Editable elements.",
+                "مزود Ollama لا يولّد صوراً نقطية هنا. اختر Gemini أو OpenAI أو ComfyUI لنموذج الصور، أو حوّل الوضع إلى عناصر قابلة للتحرير.",
+            )
         } else if self.settings.output_mode == OutputMode::NativeWithImages
             && self.settings.image_model.provider != ProviderKind::ComfyUi
             && self.settings.image_model.model.trim().is_empty()
         {
             ("Choose an image model in Providers and keys.", "اختر نموذج الصور من تبويب المزودين والمفاتيح.")
+        } else if self.settings.output_mode == OutputMode::NativeWithImages
+            && !self.settings.image_model.model.trim().is_empty()
+            && is_non_image_model(self.settings.image_model.provider, &self.settings.image_model.model)
+        {
+            (
+                "The selected image model is a text/non-image or unsupported endpoint model. Choose a supported image generation model (such as gemini-3.1-flash-image or gpt-image-1) or switch to Editable elements.",
+                "نموذج الصور المختار مخصص للنصوص أو غير مدعوم على مسار التوليد الحالي. اختر نموذج توليد صور مدعوماً (مثل gemini-3.1-flash-image أو gpt-image-1) أو حوّل الوضع إلى عناصر قابلة للتحرير.",
+            )
+        } else if self.settings.output_mode == OutputMode::NativeWithImages
+            && self.settings.verify_generated_images
+            && !supports_gemini_image_review(self.settings.text_model.provider, &self.settings.text_model.model)
+        {
+            (
+                "Generated-image inspection requires a supported Gemini 2.5+ or 3.x text model (such as gemini-3.8-flash), or turn off image inspection in Advanced settings.",
+                "فحص الصور المولدة يتطلب نموذج نص Gemini مدعوماً (مثل gemini-3.8-flash)، أو أوقف فحص الصور من الإعدادات المتقدمة.",
+            )
         } else if !self.workflow_ready() {
             ("Complete a valid ComfyUI API workflow in Providers and keys.", "أكمل مخطط ComfyUI API صالحاً في تبويب المزودين والمفاتيح.")
         } else if self.settings.budget.max_cost_usd.is_some() && !self.rates_confirmed {
@@ -978,12 +1026,28 @@ impl AiUiState {
     }
 
     pub(crate) fn active_diagnostic_alert(&self) -> Option<DiagnosticAlert> {
+        let is_benign_confirmation = self.snapshot.stage != "failed"
+            && (self.snapshot.message.starts_with("AI settings saved;")
+                || self.snapshot.message.starts_with("Session credential updated")
+                || self.snapshot.message.starts_with("API key saved ")
+                || self.snapshot.message.starts_with("Stored and session API key removed")
+                || self.snapshot.message.starts_with("Protected credential presence refreshed")
+                || self.snapshot.message.starts_with("Loaded ")
+                || self.snapshot.message.starts_with("Owned local Ollama server started")
+                || self.snapshot.message.starts_with("Stopped only the Ollama server"));
         let raw_error = if !self.error.is_empty() {
             self.error.trim()
         } else if (self.snapshot.stage == "failed" || self.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "failed"))
+            && !is_benign_confirmation
             && !self.snapshot.message.trim().is_empty()
         {
             self.snapshot.message.trim()
+        } else if (self.snapshot.stage == "failed"
+            || (self.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "failed") && self.snapshot.stage != "idle"))
+            && !is_benign_confirmation
+            && let Some(last_failed) = self.snapshot.reports.last().filter(|r| r.status == "failed" && !r.message.trim().is_empty())
+        {
+            last_failed.message.trim()
         } else {
             return None;
         };
@@ -995,7 +1059,7 @@ impl AiUiState {
 
     pub(crate) fn clear_failure_alert(&mut self) {
         self.error.clear();
-        if self.snapshot.stage == "failed" {
+        if self.snapshot.stage == "failed" || self.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "failed") {
             self.snapshot.stage = "idle".into();
             self.snapshot.message.clear();
         }
@@ -1031,108 +1095,152 @@ pub(crate) struct DiagnosticAlert {
 pub(crate) fn classify_diagnostic_alert(raw_error: &str) -> DiagnosticAlert {
     let lower = raw_error.to_ascii_lowercase();
     let has = |terms: &[&str]| terms.iter().any(|term| lower.contains(term) || raw_error.contains(term));
-    let (kind, title_ar, title_en, cause_ar, cause_en, solution_ar, solution_en) =
-        if has(&["exceeds its byte limit", "context limit", "64-kib", "bounded context limit", "size overflow"]) {
-            (
-                DiagnosticAlertKind::ContextLimit,
-                "تنبيه سعة السياق — تجاوز حجم سياق المهارات أو المراجع",
-                "AI Context Capacity Alert — Skill or Reference Context Limit Exceeded",
-                "تجاوز حجم إرشادات المهارات أو المراجع المدمجة الحد الأقصى المسموح به للطلب الواحد.",
-                "The combined size of active skill instructions or references exceeded the per-request byte limit.",
-                "اضغط على (تفعيل الدمج الذكي للمهارات) لضغط المراجع المشتركة تلقائياً أو قلل المهارات المحددة يدوياً ثم أعد المحاولة.",
-                "Click 'Enable Smart Skill Compaction' to deduplicate shared references automatically or reduce manually pinned skills, then retry.",
-            )
-        } else if has(&["credential", "api key", "api_key", "no key", "unauthorized", "unauthenticated", "401", "403", "invalid key"]) {
-            (
-                DiagnosticAlertKind::MissingCredential,
-                "تنبيه المصادقة — مفتاح المزود (API Key) مفقود أو غير صالح",
-                "Authentication Alert — Provider API Key Missing or Unauthorized",
-                "لم يتم العثور على مفتاح API صالح للمزود المحدد أو أن المفتاح الحالي منتهي الصلاحية.",
-                "No valid API key was found for the selected provider, or the configured key was rejected.",
-                "اضغط على (فتح المفاتيح والمزودين) لإدخال مفتاح API صالح وحفظه، أو اختر مزوداً محلياً (Ollama).",
-                "Click 'Open Keys & Providers' to enter and save a valid API key, or switch to a local provider (Ollama).",
-            )
-        } else if has(&["request limit", "max_requests", "request budget", "request allowance", "requests exhausted", "request ceiling"]) {
-            (
-                DiagnosticAlertKind::RequestBudget,
-                "تنبيه ميزانية الطلبات — وصلت المهمة إلى سقف عدد الطلبات",
-                "Request Budget Alert — Task Reached Request Allowance Ceiling",
-                "عدد الطلبات المسموح به في ميزانية المهمة أقل من العدد المطلوب لإكمال صفحات المراجعة أو الكتاب.",
-                "The configured request allowance in the task budget is lower than what is needed to complete the review group or book.",
-                "اضغط على (رفع حصة الطلبات تلقائياً) لضبط السقف بما يناسب صفحات الكتاب ثم اضغط إنتاج أو إعادة المحاولة.",
-                "Click 'Raise Request Allowance' to match your review group or book pages, then click Produce or Retry.",
-            )
-        } else if has(&["token limit", "token_limit", "token budget", "max_output_tokens", "input budget", "tokens exceeded"]) {
-            (
-                DiagnosticAlertKind::TokenBudget,
-                "تنبيه ميزانية الرموز (Tokens) — تجاوز سقف الرموز المسموح",
-                "Token Budget Alert — Token Reservation Exceeded Configured Limit",
-                "حجم الإدخال أو الإخراج المتوقع للمهمة يتجاوز سقف الرموز (Tokens) المحدد في الإعدادات المتقدمة.",
-                "The estimated input or output tokens for this batch exceed the configured token limit in Advanced settings.",
-                "اضغط على (رفع سقف الرموز تلقائياً) لزيادة ميزانية الرموز أو قلل عدد الصفحات لكل مراجعة.",
-                "Click 'Raise Token Limit' to increase the token budget, or reduce Pages per review.",
-            )
-        } else if has(&["cost", "max_cost_usd", "price", "rates"]) {
-            (
-                DiagnosticAlertKind::CostBudget,
-                "تنبيه سقف التكلفة — يلزم مراجعة سقف الكلفة أو أسعار المزود",
-                "Cost Ceiling Alert — Cost Limit Reached or Provider Rates Unconfirmed",
-                "وصلت التكلفة التقديرية إلى السقف المحدد أو لم يتم تأكيد أسعار المزود في الإعدادات المتقدمة.",
-                "Estimated task cost reached the configured ceiling, or provider token rates have not been confirmed.",
-                "راجع سقف التكلفة وأسعار المزود في قسم الإعدادات المتقدمة ثم أعد المحاولة.",
-                "Review the cost ceiling and confirm provider rates in Advanced settings, then retry.",
-            )
-        } else if has(&["image/media model", "non-text", "choose a text model", "missing model"]) {
-            (
-                DiagnosticAlertKind::InvalidModel,
-                "تنبيه اختيار النموذج — النموذج المحدد لا يدعم توليد النصوص",
-                "Model Selection Alert — Selected Model Does Not Support Text Planning",
-                "النموذج المختار في خانة النص مخصص للصور أو الوسائط أو أن حقل النموذج فارغ.",
-                "The model in the text slot is an image/media model or no text model name was entered.",
-                "اختر نموذج نص قياسي (مثل gemini-2.5-flash أو gpt-4.1-mini) في حقل النموذج أعلى اللوحة.",
-                "Select a standard text generation model (such as gemini-2.5-flash) in the Model field at the top.",
-            )
-        } else if has(&["page count", "pages require reviewed batches", "explicit page", "script defines"]) {
-            (
-                DiagnosticAlertKind::PageCountMismatch,
-                "تنبيه إعداد الصفحات — تعارض في عدد الصفحات أو نظام الدفعات",
-                "Page Configuration Alert — Page Count or Batch Review Mismatch",
-                "يوجد اختلاف بين عدد الصفحات المطلوب في التعليمات وعدد صفحات المستند أو إعداد المراجعة.",
-                "There is a mismatch between the prompt's page count and the target document or batch review setting.",
-                "طابق عدد صفحات المستند مع التعليمات وتأكد من ضبط (الصفحات لكل مراجعة) على ١ أو أكثر.",
-                "Match the document page count to the prompt and ensure Pages per review is set to at least 1.",
-            )
-        } else if has(&["overflow", "exceeds frame", "saferect", "safe area", "preflight", "repeated body layout"]) {
-            (
-                DiagnosticAlertKind::LayoutPreflight,
-                "تنبيه الفحص المطبعي والتخطيط — عنصر خارج الهوامش أو نص فائض",
-                "Print Preflight & Layout Alert — Text Overflow or Safe-Area Violation",
-                "رفض الفحص الهندسي المسبق الخطة المولدة بسبب نص فائض أو إطار يتجاوز هوامش الأمان.",
-                "Native print preflight rejected the generated layout due to text frame overflow or safe-area margin bounds.",
-                "أعد المحاولة ليقوم المحرك بإعادة توزيع الإطارات تلقائياً داخل منطقة الأمان، أو اختر نمط تصميم معتمد.",
-                "Retry the group so the engine reflows frames within the safe area, or select an approved design style.",
-            )
-        } else if has(&["connect", "timeout", "timed out", "11434", "8188", "rate limit", "429", "502", "503"]) {
-            (
-                DiagnosticAlertKind::ConnectionOrRateLimit,
-                "تنبيه الاتصال بالمزود — تعذّر الوصول للخادم أو تجاوز الحد الزمني",
-                "Provider Connection Alert — Endpoint Unreachable or Rate Limited",
-                "تعذّر الاتصال بخادم الذكاء الاصطناعي أو تم إيقاف الطلب مؤقتاً بسبب ضغط الطلبات (Rate Limit).",
-                "Could not connect to the AI provider endpoint, or the provider temporarily rate-limited the request.",
-                "تحقق من اتصال الإنترنت أو تشغيل الخادم المحلي (Ollama / ComfyUI) ثم أعد المحاولة بعد لحظات.",
-                "Check your network connection or local server status (Ollama / ComfyUI), then retry.",
-            )
-        } else {
-            (
-                DiagnosticAlertKind::General,
-                "تنبيه الذكاء الاصطناعي — تعذّر إكمال المهمة",
-                "AI Production Alert — Task Could Not Complete",
-                "توقفت عملية الإنتاج بسبب قيد فني أو تعذّر التحقق من مخرجات الطلب الحالي.",
-                "Production stopped due to a technical validation constraint or provider execution error.",
-                "راجع التفاصيل الفنية أدناه واضبط الإعدادات المقترحة ثم أعد المحاولة.",
-                "Review the technical detail below, apply the suggested adjustment, and retry.",
-            )
-        };
+    let (kind, title_ar, title_en, cause_ar, cause_en, solution_ar, solution_en) = if has(&[
+        "exceeds its byte limit",
+        "context limit",
+        "64-kib",
+        "bounded context limit",
+        "size overflow",
+    ]) {
+        (
+            DiagnosticAlertKind::ContextLimit,
+            "تنبيه سعة السياق — تجاوز حجم سياق المهارات أو المراجع",
+            "AI Context Capacity Alert — Skill or Reference Context Limit Exceeded",
+            "تجاوز حجم إرشادات المهارات أو المراجع المدمجة الحد الأقصى المسموح به للطلب الواحد.",
+            "The combined size of active skill instructions or references exceeded the per-request byte limit.",
+            "اضغط على (تفعيل الدمج الذكي للمهارات) لضغط المراجع المشتركة تلقائياً أو قلل المهارات المحددة يدوياً ثم أعد المحاولة.",
+            "Click 'Enable Smart Skill Compaction' to deduplicate shared references automatically or reduce manually pinned skills, then retry.",
+        )
+    } else if has(&["credential", "api key", "api_key", "no key", "unauthorized", "unauthenticated", "401", "403", "invalid key"]) {
+        (
+            DiagnosticAlertKind::MissingCredential,
+            "تنبيه المصادقة — مفتاح المزود (API Key) مفقود أو غير صالح",
+            "Authentication Alert — Provider API Key Missing or Unauthorized",
+            "لم يتم العثور على مفتاح API صالح للمزود المحدد أو أن المفتاح الحالي منتهي الصلاحية.",
+            "No valid API key was found for the selected provider, or the configured key was rejected.",
+            "اضغط على (فتح المفاتيح والمزودين) لإدخال مفتاح API صالح وحفظه، أو اختر مزوداً محلياً (Ollama).",
+            "Click 'Open Keys & Providers' to enter and save a valid API key, or switch to a local provider (Ollama).",
+        )
+    } else if has(&["request limit", "max_requests", "request budget", "request allowance", "requests exhausted", "request ceiling"]) {
+        (
+            DiagnosticAlertKind::RequestBudget,
+            "تنبيه ميزانية الطلبات — وصلت المهمة إلى سقف عدد الطلبات",
+            "Request Budget Alert — Task Reached Request Allowance Ceiling",
+            "عدد الطلبات المسموح به في ميزانية المهمة أقل من العدد المطلوب لإكمال صفحات المراجعة أو الكتاب.",
+            "The configured request allowance in the task budget is lower than what is needed to complete the review group or book.",
+            "اضغط على (رفع حصة الطلبات تلقائياً) لضبط السقف بما يناسب صفحات الكتاب ثم اضغط إنتاج أو إعادة المحاولة.",
+            "Click 'Raise Request Allowance' to match your review group or book pages, then click Produce or Retry.",
+        )
+    } else if has(&["token limit", "token_limit", "token budget", "max_output_tokens", "input budget", "tokens exceeded"]) {
+        (
+            DiagnosticAlertKind::TokenBudget,
+            "تنبيه ميزانية الرموز (Tokens) — تجاوز سقف الرموز المسموح",
+            "Token Budget Alert — Token Reservation Exceeded Configured Limit",
+            "حجم الإدخال أو الإخراج المتوقع للمهمة يتجاوز سقف الرموز (Tokens) المحدد في الإعدادات المتقدمة.",
+            "The estimated input or output tokens for this batch exceed the configured token limit in Advanced settings.",
+            "اضغط على (رفع سقف الرموز تلقائياً) لزيادة ميزانية الرموز أو قلل عدد الصفحات لكل مراجعة.",
+            "Click 'Raise Token Limit' to increase the token budget, or reduce Pages per review.",
+        )
+    } else if has(&["cost", "max_cost_usd", "price", "rates"]) {
+        (
+            DiagnosticAlertKind::CostBudget,
+            "تنبيه سقف التكلفة — يلزم مراجعة سقف الكلفة أو أسعار المزود",
+            "Cost Ceiling Alert — Cost Limit Reached or Provider Rates Unconfirmed",
+            "وصلت التكلفة التقديرية إلى السقف المحدد أو لم يتم تأكيد أسعار المزود في الإعدادات المتقدمة.",
+            "Estimated task cost reached the configured ceiling, or provider token rates have not been confirmed.",
+            "راجع سقف التكلفة وأسعار المزود في قسم الإعدادات المتقدمة ثم أعد المحاولة.",
+            "Review the cost ceiling and confirm provider rates in Advanced settings, then retry.",
+        )
+    } else if has(&[
+        "http 404",
+        "status 404",
+        "404 not found",
+        "model, schema, or endpoint not supported",
+        "model not found",
+        "was not found",
+        "not found for api version",
+        "retired",
+        "no longer available",
+        "is not supported for generatecontent",
+        "does not exist",
+    ]) {
+        (
+            DiagnosticAlertKind::InvalidModel,
+            "تنبيه توفر النموذج — النموذج المحدد متقاعد أو غير موجود لدى المزود (404)",
+            "Model Availability Alert — Selected Model Is Retired or Not Found (404)",
+            "أعاد المزود خطأ عدم توفر النموذج (مثل gemini-2.5-flash المتقاعد أو اسم نموذج غير مدعوم على هذا المسار).",
+            "The provider reported that the configured model was not found, retired (such as gemini-2.5-flash), or unsupported on this endpoint.",
+            "اضغط (استخدام gemini-3.8-flash) للنصوص أو (استخدام gemini-3.1-flash-image) للصور، أو اضغط (اكتشاف النماذج المتاحة) لاختيار نموذج مدعوم.",
+            "Click 'Use gemini-3.8-flash' for text or 'Use gemini-3.1-flash-image' for images, or click 'Discover Available Models' to pick from your provider.",
+        )
+    } else if has(&[
+        "text/non-image",
+        "does not generate raster images",
+        "ollama image generation",
+        "generated-image inspection requires",
+        "inspecting generated images",
+        "choose an image model",
+    ]) {
+        (
+            DiagnosticAlertKind::InvalidModel,
+            "تنبيه توافق نموذج الصور — إعداد الصور أو فحصها غير متوافق مع النموذج الحالي",
+            "Image Model Compatibility Alert — Image Slot or Vision Check Mismatch",
+            "تم وضع نموذج نصي أو غير مدعوم في خانة نموذج الصور، أو تفعيل فحص الصور مع نموذج نص غير متوافق.",
+            "A text-only or unsupported model is configured in the image slot, or image inspection is enabled with an incompatible text model.",
+            "اضغط (استخدام gemini-3.1-flash-image) أو اختر نموذج صور مدعوماً (مثل gpt-image-1)، أو أوقف فحص الصور، أو حوّل الوضع إلى عناصر قابلة للتحرير.",
+            "Click 'Use gemini-3.1-flash-image' or select a supported image model (such as gpt-image-1), turn off image inspection, or switch to Editable elements.",
+        )
+    } else if has(&["image/media model", "non-text", "choose a text model", "missing model"]) {
+        (
+            DiagnosticAlertKind::InvalidModel,
+            "تنبيه اختيار النموذج — النموذج المحدد لا يدعم توليد النصوص",
+            "Model Selection Alert — Selected Model Does Not Support Text Planning",
+            "النموذج المختار في خانة النص مخصص للصور أو الوسائط أو أن حقل النموذج فارغ.",
+            "The model in the text slot is an image/media model or no text model name was entered.",
+            "اختر نموذج نص قياسي (مثل gemini-3.8-flash أو gpt-4.1-mini) في حقل النموذج أعلى اللوحة.",
+            "Select a standard text generation model (such as gemini-3.8-flash or gpt-4.1-mini) in the Model field at the top.",
+        )
+    } else if has(&["page count", "pages require reviewed batches", "explicit page", "script defines"]) {
+        (
+            DiagnosticAlertKind::PageCountMismatch,
+            "تنبيه إعداد الصفحات — تعارض في عدد الصفحات أو نظام الدفعات",
+            "Page Configuration Alert — Page Count or Batch Review Mismatch",
+            "يوجد اختلاف بين عدد الصفحات المطلوب في التعليمات وعدد صفحات المستند أو إعداد المراجعة.",
+            "There is a mismatch between the prompt's page count and the target document or batch review setting.",
+            "طابق عدد صفحات المستند مع التعليمات وتأكد من ضبط (الصفحات لكل مراجعة) على ١ أو أكثر.",
+            "Match the document page count to the prompt and ensure Pages per review is set to at least 1.",
+        )
+    } else if has(&["overflow", "exceeds frame", "saferect", "safe area", "preflight", "repeated body layout"]) {
+        (
+            DiagnosticAlertKind::LayoutPreflight,
+            "تنبيه الفحص المطبعي والتخطيط — عنصر خارج الهوامش أو نص فائض",
+            "Print Preflight & Layout Alert — Text Overflow or Safe-Area Violation",
+            "رفض الفحص الهندسي المسبق الخطة المولدة بسبب نص فائض أو إطار يتجاوز هوامش الأمان.",
+            "Native print preflight rejected the generated layout due to text frame overflow or safe-area margin bounds.",
+            "أعد المحاولة ليقوم المحرك بإعادة توزيع الإطارات تلقائياً داخل منطقة الأمان، أو اختر نمط تصميم معتمد.",
+            "Retry the group so the engine reflows frames within the safe area, or select an approved design style.",
+        )
+    } else if has(&["connect", "timeout", "timed out", "11434", "8188", "rate limit", "429", "502", "503"]) {
+        (
+            DiagnosticAlertKind::ConnectionOrRateLimit,
+            "تنبيه الاتصال بالمزود — تعذّر الوصول للخادم أو تجاوز الحد الزمني",
+            "Provider Connection Alert — Endpoint Unreachable or Rate Limited",
+            "تعذّر الاتصال بخادم الذكاء الاصطناعي أو تم إيقاف الطلب مؤقتاً بسبب ضغط الطلبات (Rate Limit).",
+            "Could not connect to the AI provider endpoint, or the provider temporarily rate-limited the request.",
+            "تحقق من اتصال الإنترنت أو تشغيل الخادم المحلي (Ollama / ComfyUI) ثم أعد المحاولة بعد لحظات.",
+            "Check your network connection or local server status (Ollama / ComfyUI), then retry.",
+        )
+    } else {
+        (
+            DiagnosticAlertKind::General,
+            "تنبيه الذكاء الاصطناعي — تعذّر إكمال المهمة",
+            "AI Production Alert — Task Could Not Complete",
+            "توقفت عملية الإنتاج بسبب قيد فني أو تعذّر التحقق من مخرجات الطلب الحالي.",
+            "Production stopped due to a technical validation constraint or provider execution error.",
+            "راجع التفاصيل الفنية أدناه واضبط الإعدادات المقترحة ثم أعد المحاولة.",
+            "Review the technical detail below, apply the suggested adjustment, and retry.",
+        )
+    };
     DiagnosticAlert { raw_error: raw_error.to_owned(), kind, title_ar, title_en, cause_ar, cause_en, solution_ar, solution_en }
 }
 
@@ -1187,10 +1295,15 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
     {
         app.ui.ai.pending_models = Some(selection.clone());
     }
+    let updated_settings = matches!(&request, AiRequest::UpdateSettings(_));
     let production_request = if let AiRequest::Start(request) = &request { Some(request.clone()) } else { None };
     let snapshot = host(&mut app.session, request);
     let result = serde_json::to_value(&snapshot).map_err(|e| e.to_string());
     app.ui.ai.accept(snapshot);
+    if updated_settings && app.ui.ai.snapshot.stage != "failed" {
+        let next_settings = app.ui.ai.snapshot.settings.clone();
+        app.ui.ai.sync_settings(next_settings);
+    }
     if let Some(alert) = app.ui.ai.active_diagnostic_alert() {
         app.ui.status = format!("⚠ {} | {}", alert.title_ar, alert.title_en);
     }
@@ -1311,15 +1424,41 @@ fn provider(ui: &mut egui::Ui, id: &str, selected: &mut ProviderKind, images: bo
         }
     });
 }
-fn model(ui: &mut egui::Ui, a: bool, id: &str, m: &mut ModelSelection, images: bool, requests: &mut Vec<AiRequest>) {
-    ui.horizontal(|ui| {
+fn model(
+    ui: &mut egui::Ui,
+    a: bool,
+    id: &str,
+    m: &mut ModelSelection,
+    images: bool,
+    pending_models: &mut Option<ModelSelection>,
+    discovered: &BTreeMap<(ProviderKind, Option<String>), Vec<String>>,
+    requests: &mut Vec<AiRequest>,
+) {
+    ui.horizontal_wrapped(|ui| {
         provider(ui, id, &mut m.provider, images);
         label(ui, a, "Model", "النموذج");
         ui.add(egui::TextEdit::singleline(&mut m.model).desired_width(240.0));
         if button(ui, a, "Discover", "اكتشاف") {
+            *pending_models = Some(m.clone());
             requests.push(AiRequest::ListModels { selection: m.clone() });
         }
     });
+    if let Some(models) = discovered.get(&(m.provider, m.endpoint.clone())) {
+        let filtered: Vec<&String> =
+            models.iter().filter(|name| if images { !is_non_image_model(m.provider, name) } else { !is_non_text_model(name) }).collect();
+        if !filtered.is_empty() {
+            let picker_label = if images {
+                text(a, "Available image models", "نماذج الصور المتاحة")
+            } else {
+                text(a, "Available models", "النماذج المتاحة")
+            };
+            egui::ComboBox::from_id_salt((id, "discovered_models")).selected_text(rtl::widget(ui, picker_label)).show_ui(ui, |ui| {
+                for name in filtered {
+                    ui.selectable_value(&mut m.model, name.clone(), name);
+                }
+            });
+        }
+    }
     let mut endpoint = m.endpoint.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         label(ui, a, "Endpoint (optional)", "عنوان الخدمة (اختياري)");
@@ -1353,6 +1492,8 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     state.batch_approval_gesture = None;
     state.review_input_is_human = human_review_input(app);
     state.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
+    state.proof_facing_pages =
+        app.session.active().filter(|document| state.proof_document_matches && document.doc.settings.facing_pages).map(|_| true);
     state.proof_binding = app
         .session
         .active()
@@ -1367,7 +1508,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         app.session.documents().iter().enumerate().map(|(index, document)| OpenDocument::from_document(index, document)).collect();
     let mut activate_document = app.session.active_index();
     let original_document = activate_document;
-    egui::Window::new(text(a, "AI Production and Skills", "الذكاء"))
+    egui::Window::new(rtl::widget_ctx(ctx, text(a, "AI Production and Skills", "الذكاء")))
         .id(egui::Id::new("ai_production"))
         .open(&mut open)
         .default_size(egui::vec2(720.0, 720.0))
@@ -1415,7 +1556,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         usage.input_tokens,
                         text(a, "Output", "الإخراج"),
                         usage.output_tokens,
-                        usage.estimated_cost_usd.map_or_else(String::new, |cost| format!(" · {} ${cost:.6}", text(a, "Estimated", "التقدير"))),
+                        usage.estimated_cost_usd.map_or_else(String::new, |cost| {
+                            if a { format!(" · التقدير {}", rtl::ltr(format!("${cost:.6}"))) } else { format!(" · Estimated ${cost:.6}") }
+                        }),
                         if usage.has_unreported_usage {
                             text(a, " · Some usage unreported", " · بعض الاستخدام غير مبلغ")
                         } else {
@@ -1514,7 +1657,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     }
     if std::mem::take(&mut app.ui.ai.pick_target_document) {
         if app.services.pick_open.is_some() {
-            if let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("open")) {
+            if let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ai_target_document")) {
                 app.ui.ai.open_document_path = path.clone();
                 match open_target_document_path(app, &path) {
                     Ok(_) => {
@@ -1527,7 +1670,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     Err(error) => app.ui.ai.error = error,
                 }
             }
-        } else if let Err(error) = app.pick_and_open("open") {
+        } else if let Err(error) = app.pick_and_open("ai_target_document") {
             app.ui.ai.error = error;
         }
         requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
@@ -1564,6 +1707,15 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     load_companion_proof(app, ctx);
 }
 
+const MAX_AI_TARGET_PDF_BYTES: u64 = 64 * 1024 * 1024;
+
+fn sanitize_pdf_page_size(size: Option<(f64, f64)>) -> (f64, f64) {
+    match size {
+        Some((w, h)) if w.is_finite() && h.is_finite() && (36.0..=15552.0).contains(&w) && (36.0..=15552.0).contains(&h) => (w, h),
+        _ => (595.27559, 841.88976),
+    }
+}
+
 fn open_target_document_path(app: &mut DesignApp, path: &str) -> Result<serde_json::Value, String> {
     let lower = path.to_ascii_lowercase();
     let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("Imported");
@@ -1579,14 +1731,20 @@ fn open_target_document_path(app: &mut DesignApp, path: &str) -> Result<serde_js
             }
         }
     } else if lower.ends_with(".pdf") {
-        let bytes = if let Some(read) = app.services.read.as_mut() { read(path) } else { designcraft_engine::io::read_file(path) };
+        let bytes = if let Some(read) = app.services.read.as_mut() {
+            read(path)
+        } else {
+            designcraft_engine::io::read_capped(path, MAX_AI_TARGET_PDF_BYTES)
+                .map_err(|e| format!("{path}: {e}"))
+                .and_then(|b| if (b.len() as u64) > MAX_AI_TARGET_PDF_BYTES { Err("PDF file exceeds the 64-MiB import limit".into()) } else { Ok(b) })
+        };
         let bytes = match bytes {
             Ok(b) if designcraft_render::is_pdf(&b) => b,
             Ok(_) => return app.open_file("file.open", serde_json::json!({"path": path})),
             Err(error) => return Err(error),
         };
         let pages = designcraft_render::pdf_page_count(&bytes).unwrap_or(1).clamp(1, 500);
-        let (w, h) = designcraft_render::pdf_page_size(&bytes, 0).unwrap_or((595.27559, 841.88976));
+        let (w, h) = sanitize_pdf_page_size(designcraft_render::pdf_page_size(&bytes, 0));
         let created = app.run("file.new", serde_json::json!({"width": w, "height": h, "pages": pages, "facingPages": false, "title": stem}))?;
         let mut last = serde_json::Value::Null;
         for page in 1..=pages {
@@ -1607,16 +1765,62 @@ fn open_target_document_path(app: &mut DesignApp, path: &str) -> Result<serde_js
     }
 }
 
+pub(crate) fn open_target_document_bytes(app: &mut DesignApp, name: &str, bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let lower = name.to_ascii_lowercase();
+    let stem = std::path::Path::new(name).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("Imported");
+    let b64 = designcraft_engine::cmd::base64_encode(bytes);
+    let result = if [".docx", ".rtf", ".txt", ".md", ".xlsx"].iter().any(|ext| lower.ends_with(ext)) {
+        let created = app.run("file.new", serde_json::json!({"preset": "A4", "pages": 1, "facingPages": false, "title": stem}))?;
+        match app.open_file("file.place", serde_json::json!({"name": name, "base64": b64, "autoflow": true})) {
+            Ok(v) => Ok(v),
+            Err(error) => {
+                if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
+                    let _ = app.run("file.close", serde_json::json!({"index": index}));
+                }
+                Err(error)
+            }
+        }
+    } else if lower.ends_with(".pdf") && designcraft_render::is_pdf(bytes) {
+        if (bytes.len() as u64) > MAX_AI_TARGET_PDF_BYTES {
+            return Err("PDF file exceeds the 64-MiB import limit".into());
+        }
+        let pages = designcraft_render::pdf_page_count(bytes).unwrap_or(1).clamp(1, 500);
+        let (w, h) = sanitize_pdf_page_size(designcraft_render::pdf_page_size(bytes, 0));
+        let created = app.run("file.new", serde_json::json!({"width": w, "height": h, "pages": pages, "facingPages": false, "title": stem}))?;
+        let mut last = serde_json::Value::Null;
+        for page in 1..=pages {
+            match app.open_file(
+                "file.place",
+                serde_json::json!({"name": name, "base64": b64, "pdfPage": page, "spread": page - 1, "x": 0.0, "y": 0.0, "width": w}),
+            ) {
+                Ok(v) => last = v,
+                Err(error) => {
+                    if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
+                        let _ = app.run("file.close", serde_json::json!({"index": index}));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(last)
+    } else {
+        app.open_file("file.openBytes", serde_json::json!({"name": stem, "base64": b64}))
+    }?;
+    app.ui.ai.open_document_path = name.to_string();
+    app.ui.ai.new_document = false;
+    app.ui.ai.continue_book = false;
+    app.ui.ai.restored_target_unconfirmed = false;
+    app.ui.ai.error.clear();
+    Ok(result)
+}
+
 fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, requests: &mut Vec<AiRequest>) {
     ui.add_enabled_ui(available && !s.task_active(), |ui| {
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Models and credentials", "النماذج ومفاتيح الاتصال"))).default_open(true).show(ui, |ui| {
             label(ui, a, "Text and layout model", "نموذج النص والتخطيط");
-            model(ui, a, "ai_text_provider", &mut s.settings.text_model, false, requests);
+            model(ui, a, "ai_text_provider", &mut s.settings.text_model, false, &mut s.pending_models, &s.discovered_models, requests);
             label(ui, a, "Image model (separate)", "نموذج الصور (مستقل)");
-            model(ui, a, "ai_image_provider", &mut s.settings.image_model, true, requests);
-            for name in &s.snapshot.models {
-                rtl::label(ui, name);
-            }
+            model(ui, a, "ai_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut s.settings.output_mode, OutputMode::NativeOnly, rtl::widget(ui, text(a, "Native only", "عناصر أصلية فقط")));
                 ui.selectable_value(
@@ -1756,7 +1960,15 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
         });
         label(ui, a, "Starts the selected installed server on 127.0.0.1:11434. It does not install or download models; other running services are left alone.", "يشغّل الخادم المثبت المحدد على 127.0.0.1:11434. لا يثبت أو ينزل نماذج ولا يوقف الخدمات الأخرى.");
         if let Some(server) = &s.snapshot.local_server {
-            rtl::label(ui, format!("{} · {} · PID {:?}", server.endpoint, text(a, if server.running { "Running" } else { "Stopped" }, if server.running { "قيد التشغيل" } else { "متوقف" }), server.pid));
+            let status_label = text(a, if server.running { "Running" } else { "Stopped" }, if server.running { "قيد التشغيل" } else { "متوقف" });
+            rtl::label(
+                ui,
+                if a {
+                    rtl::rtl_paragraph(format!("{} · {status_label} · {}", rtl::ltr(&server.endpoint), rtl::ltr(format!("PID {:?}", server.pid))))
+                } else {
+                    format!("{} · {status_label} · PID {:?}", server.endpoint, server.pid)
+                },
+            );
             rtl::label(ui, &server.message);
         }
 
@@ -1768,7 +1980,10 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
             field(ui, a, "Service endpoint", "عنوان الخدمة", &mut endpoint);
             selection.endpoint = (!endpoint.trim().is_empty()).then_some(endpoint);
             field(ui, a, "Model name", "اسم النموذج", &mut selection.model);
-            if button(ui, a, "Check connection and discover models", "فحص الاتصال واكتشاف النماذج") { requests.push(AiRequest::ListModels { selection: selection.clone() }); }
+            if button(ui, a, "Check connection and discover models", "فحص الاتصال واكتشاف النماذج") {
+                s.pending_models = Some(selection.clone());
+                requests.push(AiRequest::ListModels { selection: selection.clone() });
+            }
             let matching = s.local_probe.as_ref().filter(|(probed, _, _, _)| probed.provider == selection.provider && probed.endpoint == selection.endpoint);
             if let Some((_, models, message, connected)) = matching {
                 label(ui, a, if *connected { "Connected: discovery succeeded" } else { "Connection failed or cancelled" }, if *connected { "متصل: نجح اكتشاف النماذج" } else { "فشل الاتصال أو ألغي الفحص" });
@@ -1829,17 +2044,41 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
         if resource.total_ram_mb > 0 {
             rtl::label(
                 ui,
-                format!("RAM: {} MiB / {} MiB {}", resource.available_ram_mb, resource.total_ram_mb, text(a, "free / total", "حرة / إجمالي")),
+                if a {
+                    rtl::rtl_paragraph(format!(
+                        "{}: {} حرة / إجمالي",
+                        rtl::ltr("RAM"),
+                        rtl::ltr(format!("{} MiB / {} MiB", resource.available_ram_mb, resource.total_ram_mb))
+                    ))
+                } else {
+                    format!("RAM: {} MiB / {} MiB free / total", resource.available_ram_mb, resource.total_ram_mb)
+                },
             );
         }
         for gpu in &resource.gpus {
             if gpu.total_vram_mb > 0 {
                 rtl::label(
                     ui,
-                    format!("{} · VRAM: {} MiB / {} MiB {}", gpu.name, gpu.free_vram_mb, gpu.total_vram_mb, text(a, "free / total", "حرة / إجمالي")),
+                    if a {
+                        rtl::rtl_paragraph(format!(
+                            "{} · {}: {} حرة / إجمالي",
+                            rtl::ltr(&gpu.name),
+                            rtl::ltr("VRAM"),
+                            rtl::ltr(format!("{} MiB / {} MiB", gpu.free_vram_mb, gpu.total_vram_mb))
+                        ))
+                    } else {
+                        format!("{} · VRAM: {} MiB / {} MiB free / total", gpu.name, gpu.free_vram_mb, gpu.total_vram_mb)
+                    },
                 );
             } else {
-                rtl::label(ui, format!("{} · {}", gpu.name, text(a, "VRAM telemetry unavailable", "بيانات ذاكرة المعالج الرسومي غير متاحة")));
+                rtl::label(
+                    ui,
+                    if a {
+                        rtl::rtl_paragraph(format!("{} · بيانات ذاكرة المعالج الرسومي غير متاحة", rtl::ltr(&gpu.name)))
+                    } else {
+                        format!("{} · VRAM telemetry unavailable", gpu.name)
+                    },
+                );
             }
         }
         if resource.gpus.is_empty() {
@@ -1999,7 +2238,14 @@ fn production_recovery(
     }
 }
 
-fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], activate_document: Option<usize>) {
+fn render_diagnostic_alert_banner(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    documents: &[OpenDocument],
+    activate_document: Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
     let Some(alert) = s.active_diagnostic_alert() else {
         return;
     };
@@ -2008,33 +2254,21 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
     let title_color = ui.visuals().error_fg_color;
     let accent_color = ui.visuals().warn_fg_color;
     let border = egui::Stroke::new(2.0, title_color);
-    let show_ar = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
     egui::Frame::group(ui.style()).fill(fill).stroke(border).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(
         ui,
         |ui| {
-            if show_ar {
+            if a {
                 rtl::label(ui, egui::RichText::new(format!("⚠ {}", alert.title_ar)).color(title_color).strong().size(14.0));
-            }
-            rtl::label(ui, egui::RichText::new(format!("⚠ {}", alert.title_en)).color(title_color).strong().size(13.5));
-            ui.add_space(4.0);
-            let cause_text =
-                if show_ar { format!("السبب / Cause: {} — {}", alert.cause_ar, alert.cause_en) } else { format!("Cause: {}", alert.cause_en) };
-            rtl::label(ui, egui::RichText::new(cause_text).color(accent_color).strong());
-            let solution_text = if show_ar {
-                format!("الحل المقترح / Solution: {} — {}", alert.solution_ar, alert.solution_en)
+                ui.add_space(4.0);
+                rtl::label(ui, egui::RichText::new(format!("السبب: {}", alert.cause_ar)).color(accent_color).strong());
+                rtl::label(ui, format!("الحل المقترح: {}", alert.solution_ar));
+                rtl::label(ui, format!("التفاصيل التقنية: {}", rtl::ltr(&alert.raw_error)));
             } else {
-                format!("Solution: {}", alert.solution_en)
-            };
-            rtl::label(ui, solution_text);
-            let detail_text = if show_ar {
-                format!("التفاصيل الفنية / Technical detail: {}", alert.raw_error)
-            } else {
-                format!("Technical detail: {}", alert.raw_error)
-            };
-            if show_ar {
-                rtl::label(ui, detail_text);
-            } else {
-                ui.label(detail_text);
+                ui.label(egui::RichText::new(format!("⚠ {}", alert.title_en)).color(title_color).strong().size(13.5));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("Cause: {}", alert.cause_en)).color(accent_color).strong());
+                ui.label(format!("Solution: {}", alert.solution_en));
+                ui.label(format!("Technical detail: {}", alert.raw_error));
             }
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -2054,7 +2288,59 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
                             s.expand_advanced_settings = Some(true);
                         }
                     }
-                    DiagnosticAlertKind::MissingCredential | DiagnosticAlertKind::InvalidModel | DiagnosticAlertKind::ConnectionOrRateLimit => {
+                    DiagnosticAlertKind::InvalidModel => {
+                        if s.settings.text_model.provider == ProviderKind::Gemini
+                            && s.settings.text_model.model.trim() != "gemini-3.8-flash"
+                            && ui.button(rtl::widget(ui, text(a, "Use gemini-3.8-flash", "استخدام gemini-3.8-flash"))).clicked()
+                        {
+                            s.settings.text_model.model = "gemini-3.8-flash".into();
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                            s.clear_failure_alert();
+                        }
+                        if s.settings.output_mode == OutputMode::NativeWithImages
+                            && s.settings.image_model.provider == ProviderKind::Gemini
+                            && s.settings.image_model.model.trim() != "gemini-3.1-flash-image"
+                            && ui.button(rtl::widget(ui, text(a, "Use gemini-3.1-flash-image", "استخدام gemini-3.1-flash-image"))).clicked()
+                        {
+                            s.settings.image_model.model = "gemini-3.1-flash-image".into();
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                            s.clear_failure_alert();
+                        }
+                        if ui.button(rtl::widget(ui, text(a, "Discover Available Models", "اكتشاف النماذج المتاحة"))).clicked() {
+                            let target_selection = if s.settings.output_mode == OutputMode::NativeWithImages
+                                && is_non_image_model(s.settings.image_model.provider, &s.settings.image_model.model)
+                                && !is_non_text_model(&s.settings.text_model.model)
+                            {
+                                s.settings.image_model.clone()
+                            } else {
+                                s.settings.text_model.clone()
+                            };
+                            s.pending_models = Some(target_selection.clone());
+                            requests.push(AiRequest::ListModels { selection: target_selection });
+                        }
+                        if s.settings.output_mode == OutputMode::NativeWithImages
+                            && s.settings.verify_generated_images
+                            && !supports_gemini_image_review(s.settings.text_model.provider, &s.settings.text_model.model)
+                            && ui.button(rtl::widget(ui, text(a, "Turn off image inspection", "إيقاف فحص الصور"))).clicked()
+                        {
+                            s.settings.verify_generated_images = false;
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                            s.clear_failure_alert();
+                        }
+                        if s.settings.output_mode == OutputMode::NativeWithImages
+                            && (s.settings.image_model.provider == ProviderKind::Ollama
+                                || is_non_image_model(s.settings.image_model.provider, &s.settings.image_model.model))
+                            && ui.button(rtl::widget(ui, text(a, "Switch to Editable elements", "التحويل إلى عناصر قابلة للتحرير"))).clicked()
+                        {
+                            s.settings.output_mode = OutputMode::NativeOnly;
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                            s.clear_failure_alert();
+                        }
+                        if ui.button(rtl::widget(ui, text(a, "Open Keys & Providers", "فتح المفاتيح والمزودين"))).clicked() {
+                            s.tab = 3;
+                        }
+                    }
+                    DiagnosticAlertKind::MissingCredential | DiagnosticAlertKind::ConnectionOrRateLimit => {
                         if ui.button(rtl::widget(ui, text(a, "Open Keys & Providers", "فتح المفاتيح والمزودين"))).clicked() {
                             s.tab = 3;
                         }
@@ -2068,16 +2354,39 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
                                 .max(s.settings.budget.max_requests.saturating_mul(2))
                                 .min(MAX_REQUEST_ALLOWANCE);
                             s.settings.budget.max_requests = target;
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                             s.clear_failure_alert();
                         }
                     }
                     DiagnosticAlertKind::TokenBudget => {
                         if ui.button(rtl::widget(ui, text(a, "Raise Token Limit", "رفع سقف الرموز تلقائياً"))).clicked() {
                             s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).clamp(256_000, 4_000_000);
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                             s.clear_failure_alert();
                         }
                     }
-                    DiagnosticAlertKind::PageCountMismatch | DiagnosticAlertKind::LayoutPreflight | DiagnosticAlertKind::General => {}
+                    DiagnosticAlertKind::PageCountMismatch => {
+                        if let Some(script_pages) = explicit_script_pages(&s.prompt)
+                            && ui.button(rtl::widget(ui, text(a, "Match Page Count to Script", "مطابقة عدد الصفحات مع السكربت"))).clicked()
+                        {
+                            s.new_document = true;
+                            s.continue_book = false;
+                            s.pages = script_pages;
+                            s.restored_target_unconfirmed = false;
+                            s.clear_failure_alert();
+                        }
+                    }
+                    DiagnosticAlertKind::LayoutPreflight => {
+                        if (!s.settings.allow_paid_repairs || s.settings.budget.repair_attempts == 0)
+                            && ui.button(rtl::widget(ui, text(a, "Enable Automatic Layout Repair", "تفعيل الإصلاح التلقائي للتخطيط"))).clicked()
+                        {
+                            s.settings.allow_paid_repairs = true;
+                            s.settings.budget.repair_attempts = s.settings.budget.repair_attempts.max(2);
+                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                            s.clear_failure_alert();
+                        }
+                    }
+                    DiagnosticAlertKind::General => {}
                 }
                 if ui.button(rtl::widget(ui, text(a, "Dismiss Alert", "إخفاء التنبيه"))).clicked() {
                     s.clear_failure_alert();
@@ -2086,6 +2395,25 @@ fn render_diagnostic_alert_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool,
         },
     );
     ui.add_space(6.0);
+}
+
+fn selectable_skill_cards(skills: &[SkillCard], include_design_profiles: bool, require_trusted_or_active: bool) -> Vec<&SkillCard> {
+    let mut chosen: Vec<&SkillCard> = Vec::new();
+    for card in skills.iter().filter(|c| {
+        c.enabled
+            && c.compatible
+            && (include_design_profiles || c.design_profile.is_none())
+            && (!require_trusted_or_active || c.active || c.trusted_source)
+    }) {
+        if let Some(existing) = chosen.iter_mut().find(|existing| existing.id == card.id) {
+            if card.active || !existing.active {
+                *existing = card;
+            }
+        } else {
+            chosen.push(card);
+        }
+    }
+    chosen
 }
 
 fn production(
@@ -2097,7 +2425,7 @@ fn production(
     activate_document: &mut Option<usize>,
     requests: &mut Vec<AiRequest>,
 ) {
-    render_diagnostic_alert_banner(ui, s, a, documents, *activate_document);
+    render_diagnostic_alert_banner(ui, s, a, documents, *activate_document, requests);
     production_recovery(ui, s, a, available, documents, activate_document, requests);
     if (s.proof_display.is_some() && s.show_saved_proof) || s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "awaiting_human_proof") {
         if s.proof_key.is_none() {
@@ -2158,38 +2486,46 @@ fn production(
                 s.tab = 3;
             }
         });
-        if let Some((_, models, _, _)) = s.local_probe.as_ref().filter(|(selection, models, _, success)| {
-            *success && !models.is_empty() && selection.provider == s.settings.text_model.provider && selection.endpoint == s.settings.text_model.endpoint
-        }) {
-            egui::ComboBox::from_id_salt("production_discovered_models").selected_text(text(a, "Available models", "النماذج المتاحة")).show_ui(
-                ui,
-                |ui| {
-                    for name in models.iter().filter(|name| !is_non_text_model(name)) {
-                        ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
-                    }
-                },
-            );
+        if let Some(models) = s.discovered_models.get(&(s.settings.text_model.provider, s.settings.text_model.endpoint.clone())) {
+            let filtered: Vec<&String> = models.iter().filter(|name| !is_non_text_model(name)).collect();
+            if !filtered.is_empty() {
+                egui::ComboBox::from_id_salt("production_discovered_models")
+                    .selected_text(rtl::widget(ui, text(a, "Available models", "النماذج المتاحة")))
+                    .show_ui(
+                    ui,
+                    |ui| {
+                        for name in filtered {
+                            ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
+                        }
+                    },
+                );
+            }
         }
         label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
         ui.horizontal_wrapped(|ui| {
             label(ui, a, "Design style", "نمط التصميم");
+            let available_styles = selectable_skill_cards(&s.snapshot.skills, true, !s.automatic_skills);
             let selected = s
                 .settings
                 .design_style
                 .as_ref()
-                .and_then(|id| s.snapshot.skills.iter().rev().find(|card| &card.id == id))
+                .and_then(|id| {
+                    available_styles
+                        .iter()
+                        .copied()
+                        .find(|card| &card.id == id)
+                        .or_else(|| s.snapshot.skills.iter().rev().find(|card| &card.id == id && card.active))
+                        .or_else(|| s.snapshot.skills.iter().rev().find(|card| &card.id == id))
+                })
                 .and_then(|card| card.design_profile.as_ref())
                 .map(|profile| profile.name.clone())
                 .unwrap_or_else(|| {
                     s.settings.design_style.clone().unwrap_or_else(|| text(a, "Automatic from the request", "تلقائي حسب المطلوب").into())
                 });
-            egui::ComboBox::from_id_salt("production_design_style").selected_text(selected).width(260.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("production_design_style").selected_text(rtl::widget(ui, selected)).width(260.0).show_ui(ui, |ui| {
                 ui.selectable_value(&mut s.settings.design_style, None, rtl::widget(ui, text(a, "Automatic from the request", "تلقائي حسب المطلوب")));
-                let mut seen = BTreeSet::new();
-                for card in s.snapshot.skills.iter().rev().filter(|card| card.enabled && card.compatible) {
-                    if let Some(profile) = &card.design_profile
-                        && seen.insert(&card.id)
-                    {
+                for card in available_styles {
+                    if let Some(profile) = &card.design_profile {
                         ui.selectable_value(&mut s.settings.design_style, Some(card.id.clone()), rtl::widget(ui, &profile.name));
                     }
                 }
@@ -2201,20 +2537,27 @@ fn production(
         // Keep room for the compact update row and the production action. Long
         // briefs remain complete and scroll inside their own seven-row composer.
         egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(128.0).show(ui, |ui| {
-            ui.add(egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(text(
-                a,
-                "Describe your design, audience and desired result...",
-                "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
-            )));
+            ui.add(
+                egui::TextEdit::multiline(&mut s.prompt).desired_rows(7).desired_width(f32::INFINITY).hint_text(rtl::widget(
+                    ui,
+                    text(
+                        a,
+                        "Describe your design, audience and desired result...",
+                        "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
+                    ),
+                )),
+            );
         });
         rtl::label(
             ui,
-            format!(
-                "{} {} / {} UTF-8 bytes",
-                text(a, "Prompt length:", "طول التعليمات:"),
-                s.prompt.len(),
-                designcraft_ai_types::protocol::MAX_BRIEF_BYTES
-            ),
+            if a {
+                format!(
+                    "طول التعليمات: {}",
+                    rtl::ltr(format!("{} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES))
+                )
+            } else {
+                format!("Prompt length: {} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)
+            },
         );
         if s.prompt.len() > 32768 {
             rtl::label(
@@ -2255,7 +2598,12 @@ fn production(
                 s.pick_target_document = true;
             }
             if s.new_document {
-                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
+                if a {
+                    ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000));
+                    label(ui, a, "pages", "صفحة");
+                } else {
+                    ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
+                }
             }
             label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
             ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000));
@@ -2272,10 +2620,13 @@ fn production(
             ui.horizontal_wrapped(|ui| {
                 label(ui, a, "Target document", "المستند المستهدف");
                 egui::ComboBox::from_id_salt("ai_target_document")
-                    .selected_text(selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً")))
+                    .selected_text(rtl::widget(
+                        ui,
+                        selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً")),
+                    ))
                     .show_ui(ui, |ui| {
                         for document in documents {
-                            if ui.selectable_value(activate_document, Some(document.index), &document.title).clicked() {
+                            if ui.selectable_value(activate_document, Some(document.index), rtl::widget(ui, &document.title)).clicked() {
                                 s.restored_target_unconfirmed = false;
                             }
                         }
@@ -2402,7 +2753,14 @@ fn production(
             "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
         );
         if let Some(cost) = s.settings.budget.max_cost_usd {
-            rtl::label(ui, format!("{} ${cost:.2}", text(a, "Task cost ceiling (estimate):", "سقف كلفة المهمة (تقديري):")));
+            rtl::label(
+                ui,
+                if a {
+                    format!("سقف كلفة المهمة (تقديري): {}", rtl::ltr(format!("${cost:.2}")))
+                } else {
+                    format!("Task cost ceiling (estimate): ${cost:.2}")
+                },
+            );
         }
         label(
             ui,
@@ -2561,15 +2919,19 @@ fn production(
             budgets(ui, s, a);
             ui.separator();
             ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut s.settings.output_mode, OutputMode::NativeOnly, text(a, "Editable elements", "عناصر قابلة للتحرير"));
+                ui.selectable_value(
+                    &mut s.settings.output_mode,
+                    OutputMode::NativeOnly,
+                    rtl::widget(ui, text(a, "Editable elements", "عناصر قابلة للتحرير")),
+                );
                 ui.selectable_value(
                     &mut s.settings.output_mode,
                     OutputMode::NativeWithImages,
-                    text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور"),
+                    rtl::widget(ui, text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور")),
                 );
             });
             if s.settings.output_mode == OutputMode::NativeWithImages {
-                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, requests);
+                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
                 image_inspection_setting(ui, s, a);
             }
             ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
@@ -2583,7 +2945,7 @@ fn production(
                     ),
                 ))
                 .show(ui, |ui| {
-                    for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible && c.design_profile.is_none()) {
+                    for card in selectable_skill_cards(&s.snapshot.skills, false, false) {
                         let mut selected = s.selected_skills.contains(&card.id);
                         if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
                             if selected {
@@ -2595,7 +2957,7 @@ fn production(
                     }
                 });
             } else {
-                for card in s.snapshot.skills.iter().filter(|c| c.active && c.approved && c.enabled && c.compatible) {
+                for card in selectable_skill_cards(&s.snapshot.skills, true, true) {
                     let mut selected = s.selected_skills.contains(&card.id);
                     if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
                         if selected {
@@ -2662,7 +3024,7 @@ fn usage_line(ui: &mut egui::Ui, a: bool, usage: &designcraft_ai_types::protocol
         ),
     );
     if let Some(cost) = usage.estimated_cost_usd {
-        rtl::label(ui, format!("{} ${cost:.6}", text(a, "Estimated cost", "التكلفة التقديرية")));
+        rtl::label(ui, if a { format!("التكلفة التقديرية {}", rtl::ltr(format!("${cost:.6}"))) } else { format!("Estimated cost ${cost:.6}") });
     }
     if usage.has_unreported_usage {
         label(ui, a, "Some usage has not been reported by the provider.", "لم يبلغ المزود عن بعض بيانات الاستخدام.");
@@ -2694,6 +3056,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
     let can_review = s.can_review_selected_proof();
     let pair_visible = s.companion_proof_path().is_some();
     let can_approve = s.can_approve_batch();
+    let facing_pages = s.effective_proof_facing_pages();
     let pages: Vec<_> = s.proof_display.as_ref().map_or_else(Vec::new, |key| key.pages().collect());
     let page_count = pages.len();
     let reviewed_count = pages.iter().filter(|page| s.reviewed_proofs.contains(**page)).count();
@@ -2718,7 +3081,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             text(a, "Pages", "الصفحات"),
             batch.completed_pages,
             batch.total_pages,
-            batch.status
+            if a { rtl::ltr(&batch.status) } else { batch.status.clone() }
         ),
     );
     if let Some(current) = batch.batches.iter().find(|report| report.batch == batch.current_batch).filter(|_| !pages.is_empty()) {
@@ -2736,7 +3099,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
         });
         let pair = selected
             .and_then(|index| current.page_start.checked_add(u32::try_from(index).ok()?))
-            .filter(|_| s.settings.facing_pages && s.proof_pair_view)
+            .filter(|_| facing_pages && s.proof_pair_view)
             .and_then(|page| {
                 facing_proof_pair(page, s.proof_binding.or(s.settings.right_to_left_binding).unwrap_or_else(|| automatic_proof_binding(&s.prompt, a)))
             });
@@ -2837,7 +3200,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                 ui.set_width(action_width);
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 rtl::label(ui, format!("{} {} / {}", text(a, "Pages reviewed:", "الصفحات المراجعة:"), reviewed_count, page_count));
-                if s.settings.facing_pages {
+                if facing_pages {
                     if ui.checkbox(&mut s.proof_pair_view, rtl::widget(ui, text(a, "Show facing pair", "عرض الصفحتين المتقابلتين"))).changed()
                     {
                         s.review_pointer_press = None;
@@ -2871,10 +3234,9 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                         }
                     });
                     egui::ComboBox::from_id_salt("ai_proof_page")
-                        .selected_text(format!(
-                            "{} {}",
-                            text(a, "Page", "الصفحة"),
-                            u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)
+                        .selected_text(rtl::widget(
+                            ui,
+                            format!("{} {}", text(a, "Page", "الصفحة"), u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)),
                         ))
                         .show_ui(ui, |ui| {
                             for (page_index, page) in pages.iter().enumerate() {
@@ -3015,9 +3377,11 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
 }
 
 fn image_inspection_setting(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
-    let supported_provider = s.settings.text_model.provider == ProviderKind::Gemini;
+    let supported_model = s.settings.text_model.provider == ProviderKind::Gemini
+        && (s.settings.text_model.model.trim().is_empty()
+            || supports_gemini_image_review(s.settings.text_model.provider, &s.settings.text_model.model));
     ui.add_enabled(
-        supported_provider,
+        supported_model,
         egui::Checkbox::new(
             &mut s.settings.verify_generated_images,
             rtl::widget(
@@ -3036,7 +3400,7 @@ fn image_inspection_setting(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
         "Optional advisory inspection; human proof review is still required. Requires a supported Gemini text model, validated before use.",
         "فحص استشاري اختياري؛ تبقى مراجعة البروفة البشرية مطلوبة. يتطلب نموذج نص Gemini مدعوماً، ويُتحقق من دعمه قبل الاستخدام.",
     );
-    if !supported_provider && s.settings.verify_generated_images && button(ui, a, "Turn off image inspection", "إيقاف فحص الصور") {
+    if !supported_model && s.settings.verify_generated_images && button(ui, a, "Turn off image inspection", "إيقاف فحص الصور") {
         s.settings.verify_generated_images = false;
     }
 }
@@ -3191,12 +3555,15 @@ fn export_print(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, enabled: bool, re
     egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Print — actual size (100%)", "طباعة بالحجم الفعلي (١٠٠٪)"))).show(ui, |ui| {
         field(ui, a, "Printer (empty = system default)", "الطابعة (فارغ = الافتراضية)", &mut s.printer);
         ui.checkbox(&mut s.grayscale, rtl::widget(ui, text(a, "Grayscale", "تدرج رمادي")));
-        egui::ComboBox::from_id_salt("ai_duplex").selected_text(&s.duplex).show_ui(ui, |ui| {
-            for (v, en, ar) in [
-                ("off", "One side", "وجه واحد"),
-                ("longEdge", "Duplex long edge", "وجهان: الحافة الطويلة"),
-                ("shortEdge", "Duplex short edge", "وجهان: الحافة القصيرة"),
-            ] {
+        let duplex_options = [
+            ("off", "One side", "وجه واحد"),
+            ("longEdge", "Duplex long edge", "وجهان: الحافة الطويلة"),
+            ("shortEdge", "Duplex short edge", "وجهان: الحافة القصيرة"),
+        ];
+        let duplex_selected =
+            duplex_options.iter().find(|(v, _, _)| *v == s.duplex).map(|(_, en, ar)| text(a, en, ar)).unwrap_or(s.duplex.as_str());
+        egui::ComboBox::from_id_salt("ai_duplex").selected_text(rtl::widget(ui, duplex_selected)).show_ui(ui, |ui| {
+            for (v, en, ar) in duplex_options {
                 ui.selectable_value(&mut s.duplex, v.into(), rtl::widget(ui, text(a, en, ar)));
             }
         });
@@ -3239,11 +3606,20 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                 "Reusable rules, native page families and recorded corrections. Technical checks do not replace educator or visual review.",
                 "قواعد وقوالب أصلية وتصحيحات محفوظة. الفحص التقني لا يغني عن المراجعة التربوية والبصرية.",
             );
-            let mut seen = BTreeSet::new();
-            for card in s.snapshot.skills.iter().rev() {
-                if let Some(profile) = &card.design_profile
-                    && seen.insert(&card.id)
-                {
+            let mut style_cards: Vec<&SkillCard> = Vec::new();
+            for card in &s.snapshot.skills {
+                if card.design_profile.is_some() {
+                    if let Some(existing) = style_cards.iter_mut().find(|existing| existing.id == card.id) {
+                        if card.active || !existing.active {
+                            *existing = card;
+                        }
+                    } else {
+                        style_cards.push(card);
+                    }
+                }
+            }
+            for card in style_cards {
+                if let Some(profile) = &card.design_profile {
                     ui.horizontal_wrapped(|ui| {
                         rtl::label(ui, &profile.name);
                         rtl::label(
@@ -3263,7 +3639,10 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                             requests.push(AiRequest::InspectSkill { id: card.id.clone(), revision: card.revision.clone() });
                         }
                         if ui
-                            .add_enabled(card.enabled && card.compatible, egui::Button::new(rtl::widget(ui, text(a, "Use style", "استخدام النمط"))))
+                            .add_enabled(
+                                card.enabled && card.compatible && (s.automatic_skills || card.active || card.trusted_source),
+                                egui::Button::new(rtl::widget(ui, text(a, "Use style", "استخدام النمط"))),
+                            )
                             .clicked()
                         {
                             s.settings.design_style = Some(card.id.clone());
@@ -3510,7 +3889,12 @@ fn usage(ui: &mut egui::Ui, s: &AiUiState, a: bool) {
         "الاستخدام المبلغ من المزود وتقدير الأسعار المدخلة لهذه الجلسة. قد يختلف التقدير عن الفاتورة.",
     );
     for r in s.snapshot.reports.iter().rev() {
-        egui::CollapsingHeader::new(format!("{} · {} · {}", r.title, r.status, r.id)).default_open(true).show(ui, |ui| {
+        let header = if r.title.chars().any(designcraft_fonts::is_rtl) {
+            format!("{} · {} · {}", r.title, rtl::ltr(&r.status), rtl::ltr(&r.id))
+        } else {
+            format!("{} · {} · {}", r.title, r.status, r.id)
+        };
+        egui::CollapsingHeader::new(rtl::widget(ui, header)).default_open(true).show(ui, |ui| {
             rtl::label(ui, format!("{} / {} · {} ms · {} actions", provider_name(r.provider), r.model, r.elapsed_ms, r.actions));
             if let Some(style) = &r.design_style {
                 rtl::label(
@@ -5432,11 +5816,16 @@ mod tests {
             .unwrap();
         author.run("file.save", serde_json::json!({"path": file_path.to_string_lossy()})).unwrap();
 
+        let observed_purpose = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let seen_purpose = observed_purpose.clone();
         let mut app = DesignApp::new(
             Session::new(),
             Services {
                 read: Some(Box::new(|path| std::fs::read(path).map_err(|e| e.to_string()))),
-                pick_open: Some(Box::new(|_| None)),
+                pick_open: Some(Box::new(move |purpose| {
+                    *seen_purpose.borrow_mut() = purpose.to_string();
+                    None
+                })),
                 ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })),
                 ..Default::default()
             },
@@ -5458,11 +5847,19 @@ mod tests {
         assert!(harness.query_by_label("Open path").is_some());
         assert!(harness.query_by_label("Browse…").is_some());
 
-        // Cancelling the file picker must not flip target mode when a document is already open.
+        // Cancelling the file picker must not flip target mode when a document is already open,
+        // and must request the multi-format ai_target_document filter rather than generic open.
         harness.state_mut().ui.ai.new_document = true;
         harness.state_mut().ui.ai.pick_target_document = true;
         harness.run_steps(3);
         assert!(harness.state().ui.ai.new_document, "cancelled picker must preserve new_document mode");
+        assert_eq!(observed_purpose.borrow().as_str(), "ai_target_document");
+
+        assert_eq!(sanitize_pdf_page_size(Some((420.0, 595.0))), (420.0, 595.0));
+        assert_eq!(sanitize_pdf_page_size(Some((f64::NAN, 595.0))), (595.27559, 841.88976));
+        assert_eq!(sanitize_pdf_page_size(Some((-10.0, 595.0))), (595.27559, 841.88976));
+        assert_eq!(sanitize_pdf_page_size(Some((10.0, 595.0))), (595.27559, 841.88976));
+        assert_eq!(sanitize_pdf_page_size(Some((595.0, 99_999.0))), (595.27559, 841.88976));
 
         // Opening a text file imports and autoflows it into a new editable document and switches to CurrentDocument.
         harness.state_mut().ui.ai.continue_book = true;
@@ -5473,5 +5870,271 @@ mod tests {
         assert!(!harness.state().ui.ai.continue_book);
         assert!(harness.state().ui.ai.error.is_empty(), "error={}", harness.state().ui.ai.error);
         assert_eq!(harness.state().session.active().map(|d| d.doc.title.as_str()), Some("imported-notes"));
+    }
+
+    #[test]
+    fn selectable_skills_and_new_diagnostic_quick_fixes_operate_cleanly() {
+        use egui_kittest::kittest::Queryable;
+
+        let cards = vec![
+            SkillCard {
+                design_profile: None,
+                id: "builtin-draft".into(),
+                name: "Builtin Draft".into(),
+                description: "Fresh unapproved builtin skill".into(),
+                revision: "rev-1".into(),
+                approved: false,
+                automatically_validated: false,
+                trusted_source: true,
+                active: false,
+                enabled: true,
+                compatible: true,
+            },
+            SkillCard {
+                design_profile: None,
+                id: "untrusted-user-draft".into(),
+                name: "Untrusted User Draft".into(),
+                description: "Unapproved imported draft".into(),
+                revision: "rev-ext".into(),
+                approved: false,
+                automatically_validated: false,
+                trusted_source: false,
+                active: false,
+                enabled: true,
+                compatible: true,
+            },
+            SkillCard {
+                design_profile: None,
+                id: "dual-rev".into(),
+                name: "Dual Rev Active".into(),
+                description: "Approved active revision".into(),
+                revision: "rev-active".into(),
+                approved: true,
+                automatically_validated: true,
+                trusted_source: false,
+                active: true,
+                enabled: true,
+                compatible: true,
+            },
+            SkillCard {
+                design_profile: None,
+                id: "dual-rev".into(),
+                name: "Dual Rev Newer Draft".into(),
+                description: "Unapproved newer draft".into(),
+                revision: "rev-draft".into(),
+                approved: false,
+                automatically_validated: false,
+                trusted_source: false,
+                active: false,
+                enabled: true,
+                compatible: true,
+            },
+            SkillCard {
+                design_profile: None,
+                id: "disabled-skill".into(),
+                name: "Disabled".into(),
+                description: "Disabled".into(),
+                revision: "rev-dis".into(),
+                approved: true,
+                automatically_validated: false,
+                trusted_source: true,
+                active: true,
+                enabled: false,
+                compatible: true,
+            },
+        ];
+        let manual_visible = selectable_skill_cards(&cards, false, true);
+        assert_eq!(manual_visible.len(), 2, "manual mode must hide unapproved untrusted drafts");
+        assert_eq!(manual_visible[0].id, "builtin-draft");
+        assert_eq!(manual_visible[1].id, "dual-rev");
+        assert_eq!(manual_visible[1].revision, "rev-active", "active revision must win over newer draft without duplicating IDs");
+
+        let auto_pin_visible = selectable_skill_cards(&cards, false, false);
+        assert_eq!(auto_pin_visible.len(), 3, "automatic mode pin list allows automatic validation candidates");
+        assert_eq!(auto_pin_visible[1].id, "untrusted-user-draft");
+
+        let mut state = AiUiState {
+            prompt: "# PAGE 1 — Cover\nTITLE_AR: أ\n# PAGE 2 — Intro\nTITLE_AR: ب\n# PAGE 3 — Lesson\nTITLE_AR: ج\n# PAGE 4 — Review\nTITLE_AR: د\n"
+                .into(),
+            new_document: true,
+            pages: 12,
+            ..Default::default()
+        };
+        state.settings.allow_paid_repairs = false;
+        state.settings.budget.repair_attempts = 0;
+        state.snapshot.stage = "failed".into();
+        state.snapshot.message = "Script defines 4 explicit PAGE blocks, but target page count differs".into();
+
+        let documents = Vec::new();
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+            move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
+            (state, Vec::new(), None),
+        );
+        panel.run_steps(3);
+        panel.get_by_label("Match Page Count to Script").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.pages, 4);
+        assert!(panel.state().0.active_diagnostic_alert().is_none());
+
+        panel.state_mut().0.snapshot.stage = "failed".into();
+        panel.state_mut().0.snapshot.message = "Print-preflight errors: text frame overflow".into();
+        panel.run_steps(3);
+        panel.get_by_label("Enable Automatic Layout Repair").click();
+        panel.run_steps(3);
+        assert!(panel.state().0.settings.allow_paid_repairs);
+        assert!(panel.state().0.settings.budget.repair_attempts >= 2);
+        assert!(panel.state().0.active_diagnostic_alert().is_none());
+    }
+
+    #[test]
+    fn model_validation_retired_404_quick_fixes_and_per_provider_discovery_operate_cleanly() {
+        use egui_kittest::kittest::Queryable;
+
+        // 1. Pre-flight production_issue checks for image_model and verify_generated_images (English + Arabic).
+        let mut state = AiUiState { prompt: "Illustrated worksheet".into(), new_document: true, pages: 4, ..Default::default() };
+        state.settings.output_mode = OutputMode::NativeWithImages;
+        state.settings.text_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        state.settings.image_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        assert!(state.production_issue(true, true, false).unwrap().contains("text/non-image"));
+        assert!(state.production_issue(true, true, true).unwrap().contains("مخصص للنصوص"));
+
+        state.settings.image_model = ModelSelection { provider: ProviderKind::Ollama, model: "llava:latest".into(), endpoint: None };
+        assert!(state.production_issue(true, true, false).unwrap().contains("Ollama"));
+
+        state.settings.image_model =
+            ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-flash-image-preview".into(), endpoint: None };
+        state.settings.verify_generated_images = true;
+        state.settings.text_model = ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-5.4".into(), endpoint: None };
+        assert!(state.production_issue(true, true, false).unwrap().contains("Gemini"));
+
+        // 2. HTTP 404 / retired gemini-2.5-flash diagnostic alert banner & 1-click quick fix persisting UpdateSettings.
+        state.settings.verify_generated_images = false;
+        state.settings.text_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None };
+        state.snapshot.stage = "failed".into();
+        state.snapshot.message = "AI provider HTTP 404: request, model, schema, or endpoint not supported".into();
+        assert_eq!(state.active_diagnostic_alert().map(|alert| alert.kind), Some(DiagnosticAlertKind::InvalidModel));
+
+        let documents = Vec::new();
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+            move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
+            (state, Vec::new(), None),
+        );
+        panel.run_steps(3);
+        panel.get_by_label("Use gemini-3.8-flash").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.text_model.model, "gemini-3.8-flash");
+        assert!(panel.state().1.iter().any(|req| matches!(req, AiRequest::UpdateSettings(s) if s.text_model.model == "gemini-3.8-flash")));
+        assert!(panel.state().0.active_diagnostic_alert().is_none());
+
+        // 3. Per-provider Discover populates discovered_models without clobbering across Gemini and OpenAI.
+        let mut discover_state = AiUiState {
+            settings: AiSettings {
+                text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+                image_model: ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-image-1".into(), endpoint: None },
+                ..Default::default()
+            },
+            pending_models: Some(ModelSelection { provider: ProviderKind::Gemini, model: String::new(), endpoint: None }),
+            ..Default::default()
+        };
+        let mut gemini_snap = discover_state.snapshot.clone();
+        gemini_snap.busy = false;
+        gemini_snap.stage = "completed".into();
+        gemini_snap.models = vec!["gemini-3.8-flash".into(), "gemini-3.1-flash-image-preview".into(), "text-embedding-004".into()];
+        discover_state.accept(gemini_snap);
+
+        discover_state.pending_models = Some(ModelSelection { provider: ProviderKind::OpenAi, model: String::new(), endpoint: None });
+        let mut openai_snap = discover_state.snapshot.clone();
+        openai_snap.busy = false;
+        openai_snap.stage = "completed".into();
+        openai_snap.models = vec!["gpt-5.4".into(), "gpt-image-1".into(), "dall-e-3".into()];
+        discover_state.accept(openai_snap);
+
+        let gemini_models = discover_state.discovered_models.get(&(ProviderKind::Gemini, None)).unwrap();
+        let openai_models = discover_state.discovered_models.get(&(ProviderKind::OpenAi, None)).unwrap();
+        assert_eq!(gemini_models.len(), 3);
+        assert_eq!(openai_models.len(), 3);
+        assert_eq!(gemini_models.iter().filter(|m| !is_non_text_model(m)).cloned().collect::<Vec<_>>(), vec!["gemini-3.8-flash".to_owned()]);
+        assert_eq!(
+            openai_models.iter().filter(|m| !designcraft_ai_types::is_non_image_model(ProviderKind::OpenAi, m)).cloned().collect::<Vec<_>>(),
+            vec!["gpt-image-1".to_owned(), "dall-e-3".to_owned()]
+        );
+
+        // 4. Gemini imagen-* (:predict-only) is rejected on :generateContent with gemini-3.1-flash-image guidance,
+        // and Run [100] (text=gemini-3.8-flash, image=gemini-2.5-flash) renders the 1-click "Use gemini-3.1-flash-image" button.
+        let mut img_state = AiUiState { prompt: "Illustrated page".into(), new_document: true, pages: 4, ..Default::default() };
+        img_state.settings.output_mode = OutputMode::NativeWithImages;
+        img_state.settings.text_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        img_state.settings.image_model = ModelSelection { provider: ProviderKind::Gemini, model: "imagen-3.0-generate-002".into(), endpoint: None };
+        let issue_en = img_state.production_issue(true, true, false).unwrap();
+        assert!(issue_en.contains("gemini-3.1-flash-image") && !issue_en.contains("imagen-3.0-generate-002"), "{issue_en}");
+
+        img_state.settings.image_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None };
+        img_state.snapshot.stage = "failed".into();
+        img_state.snapshot.message = "AI provider HTTP 404: request, model, schema, or endpoint not supported".into();
+        let docs = Vec::new();
+        let mut img_panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+            move |ui, (state, requests, selected)| production(ui, state, false, true, &docs, selected, requests),
+            (img_state, Vec::new(), None),
+        );
+        img_panel.run_steps(3);
+        img_panel.get_by_label("Use gemini-3.1-flash-image").click();
+        img_panel.run_steps(3);
+        assert_eq!(img_panel.state().0.settings.image_model.model, "gemini-3.1-flash-image");
+        assert!(img_panel.state().1.iter().any(|req| matches!(req, AiRequest::UpdateSettings(s) if s.image_model.model == "gemini-3.1-flash-image")));
+        assert!(img_panel.state().0.active_diagnostic_alert().is_none());
+
+        // 5. Opened facing-pages RTL book enables facing proof pair view even when AiUiState.settings.facing_pages is false.
+        let batch = BatchSnapshot {
+            job_id: "opened-rtl-book".into(),
+            status: "awaiting_human_proof".into(),
+            document_uid: Some(77),
+            document_revision: Some(12),
+            total_pages: 48,
+            completed_pages: 2,
+            pages_per_batch: 2,
+            current_batch: 1,
+            total_batches: 24,
+            batches: vec![designcraft_ai_types::protocol::BatchReport {
+                batch: 1,
+                page_start: 1,
+                page_count: 2,
+                proof_paths: vec!["proof-p2.png".into(), "proof-p3.png".into()],
+                proof_sha256: vec!["1".repeat(64), "2".repeat(64)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut opened_book_ui = AiUiState::default();
+        opened_book_ui.settings.facing_pages = false;
+        opened_book_ui.accept(AiSnapshot { available: true, stage: "awaiting_human_proof".into(), batch: Some(batch), ..Default::default() });
+        opened_book_ui.sync_proof_document(Some((77, 12)));
+        opened_book_ui.proof_facing_pages = Some(true);
+        opened_book_ui.proof_binding = Some(true);
+        assert!(opened_book_ui.effective_proof_facing_pages());
+        assert_eq!(opened_book_ui.companion_proof_path(), Some("proof-p3.png"));
+
+        // 6. Reopened failed batch checkpoint surfaces InvalidModel from reports, and benign settings-saved confirmation never triggers a fake alert.
+        let mut reopened_failed = AiUiState::default();
+        reopened_failed.snapshot.batch = Some(BatchSnapshot { status: "failed".into(), ..Default::default() });
+        reopened_failed.snapshot.reports.push(designcraft_ai_types::protocol::TaskReport {
+            design_style: None,
+            id: "100".into(),
+            status: "failed".into(),
+            title: "Batch 1".into(),
+            provider: ProviderKind::Gemini,
+            model: "gemini-2.5-flash".into(),
+            settings: None,
+            skills: Vec::new(),
+            usage: Default::default(),
+            elapsed_ms: 480,
+            actions: 0,
+            issues: Vec::new(),
+            artifacts: Vec::new(),
+            message: "AI provider HTTP 404: request, model, schema, or endpoint not supported".into(),
+        });
+        assert_eq!(reopened_failed.active_diagnostic_alert().unwrap().kind, DiagnosticAlertKind::InvalidModel);
+        reopened_failed.snapshot.stage = "idle".into();
+        reopened_failed.snapshot.message = "AI settings saved; API keys remain outside settings and reports".into();
+        assert!(reopened_failed.active_diagnostic_alert().is_none());
     }
 }

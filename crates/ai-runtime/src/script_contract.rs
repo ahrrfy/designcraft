@@ -734,6 +734,7 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
         return Err("Provider commands cannot supply reserved host copy provenance labels".into());
     }
     let mut plan = ProductionPlan { title: content.title, commands: content.commands, images: content.images };
+    crate::native_layout::normalize_command_aliases(&mut plan);
     normalize_command_references(&mut plan.commands);
     crate::image_repetition::normalize(&mut plan)?;
     if !content.copy_bindings.is_empty() {
@@ -745,21 +746,43 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
 
 fn produces_result_field(action: &EngineAction, field: &str) -> bool {
     match field {
-        "id" => matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create" | "object.group" | "file.place"),
+        "id" => matches!(
+            action.command.as_str(),
+            "frame.create"
+                | "line.create"
+                | "path.create"
+                | "object.group"
+                | "file.place"
+                | "object.qrCode"
+                | "object.pathfinder"
+                | "object.makeCompoundPath"
+        ),
         "story" => {
             (action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text"))
-                || action.command == "table.insert"
+                || matches!(action.command.as_str(), "table.insert" | "text.thread" | "text.unthread")
         }
-        "ids" => action.command == "transform.move",
+        "ids" => matches!(action.command.as_str(), "transform.move" | "edit.stepAndRepeat" | "object.releaseCompoundPath"),
+        "from" | "to" => action.command == "text.thread",
         "asset" => action.command == "file.place",
         "table" => action.command == "table.insert",
-        "name" => action.command == "swatch.create",
+        "content" => action.command == "object.qrCode",
+        "swatch" | "kind" | "stops" => action.command == "object.gradient",
+        "name" => matches!(
+            action.command.as_str(),
+            "swatch.create"
+                | "style.paragraph.create"
+                | "style.character.create"
+                | "style.object.create"
+                | "style.table.create"
+                | "style.cell.create"
+        ),
         _ => false,
     }
 }
 
 fn is_non_text_creation(action: &EngineAction) -> bool {
     matches!(action.command.as_str(), "line.create" | "path.create")
+        || (action.command == "object.qrCode" && action.params.get("rect").is_some())
         || (action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) != Some("text"))
 }
 
@@ -772,34 +795,56 @@ fn rewrite_reference_token(token: &str, earlier: &[EngineAction], prefer_non_tex
         return None;
     };
     let (step_str, field) = body.split_once('.')?;
-    if !matches!(field, "id" | "story") {
+    if !matches!(field, "id" | "story" | "table") {
         return None;
     }
     let step = step_str.parse::<usize>().ok()?;
-    if step >= earlier.len() || produces_result_field(&earlier[step], field) {
+    let source = earlier.get(step)?;
+    if produces_result_field(source, field) {
         return None;
     }
-    let resolved = if field == "id" && prefer_non_text_next && step + 1 < earlier.len() && is_non_text_creation(&earlier[step + 1]) {
-        Some(step + 1)
-    } else {
-        (0..=step)
-            .rev()
-            .find(|&candidate| produces_result_field(&earlier[candidate], field))
-            .or_else(|| ((step + 1)..earlier.len()).find(|&candidate| produces_result_field(&earlier[candidate], field)))
-    }?;
+    let resolved =
+        if field == "id" && prefer_non_text_next && step.checked_add(1).and_then(|next| earlier.get(next)).is_some_and(is_non_text_creation) {
+            step.checked_add(1)
+        } else if field == "story"
+            && is_non_text_creation(source)
+            && let Some(paired) = step
+                .checked_add(1)
+                .into_iter()
+                .flat_map(|start| start..earlier.len())
+                .take_while(|&candidate| !earlier.get(candidate).is_some_and(is_non_text_creation))
+                .find(|&candidate| earlier.get(candidate).is_some_and(|act| produces_result_field(act, "story")))
+        {
+            Some(paired)
+        } else {
+            (0..=step).rev().find(|&candidate| earlier.get(candidate).is_some_and(|act| produces_result_field(act, field))).or_else(|| {
+                step.checked_add(1)
+                    .into_iter()
+                    .flat_map(|start| start..earlier.len())
+                    .find(|&candidate| earlier.get(candidate).is_some_and(|act| produces_result_field(act, field)))
+            })
+        }?;
     Some(if braced { format!("${{{resolved}.{field}}}") } else { format!("${resolved}.{field}") })
 }
 
 fn normalize_command_references(commands: &mut [EngineAction]) {
     for index in 0..commands.len() {
         let (earlier, rest) = commands.split_at_mut(index);
-        let action = &mut rest[0];
+        let Some((action, _)) = rest.split_first_mut() else {
+            continue;
+        };
         let prefer_non_text_next = matches!(action.command.as_str(), "object.stroke" | "object.fill" | "object.fittingOptions");
+        let cmd_id = action.command.clone();
         let Some(params) = action.params.as_object_mut() else {
             continue;
         };
-        for key in ["ids", "frame", "story"] {
-            match params.get_mut(key) {
+        let keys: &[&str] = match cmd_id.as_str() {
+            "text.thread" => &["ids", "frame", "story", "table", "from", "to"],
+            "object.matchAttributes" => &["ids", "frame", "story", "table", "from"],
+            _ => &["ids", "frame", "story", "table"],
+        };
+        for key in keys {
+            match params.get_mut(*key) {
                 Some(Value::String(reference)) => {
                     if let Some(rewritten) = rewrite_reference_token(reference, earlier, prefer_non_text_next) {
                         *reference = rewritten;
@@ -1471,5 +1516,47 @@ mod tests {
         assert_eq!(grouped_plan.commands[0].params["text"], "Fourteen (10 + 4)");
         assert_eq!(grouped_plan.commands[1].params["text"], "أَرْبَعَةَ عَشَرَ");
         validate_plan(brief, scope, &grouped_plan).unwrap();
+
+        let rich_refs = json!({
+            "title": "Alias and result reference preservation",
+            "commands": [
+                {"command":"frame.create","params":{"spread":0,"rect":[45,45,240,95],"text":"Implicit text content"}},
+                {"command":"type.char","params":{"story":"$0.story","attrs":{"size":14}}},
+                {"command":"qr.create","params":{"spread":0,"rect":[260,45,330,115],"text":"https://example.org"}},
+                {"command":"object.label","params":{"ids":["$2.id"],"label":"qr-badge"}},
+                {"command":"frame.create","params":{"spread":0,"rect":[45,130,145,210],"content":"unassigned"}},
+                {"command":"frame.create","params":{"spread":0,"rect":[95,150,175,230],"content":"unassigned"}},
+                {"command":"pathfinder.subtract","params":{"ids":["$4.id","$5.id"]}},
+                {"command":"object.fill","params":{"ids":["$6.id"],"swatch":"Black"}},
+                {"command":"text.thread","params":{"from":"$0.id","spread":0,"rect":[45,250,240,310]}},
+                {"command":"text.select","params":{"story":"$8.story","anchor":0,"focus":8}}
+            ],
+            "images": []
+        });
+        let compiled_rich = compile_native_plan(&rich_refs.to_string(), scope).unwrap();
+        assert_eq!(compiled_rich.commands[0].params["content"], "text");
+        assert_eq!(compiled_rich.commands[1].params["story"], "$0.story");
+        assert_eq!(compiled_rich.commands[2].command, "object.qrCode");
+        assert_eq!(compiled_rich.commands[3].params["ids"], json!(["$2.id"]));
+        assert_eq!(compiled_rich.commands[6].command, "object.pathfinder");
+        assert_eq!(compiled_rich.commands[7].params["ids"], json!(["$6.id"]));
+        assert_eq!(compiled_rich.commands[9].params["story"], "$8.story");
+
+        // A container shape.create between an earlier header story and its own inner text frame
+        // must rewrite $2.story to the paired inner story ($3.story), not the unrelated header ($0.story).
+        let paired_container_refs = json!({
+            "title": "Paired container forward inner story",
+            "commands": [
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[45,45,300,80],"text":"Header story"}},
+                {"command":"type.para","params":{"attrs":{"align":"center"}}},
+                {"command":"shape.create","params":{"spread":0,"shape":"rect","rect":[45,100,300,170]}},
+                {"command":"frame.create","params":{"spread":0,"content":"text","rect":[55,110,290,160],"text":"Inner card story"}},
+                {"command":"text.select","params":{"story":"$2.story","anchor":0,"focus":5}},
+                {"command":"type.char","params":{"attrs":{"size":13}}}
+            ],
+            "images": []
+        });
+        let compiled_paired = compile_native_plan(&paired_container_refs.to_string(), scope).unwrap();
+        assert_eq!(compiled_paired.commands[4].params["story"], "$3.story");
     }
 }
