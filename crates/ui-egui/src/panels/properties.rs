@@ -1294,13 +1294,8 @@ fn character_section(app: &mut DesignApp, ui: &mut Ui) {
     let r = resp.rect;
     icons::paint(ui.painter(), Rect::from_min_size(r.min + vec2(3.0, 3.0), vec2(14.0, 14.0)), "search", t.icon);
     widgets::chevron_down(ui.painter(), r.min + vec2(22.0, 10.5), t.icon);
-    ui.painter().text(
-        r.min + vec2(30.0, 10.5),
-        egui::Align2::LEFT_CENTER,
-        if fam.is_empty() { "—".to_string() } else { super::font_label(app, &menu, &fam) },
-        egui::FontId::proportional(11.5),
-        t.text,
-    );
+    let font_lbl = if fam.is_empty() { "—".to_string() } else { super::font_label(app, &menu, &fam) };
+    crate::rtl::paint(ui.painter(), r.min + vec2(30.0, 10.5), egui::Align2::LEFT_CENTER, &font_lbl, egui::FontId::proportional(11.5), t.text);
     if let Some(f) = super::font_popup(app, &resp, &menu, &fam) {
         super::apply_font(app, &f);
     }
@@ -3747,10 +3742,11 @@ fn flex_section(app: &mut DesignApp, ui: &mut Ui) {
         .enumerate()
         {
             let y = k as f32 * (FIELD_H + 5.0);
-            ui.painter().text(
+            crate::rtl::paint(
+                ui.painter(),
                 sub(b, 56.0, y, 18.0, FIELD_H).right_center(),
                 egui::Align2::RIGHT_CENTER,
-                tr(label),
+                &tr(label),
                 egui::FontId::proportional(11.5),
                 t.text,
             );

@@ -48,6 +48,15 @@ pub(crate) fn formatted_proof_state(source: &DocState, prefs: &Prefs, right_to_l
     setup(source, prefs, true, right_to_left)
 }
 
+pub(crate) fn single_page_proof_state(source: &DocState, prefs: &Prefs, right_to_left: bool) -> Result<DocState, String> {
+    validate_pages(source)?;
+    validate_item_trees(source)?;
+    if !source.doc.settings.facing_pages && source.doc.settings.right_to_left_binding == right_to_left {
+        return Ok(source.clone());
+    }
+    setup(source, prefs, false, right_to_left)
+}
+
 fn validate_pages(source: &DocState) -> Result<(), String> {
     let count = source.doc.spreads.iter().try_fold(0usize, |count, spread| count.checked_add(spread.pages.len()).filter(|count| *count <= MAX_PAGES));
     let Some(count) = count.filter(|count| *count > 0) else {
@@ -100,6 +109,9 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
         return Err("Expand illustration placements before mapping facing pages".into());
     }
     let mut mapped = plan.clone();
+    if actual.doc.settings.facing_pages {
+        mirror_facing_footer_outer(&mut mapped.commands, actual)?;
+    }
     let mut result_pages: Vec<StepPages> = Vec::with_capacity(plan.commands.len());
     let mut selected: Vec<usize> = Vec::new();
     for (index, action) in mapped.commands.iter_mut().enumerate() {
@@ -313,11 +325,9 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
                     && !vec_val.is_null()
                 {
                     translate_array(&mut vec_val, 4, &[], 0.0)?;
-                    if let Some(arr) = vec_val.as_array()
-                        && arr.len() == 4
-                    {
-                        gf.entry("from").or_insert_with(|| json!([arr[0].clone(), arr[1].clone()]));
-                        gf.entry("to").or_insert_with(|| json!([arr[2].clone(), arr[3].clone()]));
+                    if let Some([x0, y0, x1, y1]) = vec_val.as_array().map(Vec::as_slice) {
+                        gf.entry("from").or_insert_with(|| json!([x0.clone(), y0.clone()]));
+                        gf.entry("to").or_insert_with(|| json!([x1.clone(), y1.clone()]));
                     }
                 }
                 if gf.contains_key("from") != gf.contains_key("to") {
@@ -342,6 +352,102 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
         result_pages.push(step_pages);
     }
     Ok(mapped)
+}
+
+fn mirror_facing_footer_outer(commands: &mut [designcraft_ai_types::EngineAction], actual: &DocState) -> Result<(), String> {
+    let mut spine_footer_pages = std::collections::BTreeSet::new();
+    let len = commands.len();
+    for j in 0..len {
+        let j2 = j.saturating_add(2);
+        let j3 = j.saturating_add(3);
+        let is_footer_page = commands.get(j).is_some_and(|a| a.command == "frame.create")
+            && commands.get(j2).is_some_and(|a| a.command == "type.para")
+            && commands
+                .get(j3)
+                .is_some_and(|a| a.command == "object.label" && a.params.get("label").and_then(Value::as_str) == Some("part.ui.footer.page"));
+        if !is_footer_page {
+            continue;
+        }
+        let Some(frame_cmd) = commands.get(j) else {
+            continue;
+        };
+        let Some(absolute_u64) = frame_cmd.params.get("spread").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Ok(absolute) = usize::try_from(absolute_u64) else {
+            continue;
+        };
+        let (_, page) = page_location(actual, absolute)?;
+        let Some((x0, x1)) = frame_cmd
+            .params
+            .get("rect")
+            .and_then(Value::as_array)
+            .filter(|r| r.len() == 4)
+            .and_then(|r| Some((r.first()?.as_f64()?, r.get(2)?.as_f64()?)))
+        else {
+            continue;
+        };
+        let cx = (x0 + x1) * 0.5;
+        let on_spine = match page.side {
+            doc::PageSide::Left => cx > page.width * 0.5,
+            doc::PageSide::Right => cx < page.width * 0.5,
+            doc::PageSide::Single => false,
+        };
+        if !on_spine {
+            continue;
+        }
+        spine_footer_pages.insert(absolute_u64);
+        if let Some(rect) = commands.get_mut(j).and_then(|cmd| cmd.params.get_mut("rect")).and_then(Value::as_array_mut) {
+            if let Some(s0) = rect.get_mut(0) {
+                *s0 = json!(page.width - x1);
+            }
+            if let Some(s2) = rect.get_mut(2) {
+                *s2 = json!(page.width - x0);
+            }
+        }
+        if let Some(attrs) = commands.get_mut(j2).and_then(|cmd| cmd.params.get_mut("attrs")).and_then(Value::as_object_mut) {
+            let align = if page.side == doc::PageSide::Left { "left" } else { "right" };
+            attrs.insert("align".into(), json!(align));
+        }
+    }
+    if spine_footer_pages.is_empty() {
+        return Ok(());
+    }
+    for i in 0..len {
+        let i2 = i.saturating_add(2);
+        let is_footer_bar = commands.get(i).is_some_and(|a| a.command == "path.create")
+            && commands
+                .get(i2)
+                .is_some_and(|a| a.command == "object.label" && a.params.get("label").and_then(Value::as_str) == Some("part.ui.footer.bar"));
+        if !is_footer_bar {
+            continue;
+        }
+        let Some(absolute_u64) = commands.get(i).and_then(|cmd| cmd.params.get("spread")).and_then(Value::as_u64) else {
+            continue;
+        };
+        if !spine_footer_pages.contains(&absolute_u64) {
+            continue;
+        }
+        let Ok(absolute) = usize::try_from(absolute_u64) else {
+            continue;
+        };
+        let (_, page) = page_location(actual, absolute)?;
+        if let Some(anchors) = commands.get_mut(i).and_then(|cmd| cmd.params.get_mut("anchors")).and_then(Value::as_array_mut) {
+            for anchor in anchors {
+                if let Some(obj) = anchor.as_object_mut() {
+                    for key in ["p", "in", "out"] {
+                        if let Some(pt) = obj.get_mut(key).and_then(Value::as_array_mut)
+                            && let Some(x) = pt.first().and_then(Value::as_f64)
+                            && let Some(slot0) = pt.get_mut(0)
+                        {
+                            *slot0 = json!(page.width - x);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1090,5 +1196,64 @@ mod tests {
         let pdf_path = dir.path().join("nested-facing-feather.pdf");
         session.execute("file.exportPdf", &json!({"path": pdf_path})).unwrap();
         assert!(std::fs::metadata(&pdf_path).unwrap().len() > 500);
+    }
+
+    #[test]
+    fn ai28_mirror_facing_footer_outer_flips_folio_and_bar_away_from_spine_in_rtl_and_ltr() {
+        let footer_cmds = |abs_page: u64, x0: f64, x1: f64, align: &str, bar_x0: f64, bar_x1: f64| -> Vec<designcraft_ai_types::EngineAction> {
+            vec![
+                action(
+                    "path.create",
+                    json!({"spread": abs_page, "closed": true, "anchors": [{"p": [bar_x0, 790.0]}, {"p": [bar_x1, 790.0]}, {"p": [bar_x1, 804.0]}, {"p": [bar_x0, 804.0]}]}),
+                ),
+                action("object.fill", json!({"ids": ["$0.id"], "swatch": "[Black]"})),
+                action("object.label", json!({"ids": ["$0.id"], "label": "part.ui.footer.bar"})),
+                action("frame.create", json!({"spread": abs_page, "rect": [x0, 790.0, x1, 804.0], "content": "text", "text": "2"})),
+                action("text.select", json!({"story": "$3.story", "anchor": 0, "focus": 1})),
+                action("type.para", json!({"attrs": {"align": align}})),
+                action("object.label", json!({"ids": ["$3.id"], "label": "part.ui.footer.page"})),
+            ]
+        };
+
+        // 1. RTL facing document (400pt wide pages):
+        // Page 0 = Cover (Single, Right), Spread 1 holds Page 1 (Right, x=400..800, spine on left edge of page)
+        // and Page 2 (Left, x=0..400, spine on right edge of page).
+        let mut rtl_session = Session::new();
+        rtl_session
+            .execute("file.new", &json!({"width": 400.0, "height": 820.0, "pages": 3, "facingPages": true, "binding": "rightToLeft"}))
+            .unwrap();
+        let rtl_state = rtl_session.doc().unwrap().clone();
+        // Put left-side folio [24..64] on BOTH page 1 (Right page -> spine is on its left!) and page 2 (Left page -> outer is on its left!).
+        let mut rtl_cmds = footer_cmds(1, 24.0, 64.0, "left", 20.0, 90.0);
+        rtl_cmds.extend(footer_cmds(2, 24.0, 64.0, "left", 20.0, 90.0));
+        mirror_facing_footer_outer(&mut rtl_cmds, &rtl_state).unwrap();
+        // Page 1 (Right page): folio was near spine (x=24..64 < 200) -> mirrored to outer right [336..376], align="right", bar mirrored [380..310].
+        assert_eq!(rtl_cmds[3].params["rect"], json!([336.0, 790.0, 376.0, 804.0]));
+        assert_eq!(rtl_cmds[5].params["attrs"]["align"], json!("right"));
+        assert_eq!(rtl_cmds[0].params["anchors"][0]["p"], json!([380.0, 790.0]));
+        // Page 2 (Left page): folio at [24..64] is ALREADY on the outer left edge -> untouched!
+        assert_eq!(rtl_cmds[10].params["rect"], json!([24.0, 790.0, 64.0, 804.0]));
+        assert_eq!(rtl_cmds[12].params["attrs"]["align"], json!("left"));
+        assert_eq!(rtl_cmds[7].params["anchors"][0]["p"], json!([20.0, 790.0]));
+
+        // 2. LTR facing document (400pt wide pages):
+        // Spread 1 holds Page 1 (Left, x=0..400, spine on right edge of page) and Page 2 (Right, x=400..800, spine on left edge of page).
+        let mut ltr_session = Session::new();
+        ltr_session
+            .execute("file.new", &json!({"width": 400.0, "height": 820.0, "pages": 3, "facingPages": true, "binding": "leftToRight"}))
+            .unwrap();
+        let ltr_state = ltr_session.doc().unwrap().clone();
+        // Put right-side folio [336..376] on BOTH page 1 (Left page -> spine is on its right!) and page 2 (Right page -> outer is on its right!).
+        let mut ltr_cmds = footer_cmds(1, 336.0, 376.0, "right", 310.0, 380.0);
+        ltr_cmds.extend(footer_cmds(2, 336.0, 376.0, "right", 310.0, 380.0));
+        mirror_facing_footer_outer(&mut ltr_cmds, &ltr_state).unwrap();
+        // Page 1 (Left page): folio was near spine (x=336..376 > 200) -> mirrored to outer left [24..64], align="left", bar mirrored [90..20].
+        assert_eq!(ltr_cmds[3].params["rect"], json!([24.0, 790.0, 64.0, 804.0]));
+        assert_eq!(ltr_cmds[5].params["attrs"]["align"], json!("left"));
+        assert_eq!(ltr_cmds[0].params["anchors"][0]["p"], json!([90.0, 790.0]));
+        // Page 2 (Right page): folio at [336..376] is ALREADY on the outer right edge -> untouched!
+        assert_eq!(ltr_cmds[10].params["rect"], json!([336.0, 790.0, 376.0, 804.0]));
+        assert_eq!(ltr_cmds[12].params["attrs"]["align"], json!("right"));
+        assert_eq!(ltr_cmds[7].params["anchors"][0]["p"], json!([310.0, 790.0]));
     }
 }

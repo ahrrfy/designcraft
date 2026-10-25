@@ -6,6 +6,9 @@ param(
     [switch]$LibraryOnly
 )
 $ErrorActionPreference = 'Stop'
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
 $CraftFontsPinnedRef = 'abb83316d96aa59c1cf64784289e378fe9fa5695'
 
 function Resolve-UpstreamSyncAction([bool]$UpstreamIsAncestor, [bool]$MainReleaseExists) {
@@ -120,14 +123,17 @@ function Publish-VerifiedCommitRelease([string]$Worktree, [string]$TargetDir, [s
                 New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
                 Copy-Item -LiteralPath $_.FullName -Destination $destination
             }
-            @(
-                'Smart Design / التصميم الذكي — independent Windows x64 preview',
+            $arBrand = -join ([char[]]@(0x0627, 0x0644, 0x062A, 0x0635, 0x0645, 0x064A, 0x0645, 0x0020, 0x0627, 0x0644, 0x0630, 0x0643, 0x064A))
+            $emDash = [string][char]0x2014
+            $runMeLines = @(
+                ('Smart Design / ' + $arBrand + ' ' + $emDash + ' independent Windows x64 preview'),
                 'Based on DesignCraft by the ArtCraft team and contributors. This fork is independently maintained.',
                 'UNSIGNED PREVIEW: these binaries are not code-signed. Pre-alpha; keep backup copies of documents.',
                 'Extract the whole ZIP into a new folder, then run .\designcraft.exe. No MSI or system associations are installed.',
                 ('Source commit: ' + $sha),
                 ('Verified commit quality gates: ' + $ciUrl)
-            ) | Set-Content -LiteralPath (Join-Path $stage 'RUN-ME.txt') -Encoding utf8
+            ) -join "`r`n"
+            [System.IO.File]::WriteAllText((Join-Path $stage 'RUN-ME.txt'), ($runMeLines + "`r`n"), $utf8NoBom)
             $sha | Set-Content -LiteralPath (Join-Path $stage 'SOURCE-COMMIT.txt') -Encoding ascii
             $ciUrl | Set-Content -LiteralPath (Join-Path $stage 'CI-RUN.txt') -Encoding ascii
             $zip = Join-Path $releaseDir ('smart-design-' + $label + '-windows-x64-unsigned-portable.zip')
@@ -143,14 +149,15 @@ function Publish-VerifiedCommitRelease([string]$Worktree, [string]$TargetDir, [s
                     'designcraft-cli.exe' = (Get-FileHash -LiteralPath (Join-Path $stage 'designcraft-cli.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
                 }
             }
-            $update | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $releaseDir 'update.json') -Encoding utf8
+            [System.IO.File]::WriteAllText((Join-Path $releaseDir 'update.json'), (($update | ConvertTo-Json -Depth 5) + "`n"), $utf8NoBom)
             $notesPath = Join-Path $distRoot 'release-notes.txt'
-            @(
+            $notesText = @(
                 'Independent Smart Design fork. Unsigned Windows x64 portable preview; no MSI.',
                 ('Source commit: ' + $sha),
                 ('Verified Windows quality gates: ' + $ciUrl),
                 'Automatically synced, verified and published. This does not certify physical printing or commercial-press output.'
-            ) | Set-Content -LiteralPath $notesPath -Encoding utf8
+            ) -join "`n"
+            [System.IO.File]::WriteAllText($notesPath, ($notesText + "`n"), $utf8NoBom)
             gh release create $label --repo ahrrfy/designcraft --target $sha --prerelease --title ('Smart Design ' + $label + ' (unsigned preview)') --notes-file $notesPath $zip (Join-Path $releaseDir 'SHA256SUMS.txt') (Join-Path $releaseDir 'update.json') | Out-Null
             if ($LASTEXITCODE -ne 0) { throw 'Failed to create GitHub release.' }
             return $label

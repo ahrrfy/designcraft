@@ -306,7 +306,7 @@ pub fn dropdown_h(ui: &mut Ui, text: &str, width: f32, h: f32) -> Response {
     p.line_segment([seg.left_top(), seg.left_bottom()], Stroke::new(1.0, t.field_border));
     chevron_down(p, seg.center(), t.icon);
     let clip = Rect::from_min_max(r.min, pos2(seg.min.x - 2.0, r.max.y));
-    p.with_clip_rect(clip).text(pos2(r.min.x + 7.0, r.center().y), egui::Align2::LEFT_CENTER, text, label_font(), t.text);
+    crate::rtl::paint(&p.with_clip_rect(clip), pos2(r.min.x + 7.0, r.center().y), egui::Align2::LEFT_CENTER, text, label_font(), t.text);
     resp
 }
 
@@ -318,7 +318,7 @@ pub fn dropdown_list(ui: &mut Ui, text: &str, width: f32, items: &[String], curr
         ui.set_min_width(width);
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
             for (i, it) in items.iter().enumerate() {
-                if ui.selectable_label(current == Some(i), it).clicked() {
+                if ui.selectable_label(current == Some(i), crate::rtl::widget(ui, it.as_str())).clicked() {
                     out = Some(i);
                     ui.close();
                 }

@@ -157,3 +157,14 @@ fn malayalam_fonts_load_from_the_font_folders_when_first_needed() {
     assert!(!db.is_loaded("Noto Sans Malayalam"));
     assert_eq!(family(&db, KA, None).as_deref(), Some("Noto Sans Malayalam"));
 }
+
+#[test]
+fn tahoma_substitution_and_arabic_system_fallbacks_are_registered() {
+    let db = db_with(&[("Noto Sans Arabic", &['\u{0628}'])]);
+    assert_eq!(db.scoped(0).substitute_family("Tahoma"), "Noto Sans Arabic");
+    let db_dejavu = db_with(&[("DejaVu Sans", &['\u{0628}'])]);
+    assert_eq!(db_dejavu.scoped(0).substitute_family("Tahoma"), "DejaVu Sans");
+    for arabic_sys in ["Tahoma", "Geeza Pro", "Arial", "Noto Naskh Arabic", "Noto Sans Arabic", "Amiri", "DejaVu Sans"] {
+        assert!(SYSTEM_FALLBACKS.contains(&arabic_sys), "SYSTEM_FALLBACKS missing {arabic_sys}");
+    }
+}

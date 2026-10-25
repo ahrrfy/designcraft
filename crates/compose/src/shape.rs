@@ -796,6 +796,7 @@ fn shape_run_raw(
     // Split into segments: font coverage changes and special characters (markers, tabs, breaks).
     let mut seg_start = range.start;
     let mut seg_face = primary.clone();
+    let mut last_base_start: Option<usize> = None;
     let flush = |a: usize, b: usize, face: &Arc<FontFace>, out: &mut Vec<Glyph>| {
         if a < b {
             shape_segment(db, text, a..b, None, p, face, auto_leading, styles, out, sub.upright());
@@ -812,6 +813,7 @@ fn shape_run_raw(
             if d != c {
                 flush(seg_start, i, &seg_face, out);
                 seg_start = i + c.len_utf8();
+                last_base_start = None;
                 let face = if primary.covers(d) { primary.clone() } else { fallback(d) };
                 shape_segment(db, text, i..i + c.len_utf8(), Some(d.encode_utf8(&mut [0; 4])), p, &face, auto_leading, styles, out, sub.upright());
                 continue;
@@ -927,9 +929,32 @@ fn shape_run_raw(
                     out.push(g);
                 }
             }
+            last_base_start = None;
             continue;
         }
+        if !is_mark(c) {
+            last_base_start = Some(i);
+        }
         let covered = c.is_whitespace() || c.is_control() || c == SOFT_HYPHEN || primary.covers(c);
+        if is_mark(c)
+            && !seg_face.covers(c)
+            && auto_leading.glyph_fallback
+            && let Some(cand) = db.fallback_for(c, primary.id(), lang)
+        {
+            let cluster_start = last_base_start.filter(|&bs| bs >= seg_start).unwrap_or(i);
+            if cluster_start < i && text.get(cluster_start..i).is_some_and(|s| s.chars().all(|ch| cand.covers(ch))) {
+                flush(seg_start, cluster_start, &seg_face, out);
+                seg_start = cluster_start;
+                seg_face = cand;
+                continue;
+            }
+            if cand.id() != seg_face.id() {
+                flush(seg_start, i, &seg_face, out);
+                seg_start = i;
+                seg_face = cand;
+            }
+            continue;
+        }
         let face = if covered || is_mark(c) { if is_mark(c) { seg_face.clone() } else { primary.clone() } } else { fallback(c) };
         if face.id() != seg_face.id() {
             flush(seg_start, i, &seg_face, out);

@@ -139,5 +139,16 @@ Check ($after.profile -eq $profile -and $after.document_path -eq $book -and $aft
 Check ((Get-Content -LiteralPath $book -Raw) -eq 'Synthetic user work; never overwrite.') 'User book changed.'
 Check ((Get-Content -LiteralPath (Join-Path $profile 'sentinel.txt') -Raw) -eq 'Synthetic existing settings; never overwrite.') 'Profile changed.'
 Check (Test-Path -LiteralPath ($manifest + '.before-update')) 'Rollback pointer is missing.'
+& {
+    $recWithPid = [pscustomobject]@{executable = (Join-Path $installed 'designcraft.exe'); app_pid = 987654}
+    function Get-Process { param($Name, $ErrorAction) return @([pscustomobject]@{Id = 987654; Path = 'C:\Program Files\DesignCraft\designcraft.exe'}) }
+    Check (-not (Test-PreviewProcessRunning $recWithPid $manifest)) 'Recycled PID on unrelated Launcher installation falsely blocked update.'
+    function Get-Process { param($Name, $ErrorAction) return @([pscustomobject]@{Id = 444; Path = (Join-Path $installed 'designcraft.exe')}) }
+    Check (Test-PreviewProcessRunning $recWithPid $manifest) 'Active preview process path was not detected.'
+    $throwingProc = [pscustomobject]@{Id = 555}
+    $throwingProc | Add-Member -MemberType ScriptProperty -Name Path -Value { throw [UnauthorizedAccessException]::new('elevated') }
+    function Get-Process { param($Name, $ErrorAction) return @($throwingProc) }
+    Check (Test-PreviewProcessRunning $recWithPid $manifest) 'Inaccessible process Path did not fail closed safely.'
+}
 Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

@@ -13,7 +13,7 @@ use crate::{DocState, EngineError, Result, Session};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "file.new", "Document…", ["File", "New"], Some("Cmd+N"),
-            "{preset?: \"Letter\"|\"A4\"|… or a saved preset (file.savePreset), intent?: print|web|mobile, units?: points|picas|millimeters|…, width?, height?, pages?, startPage?, facingPages?, columns?, gutter?, margins?: number|{top,bottom,inside,outside}, bleed?, slug?: n | [top, bottom, inside, outside], title?, primaryTextFrame?: bool}",
+            "{preset?: \"Letter\"|\"A4\"|… or a saved preset (file.savePreset), intent?: print|web|mobile, units?: points|picas|millimeters|…, width?, height?, pages?, startPage?, facingPages?, binding?: leftToRight|rightToLeft, columns?, gutter?, margins?: number|{top,bottom,inside,outside}, bleed?, slug?: n | [top, bottom, inside, outside], title?, primaryTextFrame?: bool}",
             always, file_new),
         cmd!(noundo "file.newSample", "Sample Document", ["Help"], None, "{} — a multi-page magazine sample", always, file_sample),
         cmd!(query "file.presets", "Document Presets", [], None, "{} → the built-in presets [{name, intent, width, height, units}], then the saved ones (with `saved: true`)", always, |s, _| {
@@ -415,6 +415,9 @@ fn apply_settings(nd: &mut NewDocument, p: &Value) {
     nd.pages = p.get("pages").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(nd.pages).clamp(1, 9999);
     nd.start_page = p.get("startPage").and_then(Value::as_u64).map(|v| v.clamp(1, 99_999) as u32).unwrap_or(nd.start_page);
     nd.facing_pages = p.get("facingPages").and_then(Value::as_bool).unwrap_or(nd.facing_pages);
+    if let Some(b) = p.get("binding").and_then(Value::as_str) {
+        nd.right_to_left_binding = b == "rightToLeft";
+    }
     nd.columns = p.get("columns").and_then(Value::as_u64).map(|v| v.clamp(1, 216) as u32).unwrap_or(nd.columns);
     nd.gutter = f64_or(p, "gutter", nd.gutter);
     nd.primary_text_frame = p.get("primaryTextFrame").and_then(Value::as_bool).unwrap_or(nd.primary_text_frame);

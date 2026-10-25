@@ -129,6 +129,7 @@ function Invoke-FlowScenario([string]$Scenario) {
     function Get-Process {
         param($Name, $ErrorAction)
         if ($Scenario -eq 'staged_waiting_for_app_close') { return [pscustomobject]@{Id=123} }
+        if ($Scenario -eq 'installed_for_next_launch') { return [pscustomobject]@{Id=987654; Path='C:\Program Files\DesignCraft\designcraft.exe'} }
     }
     $lines = @(& $updater -ManifestPath $manifest)
     Check ($lines.Count -eq 1 -and $lines[0] -is [string] -and $lines[0].Length -lt 40000) 'Updater did not emit exactly one bounded JSON result.'

@@ -31,4 +31,5 @@ sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
+designcraft-fonts = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

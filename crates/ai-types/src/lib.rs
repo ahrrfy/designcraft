@@ -51,7 +51,7 @@ pub fn is_non_text_model(model: &str) -> bool {
     if model.is_empty() {
         return false;
     }
-    if ["dall-e", "gpt-image", "imagen", "veo", "whisper"]
+    if ["dall-e", "gpt-image", "imagen", "veo", "whisper", "flux", "sdxl"]
         .iter()
         .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")) || model.starts_with(&format!("{prefix}_")))
     {
@@ -63,11 +63,18 @@ pub fn is_non_text_model(model: &str) -> bool {
             "image"
                 | "images"
                 | "imagen"
+                | "banana"
+                | "omni"
+                | "flux"
+                | "sdxl"
+                | "diffusion"
+                | "rerank"
                 | "tts"
                 | "audio"
                 | "embed"
                 | "embedding"
                 | "embeddings"
+                | "embeddinggemma"
                 | "live"
                 | "realtime"
                 | "transcribe"
@@ -79,6 +86,31 @@ pub fn is_non_text_model(model: &str) -> bool {
                 | "whisper"
         )
     })
+}
+
+/// Identifies retired or shut-down Gemini / Imagen model identifiers so callers can surface
+/// proactive migration hints toward current models (`gemini-3.8-flash` / `gemini-3.1-flash-image`).
+pub fn is_retired_gemini_model(provider: ProviderKind, model: &str) -> bool {
+    if provider != ProviderKind::Gemini {
+        return false;
+    }
+    let normalized = model.trim().to_ascii_lowercase();
+    let name = normalized.strip_prefix("models/").unwrap_or(&normalized);
+    if name == "imagen" || name.starts_with("imagen-") || name.starts_with("imagen_") {
+        return true;
+    }
+    [
+        "gemini-1.0",
+        "gemini-1.5",
+        "gemini-2.0",
+        "gemini-2.5",
+        "gemini-3-pro-preview",
+        "gemini-3-pro-image-preview",
+        "gemini-3.1-flash-image-preview",
+        "gemini-3.1-flash-lite-preview",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Identifies providers or model identifiers that cannot generate images so illustrated runs fail
@@ -97,65 +129,56 @@ pub fn is_non_image_model(provider: ProviderKind, model: &str) -> bool {
     if provider == ProviderKind::Gemini && (model == "imagen" || model.starts_with("imagen-") || model.starts_with("imagen_")) {
         return true;
     }
-    if model.starts_with("dall-e")
-        || model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| {
-            if provider == ProviderKind::Gemini {
-                matches!(part, "image" | "images" | "banana")
-            } else {
-                matches!(part, "image" | "images" | "imagen" | "banana" | "dalle" | "flux" | "sdxl" | "diffusion")
-            }
-        })
-    {
-        return false;
-    }
-    if [
-        "gemini-",
-        "gemma-",
-        "learnlm-",
-        "gpt-3",
-        "gpt-4",
-        "gpt-5",
-        "chatgpt-",
-        "claude-",
-        "llama",
-        "qwen",
-        "mistral",
-        "deepseek",
-        "text-embedding",
-        "tts-",
-        "whisper",
-        "veo",
-        "sora",
-        "lyria",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
-    {
+    if ["text-embedding", "tts-", "whisper", "veo", "sora", "lyria"].iter().any(|prefix| model.starts_with(prefix)) {
         return true;
     }
-    if ["o1", "o3", "o4"]
-        .iter()
-        .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")) || model.starts_with(&format!("{prefix}_")))
-    {
-        return true;
-    }
-    model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| {
+    if model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| {
         matches!(
             part,
-            "tts"
-                | "audio"
-                | "embed"
+            "embed"
                 | "embedding"
                 | "embeddings"
-                | "live"
-                | "realtime"
-                | "transcribe"
+                | "embeddinggemma"
                 | "moderation"
+                | "rerank"
+                | "transcribe"
+                | "whisper"
+                | "tts"
+                | "realtime"
+                | "audio"
+                | "live"
                 | "veo"
                 | "sora"
                 | "lyria"
                 | "aqa"
-                | "whisper"
+        )
+    }) {
+        return true;
+    }
+    if provider == ProviderKind::Gemini {
+        return !model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| matches!(part, "image" | "images" | "banana"));
+    }
+    if model.starts_with("dall-e") || model.contains("stable-diffusion") {
+        return false;
+    }
+    !model.split(|c: char| !c.is_ascii_alphanumeric()).any(|part| {
+        matches!(
+            part,
+            "image"
+                | "images"
+                | "banana"
+                | "imagen"
+                | "dalle"
+                | "flux"
+                | "sdxl"
+                | "diffusion"
+                | "playground"
+                | "ideogram"
+                | "recraft"
+                | "midjourney"
+                | "safetensors"
+                | "ckpt"
+                | "gguf"
         )
     })
 }
@@ -167,6 +190,12 @@ pub fn supports_gemini_image_review(provider: ProviderKind, model: &str) -> bool
     }
     let model = model.trim().to_ascii_lowercase();
     let model = model.strip_prefix("models/").unwrap_or(&model);
+    if (model == "gemini-4" || model.starts_with("gemini-4-") || model.starts_with("gemini-4."))
+        && !is_non_text_model(model)
+        && model.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_'))
+    {
+        return true;
+    }
     [
         "gemini-flash",
         "gemini-flash-lite",
@@ -217,35 +246,78 @@ mod tests {
         assert!(is_non_image_model(ProviderKind::OpenAi, "gpt-4o"));
         assert!(is_non_image_model(ProviderKind::OpenAi, "o3-mini"));
         assert!(is_non_image_model(ProviderKind::Ollama, "qwen2.5:14b"));
+        assert!(is_non_image_model(ProviderKind::OpenAi, "jina-clip-image-embed"));
+        assert!(is_non_image_model(ProviderKind::Gemini, "jina-clip-image-embed"));
+        for unknown_llm in
+            ["anthropic/claude-sonnet-4-5", "openai/gpt-5.4", "codex-mini-latest", "grok-3", "phi-4", "qwen3", "llama-3", "mistral", "deepseek"]
+        {
+            assert!(is_non_image_model(ProviderKind::OpenAi, unknown_llm), "expected {unknown_llm} to be rejected as non-image");
+            assert!(is_non_image_model(ProviderKind::Gemini, unknown_llm), "expected {unknown_llm} to be rejected as non-image");
+        }
         assert!(!is_non_image_model(ProviderKind::Gemini, "gemini-3.1-flash-image"));
         assert!(!is_non_image_model(ProviderKind::Gemini, "gemini-3.1-flash-image-preview"));
         assert!(!is_non_image_model(ProviderKind::Gemini, "gemini-2.5-flash-image"));
         assert!(!is_non_image_model(ProviderKind::Gemini, "gemini-nano-banana-2.1"));
         assert!(!is_non_image_model(ProviderKind::OpenAi, "gpt-image-1"));
         assert!(!is_non_image_model(ProviderKind::OpenAi, "dall-e-3"));
+        assert!(!is_non_image_model(ProviderKind::OpenAi, "black-forest-labs/flux.1-dev"));
+        assert!(!is_non_image_model(ProviderKind::OpenAi, "stabilityai/stable-diffusion-xl-base-1.0"));
         assert!(!is_non_image_model(ProviderKind::ComfyUi, ""));
+        assert!(!is_non_image_model(ProviderKind::ComfyUi, "juggernautXL_v9"));
         assert!(!is_non_image_model(ProviderKind::Gemini, "image-model"));
-        assert!(!is_non_image_model(ProviderKind::Gemini, "test"));
+        assert!(!is_non_image_model(ProviderKind::Gemini, "test-image"));
 
         for non_gen in [
             "gemini-tuned-embed-only",
             "nomic-embed-text",
             "mxbai-embed-large:latest",
+            "embeddinggemma:300m",
             "omni-moderation-latest",
             "gpt-4o-realtime-preview",
             "gpt-4o-transcribe",
             "lyria-realtime-exp",
             "sora-1",
+            "jina-clip-image-embed",
         ] {
             assert!(is_non_text_model(non_gen), "expected {non_gen} to be classified non-text");
             assert!(is_non_image_model(ProviderKind::OpenAi, non_gen), "expected {non_gen} to be classified non-image");
             assert!(is_non_image_model(ProviderKind::Gemini, non_gen), "expected {non_gen} to be classified non-image");
         }
+        for non_text in ["gemini-nano-banana-2.1", "qwen2.5-omni-7b", "flux.1-schnell", "sdxl-lightning", "stable-diffusion-3.5"] {
+            assert!(is_non_text_model(non_text), "expected {non_text} to be classified non-text");
+        }
+        for gemma_text in ["gemma-3-12b-it", "gemma-3-27b-it", "gemma2:9b", "gemma3:12b", "google/gemma-3-27b-it"] {
+            assert!(!is_non_text_model(gemma_text), "expected {gemma_text} to be allowed as a text model");
+            assert!(is_non_image_model(ProviderKind::Ollama, gemma_text));
+            assert!(is_non_image_model(ProviderKind::OpenAi, gemma_text));
+            assert!(is_non_image_model(ProviderKind::Gemini, gemma_text));
+        }
         assert!(!is_non_text_model("embedded-layout-helper"));
+        assert!(!is_non_text_model("imaginative-writer-7b"));
+
+        for retired in [
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "models/gemini-2.5-flash-image",
+            "gemini-3-pro-preview",
+            "gemini-3-pro-image-preview",
+            "gemini-3.1-flash-image-preview",
+            "gemini-3.1-flash-lite-preview",
+            "imagen-3.0-generate-002",
+        ] {
+            assert!(is_retired_gemini_model(ProviderKind::Gemini, retired), "expected {retired} to be classified retired");
+            assert!(!is_retired_gemini_model(ProviderKind::OpenAi, retired));
+        }
+        assert!(!is_retired_gemini_model(ProviderKind::Gemini, "gemini-3.8-flash"));
+        assert!(!is_retired_gemini_model(ProviderKind::Gemini, "gemini-3.1-flash-image"));
+        assert!(!is_retired_gemini_model(ProviderKind::Gemini, "gemini-4-argon"));
 
         assert!(supports_gemini_image_review(ProviderKind::Gemini, " gemini-3.8-flash "));
         assert!(supports_gemini_image_review(ProviderKind::Gemini, "models/gemini-3.1-pro-preview-customtools"));
         assert!(supports_gemini_image_review(ProviderKind::Gemini, "gemini-2.0-flash"));
+        assert!(supports_gemini_image_review(ProviderKind::Gemini, "gemini-4-argon"));
+        assert!(supports_gemini_image_review(ProviderKind::Gemini, "models/gemini-4.1-pro"));
+        assert!(!supports_gemini_image_review(ProviderKind::Gemini, "gemini-4-flash-image"));
         assert!(!supports_gemini_image_review(ProviderKind::OpenAi, "gpt-4o"));
         assert!(!supports_gemini_image_review(ProviderKind::Ollama, "llava"));
         assert!(!supports_gemini_image_review(ProviderKind::Gemini, "gemini-3.1-flash-image"));

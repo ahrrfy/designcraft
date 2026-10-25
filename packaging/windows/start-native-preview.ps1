@@ -6,6 +6,12 @@ param(
     [switch]$LibraryOnly
 )
 $ErrorActionPreference = 'Stop'
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+function Format-QuotedWinArg([string]$Value) {
+    return '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
 # Load only our installed local helper, never a release-provided script.
 $taskLauncherLibraryOnly = $LibraryOnly
 . (Join-Path $PSScriptRoot 'update-native-preview.ps1') -ManifestPath $ManifestPath -LibraryOnly
@@ -45,10 +51,10 @@ function Get-PreviewUpdateTaskDefinition([string]$Path, [string]$TaskName = 'Sma
     $updater = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))
     $fullManifest = [IO.Path]::GetFullPath($Path)
     $powershellExe = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
-    $arguments = '-NoProfile -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File "' + $scriptFile + '" -ManifestPath "' + $fullManifest + '"'
+    $arguments = '-NoProfile -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File ' + (Format-QuotedWinArg $scriptFile) + ' -ManifestPath ' + (Format-QuotedWinArg $fullManifest)
     if ($ScriptName -eq 'sync-upstream-local.ps1' -and $RepoPath) {
         if (-not [IO.Path]::IsPathRooted($RepoPath)) { throw 'An absolute repository path is required.' }
-        $arguments += ' -RepoPath "' + ([IO.Path]::GetFullPath($RepoPath)) + '"'
+        $arguments += ' -RepoPath ' + (Format-QuotedWinArg ([IO.Path]::GetFullPath($RepoPath)))
     }
     return [pscustomobject]@{
         task_name = $TaskName
@@ -94,7 +100,7 @@ function Install-PreviewLauncherShortcuts([string]$Path, [string]$ShortcutDirect
             $shortcutPath = Join-Path $ShortcutDirectory $item.name
             $shortcut = $shell.CreateShortcut($shortcutPath)
             $shortcut.TargetPath = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell/v1.0/powershell.exe'
-            $shortcut.Arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $item.script + '" -ManifestPath "' + $Path + '"'
+            $shortcut.Arguments = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ' + (Format-QuotedWinArg $item.script) + ' -ManifestPath ' + (Format-QuotedWinArg $Path)
             $shortcut.WorkingDirectory = Split-Path $Path -Parent
             $shortcut.Description = $item.description
             $shortcut.WindowStyle = 7
@@ -123,7 +129,7 @@ try {
     $taskRecord = Read-UpdateJson $ManifestPath
     $taskPort = 0
     if (-not [int]::TryParse([string]$taskRecord.port, [ref]$taskPort) -or $taskPort -lt 1 -or $taskPort -gt 65535) { throw 'Invalid preview control port.' }
-    $taskRunning = ($null -ne (Get-Process -Name designcraft -ErrorAction SilentlyContinue)) -or
+    $taskRunning = (Test-PreviewProcessRunning $taskRecord $ManifestPath) -or
         ($null -ne (Get-NetTCPConnection -LocalPort $taskPort -State Listen -ErrorAction SilentlyContinue))
     $taskRecord = Resolve-PreviewLaunch $ManifestPath $ExecutablePath -AppRunning:$taskRunning
     $taskRecord | Add-Member -NotePropertyName update_script_path -NotePropertyValue ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))) -Force
@@ -132,7 +138,7 @@ try {
     $taskBook = if ($taskRecord.document_path) { $taskRecord.document_path } else { $taskRecord.repaired_native_book }
     Set-PreviewLaunchEnvironment $ManifestPath $taskRecord
     $taskArguments = @('--control', [string]$taskPort)
-    if ($taskBook) { $taskArguments += ('"' + $taskBook + '"') }
+    if ($taskBook) { $taskArguments += (Format-QuotedWinArg $taskBook) }
     # Automated starts stay hidden; a user-initiated interactive launch is visible.
     $taskStyle = if ($Hidden) { 'Hidden' } else { 'Normal' }
     $taskProcess = Start-Process -FilePath $taskExecutable -ArgumentList $taskArguments -WindowStyle $taskStyle -PassThru

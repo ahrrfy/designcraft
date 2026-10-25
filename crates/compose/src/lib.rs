@@ -4655,4 +4655,38 @@ mod column_allocation_safety_tests {
     fn column_allocation_caps_fixed_width_frame_count() {
         check(designcraft_doc::ColumnsKind::FixedWidth);
     }
+
+    #[test]
+    fn combining_mark_missing_in_primary_falls_back_as_whole_base_mark_cluster() {
+        let base = '\u{0628}'; // Arabic letter Beh
+        let mark = '\u{0670}'; // Superscript Alef combining mark
+        let db = FontDb::with_font_dirs(vec![]);
+        db.add_font(designcraft_fonts::testing::font_with("DC Base Only", &[base]).unwrap());
+        db.add_font(designcraft_fonts::testing::font_with("DC Base And Mark", &[base, mark]).unwrap());
+
+        let mut doc = Document::new(&designcraft_doc::build::NewDocument::default());
+        doc.settings.glyph_fallback = true;
+        let text = format!("{base}{mark}");
+        let rect = Rect::new(36.0, 36.0, 236.0, 136.0);
+        let (fid, sid) = doc.add_text_frame(designcraft_doc::SpreadRef::Doc(0), rect, doc.default_layer(), &text, Default::default()).unwrap();
+        {
+            let story = doc.story_mut(sid).unwrap();
+            story.direction = designcraft_doc::TextDirection::RightToLeft;
+            let len = story.text.len();
+            story.format_chars(0..len, |fmt| {
+                fmt.over.font_family = Some("DC Base Only".into());
+                fmt.over.language = Some("ar".into());
+            });
+        }
+        let specs = frame_specs(&doc, sid);
+        let composed = compose_with_db(&doc, doc.stories.get(&sid).unwrap(), &specs, &ComposeOptions::default(), &db);
+        let frame = composed.frame(fid).unwrap();
+        assert!(!frame.lines.is_empty());
+        let glyphs: Vec<_> = frame.lines.iter().flat_map(|l| l.glyphs.iter()).collect();
+        assert!(!glyphs.is_empty());
+        for g in &glyphs {
+            assert_ne!(g.gid, 0, "combining mark cluster must not emit .notdef");
+            assert_eq!(g.face.family, "DC Base And Mark", "base and mark must shape together in fallback face");
+        }
+    }
 }

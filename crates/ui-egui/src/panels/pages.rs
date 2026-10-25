@@ -346,7 +346,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                         ui.painter().rect_filled(r, 0.0, t.hover);
                     }
                     if opts.parents_vertical {
-                        ui.painter().text(
+                        crate::rtl::paint(
+                            ui.painter(),
                             r.left_center() + vec2(3.0, 0.0),
                             egui::Align2::LEFT_CENTER,
                             label,
@@ -358,16 +359,23 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                         let w = icon_h * row.unit_w;
                         parent_icon(app, ui, egui::pos2(r.center().x + w / 2.0, r.min.y + 3.0 + icon_h / 2.0), row, icon_h, parent_thumbnails, &t);
                         let short = row.prefix.clone().unwrap_or_else(|| label.to_string());
-                        ui.painter().text(
+                        crate::rtl::paint(
+                            ui.painter(),
                             egui::pos2(r.center().x, r.max.y - 9.0),
                             egui::Align2::CENTER_CENTER,
-                            short,
+                            &short,
                             egui::FontId::proportional(11.0),
                             t.text_strong,
                         );
                     }
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, label));
-                    let resp = if opts.parents_vertical { resp } else { resp.on_hover_text(label) };
+                    let resp = if opts.parents_vertical {
+                        resp
+                    } else {
+                        resp.on_hover_ui(|ui| {
+                            crate::rtl::label(ui, label);
+                        })
+                    };
                     resp.dnd_set_drag_payload(PageDrag::Parent(row.parent.map(|(_, id)| id)));
                     if resp.double_clicked()
                         && let Some((_, id)) = row.parent
@@ -716,7 +724,7 @@ fn page_menu(app: &mut DesignApp, ui: &mut egui::Ui, doc: &designcraft_doc::Docu
         }
         for pp in &doc.parents {
             let l = pp.parent.as_ref().map(|i| i.label()).unwrap_or_default();
-            if ui.button(&l).clicked() {
+            if ui.button(crate::rtl::widget(ui, &l)).clicked() {
                 let _ = app.run("layout.pages.applyParent", json!({"pages": [abs], "parent": pp.id.0}));
                 ui.close();
             }
@@ -772,7 +780,7 @@ fn page_menu(app: &mut DesignApp, ui: &mut egui::Ui, doc: &designcraft_doc::Docu
 pub(crate) fn drag_ghost(ui: &egui::Ui, label: &str, t: &Tokens) {
     let Some(p) = ui.ctx().pointer_interact_pos() else { return };
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("page_drag")));
-    let g = painter.layout_no_wrap(label.to_string(), egui::FontId::proportional(11.0), t.text_strong);
+    let g = crate::rtl::plain(ui.ctx(), label, egui::FontId::proportional(11.0), t.text_strong);
     let r = egui::Rect::from_min_size(p + vec2(10.0, 8.0), g.size() + vec2(10.0, 6.0));
     painter.rect(r, 2.0, t.panel_darker, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
     painter.galley(r.min + vec2(5.0, 3.0), g, t.text_strong);

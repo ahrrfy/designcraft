@@ -51,7 +51,14 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         if nr.hovered() {
             ui.painter().rect_filled(name_r, 0.0, t.hover);
         }
-        ui.painter().text(name_r.left_center() + vec2(4.0, 0.0), egui::Align2::LEFT_CENTER, &c.name, egui::FontId::proportional(12.5), t.text);
+        crate::rtl::paint(
+            ui.painter(),
+            name_r.left_center() + vec2(4.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            &c.name,
+            egui::FontId::proportional(12.5),
+            t.text,
+        );
         let chip = egui::Rect::from_min_size(egui::pos2(row.max.x - 20.0, row.min.y + 5.0), vec2(14.0, 12.0));
         ui.painter().rect_filled(chip, 2.0, egui::Color32::from_rgb(c.color[0], c.color[1], c.color[2]));
         if nr.clicked() {
@@ -75,10 +82,13 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let id = egui::Id::new("new_condition_name");
     let mut name: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
     ui.horizontal(|ui| {
-        ui.add(
+        let mut layouter = crate::rtl::text_edit_layouter(false, None, None);
+        crate::rtl::show_text_edit(
+            ui,
             egui::TextEdit::singleline(&mut name)
                 .hint_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New condition name")))
-                .desired_width(150.0),
+                .desired_width(150.0)
+                .layouter(&mut layouter),
         );
         if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New"))).clicked() && !name.trim().is_empty() {
             match app.run("condition.new", json!({"name": name.trim()})) {

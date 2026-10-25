@@ -19,6 +19,7 @@ pub(crate) struct PrintContract {
     pub column_width_mm: Option<f64>,
     pub baseline_mm: Option<f64>,
     pub min_ppi: Option<f64>,
+    pub color_space: Option<String>,
     pub pdf_x4: bool,
     pub crop_offset_mm: Option<f64>,
     pub english_fonts: Vec<String>,
@@ -52,7 +53,7 @@ impl PrintContract {
         for line in prompt.lines() {
             let lower = line.to_lowercase();
             let heading = lower.trim_start_matches('#').trim_start();
-            if lower.starts_with('#') && (heading.starts_with("page ") || heading.starts_with("صفحة ")) {
+            if lower.starts_with('#') && (heading.starts_with("page ") || heading.starts_with("صفحة ") || heading.starts_with("الصفحة ")) {
                 page_content = true;
             }
             let final_export = lower.contains("prepress preflight export:");
@@ -72,9 +73,9 @@ impl PrintContract {
             let Some((key, value)) = spec else { continue };
             let value = clean(value);
             match key.as_str() {
-                "trim size" | "page size" => {
+                "trim size" | "page size" | "حجم الصفحة" | "مقاس الصفحة" | "مقاس القطع" | "حجم القطع" => {
                     let size = if value.to_lowercase().contains("a4") {
-                        if value.to_lowercase().contains("landscape") { [297.0, 210.0] } else { [210.0, 297.0] }
+                        if value.to_lowercase().contains("landscape") || value.contains("أفقي") { [297.0, 210.0] } else { [210.0, 297.0] }
                     } else {
                         let numbers = numbers(&value)?;
                         let Some((&width, tail)) = numbers.split_first() else { return Err("Trim Size needs explicit dimensions in mm".into()) };
@@ -84,33 +85,41 @@ impl PrintContract {
                     };
                     put(&mut out.page_mm, size, "Trim Size")?;
                 }
-                "bleed" => {
+                "bleed" | "القص" | "هامش القص" | "نزف الطباعة" | "الهامش الخارجي للقص" => {
                     require_mm(&value, "Bleed")?;
                     let amount = first_number(&value, "Bleed")?;
                     put(&mut out.bleed_mm, bounded(amount, 0.0, 100.0, "bleed")?, "Bleed")?;
                 }
-                "safe margin / live area" | "safe margins" | "margins" => {
-                    require_mm(&value, "Margins")?;
-                    let values = numbers(&value)?;
-                    let Some(&outer) = values.first() else { return Err("Margins need explicit dimensions".into()) };
-                    let inside = match values.as_slice() {
-                        [_] => outer,
-                        [_, inner] if value.to_lowercase().contains("inside")
-                            && ["top", "bottom", "outside"].iter().all(|edge| value.to_lowercase().contains(edge)) => *inner,
-                        _ => return Err("Margins must specify one uniform mm value or grouped top/bottom/outside followed by inside mm; use explicit native settings for other edge combinations".into()),
-                    };
-                    bounded(outer, 0.0, 100.0, "margin")?;
-                    bounded(inside, 0.0, 100.0, "inside margin")?;
-                    put(&mut out.margins_mm, [outer, outer, inside, outer], "Margins")?;
+                "safe margin / live area" | "safe margins" | "margins" | "الهوامش" | "هامش الأمان" | "هوامش الأمان" => {
+                    out.read_margins(&value)?;
                 }
-                "grid system" => out.read_grid(&value)?,
-                "english primary font" => put_fonts(&mut out.english_fonts, font_candidates(&value)?, "English fonts")?,
-                "arabic primary font" => put_fonts(&mut out.arabic_fonts, font_candidates(&value)?, "Arabic fonts")?,
-                "color profile" | "colour profile" => {
+                "grid system" | "نظام الشبكة" => out.read_grid(&value)?,
+                "english primary font" | "الخط الإنجليزي" | "الخط الإنجليزي الأساسي" => {
+                    put_fonts(&mut out.english_fonts, font_candidates(&value)?, "English fonts")?
+                }
+                "arabic primary font" | "الخط العربي" | "الخط العربي الأساسي" => {
+                    put_fonts(&mut out.arabic_fonts, font_candidates(&value)?, "Arabic fonts")?
+                }
+                "color profile" | "colour profile" | "الملف اللوني" => {
                     out.unsupported.push(format!("Requested ICC/color profiles require explicit press setup; the automatic PDF/X export uses one active CMYK output intent and cannot apply separate cover/interior profiles: {value}"));
                 }
-                "image resolution" | "effective image resolution" => out.read_resolution(&value)?,
-                "pdf standard" | "export standard" | "prepress preflight export" => out.read_export(&value)?,
+                "color space" | "colour space" | "الفضاء اللوني" | "نظام الألوان" => {
+                    let lower_val = value.to_lowercase();
+                    let space = if lower_val.contains("cmyk") {
+                        "CMYK"
+                    } else if lower_val.contains("rgb") {
+                        "RGB"
+                    } else {
+                        return Err("Color Space must specify CMYK or RGB".into());
+                    };
+                    put(&mut out.color_space, space.to_string(), "Color Space")?;
+                }
+                "image resolution" | "effective image resolution" | "الدقة" | "دقة الصور" | "دقة الطباعة" => {
+                    out.read_resolution(&value)?
+                }
+                "pdf standard" | "export standard" | "prepress preflight export" | "معيار التصدير" | "معيار pdf" => {
+                    out.read_export(&value)?
+                }
                 _ => continue,
             }
             found = true;
@@ -122,22 +131,72 @@ impl PrintContract {
         Ok(Some(out))
     }
 
-    fn read_grid(&mut self, value: &str) -> Result<(), String> {
+    fn read_margins(&mut self, value: &str) -> Result<(), String> {
+        require_mm(value, "Margins")?;
+        let values = numbers(value)?;
+        let Some(&first) = values.first() else { return Err("Margins need explicit dimensions".into()) };
         let lower = value.to_lowercase();
-        let column = lower.find("-column").or_else(|| lower.find(" column"));
-        if let Some(position) = column {
-            let count = preceding_number(&lower, position, "column count")?;
+        let (outer, inside) = match values.as_slice() {
+            [_] => (first, first),
+            [a, b] if lower.contains("inside") && ["top", "bottom", "outside"].iter().all(|edge| lower.contains(edge)) => (*a, *b),
+            [a, b] if (lower.contains("داخلي") || lower.contains("الداخلي")) && (lower.contains("خارجي") || lower.contains("الخارجي")) =>
+            {
+                let in_pos = lower.find("الداخلي").or_else(|| lower.find("داخلي")).unwrap_or(0);
+                let out_pos = lower.find("الخارجي").or_else(|| lower.find("خارجي")).unwrap_or(usize::MAX);
+                if in_pos < out_pos { (*b, *a) } else { (*a, *b) }
+            }
+            _ => {
+                return Err(
+                    "Margins must specify one uniform mm value or grouped top/bottom/outside with inside mm; use explicit native settings for other edge combinations"
+                        .into(),
+                );
+            }
+        };
+        bounded(outer, 0.0, 100.0, "margin")?;
+        bounded(inside, 0.0, 100.0, "inside margin")?;
+        put(&mut self.margins_mm, [outer, outer, inside, outer], "Margins")
+    }
+
+    fn read_grid(&mut self, value: &str) -> Result<(), String> {
+        let lower = ascii_digits(value).to_lowercase();
+        if let Some(label) = ["عدد الأعمدة", "عدد الاعمدة"].into_iter().find(|k| lower.contains(k))
+            && let Some(pos) = lower.find(label)
+            && let Some(tail) = lower.get(pos.saturating_add(label.len())..)
+        {
+            let count = first_number(tail, "column count")?;
             if count.fract() != 0.0 {
                 return Err("Print column count must be a whole number".into());
             }
             put(&mut self.columns, bounded(count, 1.0, 216.0, "column count")? as u32, "column count")?;
+        } else {
+            let column =
+                lower.find("-column").or_else(|| lower.find(" column")).or_else(|| lower.find("أعمدة")).or_else(|| lower.find("اعمدة")).or_else(
+                    || {
+                        lower.match_indices("عمود").find_map(|(idx, _)| {
+                            let before = lower.get(..idx).unwrap_or("");
+                            (!before.trim_end().ends_with("عرض") && !before.trim_end().ends_with("عرض ال") && !before.trim_end().ends_with("فاصل"))
+                                .then_some(idx)
+                        })
+                    },
+                );
+            if let Some(position) = column {
+                let count = preceding_number(&lower, position, "column count")?;
+                if count.fract() != 0.0 {
+                    return Err("Print column count must be a whole number".into());
+                }
+                put(&mut self.columns, bounded(count, 1.0, 216.0, "column count")? as u32, "column count")?;
+            }
         }
-        for (label, target) in [("column width:", &mut self.column_width_mm), ("gutter:", &mut self.gutter_mm)] {
-            if let Some(position) = lower.find(label) {
-                let tail = lower.get(position.saturating_add(label.len())..).ok_or("Invalid grid specification")?;
-                require_mm(tail, label)?;
-                let n = bounded(first_number(tail, label)?, 0.0, 1000.0, label)?;
-                put(target, n, label)?;
+        for (labels, name, target) in [
+            (&["column width:", "عرض العمود:", "عرض العمود"][..], "column width:", &mut self.column_width_mm),
+            (&["gutter:", "فاصل الأعمدة:", "فاصل الاعمدة:", "فاصل الأعمدة", "فاصل الاعمدة", "الفاصل:", "الفاصل"][..], "gutter:", &mut self.gutter_mm),
+        ] {
+            if let Some((position, matched)) = labels.iter().find_map(|l| lower.find(l).map(|p| (p, *l))) {
+                let tail = lower.get(position.saturating_add(matched.len())..).ok_or("Invalid grid specification")?;
+                let seg = tail.split([',', '،', ';', '؛']).next().unwrap_or(tail);
+                require_mm(seg, name)?;
+                let n = bounded(first_number(seg, name)?, 0.0, 1000.0, name)?;
+                put(target, n, name)?;
             }
         }
         if let Some(position) = lower.find("baseline") {
@@ -145,6 +204,26 @@ impl PrintContract {
             require_mm(before, "baseline")?;
             let increment = preceding_number(&lower, position, "baseline")?;
             put(&mut self.baseline_mm, bounded(increment, 0.1, 100.0, "baseline")?, "baseline")?;
+        } else if let Some((position, matched)) =
+            ["خط الأساس", "خط الاساس", "شبكة الأساس", "شبكة الاساس"].into_iter().find_map(|l| lower.find(l).map(|p| (p, l)))
+        {
+            let tail = lower.get(position.saturating_add(matched.len())..).unwrap_or("");
+            let seg = tail.split([',', '،', ';', '؛']).next().unwrap_or(tail);
+            let before = lower.get(..position).unwrap_or("");
+            let increment_mm = if let Ok(n) = first_number(seg, "baseline") {
+                if seg.contains("نقطة") || seg.contains("نقاط") || seg.contains("pt") {
+                    n / PT_PER_MM
+                } else {
+                    require_mm(seg, "baseline")?;
+                    n
+                }
+            } else if before.contains("نقطة") || before.contains("نقاط") || before.contains("pt") {
+                preceding_number(&lower, position, "baseline")? / PT_PER_MM
+            } else {
+                require_mm(before, "baseline")?;
+                preceding_number(&lower, position, "baseline")?
+            };
+            put(&mut self.baseline_mm, bounded(increment_mm, 0.1, 100.0, "baseline")?, "baseline")?;
         }
         if self.columns.is_none() && self.baseline_mm.is_none() {
             return Err("Grid System needs an explicit column count or baseline increment".into());
@@ -153,14 +232,20 @@ impl PrintContract {
     }
 
     fn read_resolution(&mut self, value: &str) -> Result<(), String> {
-        let lower = value.to_lowercase();
-        let position = lower.find("ppi").or_else(|| lower.find("dpi")).ok_or("Image resolution must use PPI or DPI")?;
+        let lower = ascii_digits(value).to_lowercase();
+        let position = lower
+            .find("ppi")
+            .or_else(|| lower.find("dpi"))
+            .or_else(|| lower.find("نقطة"))
+            .or_else(|| lower.find("بكسل"))
+            .or_else(|| lower.find("بوصة"))
+            .ok_or("Image resolution must use PPI or DPI")?;
         let amount = bounded(preceding_number(&lower, position, "image resolution")?, 36.0, 2400.0, "image resolution")?;
         put(&mut self.min_ppi, amount, "image resolution")
     }
 
     fn read_export(&mut self, value: &str) -> Result<(), String> {
-        let lower = clean(value).to_lowercase();
+        let lower = ascii_digits(&clean(value)).to_lowercase();
         if lower.contains("pdf/x-4") || lower.contains("pdf/x–4") {
             self.pdf_x4 = true;
         } else if lower.contains("pdf/x") || lower.contains("pdf/a") {
@@ -225,12 +310,23 @@ impl PrintContract {
     }
 
     /// Only for creation of a new private document. Existing documents use validate_existing.
+    #[cfg(test)]
     pub(crate) fn document_params(&self, profile: Option<&DesignProfile>, pages: u32) -> Result<Value, String> {
+        self.document_params_with_binding(profile, pages, false)
+    }
+
+    /// Only for creation of a new private document, with optional RTL binding direction.
+    pub(crate) fn document_params_with_binding(
+        &self,
+        profile: Option<&DesignProfile>,
+        pages: u32,
+        right_to_left_binding: bool,
+    ) -> Result<Value, String> {
         self.validate_supported()?;
         if let Some(profile) = profile {
             profile.validate()?;
         }
-        let mut params = crate::design::document_params(profile, pages);
+        let mut params = crate::design::document_params_with_binding(profile, pages, right_to_left_binding);
         if let Some([width, height]) = self.page_mm {
             params["width"] = json!(width * PT_PER_MM);
             params["height"] = json!(height * PT_PER_MM);
@@ -399,20 +495,46 @@ fn recognized_spec(key: &str) -> bool {
         key,
         "trim size"
             | "page size"
+            | "حجم الصفحة"
+            | "مقاس الصفحة"
+            | "مقاس القطع"
+            | "حجم القطع"
             | "bleed"
+            | "القص"
+            | "هامش القص"
+            | "نزف الطباعة"
+            | "الهامش الخارجي للقص"
             | "safe margin / live area"
             | "safe margins"
             | "margins"
+            | "الهوامش"
+            | "هامش الأمان"
+            | "هوامش الأمان"
             | "grid system"
+            | "نظام الشبكة"
             | "english primary font"
+            | "الخط الإنجليزي"
+            | "الخط الإنجليزي الأساسي"
             | "arabic primary font"
+            | "الخط العربي"
+            | "الخط العربي الأساسي"
             | "color profile"
             | "colour profile"
+            | "الملف اللوني"
+            | "color space"
+            | "colour space"
+            | "الفضاء اللوني"
+            | "نظام الألوان"
             | "image resolution"
             | "effective image resolution"
+            | "الدقة"
+            | "دقة الصور"
+            | "دقة الطباعة"
             | "pdf standard"
             | "export standard"
             | "prepress preflight export"
+            | "معيار التصدير"
+            | "معيار pdf"
     )
 }
 
@@ -439,17 +561,31 @@ fn bounded(value: f64, min: f64, max: f64, label: &str) -> Result<f64, String> {
     Ok(value)
 }
 
+fn ascii_digits(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '\u{0660}'..='\u{0669}' => char::from_u32(u32::from('0') + (u32::from(c) - 0x0660)).unwrap_or(c),
+            '\u{06F0}'..='\u{06F9}' => char::from_u32(u32::from('0') + (u32::from(c) - 0x06F0)).unwrap_or(c),
+            '\u{066B}' => '.',
+            _ => c,
+        })
+        .collect()
+}
+
 fn require_mm(value: &str, label: &str) -> Result<(), String> {
-    if !value.to_lowercase().contains("mm") {
+    let lower = value.to_lowercase();
+    if !lower.contains("mm") && !value.contains("مم") && !value.contains("ملم") {
         return Err(format!("Print {label} requires explicit millimeters (mm)"));
     }
     Ok(())
 }
 
 fn numbers(value: &str) -> Result<Vec<f64>, String> {
+    let normalized = ascii_digits(value);
     let mut out = Vec::new();
     let mut token = String::new();
-    let mut chars = value.chars().chain(std::iter::once(' ')).peekable();
+    let mut chars = normalized.chars().chain(std::iter::once(' ')).peekable();
     while let Some(c) = chars.next() {
         if token.is_empty() {
             if c.is_ascii_digit() || (matches!(c, '.' | '-' | '+') && chars.peek().is_some_and(char::is_ascii_digit)) {
@@ -482,9 +618,9 @@ fn preceding_number(value: &str, end: usize, label: &str) -> Result<f64, String>
 }
 
 fn font_candidates(value: &str) -> Result<Vec<String>, String> {
-    let names = value.split('(').next().unwrap_or(value).split(" with ").next().unwrap_or(value);
-    let names = names.replace(" or ", "/");
-    let out: Vec<String> = names.split(['/', ',']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let names = value.split('(').next().unwrap_or(value).split(" with ").next().unwrap_or(value).split(" مع ").next().unwrap_or(value);
+    let names = names.replace(" or ", "/").replace(" أو ", "/");
+    let out: Vec<String> = names.split(['/', ',', '،']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
     if out.is_empty() || out.len() > 8 || out.iter().any(|s| s.len() > 160) {
         return Err("Requested print font list must have 1–8 bounded family names".into());
     }
@@ -591,5 +727,32 @@ mod tests {
         assert_eq!(contract.english_fonts, ["Andika", "Century Gothic Pro", "Fredoka"]);
         assert_eq!(contract.arabic_fonts, ["Readex Pro", "Cairo", "Tajawal"]);
         assert_eq!(contract.min_image_ppi(), Some(300.0));
+    }
+
+    #[test]
+    fn arabic_print_specification_keys_and_rtl_binding_are_recognized() {
+        let ar_prompt = "حجم الصفحة: ٢١٠ مم × ٢٩٧ مم\nهامش القص: ٣ مم\nالدقة: ٣٠٠ نقطة في البوصة\nالفضاء اللوني: CMYK\nالهوامش: داخلي ٢٠ مم، خارجي ١٥ مم\nنظام الشبكة: ٦ أعمدة، الفاصل ٤٫٥ مم، خط الأساس ١٢ نقطة\nالخط العربي: Amiri، Noto Naskh Arabic أو Cairo مع التشكيل الكامل\n";
+        let contract = PrintContract::from_prompt(ar_prompt).unwrap().unwrap();
+        assert_eq!(contract.page_mm, Some([210.0, 297.0]));
+        assert_eq!(contract.bleed_mm, Some(3.0));
+        assert_eq!(contract.min_image_ppi(), Some(300.0));
+        assert_eq!(contract.color_space.as_deref(), Some("CMYK"));
+        assert_eq!(contract.margins_mm, Some([15.0, 15.0, 20.0, 15.0]));
+        assert_eq!(contract.columns, Some(6));
+        assert_eq!(contract.gutter_mm, Some(4.5));
+        assert!((contract.baseline_mm.unwrap() - 12.0 / PT_PER_MM).abs() < 1e-6);
+        assert_eq!(contract.arabic_fonts, ["Amiri", "Noto Naskh Arabic", "Cairo"]);
+        contract.validate_final_export().unwrap();
+        let rtl_params = contract.document_params_with_binding(None, 2, true).unwrap();
+        assert_eq!(rtl_params["binding"], "rightToLeft");
+        assert_eq!(rtl_params["facingPages"], false);
+
+        let ascii_ar = "الهوامش: خارجي 14 مم، داخلي 19 مم\nنظام الشبكة: 4 أعمدة، عرض العمود 40 مم، الفاصل 4 مم، خط الأساس 6 مم\n";
+        let contract2 = PrintContract::from_prompt(ascii_ar).unwrap().unwrap();
+        assert_eq!(contract2.margins_mm, Some([14.0, 14.0, 19.0, 14.0]));
+        assert_eq!(contract2.columns, Some(4));
+        assert_eq!(contract2.column_width_mm, Some(40.0));
+        assert_eq!(contract2.gutter_mm, Some(4.0));
+        assert_eq!(contract2.baseline_mm, Some(6.0));
     }
 }

@@ -132,7 +132,11 @@ impl Dialog {
 
 fn text_field(ui: &mut egui::Ui, d: &mut Dialog, key: &str, w: f32) {
     let mut s = d.s(key);
-    if ui.add(egui::TextEdit::singleline(&mut s).desired_width(w).horizontal_align(egui::Align::Min)).changed() {
+    let mut layouter = crate::rtl::text_edit_layouter(false, None, None);
+    if crate::rtl::show_text_edit(ui, egui::TextEdit::singleline(&mut s).desired_width(w).horizontal_align(egui::Align::Min).layouter(&mut layouter))
+        .response
+        .changed()
+    {
         d.fields.insert(key.into(), Value::String(s));
     }
 }
@@ -245,10 +249,13 @@ fn is_modifier_key(key: egui::Key) -> bool {
 
 fn keyboard_shortcuts(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
     let mut q = d.s("query");
-    ui.add(
+    let mut layouter = crate::rtl::text_edit_layouter(false, None, None);
+    crate::rtl::show_text_edit(
+        ui,
         egui::TextEdit::singleline(&mut q)
             .hint_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Search commands")))
-            .desired_width(f32::INFINITY),
+            .desired_width(f32::INFINITY)
+            .layouter(&mut layouter),
     );
     d.fields.insert("query".into(), json!(q));
     let recording = d.s("recording");

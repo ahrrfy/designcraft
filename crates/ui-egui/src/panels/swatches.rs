@@ -39,7 +39,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         let f = egui::Rect::from_min_size(row.min + vec2(20.0, 5.0), vec2(16.0, 12.0));
         ui.painter().rect_stroke(f, 1.5, egui::Stroke::new(1.2, t.text_dim), egui::StrokeKind::Inside);
         ui.painter().line_segment([f.left_top() + vec2(1.0, 3.0), f.right_top() + vec2(-1.0, 3.0)], egui::Stroke::new(1.0, t.text_dim));
-        ui.painter().text(row.min + vec2(42.0, 11.0), egui::Align2::LEFT_CENTER, &g.name, egui::FontId::proportional(12.5), t.text);
+        crate::rtl::paint(ui.painter(), row.min + vec2(42.0, 11.0), egui::Align2::LEFT_CENTER, &g.name, egui::FontId::proportional(12.5), t.text);
         // A double click's first click folded the group: it stays as it was.
         if resp.clicked() {
             open = !open;
@@ -266,7 +266,14 @@ fn swatch_row(
     let (c, g) = crate::widgets::swatch_colors(doc, &sw.name, 1.0);
     let chip = egui::Rect::from_min_size(row.min + vec2(4.0 + indent, 3.0), vec2(16.0, 16.0));
     crate::widgets::paint_chip(ui.painter(), chip, c, g);
-    ui.painter().text(row.min + vec2(28.0 + indent, 11.0), egui::Align2::LEFT_CENTER, &sw.name, egui::FontId::proportional(12.5), t.text);
+    crate::rtl::paint(
+        ui.painter(),
+        row.min + vec2(28.0 + indent, 11.0),
+        egui::Align2::LEFT_CENTER,
+        &sw.name,
+        egui::FontId::proportional(12.5),
+        t.text,
+    );
     // Type indicators: spot dot / process square, colour mode.
     let kind = match &sw.value {
         SwatchValue::Color { color, color_type } => {
@@ -284,7 +291,14 @@ fn swatch_row(
     if sw.locked {
         icons::paint(ui.painter(), egui::Rect::from_min_size(egui::pos2(row.max.x - 64.0, row.min.y + 4.0), vec2(13.0, 13.0)), "lock", t.text_dim);
     }
-    ui.painter().text(row.right_center() - vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, kind, egui::FontId::proportional(10.5), t.text_dim);
+    crate::rtl::paint(
+        ui.painter(),
+        row.right_center() - vec2(6.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        &kind,
+        egui::FontId::proportional(10.5),
+        t.text_dim,
+    );
     if resp.clicked() && !resp.double_clicked() {
         ui.data_mut(|d| d.insert_temp(egui::Id::new(PICKED), sw.name.clone()));
         let _ = super::apply_swatch(app, app.ui.stroke_front, &sw.name, None);

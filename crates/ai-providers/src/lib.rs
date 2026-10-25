@@ -138,8 +138,13 @@ pub fn gemini_print_size(model: &str, ratio: &str, min_pixels: [u32; 2]) -> Resu
     ))
 }
 
+fn normalize_gemini_model(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    lower.strip_prefix("models/").unwrap_or(&lower).to_string()
+}
+
 fn gemini_has_print_tiers(model: &str) -> bool {
-    let model = model.strip_prefix("models/").unwrap_or(model);
+    let model = normalize_gemini_model(model);
     ["gemini-3.1-flash-image", "gemini-3-pro-image", "gemini-3.1-pro-image", "gemini-nano-banana-2.1"]
         .iter()
         .any(|known| model == *known || model.strip_prefix(known).is_some_and(|suffix| suffix.starts_with("-preview")))
@@ -147,8 +152,8 @@ fn gemini_has_print_tiers(model: &str) -> bool {
 
 fn gemini_print_ratio_supported(model: &str, ratio: &str) -> bool {
     if matches!(ratio, "1:4" | "4:1" | "1:8" | "8:1") {
-        let model = model.strip_prefix("models/").unwrap_or(model);
-        model.starts_with("gemini-3.1-flash-image") || model.starts_with("gemini-nano-banana-2.1")
+        let model = normalize_gemini_model(model);
+        model.starts_with("gemini-3.1-flash-image") || model.starts_with("gemini-3.1-flash-lite-image") || model.starts_with("gemini-nano-banana-2.1")
     } else {
         gemini_base_pixels(ratio).is_some()
     }

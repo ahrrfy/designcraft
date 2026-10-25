@@ -4,12 +4,20 @@ use designcraft_engine::DocState;
 use std::sync::Arc;
 
 pub(crate) fn document_params(profile: Option<&DesignProfile>, pages: u32) -> serde_json::Value {
-    match profile {
+    document_params_with_binding(profile, pages, false)
+}
+
+pub(crate) fn document_params_with_binding(profile: Option<&DesignProfile>, pages: u32, right_to_left_binding: bool) -> serde_json::Value {
+    let mut params = match profile {
         Some(p) => {
             serde_json::json!({"width":p.page_mm[0]*72.0/25.4,"height":p.page_mm[1]*72.0/25.4,"pages":pages,"facingPages":false,"margins":p.margin_mm*72.0/25.4,"bleed":0})
         }
         None => serde_json::json!({"preset":"A4","pages":pages,"facingPages":false,"margins":15.0*72.0/25.4,"bleed":0}),
+    };
+    if right_to_left_binding {
+        params["binding"] = serde_json::json!("rightToLeft");
     }
+    params
 }
 
 pub(crate) fn check_geometry(before: Option<&DocState>, after: &DocState, profile: &DesignProfile) -> Result<(), String> {

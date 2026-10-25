@@ -475,6 +475,11 @@ struct FallbackSnapshotHook {
 const SYSTEM_FALLBACKS: &[&str] = &[
     "Helvetica Neue",
     "Arial",
+    "Tahoma",
+    "Geeza Pro",
+    "Noto Naskh Arabic",
+    "Noto Sans Arabic",
+    "Amiri",
     "Segoe UI",
     "Noto Sans",
     "DejaVu Sans",
@@ -1704,6 +1709,7 @@ impl ScopedFonts<'_> {
             "calibri" | "calibri light" => &["Carlito", "Liberation Sans"],
             "cambria" | "cambria math" => &["Caladea", "Liberation Serif"],
             "arial" | "helvetica" => &["Liberation Sans", "Arial", "Helvetica"],
+            "tahoma" => &["Noto Sans Arabic", "DejaVu Sans", "Geeza Pro", "Arial", "Liberation Sans", "Source Sans 3"],
             "times new roman" | "times" => &["Liberation Serif", "Times New Roman", "Times"],
             "courier new" | "courier" => &["Liberation Mono", "Courier New", "Courier"],
             _ if lower.contains("arabic") || lower.contains("naskh") => &["Amiri", "Noto Naskh Arabic", "Geeza Pro"],
@@ -1724,7 +1730,7 @@ impl ScopedFonts<'_> {
         let coverage = |face: &FontFace| characters.iter().filter(|&&c| c.is_whitespace() || c.is_control() || face.covers(c)).count();
         let mut score = coverage(&best);
         let candidates: &[&str] = if characters.iter().any(|c| ('\u{0600}'..='\u{08ff}').contains(c)) {
-            &["Amiri", "Noto Naskh Arabic", "Al Bayan", "Damascus", "Geeza Pro", "Arial"]
+            &["Amiri", "Noto Naskh Arabic", "Noto Sans Arabic", "Tahoma", "Al Bayan", "Damascus", "Geeza Pro", "Arial", "DejaVu Sans"]
         } else if characters.iter().any(|c| ('\u{3400}'..='\u{9fff}').contains(c)) {
             &["Songti SC", "Kaiti SC", "Noto Serif CJK SC", "PingFang SC", "Noto Sans CJK SC"]
         } else {

@@ -734,6 +734,22 @@ impl Runner<'_> {
         prefs: &Prefs,
         scope: Option<BatchScope>,
     ) -> Result<ProductionPlan, String> {
+        self.generic_production_plan_with_min_requests(request, context, catalog, skills, base, prefs, scope, 1, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generic_production_plan_with_min_requests(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        catalog: &Value,
+        skills: &[SkillSnapshot],
+        base: &DocState,
+        prefs: &Prefs,
+        scope: Option<BatchScope>,
+        min_text_requests: u32,
+        defer_images: bool,
+    ) -> Result<ProductionPlan, String> {
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
         let opened_document = current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook);
         let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
@@ -844,7 +860,7 @@ impl Runner<'_> {
             }
             let text_scope = if plan.images.is_empty() { scope } else { None };
             simulate_styled_with_ppi(&plan, base, prefs, request.settings.output_mode, self.cancel, text_scope, geometry_check, required_min_ppi)?;
-            if self.planning_only {
+            if self.planning_only || defer_images {
                 return Ok(plan);
             }
             let expanded = self.expand_images_with_geometry(
@@ -859,6 +875,12 @@ impl Runner<'_> {
             simulate_styled_with_ppi(&expanded, base, prefs, request.settings.output_mode, self.cancel, scope, geometry_check, required_min_ppi)?;
             self.audit_print(&expanded, base, prefs)?;
             return Ok(expanded);
+        }
+        if !self.planning_only {
+            validate_monetary_image_rates(&request.settings)?;
+        }
+        if self.ledger.remaining_requests() < min_text_requests {
+            return Err("AI request limit reached".into());
         }
         let mut image_cache = BTreeMap::new();
         let mut image_bytes = 0usize;
@@ -944,7 +966,7 @@ impl Runner<'_> {
                     if let Err(error) = text_check {
                         (previous, error)
                     } else {
-                        if self.planning_only {
+                        if self.planning_only || defer_images {
                             self.cache_plan(cache_key.as_deref(), &raw_plan)?;
                             return Ok(raw_plan);
                         }
@@ -1084,12 +1106,18 @@ impl Runner<'_> {
             object.insert("remainingTaskRequests".into(), json!(remaining_requests));
             // Explicit scope validation is independent of the context marker and proof policy.
             // Every part uses this Runner's same ledger, keys, cancellation and pinned skills.
-            let previous_planning = self.planning_only;
-            self.planning_only = true;
-            let planned =
-                self.generic_production_plan(request, &chunk_context, catalog, skills, scratch.doc().map_err(|e| e.to_string())?, prefs, Some(scope));
-            self.planning_only = previous_planning;
-            let plan = planned?;
+            let remaining_chunks = (end - next).div_ceil(capacity.max(1));
+            let plan = self.generic_production_plan_with_min_requests(
+                request,
+                &chunk_context,
+                catalog,
+                skills,
+                scratch.doc().map_err(|e| e.to_string())?,
+                prefs,
+                Some(scope),
+                remaining_chunks,
+                true,
+            )?;
             let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
             plan_bytes =
                 plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
@@ -1338,16 +1366,21 @@ impl Runner<'_> {
                 // new top-level frames would otherwise paint over the native dialogue/labels above its artwork.
                 let authored = plan.commands.get(..authored_count).ok_or("Authored image slots disappeared")?;
                 let slot = authored_image_frame(authored, placement.page, view_rect, &filled_frames);
+                let asset_name = generated_asset_name(&image.mime_type);
                 let index = if let Some(index) = slot {
                     filled_frames.insert(index);
-                    plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
+                    plan.commands.push(EngineAction {
+                        command: "file.place".into(),
+                        params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":asset_name}),
+                    });
                     index
                 } else if let Some(existing_id) =
                     existing_document_image_frame(existing_base, authored, placement.page, view_rect, &filled_existing_frames)
                 {
                     filled_existing_frames.insert(existing_id);
                     let place_index = plan.commands.len();
-                    plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":existing_id,"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
+                    plan.commands
+                        .push(EngineAction { command: "file.place".into(), params: json!({"frame":existing_id,"base64":encoded,"name":asset_name}) });
                     place_index
                 } else {
                     let index = plan.commands.len();
@@ -1355,7 +1388,10 @@ impl Runner<'_> {
                         command: "frame.create".into(),
                         params: json!({"spread":placement.page,"rect":view_rect,"content":"graphic"}),
                     });
-                    plan.commands.push(EngineAction { command: "file.place".into(), params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":if image.mime_type=="image/png" {"generated.png"} else {"generated.jpg"}}) });
+                    plan.commands.push(EngineAction {
+                        command: "file.place".into(),
+                        params: json!({"frame":format!("${index}.id"),"base64":encoded,"name":asset_name}),
+                    });
                     index
                 };
                 if repeated {
@@ -1426,6 +1462,20 @@ impl Runner<'_> {
         prefs: &Prefs,
         scope: BatchScope,
     ) -> Result<ProductionPlan, String> {
+        self.template_content_with_min_requests(request, context, style, base, prefs, scope, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn template_content_with_min_requests(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        style: &SkillSnapshot,
+        base: &DocState,
+        prefs: &Prefs,
+        scope: BatchScope,
+        min_text_requests: u32,
+    ) -> Result<ProductionPlan, String> {
         self.progress(
             &format!(
                 "Planning content for pages {}–{} before image generation",
@@ -1456,17 +1506,34 @@ impl Runner<'_> {
             .map(|family| family.text_slots.iter().map(|slot| slot.max_chars).sum::<usize>())
             .max()
             .unwrap_or(0);
-        let per_page =
-            u32::try_from(text_capacity).map_err(|_| "Template content capacity overflow")?.saturating_mul(2).saturating_add(128).max(1024);
-        // Gemini counts internal thinking against the same output allowance.
-        // Preserve a bounded reasoning margin without asking for more page content.
-        let thinking_margin = if request.settings.text_model.provider == ProviderKind::Gemini { 4096 } else { 0 };
+        let max_image_slots = style
+            .design_profile
+            .as_ref()
+            .into_iter()
+            .flat_map(|profile| &profile.page_families)
+            .map(|family| family.image_slots.len())
+            .max()
+            .unwrap_or(0);
+        let image_prompt_allowance = if request.settings.output_mode == OutputMode::NativeWithImages {
+            u32::try_from(max_image_slots).unwrap_or(8).saturating_mul(512)
+        } else {
+            0
+        };
+        let per_page = u32::try_from(text_capacity)
+            .map_err(|_| "Template content capacity overflow")?
+            .saturating_mul(2)
+            .saturating_add(128)
+            .saturating_add(image_prompt_allowance)
+            .max(1024);
+        // Gemini, OpenAI o-series/GPT-5, and Ollama reasoning models count internal
+        // thinking against the same output allowance. Preserve a bounded reasoning margin.
+        let thinking_margin = if model_needs_thinking_margin(&request.settings.text_model) { 4096 } else { 0 };
         let output_limit =
             scope.count.saturating_mul(per_page).saturating_add(512).saturating_add(thinking_margin).min(request.settings.budget.max_output_tokens);
         let generation = GenerationRequest {
             system: format!(
                 "{}\n{EDITORIAL_POLICY}\nWhen multiple declared families are available, avoid document.previousTemplateFamily on the first requested page and vary subsequent families, unless the user explicitly requests identical layouts. That field is inferred from actual native item labels; null means unknown, not an approval.",
-                crate::template_plan::system_for_brief(style, &request.prompt)?
+                crate::template_plan::system_for_brief_with_mode(style, &request.prompt, request.settings.output_mode)?
             ),
             prompt,
             json_schema: schema,
@@ -1507,6 +1574,12 @@ impl Runner<'_> {
                     self.cache_notice(format!("Ignored stale cached template plan: {error}"))?;
                 }
             }
+        }
+        if !self.planning_only && families.iter().any(|id| profile.page_families.iter().any(|f| &f.id == id && !f.image_slots.is_empty())) {
+            validate_monetary_image_rates(&request.settings)?;
+        }
+        if self.ledger.remaining_requests() < min_text_requests {
+            return Err("AI request limit reached".into());
         }
         let original_prompt = generation.prompt.clone();
         let mut generation = generation;
@@ -1597,7 +1670,16 @@ impl Runner<'_> {
                 .insert("curriculum_blueprint".into(), crate::template_plan::curriculum_blueprint(&request.prompt, style, scope, total_pages)?);
             // Only the complete group creates proof artifacts and checkpoints.
             // All parts share the actual ledger, cancellation and pinned keys.
-            let plan = self.template_content(&request, &chunk_context, style, scratch.doc().map_err(|e| e.to_string())?, &prefs, scope)?;
+            let remaining_chunks = (end - next).div_ceil(capacity);
+            let plan = self.template_content_with_min_requests(
+                &request,
+                &chunk_context,
+                style,
+                scratch.doc().map_err(|e| e.to_string())?,
+                &prefs,
+                scope,
+                remaining_chunks,
+            )?;
             let bytes = serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len();
             plan_bytes =
                 plan_bytes.checked_add(bytes).filter(|total| *total <= MAX_GROUP_PLAN_BYTES).ok_or("Review plans exceed the 256-MiB limit")?;
@@ -1720,6 +1802,38 @@ fn validate_image_review_settings(settings: &AiSettings) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn validate_monetary_image_rates(settings: &AiSettings) -> Result<(), String> {
+    if settings.budget.max_cost_usd.is_some()
+        && settings.output_mode == OutputMode::NativeWithImages
+        && !matches!(settings.image_model.provider, ProviderKind::Ollama | ProviderKind::ComfyUi)
+    {
+        let has_rate = settings.image_rates.as_ref().and_then(|r| r.image_per_request.or(r.image_reserve_usd)).is_some();
+        if !has_rate {
+            return Err("Set rates for the selected provider before using a monetary limit".into());
+        }
+    }
+    Ok(())
+}
+
+fn generated_asset_name(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "generated.png",
+        "image/webp" => "generated.webp",
+        _ => "generated.jpg",
+    }
+}
+
+fn model_needs_thinking_margin(selection: &ModelSelection) -> bool {
+    let normalized = selection.model.trim().trim_start_matches("models/").to_ascii_lowercase();
+    let leaf = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    match selection.provider {
+        ProviderKind::Gemini => true,
+        ProviderKind::OpenAi => leaf.starts_with("o1") || leaf.starts_with("o3") || leaf.starts_with("o4") || leaf.starts_with("gpt-5"),
+        ProviderKind::Ollama => leaf.starts_with("deepseek-r1") || leaf.starts_with("qwq") || leaf.starts_with("qwen3"),
+        _ => false,
+    }
 }
 
 fn image_review_identity(settings: &AiSettings) -> Value {
@@ -2247,8 +2361,43 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
             "no diacritics",
             "unvocalized",
         ]);
-    let has_vocalization_request =
-        has(&["مشكول", "التشكيل الكامل", "مع التشكيل", "بالتشكيل", "بالحركات", "حركات الحروف", "fully vocalized", "with diacritics", "phonics"]);
+    let has_vocalization_request = !explicitly_plain
+        && (has(&[
+            "مشكول",
+            "مشكل",
+            "مشكّل",
+            "التشكيل",
+            "تشكيل",
+            "مع التشكيل",
+            "بالتشكيل",
+            "بالحركات",
+            "الحركات",
+            "حركات الحروف",
+            "فتحة",
+            "ضمة",
+            "كسرة",
+            "سكون",
+            "شدة",
+            "تنوين",
+            "تأسيس",
+            "نورانية",
+            "هجاء",
+            "تهجئة",
+            "روضة",
+            "تمهيدي",
+            "kg1",
+            "kg2",
+            "kg 1",
+            "kg 2",
+            "fully vocalized",
+            "with diacritics",
+            "phonics",
+        ]) || context.pointer("/document/mastermind_orchestration/active_skill_synergy").and_then(Value::as_array).is_some_and(|skills| {
+            skills
+                .iter()
+                .filter_map(|s| s.get("skill_id").and_then(Value::as_str))
+                .any(|id| id == "kg-oxford-cambridge-style" || id.starts_with("early-years-") || id.contains("phonics"))
+        }));
     let parsed_script = crate::script_contract::parse(prompt)?;
     let script_requires_verbatim_vocalization = parsed_script
         .as_ref()
@@ -3310,6 +3459,40 @@ fn batch_proofs_with_layout(
         .map_err(|e| e.to_string())?;
     review_proofs(&mut scratch, cancel, scope, settings, brief)
 }
+pub(crate) fn render_live_batch_proofs(
+    doc: &DocState,
+    prefs: &Prefs,
+    cache: &Arc<designcraft_engine::compose::Cache>,
+    settings: &AiSettings,
+    brief: &str,
+    scope: BatchScope,
+) -> Result<(Vec<ProofArtifact>, Vec<Value>), String> {
+    let min_ppi = crate::print_contract::PrintContract::from_prompt(brief)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+    let mut scratch = Session::new();
+    scratch.cache = cache.clone();
+    scratch.prefs = prefs.clone();
+    scratch.add_document(doc.clone());
+    let preflight = scratch.execute("preflight.run", &json!({"minPpi": min_ppi})).map_err(|e| e.to_string())?;
+    let issues = preflight.get("issues").and_then(Value::as_array).cloned().unwrap_or_default();
+    let errors: Vec<_> = issues.iter().filter(|issue| issue.get("severity").and_then(Value::as_str) == Some("error")).collect();
+    if !errors.is_empty() {
+        let summary = errors
+            .iter()
+            .take(8)
+            .map(|issue| {
+                let kind = issue.get("kind").and_then(Value::as_str).unwrap_or("preflight");
+                let msg = issue.get("message").and_then(Value::as_str).unwrap_or("error");
+                format!("{kind}: {msg}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("Preflight rejected edited document ({} errors): {summary}", errors.len()));
+    }
+    let cancel = AtomicBool::new(false);
+    let proofs = review_proofs(&mut scratch, &cancel, scope, settings, brief)?;
+    Ok((proofs, issues))
+}
+
 fn review_proofs(
     scratch: &mut Session,
     cancel: &AtomicBool,
@@ -3324,6 +3507,7 @@ fn review_proofs(
             crate::runtime::book_binding(settings, brief),
         )?;
         let mut proof = Session::new();
+        proof.cache = scratch.cache.clone();
         proof.prefs = scratch.prefs.clone();
         proof.add_document(state);
         batch_proofs_from_draft(&mut proof, cancel, scope)
@@ -3667,6 +3851,9 @@ fn image_request_size(
 ) -> Result<Option<String>, String> {
     let slot = declared_image_slot(placement, profile);
     let source_ratio = image_source_ratio(placement, slot)?;
+    if selection.provider == ProviderKind::OpenAi {
+        return Ok(openai_image_size(&selection.model, source_ratio).map(str::to_owned));
+    }
     if selection.provider != ProviderKind::Gemini {
         return Ok(None);
     }
@@ -3678,6 +3865,33 @@ fn image_request_size(
         ));
     }
     Ok(Some(name.to_owned()))
+}
+
+fn openai_image_size(model: &str, ratio: f64) -> Option<&'static str> {
+    let model = model.trim().trim_start_matches("models/").to_ascii_lowercase();
+    let landscape = ratio > 1.15;
+    let portrait = ratio < (1.0 / 1.15);
+    if model.starts_with("gpt-image") {
+        Some(if landscape {
+            "1536x1024"
+        } else if portrait {
+            "1024x1536"
+        } else {
+            "1024x1024"
+        })
+    } else if model.starts_with("dall-e-3") {
+        Some(if landscape {
+            "1792x1024"
+        } else if portrait {
+            "1024x1792"
+        } else {
+            "1024x1024"
+        })
+    } else if model.starts_with("dall-e-2") {
+        Some("1024x1024")
+    } else {
+        None
+    }
 }
 
 fn image_source_ratio(
@@ -3723,12 +3937,14 @@ fn preflight_profile_image_ratios(profile: &designcraft_ai_types::DesignProfile,
 }
 
 fn gemini_image_ratio(model: &str, ratio: f64) -> (&'static str, f64) {
-    let model = model.strip_prefix("models/").unwrap_or(model);
-    // Gemini 3.1 Flash Image documents the extra atlas ratios. Older and unknown
-    // models use the common ratio table unless support is explicitly known.
+    let lower = model.trim().to_ascii_lowercase();
+    let model = lower.strip_prefix("models/").unwrap_or(&lower);
+    // Gemini 3.1 Flash/Flash-Lite Image and Nano Banana 2.1 support the extra atlas ratios.
+    // Older and unknown models use the common ratio table unless support is explicitly known.
     // https://ai.google.dev/gemini-api/docs/generate-content/image-generation
-    let atlas =
-        model == "gemini-3.1-flash-image" || model == "gemini-3.1-flash-image-preview" || model.starts_with("gemini-3.1-flash-image-preview-");
+    let atlas = model.starts_with("gemini-3.1-flash-image")
+        || model.starts_with("gemini-3.1-flash-lite-image")
+        || model.starts_with("gemini-nano-banana-2.1");
     let mut nearest = ("1:1", ratio.ln().abs());
     let mut selected_ratio = 1.0;
     for (name, value) in [
@@ -8621,5 +8837,263 @@ mod tests {
         );
         assert_eq!(run_discovery(ProviderKind::ComfyUi), vec!["sdxl_base_1.0.safetensors".to_owned()]);
         assert_eq!(run_discovery(ProviderKind::OpenAi), vec!["gpt-4.1-mini".to_owned()]);
+    }
+
+    #[test]
+    fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards() {
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+
+        // 1. Placed asset names preserve WebP, PNG, and JPEG extensions.
+        assert_eq!(generated_asset_name("image/webp"), "generated.webp");
+        assert_eq!(generated_asset_name("image/png"), "generated.png");
+        assert_eq!(generated_asset_name("image/jpeg"), "generated.jpg");
+
+        // 2. OpenAI and Gemini aspect-ratio sizing.
+        let mk_place = |rect: [f64; 4]| designcraft_ai_types::protocol::ImagePlacement {
+            prompt: "hero".into(),
+            page: 0,
+            rect,
+            label: "hero".into(),
+            repeat_rects: vec![],
+            repeat_groups: vec![],
+        };
+        let gpt_img = ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-image-1".into(), endpoint: None };
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 300.0, 180.0]), None, &gpt_img).unwrap().as_deref(), Some("1536x1024"));
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 180.0, 300.0]), None, &gpt_img).unwrap().as_deref(), Some("1024x1536"));
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 200.0, 200.0]), None, &gpt_img).unwrap().as_deref(), Some("1024x1024"));
+
+        let dalle3 = ModelSelection { provider: ProviderKind::OpenAi, model: "dall-e-3".into(), endpoint: None };
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 320.0, 180.0]), None, &dalle3).unwrap().as_deref(), Some("1792x1024"));
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 180.0, 320.0]), None, &dalle3).unwrap().as_deref(), Some("1024x1792"));
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 200.0, 200.0]), None, &dalle3).unwrap().as_deref(), Some("1024x1024"));
+
+        let dalle2 = ModelSelection { provider: ProviderKind::OpenAi, model: "dall-e-2".into(), endpoint: None };
+        assert_eq!(image_request_size(&mk_place([0.0, 0.0, 320.0, 180.0]), None, &dalle2).unwrap().as_deref(), Some("1024x1024"));
+
+        assert_eq!(gemini_image_ratio("gemini-nano-banana-2.1", 4.0).0, "4:1");
+        assert_eq!(gemini_image_ratio("gemini-3.1-flash-lite-image", 0.125).0, "1:8");
+        assert_ne!(gemini_image_ratio("gemini-2.5-flash-image", 4.0).0, "4:1");
+
+        // 3. Reasoning model thinking margin detection + template_content output allowance.
+        for (provider, model, expected) in [
+            (ProviderKind::Gemini, "gemini-4-argon", true),
+            (ProviderKind::OpenAi, "gpt-5", true),
+            (ProviderKind::OpenAi, "o3-mini", true),
+            (ProviderKind::OpenAi, "gpt-4.1", false),
+            (ProviderKind::Ollama, "qwen3:32b", true),
+            (ProviderKind::Ollama, "library/deepseek-r1:14b", true),
+            (ProviderKind::Ollama, "qwq:latest", true),
+            (ProviderKind::Ollama, "llama3.3:70b", false),
+        ] {
+            assert_eq!(model_needs_thinking_margin(&ModelSelection { provider, model: model.into(), endpoint: None }), expected, "{model}");
+        }
+
+        // 4. Upfront admission guards reject before spending Request #1.
+        struct ZeroCallProvider {
+            calls: std::cell::Cell<u32>,
+        }
+        impl Provider for ZeroCallProvider {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                self.calls.set(self.calls.get().saturating_add(1));
+                Err("Provider must not be called when upfront admission fails".into())
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                self.calls.set(self.calls.get().saturating_add(1));
+                Err("Provider must not be called when upfront admission fails".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+        }
+
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages": 2, "width": 595.2756, "height": 841.8898})).unwrap();
+        let base = session.doc().unwrap().clone();
+
+        // 4a. Monetary limit with cloud image provider and missing image_rates fails with 0 calls.
+        let mut settings = AiSettings {
+            text_model: ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-4.1".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-image-1".into(), endpoint: None },
+            output_mode: OutputMode::NativeWithImages,
+            budget: BudgetSpec {
+                max_cost_usd: Some(5.0),
+                rates: Some(designcraft_ai_types::protocol::TokenRates {
+                    input_per_million: 2.0,
+                    cached_input_per_million: 0.5,
+                    output_per_million: 8.0,
+                    cache_write_per_million: None,
+                    image_per_request: None,
+                    image_reserve_usd: None,
+                }),
+                ..Default::default()
+            },
+            image_rates: None,
+            ..Default::default()
+        };
+        let provider = ZeroCallProvider { calls: std::cell::Cell::new(0) };
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let Err(err) = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(
+            TaskRequest {
+                prompt: "Design a 1-page poster.".into(),
+                settings: settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+                export_directory: None,
+            },
+            json!({}),
+            designcraft_engine::cmd::production::catalog(),
+            vec![],
+            base.clone(),
+            session.prefs.clone(),
+        ) else {
+            panic!("Expected upfront monetary image-rate rejection");
+        };
+        assert!(err.contains("rates"), "err={err}");
+        assert_eq!(provider.calls.get(), 0);
+        assert_eq!(ledger.summary().requests, 0);
+        assert_eq!(gemini_image_ratio("MODELS/Gemini-3.1-Flash-Image", 0.25).0, "1:4");
+
+        // 4a-ii. planning_only=true AND cached plan + cached disk illustration in NativeWithImages
+        // with max_cost_usd=Some(5.0) and missing image_rates BOTH succeed without failing on missing image rates!
+        struct SingleTextPlanProvider {
+            plan_json: String,
+            calls: std::cell::Cell<u32>,
+        }
+        impl Provider for SingleTextPlanProvider {
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                self.calls.set(self.calls.get().saturating_add(1));
+                Ok(GenerationResponse { text: self.plan_json.clone(), usage: Usage::default(), error: None })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                Err("Image provider must not be called in planning_only or cached run".into())
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let placement = designcraft_ai_types::protocol::ImagePlacement {
+            page: 0,
+            rect: [72.0, 120.0, 172.0, 220.0],
+            prompt: "Clean geometric studio emblem".into(),
+            label: "Hero".into(),
+            repeat_rects: vec![],
+            repeat_groups: vec![],
+        };
+        let planned_value = json!({
+            "title": "Cached Poster",
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 260.0, 420.0, 340.0], "content": "text", "text": "Cached Headline"}}
+            ],
+            "images": [placement]
+        });
+        let text_provider = SingleTextPlanProvider { plan_json: planned_value.to_string(), calls: std::cell::Cell::new(0) };
+        let poster_req = TaskRequest {
+            prompt: "Design a 1-page poster.".into(),
+            settings: settings.clone(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let cache_ctx = json!({"_production_cache_root": cache_dir.path().to_string_lossy()});
+        let mut plan_ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let mut plan_runner = Runner {
+            cache_root: Some(cache_dir.path().to_path_buf()),
+            print: None,
+            planning_only: true,
+            ledger: &mut plan_ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &text_provider,
+        };
+        let preview_product = plan_runner
+            .production(
+                poster_req.clone(),
+                cache_ctx.clone(),
+                designcraft_engine::cmd::production::catalog(),
+                vec![],
+                base.clone(),
+                session.prefs.clone(),
+            )
+            .expect("planning_only must succeed without image_rates");
+        assert!(matches!(preview_product, Product::Plan(ref p) if p.images.len() == 1));
+        assert_eq!(text_provider.calls.get(), 1);
+
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(300, 300, image::Rgb([220, 230, 240])).write_to(&mut png_bytes, image::ImageFormat::Png).unwrap();
+        let cached_img = providers::GeneratedImage { bytes: png_bytes.into_inner(), filename: "cached.png".into(), mime_type: "image/png".into() };
+        let style_ctx = illustration_style(None).unwrap();
+        let disk_key = plan_runner.image_disk_key(&placement, &style_ctx, None, &settings).unwrap();
+        crate::production_cache::store_image(cache_dir.path(), &disk_key, &cached_img).unwrap();
+
+        let zero_provider = ZeroCallProvider { calls: std::cell::Cell::new(0) };
+        let mut cached_ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let cached_product = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut cached_ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &zero_provider,
+        }
+        .production(poster_req, cache_ctx, designcraft_engine::cmd::production::catalog(), vec![], base.clone(), session.prefs.clone())
+        .expect("cached plan + cached disk illustration must succeed with 0 provider calls");
+        assert!(matches!(cached_product, Product::Plan(ref p) if p.images.is_empty() && p.commands.len() >= 3));
+        assert_eq!(zero_provider.calls.get(), 0);
+        assert_eq!(cached_ledger.summary().requests, 0);
+
+        // 4b. Multi-chunk review group (2 pages, explicit script => capacity=1 => 2 chunks) with max_requests=1 fails with 0 calls.
+        settings.output_mode = OutputMode::NativeOnly;
+        settings.budget.max_cost_usd = None;
+        settings.budget.max_requests = 1;
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let Err(err) = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        }
+        .production(
+            TaskRequest {
+                prompt: "Trim Size: A4\n# PAGE 1: Cover\nHello\n# PAGE 2: Body\nWorld".into(),
+                settings,
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+                export_directory: None,
+            },
+            json!({"batch_scope": {"start": 0, "count": 2}}),
+            designcraft_engine::cmd::production::catalog(),
+            vec![],
+            base,
+            session.prefs.clone(),
+        ) else {
+            panic!("Expected upfront request-limit rejection");
+        };
+        assert!(err.contains("AI request limit reached"), "err={err}");
+        assert_eq!(provider.calls.get(), 0);
+        assert_eq!(ledger.summary().requests, 0);
     }
 }

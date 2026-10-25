@@ -150,7 +150,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                                                         if tl.id == current {
                                                             ui.painter().circle_filled(r.min + vec2(-2.0, 12.0), 2.0, t.accent);
                                                         }
-                                                        ui.painter().text(
+                                                        crate::rtl::paint(
+                                                            ui.painter(),
                                                             r.min + vec2(28.0, 12.0),
                                                             egui::Align2::LEFT_CENTER,
                                                             crate::i18n::tr(&app.ui.language, tl.label),
