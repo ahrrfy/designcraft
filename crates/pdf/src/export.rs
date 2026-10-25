@@ -252,6 +252,15 @@ fn export_pdf_with_report_inner(doc: &Document, cache: &Cache, opts: &PdfOptions
             }
         }
     }
+    if doc.settings.right_to_left_binding {
+        let mut cat_entries = String::from("/ViewerPreferences<</Direction/R2L>>");
+        if doc.settings.facing_pages && !opts.spreads && sheets.len() > 1 {
+            cat_entries.push_str("/PageLayout/TwoPageRight");
+        }
+        if let Some(b) = crate::transitions::add_catalog_entries(&bytes, &cat_entries) {
+            bytes = b;
+        }
+    }
     if opts.standard == Standard::PdfX4 {
         // Output intent and PDF/X identification, then check the result.
         match crate::pdfx::make_pdfx4(&bytes, &title, created) {
@@ -318,14 +327,21 @@ pub struct BookletOptions {
 
 /// The printer spreads for `n` pages: (left, right) absolute page indices, `None` = blank.
 pub fn booklet_pairs(n: usize, kind: BookletKind) -> Vec<(Option<usize>, Option<usize>)> {
+    booklet_pairs_directed(n, kind, false)
+}
+
+/// The printer spreads for `n` pages, ordered for LTR (`rtl == false`) or RTL (`rtl == true`)
+/// binding: (left, right) absolute page indices, `None` = blank.
+pub fn booklet_pairs_directed(n: usize, kind: BookletKind, rtl: bool) -> Vec<(Option<usize>, Option<usize>)> {
     let page = |i: usize| (i < n).then_some(i);
-    match kind {
+    let pairs: Vec<(Option<usize>, Option<usize>)> = match kind {
         BookletKind::TwoUpConsecutive => (0..n.div_ceil(2)).map(|k| (page(2 * k), page(2 * k + 1))).collect(),
         BookletKind::SaddleStitch => {
             let m = n.div_ceil(4).max(1) * 4;
             (0..m / 2).map(|i| if i % 2 == 0 { (page(m - 1 - i), page(i)) } else { (page(i), page(m - 1 - i)) }).collect()
         }
-    }
+    };
+    if rtl { pairs.into_iter().map(|(l, r)| (r, l)).collect() } else { pairs }
 }
 
 /// An imposed PDF: two document pages per sheet, in booklet order.
@@ -369,7 +385,7 @@ fn export_booklet_inner(doc: &Document, cache: &Cache, opts: &BookletOptions) ->
         text_area: None,
         para_tags: HashMap::new(),
     };
-    let pairs = booklet_pairs(n, opts.kind);
+    let pairs = booklet_pairs_directed(n, opts.kind, doc.settings.right_to_left_binding);
     // Sheet size from the largest page.
     let (mut pw, mut ph) = (0.0f64, 0.0f64);
     for i in 0..n {
@@ -2125,5 +2141,20 @@ mod eps_tests {
         assert_eq!(civil(-10_000_000_000_000), (-314918, 8, 13, 6, 13, 20));
         assert_eq!(civil(i64::MAX), (292277026596, 12, 4, 15, 30, 7));
         assert_eq!(civil(i64::MIN), (-292277022657, 1, 27, 8, 29, 52));
+    }
+
+    #[test]
+    fn rtl_binding_writes_r2l_viewer_preferences_and_reverses_booklet_imposition() {
+        let nd = designcraft_doc::build::NewDocument { pages: 4, facing_pages: true, right_to_left_binding: true, ..Default::default() };
+        let doc = Document::new(&nd);
+        for standard in [Standard::None, Standard::PdfX4] {
+            let report = export_pdf_with_report(&doc, &Cache::new(), &PdfOptions { standard, ..Default::default() }).unwrap();
+            let raw = String::from_utf8_lossy(&report.bytes);
+            assert!(raw.contains("/ViewerPreferences") && raw.contains("/Direction") && raw.contains("/R2L"), "missing R2L in {standard:?}");
+            assert!(raw.contains("/PageLayout") && raw.contains("/TwoPageRight"), "missing TwoPageRight in {standard:?}");
+            assert!(!hayro_syntax::Pdf::new(report.bytes).unwrap().pages().is_empty());
+        }
+        assert_eq!(booklet_pairs_directed(4, BookletKind::SaddleStitch, false), vec![(Some(3), Some(0)), (Some(1), Some(2))]);
+        assert_eq!(booklet_pairs_directed(4, BookletKind::SaddleStitch, true), vec![(Some(0), Some(3)), (Some(2), Some(1))]);
     }
 }

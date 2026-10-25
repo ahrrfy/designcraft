@@ -36,11 +36,12 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
     let mut created_frames = BTreeMap::new();
     let current_doc = &scratch.doc().map_err(|e| e.to_string())?.doc;
     for (index, action) in candidate.commands.iter().enumerate() {
-        if action.command == "frame.create"
+        if ((action.command == "frame.create"
             && matches!(action.params.get("content").and_then(Value::as_str), None | Some("unassigned"))
-            && action.params.get("text").is_none()
+            && action.params.get("text").is_none())
+            || (action.command == "path.create" && action.params.get("closed").and_then(Value::as_bool) == Some(true)))
             && let Some(id) = results.get(index).and_then(|value| value.get("id")).and_then(Value::as_u64)
-            && current_doc.item(ItemId(id)).is_some_and(|it| matches!(it.content, designcraft_engine::doc::Content::Unassigned))
+            && current_doc.item(ItemId(id)).is_some_and(is_expandable_card_shape)
         {
             created_frames.insert(ItemId(id), index);
         }
@@ -113,14 +114,20 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         let fitted_doc = scratch.doc().map_err(|e| e.to_string())?.doc.clone();
         let fitted = fitted_doc.item(fit_id).ok_or("Fitted text frame disappeared")?;
         let measured = outer.transform_rect_bbox(fitted.bounds());
-        let extra_height = measured.height() - old.height() + 0.01;
-        // Include the same rounding allowance in collision checks and the published source.
-        let grown = Rect::new(measured.x0, measured.y0, measured.x1, measured.y1 + 0.01);
+        let story_has_arabic_marks =
+            story.text.chars().any(|c| ('\u{064B}'..='\u{065F}').contains(&c) || c == '\u{0670}' || ('\u{06D6}'..='\u{06ED}').contains(&c));
         let page = spread.page_at_x(old.center().x).ok_or("Native text frame has no owning page")?;
         let safe = spread.pages.get(page).ok_or("Native text page disappeared")?.margin_rect();
+        let mark_pad =
+            if story_has_arabic_marks && contains(safe, Rect::new(measured.x0, measured.y0, measured.x1, measured.y1 + 2.0)) { 2.0 } else { 0.01 };
+        let extra_height = measured.height() - old.height() + mark_pad;
+        // Include the same rounding/mark allowance in collision checks and the published source.
+        let grown = Rect::new(measured.x0, measured.y0, measured.x1, measured.y1 + mark_pad);
+        let allowed_loc = is_allowed_fit_location(&doc, &loc);
         let mut growth = TextPosition { index: fit_index, id: fit_id, spread: spread_index, page, original: old, target: grown, safe, language: 0 };
         let mut blocked = !extra_height.is_finite()
             || extra_height <= 0.0
+            || !allowed_loc
             || (fit_is_existing_base
                 && (loc.path.len() != 1
                     || item.locked
@@ -132,7 +139,7 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         if !contains(safe, grown) {
             growth.target = shift(grown, 0.0, safe.y1 - grown.y1);
             blocked |= grown.y1 <= safe.y1
-                || loc.path.len() != 1
+                || !allowed_loc
                 || fit_is_existing_base
                 || item.locked
                 || item.hidden
@@ -147,7 +154,7 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
             && extra_height > 0.0
             && grown.y1 > old.y1
             && !fit_is_existing_base
-            && loc.path.len() == 1
+            && allowed_loc
             && !item.locked
             && !item.hidden
             && !item.nonprinting
@@ -640,11 +647,12 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
                         | "object.fit"
                         | "object.align"
                         | "object.distribute"
+                        | "object.group"
                         | "style.object.apply"
                 )
             })
         });
-        let needs_explicit_height_set = fit_is_existing_base || has_later_geometry_op;
+        let needs_explicit_height_set = fit_is_existing_base || has_later_geometry_op || loc.path.len() > 1;
         let bg_cmd_count: usize = backgrounds
             .iter()
             .map(|bg| {
@@ -683,7 +691,8 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
                 "message":"Expanded a new rectangular text container into verified free space; preserved its padding and existing artwork"}));
         }
         if needs_explicit_height_set {
-            let fitted_height = (if prefs.dimensions_include_stroke { fitted.visible_bounds().height() } else { fitted.bounds().height() }) + 0.01;
+            let fitted_height =
+                (if prefs.dimensions_include_stroke { fitted.visible_bounds().height() } else { fitted.bounds().height() }) + mark_pad;
             scratch.execute("transform.set", &json!({"ids":[fit_id.0],"height":fitted_height,"ref":0})).map_err(|error| error.to_string())?;
             candidate
                 .commands
@@ -763,7 +772,7 @@ pub(crate) fn prepare(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs,
         let growth = TextPosition { index: 0, id: fit_id, spread: spread_index, page, original: old, target: grown, safe, language: 0 };
         let blocked = !extra_height.is_finite()
             || extra_height <= 0.0
-            || loc.path.len() != 1
+            || !is_allowed_fit_location(&doc, &loc)
             || item.locked
             || item.hidden
             || item.nonprinting
@@ -900,6 +909,56 @@ fn resolve_fallback_face(db: &designcraft_fonts::ScopedFonts<'_>, ch: char, bold
     None
 }
 
+fn is_combining_arabic_mark(ch: char) -> bool {
+    matches!(ch, '\u{0610}'..='\u{061a}' | '\u{064b}'..='\u{065f}' | '\u{0670}' | '\u{06d6}'..='\u{06ed}' | '\u{08d3}'..='\u{08ff}')
+}
+
+fn resolve_cluster_fallback_face(db: &designcraft_fonts::ScopedFonts<'_>, cluster: &str, bold: bool, italic: bool) -> Option<(String, String)> {
+    const ARABIC_PREFERRED: &[&str] = &[
+        "Traditional Arabic",
+        "Sakkal Majalla",
+        "Simplified Arabic",
+        "Amiri",
+        "Noto Naskh Arabic",
+        "Segoe UI Historic",
+        "Arial",
+        "Segoe UI Symbol",
+        "DejaVu Sans",
+    ];
+    let covers_all = |family: &str, style: &str| {
+        let face = db.face(family, style);
+        cluster.chars().filter(|&c| !is_variation_selector(c)).all(|c| face.covers(c))
+    };
+    let check_family = |family: &str| -> Option<(String, String)> {
+        let styles = db.styles(family);
+        if styles.is_empty() {
+            return None;
+        }
+        if let Some(style) = styles.iter().find(|s| {
+            let (weight, slanted) = db.traits_of(family, s);
+            (weight >= 600.0) == bold && slanted == italic && covers_all(family, s)
+        }) {
+            return Some((family.to_owned(), style.clone()));
+        }
+        if let Some(style) = styles.iter().find(|s| matches!(s.as_str(), "Regular" | "Roman" | "Book" | "Normal" | "Medium") && covers_all(family, s))
+        {
+            return Some((family.to_owned(), style.clone()));
+        }
+        styles.iter().find(|s| covers_all(family, s)).map(|s| (family.to_owned(), s.clone()))
+    };
+    for &family in ARABIC_PREFERRED {
+        if let Some(found) = check_family(family) {
+            return Some(found);
+        }
+    }
+    for family in db.families() {
+        if let Some(found) = check_family(&family) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn apply_story_glyph_fallbacks(
     story_id: StoryId,
     item_id: ItemId,
@@ -917,13 +976,18 @@ fn apply_story_glyph_fallbacks(
         let (_, base_chars) = doc.styles.resolve_para(para);
         let text = story.text.get(range.clone()).ok_or("Invalid native paragraph boundary")?;
         let mut iter = text.char_indices().peekable();
+        let mut last_base: Option<(usize, char)> = None;
         while let Some((offset, ch)) = iter.next() {
             let byte = range.start.saturating_add(offset);
             let mut end = byte.saturating_add(ch.len_utf8());
-            // Only decorative symbols and Arabic honorific ligatures/signs get a fallback.
-            // Ordinary copy and Arabic letterforms retain the selected family; a missing
-            // requested font remains an explicit error.
-            if !is_fallback_symbol_or_honorific(ch) {
+            let combining_mark = is_combining_arabic_mark(ch);
+            if !combining_mark && !is_variation_selector(ch) {
+                last_base = Some((byte, ch));
+            }
+            // Only decorative symbols, Arabic honorific ligatures/signs, and missing Arabic
+            // combining marks get a fallback. Ordinary copy and Arabic letterforms retain the
+            // selected family; a missing requested font remains an explicit error.
+            if !is_fallback_symbol_or_honorific(ch) && !combining_mark {
                 if is_variation_selector(ch) {
                     let attrs = doc.styles.resolve_char(&base_chars, story.char_format_of(byte));
                     if !db.face(&attrs.font_family, &attrs.font_style).covers(ch) {
@@ -940,26 +1004,41 @@ fn apply_story_glyph_fallbacks(
                 continue;
             }
             let (weight, italic) = db.traits_of(&attrs.font_family, &attrs.font_style);
-            let (family, style) = resolve_fallback_face(&db, ch, weight >= 600.0, italic)
-                .ok_or_else(|| format!("Native text frame {} needs an installed font covering symbol {ch}", item_id.0))?;
-            let mut cluster_chars = ch.to_string();
-            while let Some(&(vs_offset, vs)) = iter.peek() {
-                if !is_variation_selector(vs) {
+            let mut span_start = byte;
+            let mut cluster_chars = String::new();
+            if combining_mark && let Some((base_byte, base_ch)) = last_base {
+                span_start = base_byte;
+                cluster_chars.push(base_ch);
+            }
+            cluster_chars.push(ch);
+            while let Some(&(next_offset, next_ch)) = iter.peek() {
+                if !(is_variation_selector(next_ch) || (combining_mark && is_combining_arabic_mark(next_ch))) {
                     break;
                 }
-                end = range.start.saturating_add(vs_offset).saturating_add(vs.len_utf8());
-                cluster_chars.push(vs);
+                end = range.start.saturating_add(next_offset).saturating_add(next_ch.len_utf8());
+                cluster_chars.push(next_ch);
                 let _ = iter.next();
             }
+            let resolved = if combining_mark && span_start < byte {
+                resolve_cluster_fallback_face(&db, &cluster_chars, weight >= 600.0, italic).or_else(|| {
+                    resolve_fallback_face(&db, ch, weight >= 600.0, italic).map(|(f, s)| {
+                        span_start = byte;
+                        (f, s)
+                    })
+                })
+            } else {
+                resolve_fallback_face(&db, ch, weight >= 600.0, italic)
+            };
+            let (family, style) = resolved.ok_or_else(|| format!("Native text frame {} needs an installed font covering symbol {ch}", item_id.0))?;
             if let Some((_, prev_end, prev_chars, prev_family, prev_style)) = fallbacks.last_mut()
-                && *prev_end == byte
+                && *prev_end >= span_start
                 && *prev_family == family
                 && *prev_style == style
             {
-                *prev_end = end;
+                *prev_end = end.max(*prev_end);
                 prev_chars.push_str(&cluster_chars);
             } else {
-                fallbacks.push((byte, end, cluster_chars, family, style));
+                fallbacks.push((span_start, end, cluster_chars, family, style));
                 if fallbacks.len() > 256 {
                     return Err("Too many symbol fallback ranges in one native story".into());
                 }
@@ -2033,16 +2112,16 @@ fn parse_keyed_channels<const N: usize>(raw: &str, keys: [char; N], max: f32) ->
 fn parse_inline_color(raw: &str) -> Option<designcraft_engine::doc::color::Color> {
     use designcraft_engine::doc::color::Color;
     let trimmed = raw.trim();
-    if let Some(hex) = trimmed.strip_prefix('#') {
+    if let Some(hex) = trimmed.strip_prefix('#').filter(|h| h.is_ascii()) {
         if hex.len() == 6
-            && let (Ok(r), Ok(g), Ok(b)) =
-                (u8::from_str_radix(&hex[0..2], 16), u8::from_str_radix(&hex[2..4], 16), u8::from_str_radix(&hex[4..6], 16))
+            && let (Some(rs), Some(gs), Some(bs)) = (hex.get(0..2), hex.get(2..4), hex.get(4..6))
+            && let (Ok(r), Ok(g), Ok(b)) = (u8::from_str_radix(rs, 16), u8::from_str_radix(gs, 16), u8::from_str_radix(bs, 16))
         {
             return Some(Color::rgb8(r, g, b));
         }
         if hex.len() == 3
-            && let (Ok(r), Ok(g), Ok(b)) =
-                (u8::from_str_radix(&hex[0..1], 16), u8::from_str_radix(&hex[1..2], 16), u8::from_str_radix(&hex[2..3], 16))
+            && let (Some(rs), Some(gs), Some(bs)) = (hex.get(0..1), hex.get(1..2), hex.get(2..3))
+            && let (Ok(r), Ok(g), Ok(b)) = (u8::from_str_radix(rs, 16), u8::from_str_radix(gs, 16), u8::from_str_radix(bs, 16))
         {
             return Some(Color::rgb8(r * 17, g * 17, b * 17));
         }
@@ -2140,6 +2219,61 @@ struct BackgroundGrowth {
     target: Rect,
 }
 
+fn is_expandable_card_shape(item: &designcraft_engine::doc::Item) -> bool {
+    if !matches!(item.content, designcraft_engine::doc::Content::Unassigned) {
+        return false;
+    }
+    match item.shape {
+        designcraft_engine::doc::Shape::Rectangle => true,
+        designcraft_engine::doc::Shape::Path => {
+            let [sp] = item.path.subpaths.as_slice() else { return false };
+            if !sp.closed || !(4..=16).contains(&sp.anchors.len()) {
+                return false;
+            }
+            let b = item.inner_bounds();
+            if !b.width().is_finite() || !b.height().is_finite() || b.width() <= 8.0 || b.height() <= 8.0 {
+                return false;
+            }
+            let eps = 1.5;
+            let padded = Rect::new(b.x0 - eps, b.y0 - eps, b.x1 + eps, b.y1 + eps);
+            let on_perimeter = sp.anchors.iter().all(|a| {
+                let on_edge =
+                    (a.p.x - b.x0).abs() <= eps || (a.p.x - b.x1).abs() <= eps || (a.p.y - b.y0).abs() <= eps || (a.p.y - b.y1).abs() <= eps;
+                on_edge && contains(padded, Rect::from_points(a.h_in, a.h_out))
+            });
+            let spans_top_bottom = sp.anchors.iter().any(|a| (a.p.y - b.y0).abs() <= eps) && sp.anchors.iter().any(|a| (a.p.y - b.y1).abs() <= eps);
+            on_perimeter && spans_top_bottom
+        }
+        _ => false,
+    }
+}
+
+fn is_allowed_fit_location(doc: &designcraft_engine::doc::Document, loc: &designcraft_engine::doc::ItemLoc) -> bool {
+    match loc.path.as_slice() {
+        [_] => true,
+        [group_idx, _] => {
+            let parent_loc = designcraft_engine::doc::ItemLoc { spread: loc.spread, path: vec![*group_idx] };
+            let Some(group) = doc.item_at(&parent_loc) else { return false };
+            let gl = group.xf.as_coeffs();
+            matches!(group.content, designcraft_engine::doc::Content::Group { .. })
+                && !group.locked
+                && !group.hidden
+                && !group.nonprinting
+                && group.overrides.is_none()
+                && group.flex.is_none()
+                && !group.effects.any()
+                && group.wrap.is_default()
+                && group.states.is_empty()
+                && doc.layer(group.layer).is_none_or(|layer| !layer.locked && layer.visible && layer.printable)
+                && (gl[0] - 1.0).abs() <= 0.001
+                && gl[1].abs() <= 0.001
+                && gl[2].abs() <= 0.001
+                && (gl[3] - 1.0).abs() <= 0.001
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn is_snug_growable_background(
     obstacle: &FittingObstacle,
@@ -2168,9 +2302,8 @@ fn is_snug_growable_background(
     let spread = doc.spreads.get(spread_index)?;
     let linear = (doc.parent_xf(&loc) * item.xf).as_coeffs();
     if base.doc.item(obstacle.id).is_some()
-        || loc.path.len() != 1
-        || item.shape != designcraft_engine::doc::Shape::Rectangle
-        || !matches!(item.content, designcraft_engine::doc::Content::Unassigned)
+        || !is_allowed_fit_location(doc, &loc)
+        || !is_expandable_card_shape(item)
         || item.locked
         || item.hidden
         || item.nonprinting
@@ -2225,9 +2358,8 @@ fn containing_background_growths(
         let linear = (doc.parent_xf(&loc) * item.xf).as_coeffs();
         if obstacle.inherited
             || base.doc.item(obstacle.id).is_some()
-            || loc.path.len() != 1
-            || item.shape != designcraft_engine::doc::Shape::Rectangle
-            || !matches!(item.content, designcraft_engine::doc::Content::Unassigned)
+            || !is_allowed_fit_location(doc, &loc)
+            || !is_expandable_card_shape(item)
             || item.locked
             || item.hidden
             || item.nonprinting
@@ -3988,5 +4120,80 @@ mod tests {
         let notes4 = prepare(&mut omitted_wrap, s_cfg.doc().unwrap(), &s_cfg.prefs, &AtomicBool::new(false)).unwrap();
         assert!(notes4.iter().any(|n| n["kind"] == "nativeBackgroundReflow"));
         assert!(prepare(&mut blocked_wrap, s_cfg.doc().unwrap(), &s_cfg.prefs, &AtomicBool::new(false)).is_err());
+    }
+
+    #[test]
+    fn ai28_grouped_rounded_pill_expands_on_overset_and_combining_mark_fallback_keeps_cluster() {
+        let copy = "نَشَاطٌ تَعْلِيمِيٌّ مُشَكَّلٌ: اِخْتَرِ الْحَرْفَ الصَّحِيحَ وَضَعْ دَائِرَةً حَوْلَ الإِجَابَةِ";
+        let all_chars: Vec<char> = copy.chars().collect();
+        let base_only_chars: Vec<char> = copy.chars().filter(|&ch| !is_combining_arabic_mark(ch)).collect();
+        let fonts = designcraft_fonts::FontDb::global();
+        fonts.add_font(designcraft_fonts::testing::font_with("DC AI28 Pill Base", &base_only_chars).unwrap());
+        fonts.add_font(designcraft_fonts::testing::font_with("DC AI28 Pill Full", &all_chars).unwrap());
+
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"width": 595, "height": 842, "pages": 1, "facingPages": false, "margins": [36, 36, 36, 36]})).unwrap();
+        let base = session.doc().unwrap().clone();
+
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Grouped rounded pill overset expansion",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [72.0, 100.0, 320.0, 130.0]}},
+                {"command": "object.cornerOptions", "params": {"ids": ["$0.id"], "shape": "rounded", "size": 12.0}},
+                {"command": "object.fill", "params": {"ids": ["$0.id"], "swatch": "[Paper]"}},
+                {"command": "frame.create", "params": {"spread": 0, "rect": [82.0, 104.0, 310.0, 126.0], "content": "text", "text": copy, "caret": false}},
+                {"command": "text.select", "params": {"story": "$3.story", "anchor": 0, "focus": copy.len()}},
+                {"command": "type.char", "params": {"attrs": {"fontFamily": "DC AI28 Pill Base", "size": 12.0, "leading": {"kind": "points", "value": 18.0}}}},
+                {"command": "object.group", "params": {"ids": ["$0.id", "$3.id"]}}
+            ]
+        }))
+        .unwrap();
+
+        let notes = prepare(&mut plan, &base, &session.prefs, &AtomicBool::new(false)).unwrap();
+        assert!(notes.iter().any(|n| n["kind"] == "symbolFontFallback"), "expected combining-mark cluster fallback: {notes:?}");
+        assert!(
+            plan.commands.iter().skip(7).any(|cmd| cmd.command == "text.select" && cmd.params["anchor"] == 0),
+            "first combining-mark fallback must include leading base letter byte 0: {:?}",
+            &plan.commands[7..]
+        );
+        assert!(notes.iter().any(|n| n["kind"] == "nativeBackgroundReflow"), "expected grouped rounded pill to expand: {notes:?}");
+        assert!(notes.iter().any(|n| n["kind"] == "nativeTextReflow"), "expected grouped text frame to expand: {notes:?}");
+
+        let mut verify = Session::new();
+        verify.add_document(base);
+        let applied =
+            verify.execute("production.apply", &json!({"commands": plan.commands, "outputMode": "native_only", "requirePreflight": true})).unwrap();
+        let doc = &verify.doc().unwrap().doc;
+        let pill = doc.item(ItemId(applied["results"][0]["id"].as_u64().unwrap())).unwrap().bounds();
+        let text = doc.item(ItemId(applied["results"][3]["id"].as_u64().unwrap())).unwrap().bounds();
+        assert!(pill.height() > 30.0 && text.height() > 22.0 && contains(pill, text), "pill={pill:?} text={text:?}");
+    }
+
+    #[test]
+    fn ai28_parse_inline_color_and_swatch_recovery_do_not_panic_on_multibyte_hash_strings() {
+        assert!(parse_inline_color("#aأ").is_none());
+        assert!(parse_inline_color("#aأbcd").is_none());
+        assert!(parse_inline_color("#أب").is_none());
+        assert!(parse_inline_color("#1a2b3c").is_some());
+        assert!(parse_inline_color("#abc").is_some());
+
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages": 1, "facingPages": false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let mut plan: ProductionPlan = serde_json::from_value(json!({
+            "title": "Multibyte swatch safety",
+            "images": [],
+            "commands": [
+                {"command": "frame.create", "params": {"spread": 0, "rect": [36.0, 36.0, 120.0, 120.0]}},
+                {"command": "object.fill", "params": {"ids": ["$0.id"], "swatch": "#aأ"}},
+                {"command": "object.stroke", "params": {"ids": ["$0.id"], "color": "#aأbcd"}}
+            ]
+        }))
+        .unwrap();
+        let notes = recover_unregistered_swatches(&mut plan, &base).unwrap();
+        assert!(notes.is_empty());
+        assert_eq!(plan.commands[1].params["swatch"], "#aأ");
+        assert_eq!(plan.commands[2].params["color"], "#aأbcd");
     }
 }

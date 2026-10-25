@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(90);
 // Complex native-page plans and high-resolution artwork can legitimately
-// exceed 90 seconds. Keep connection/discovery bounds and never retry a POST;
-// only Gemini generation receives this longer, still bounded response window.
-const GEMINI_GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
+// exceed 90 seconds. Keep connection/discovery bounds and never retry a timeout;
+// generation POST calls receive this longer, still bounded response window.
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(240);
 const IMAGE_JSON_LIMIT: usize = 24 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -108,10 +108,11 @@ impl<'a> Transport<'a> {
     }
 
     fn request(&self, method: reqwest::Method, url: Url) -> Result<RequestBuilder, String> {
-        let generation = self.provider == ProviderKind::Gemini && method == reqwest::Method::POST;
+        let generation =
+            method == reqwest::Method::POST && matches!(self.provider, ProviderKind::Gemini | ProviderKind::OpenAi | ProviderKind::Ollama);
         let mut request = self.client.request(method, url);
         if generation {
-            request = request.timeout(GEMINI_GENERATION_TIMEOUT);
+            request = request.timeout(GENERATION_TIMEOUT);
         }
         if let Some(key) = self.key {
             let mut value = HeaderValue::from_str(if self.provider == ProviderKind::Gemini { key } else { "" }).map_err(|_| "Invalid API key")?;
@@ -145,13 +146,20 @@ impl<'a> Transport<'a> {
     fn post(&self, path: &str, body: &Value, cancel: &AtomicBool, limit: usize) -> Result<Value, String> {
         self.json(reqwest::Method::POST, self.url(path)?, Some(body), cancel, limit)
     }
+
+    fn post_once(&self, path: &str, body: &Value, cancel: &AtomicBool, limit: usize) -> Result<Value, String> {
+        let encoded = encode_json(body)?;
+        let request = self.request(reqwest::Method::POST, self.url(path)?)?.header("content-type", "application/json").body(encoded);
+        let response = send_once(request, cancel)?;
+        let bytes = read_bounded(response, cancel, limit)?;
+        serde_json::from_slice(&bytes).map_err(|_| "Provider returned malformed or truncated JSON".into())
+    }
 }
 
-fn send(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String> {
-    check_cancel(cancel)?;
-    let response = request.send().map_err(|error| {
+fn send_raw(request: RequestBuilder) -> Result<Response, String> {
+    request.send().map_err(|error| {
         // Do not expose reqwest errors: they can contain full URLs and credentials.
-        if error.is_connect() {
+        let detail = if error.is_connect() {
             if error.is_timeout() {
                 "AI provider connection timed out; no automatic retry was sent"
             } else {
@@ -161,15 +169,42 @@ fn send(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String
             "AI provider response timed out; request outcome is unknown; no automatic retry was sent"
         } else {
             "AI provider request failed before a complete response; request outcome is unknown; no automatic retry was sent"
-        }
-    })?;
+        };
+        detail.into()
+    })
+}
+
+fn retry_after_delay_ms(response: &Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds <= 3)
+        .map(|seconds| seconds.saturating_mul(1000))
+}
+
+fn sleep_cancelable(mut remaining_ms: u64, cancel: &AtomicBool) -> Result<(), String> {
     check_cancel(cancel)?;
+    while remaining_ms > 0 {
+        let slice = remaining_ms.min(50);
+        std::thread::sleep(Duration::from_millis(slice));
+        check_cancel(cancel)?;
+        remaining_ms = remaining_ms.saturating_sub(slice);
+    }
+    Ok(())
+}
+
+fn check_http_status(response: Response) -> Result<Response, String> {
     let status = response.status();
     if !status.is_success() {
         let detail = match status.as_u16() {
+            400 => "invalid request or unsupported model parameter",
             401 | 403 => "authentication or permission denied",
+            404 => "model or endpoint not found",
+            422 => "request schema or parameters rejected",
             429 => "rate or quota limit reached",
-            400 | 404 | 422 => "request, model, schema, or endpoint not supported",
+            502..=504 => "provider temporarily unavailable",
             300..=399 => "redirect refused",
             _ => "provider returned an error",
         };
@@ -177,6 +212,36 @@ fn send(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String
         return Err(format!("AI provider HTTP {}: {detail}", status.as_u16()));
     }
     Ok(response)
+}
+
+fn send_once(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String> {
+    check_cancel(cancel)?;
+    let response = send_raw(request)?;
+    check_cancel(cancel)?;
+    check_http_status(response)
+}
+
+fn send(mut request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String> {
+    let mut attempt = 0u8;
+    loop {
+        check_cancel(cancel)?;
+        let retry_clone = if attempt < 2 { request.try_clone() } else { None };
+        // Timeouts, connection errors, and read failures return Err from send_raw and are NEVER retried.
+        let response = send_raw(request)?;
+        check_cancel(cancel)?;
+        let code = response.status().as_u16();
+        if matches!(code, 429 | 503)
+            && let Some(next_request) = retry_clone
+        {
+            let delay_ms = retry_after_delay_ms(&response).unwrap_or(if attempt == 0 { 250 } else { 750 });
+            drop(response);
+            sleep_cancelable(delay_ms, cancel)?;
+            request = next_request;
+            attempt = attempt.saturating_add(1);
+            continue;
+        }
+        return check_http_status(response);
+    }
 }
 
 fn read_bounded(mut response: Response, cancel: &AtomicBool, limit: usize) -> Result<Vec<u8>, String> {
@@ -244,6 +309,96 @@ fn gemini_json_prompt(request: &GenerationRequest) -> Result<String, String> {
     Ok(format!("{}{PREFIX}{schema}", request.prompt))
 }
 
+fn schema_declares_type(map: &serde_json::Map<String, Value>, expected: &str) -> bool {
+    match map.get("type") {
+        Some(Value::String(kind)) => kind == expected,
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+pub(super) fn gemini_supports_json_schema(schema: &Value) -> bool {
+    fn is_valid_type_name(name: &str) -> bool {
+        matches!(name, "object" | "array" | "string" | "number" | "integer" | "boolean" | "null")
+    }
+    fn check_node(node: &Value, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let Some(map) = node.as_object() else {
+            return false;
+        };
+        if map.is_empty()
+            || map.contains_key("$ref")
+            || map.contains_key("$defs")
+            || map.contains_key("definitions")
+            || map.contains_key("oneOf")
+            || map.contains_key("allOf")
+            || map.contains_key("not")
+            || map.contains_key("const")
+        {
+            return false;
+        }
+        if !map.get("additionalProperties").is_none_or(|ap| ap == &Value::Bool(false) || check_node(ap, depth.saturating_add(1))) {
+            return false;
+        }
+        let has_valid_type = match map.get("type") {
+            None => false,
+            Some(Value::String(kind)) if is_valid_type_name(kind) => true,
+            Some(Value::Array(kinds)) if !kinds.is_empty() && kinds.iter().all(|kind| kind.as_str().is_some_and(is_valid_type_name)) => true,
+            Some(_) => return false,
+        };
+        let has_valid_enum = match map.get("enum") {
+            None => false,
+            Some(Value::Array(values)) if !values.is_empty() => true,
+            Some(_) => return false,
+        };
+        if schema_declares_type(map, "object") || map.contains_key("properties") {
+            let Some(props) = map.get("properties").and_then(Value::as_object) else {
+                return false;
+            };
+            if props.is_empty() || !props.values().all(|prop| check_node(prop, depth.saturating_add(1))) {
+                return false;
+            }
+        }
+        if schema_declares_type(map, "array") || map.contains_key("items") || map.contains_key("prefixItems") {
+            if map.get("maxItems").and_then(Value::as_u64) == Some(0) {
+                return false;
+            }
+            let valid_items = match map.get("items") {
+                None => false,
+                Some(items) => check_node(items, depth.saturating_add(1)),
+            };
+            if map.contains_key("items") && !valid_items {
+                return false;
+            }
+            let valid_prefix_items = match map.get("prefixItems") {
+                None => false,
+                Some(Value::Array(list)) if !list.is_empty() && list.iter().all(|item| check_node(item, depth.saturating_add(1))) => true,
+                Some(_) => return false,
+            };
+            if !valid_items && !valid_prefix_items {
+                return false;
+            }
+        }
+        let has_any_of = match map.get("anyOf") {
+            None => false,
+            Some(Value::Array(list)) if !list.is_empty() && list.iter().all(|branch| check_node(branch, depth.saturating_add(1))) => true,
+            Some(_) => return false,
+        };
+        has_valid_type || has_any_of || has_valid_enum
+    }
+    check_node(schema, 0)
+}
+
+fn sanitize_reason_token(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed.len() > 32 {
+        return None;
+    }
+    trimmed.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_').then(|| trimmed.to_string())
+}
+
 fn gemini_thinking_config(model: &str, max_output_tokens: u32) -> Option<Value> {
     let model = model.trim().to_ascii_lowercase();
     let model = model.strip_prefix("models/").unwrap_or(&model);
@@ -303,6 +458,13 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
             "max_output_tokens":request.max_output_tokens,"text":{"format":{"type":"json_schema","name":"designcraft_plan","schema":request.json_schema,"strict":false}}}),
         ProviderKind::Gemini => {
             let mut generation_config = json!({"responseMimeType":"application/json","maxOutputTokens":request.max_output_tokens});
+            let normalized_model = model.to_ascii_lowercase();
+            if (normalized_model.starts_with("gemini-2.5") || normalized_model.starts_with("gemini-3") || normalized_model.starts_with("gemini-4"))
+                && gemini_supports_json_schema(&request.json_schema)
+                && let Some(config) = generation_config.as_object_mut()
+            {
+                config.insert("responseJsonSchema".into(), request.json_schema.clone());
+            }
             if let Some(thinking_config) = gemini_thinking_config(model, request.max_output_tokens)
                 && let Some(config) = generation_config.as_object_mut()
             {
@@ -461,8 +623,13 @@ fn generation_text(provider: ProviderKind, value: &Value) -> Result<String, Stri
             text
         }
         ProviderKind::Gemini => {
-            let candidate =
-                value.get("candidates").and_then(Value::as_array).and_then(|v| v.first()).ok_or("Gemini returned no candidate (possibly blocked)")?;
+            let Some(candidate) = value.get("candidates").and_then(Value::as_array).and_then(|v| v.first()) else {
+                let block_reason = sanitize_reason_token(value.pointer("/promptFeedback/blockReason").and_then(Value::as_str));
+                return Err(match block_reason {
+                    Some(reason) => format!("Gemini returned no candidate ({reason})"),
+                    None => "Gemini returned no candidate (possibly blocked)".into(),
+                });
+            };
             let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
             let text = gemini_candidate_text(candidate);
             if finish_reason != Some("STOP") {
@@ -473,7 +640,10 @@ fn generation_text(provider: ProviderKind, value: &Value) -> Result<String, Stri
                     && text.len() <= MAX_JSON_BYTES
                     && serde_json::from_str::<Value>(&text).is_ok_and(|v| v.is_object());
                 if !boundary_complete {
-                    return Err("Gemini response did not finish normally".into());
+                    return Err(match sanitize_reason_token(finish_reason) {
+                        Some(reason) => format!("Gemini response did not finish normally ({reason})"),
+                        None => "Gemini response did not finish normally".into(),
+                    });
                 }
             }
             text
@@ -616,8 +786,11 @@ pub(super) fn generate_images(
 
 pub(super) fn image_generation_body(provider: ProviderKind, model: &str, request: &ImageRequest) -> Result<Value, String> {
     if provider == ProviderKind::OpenAi {
-        // GPT Image models return base64 by default. No URL download is followed.
+        // GPT Image models return base64 by default; DALL-E defaults to ephemeral URLs unless b64_json is requested.
         let mut body = json!({"model":model,"prompt":request.prompt,"n":1});
+        if model.trim().to_ascii_lowercase().starts_with("dall-e") {
+            body["response_format"] = json!("b64_json");
+        }
         if let Some(size) = &request.size {
             body["size"] = json!(size);
         }
@@ -626,7 +799,7 @@ pub(super) fn image_generation_body(provider: ProviderKind, model: &str, request
         }
         Ok(body)
     } else {
-        let mut config = json!({"responseModalities":["TEXT","IMAGE"]});
+        let mut config = json!({"responseModalities":["IMAGE"]});
         // Gemini's native image config uses an aspect ratio, not an OpenAI pixel size.
         // https://ai.google.dev/gemini-api/docs/image-generation
         if let Some(size) = &request.size {
@@ -634,9 +807,16 @@ pub(super) fn image_generation_body(provider: ProviderKind, model: &str, request
             if super::gemini_base_pixels(ratio).is_none() {
                 return Err("Unsupported Gemini image aspect ratio".into());
             }
+            let lower_model = model.trim().to_ascii_lowercase();
+            let normalized_model = lower_model.strip_prefix("models/").unwrap_or(&lower_model);
+            if tier.is_none() && normalized_model.starts_with("gemini-") && !super::gemini_print_ratio_supported(normalized_model, ratio) {
+                return Err("Unsupported Gemini model for requested image aspect ratio".into());
+            }
             config["imageConfig"] = json!({"aspectRatio":ratio});
             if let Some(tier) = tier {
-                if !super::gemini_has_print_tiers(model) || !super::gemini_print_ratio_supported(model, ratio) || !matches!(tier, "1K" | "2K" | "4K")
+                if !super::gemini_has_print_tiers(normalized_model)
+                    || !super::gemini_print_ratio_supported(normalized_model, ratio)
+                    || !matches!(tier, "1K" | "2K" | "4K")
                 {
                     return Err("Unsupported Gemini model or native image resolution tier (1K, 2K, 4K)".into());
                 }
@@ -755,9 +935,19 @@ fn image_contents(provider: ProviderKind, value: &Value, cancel: &AtomicBool) ->
             add(item.get("b64_json").and_then(Value::as_str).ok_or("OpenAI did not return inline image data; URL responses are unsupported")?)?;
         }
     } else {
-        for candidate in value.get("candidates").and_then(Value::as_array).into_iter().flatten() {
-            if candidate.get("finishReason").and_then(Value::as_str) != Some("STOP") {
-                return Err("Gemini image response did not finish normally".into());
+        let candidates = value.get("candidates").and_then(Value::as_array);
+        if candidates.is_none_or(Vec::is_empty)
+            && let Some(reason) = sanitize_reason_token(value.pointer("/promptFeedback/blockReason").and_then(Value::as_str))
+        {
+            return Err(format!("Gemini image response blocked ({reason})"));
+        }
+        for candidate in candidates.into_iter().flatten() {
+            let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+            if finish_reason != Some("STOP") {
+                return Err(match sanitize_reason_token(finish_reason) {
+                    Some(reason) => format!("Gemini image response did not finish normally ({reason})"),
+                    None => "Gemini image response did not finish normally".into(),
+                });
             }
             for part in candidate.pointer("/content/parts").and_then(Value::as_array).into_iter().flatten() {
                 // Gemini image models may return draft thought images before the
@@ -798,7 +988,7 @@ pub(super) fn generate_comfy(
     // Once submitted, capture its id even if cancellation arrives while waiting
     // for the response, so cleanup can address exactly this pending queue item.
     let submission = AtomicBool::new(false);
-    let queued = transport.post("prompt", &json!({"prompt":request.workflow}), &submission, MAX_JSON_BYTES)?;
+    let queued = transport.post_once("prompt", &json!({"prompt":request.workflow}), &submission, MAX_JSON_BYTES)?;
     let id = queued.get("prompt_id").and_then(Value::as_str).ok_or("ComfyUI rejected the workflow or omitted prompt_id")?;
     if id.is_empty() || id.len() > 128 || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
         return Err("ComfyUI returned invalid prompt_id".into());
@@ -812,7 +1002,7 @@ pub(super) fn generate_comfy(
         if let Ok(url) = transport.url("queue")
             && let Ok(request) = transport.request(reqwest::Method::POST, url)
         {
-            let _ = send(request.timeout(Duration::from_secs(3)).json(&json!({"delete":[id]})), &cleanup);
+            let _ = send_once(request.timeout(Duration::from_secs(3)).json(&json!({"delete":[id]})), &cleanup);
         }
     }
     result

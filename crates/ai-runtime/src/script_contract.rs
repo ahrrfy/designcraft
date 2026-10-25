@@ -58,38 +58,90 @@ fn end(scope: BatchScope) -> Result<u32, String> {
     scope.start.checked_add(scope.count).filter(|end| scope.count > 0 && *end <= MAX_PAGES).ok_or_else(|| "Invalid explicit-script page scope".into())
 }
 
-fn page_heading(line: &str) -> Result<Option<(u32, String)>, String> {
+fn script_digit_value(c: char) -> Option<u32> {
+    match c {
+        '0'..='9' => Some(u32::from(c as u8 - b'0')),
+        '\u{0660}'..='\u{0669}' => Some(u32::from(c) - 0x0660),
+        '\u{06F0}'..='\u{06F9}' => Some(u32::from(c) - 0x06F0),
+        _ => None,
+    }
+}
+
+fn is_arabic_combining_mark(c: char) -> bool {
+    ('\u{064B}'..='\u{065F}').contains(&c) || c == '\u{0670}' || ('\u{06D6}'..='\u{06ED}').contains(&c)
+}
+
+fn base_char_count(s: &str) -> usize {
+    s.chars().filter(|&c| !is_arabic_combining_mark(c)).count()
+}
+
+fn has_explicit_script_markers(brief: &str) -> bool {
+    let mut bare_arabic_page_lines = 0usize;
+    for line in brief.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("* **") || trimmed.starts_with("- **") {
+            return true;
+        }
+        for prefix in ["صفحة", "الصفحة"] {
+            if let Some(rest) = trimmed.strip_prefix(prefix)
+                && rest.starts_with(char::is_whitespace)
+                && rest.trim_start().starts_with(|c| script_digit_value(c).is_some())
+                && rest.contains(':')
+            {
+                bare_arabic_page_lines = bare_arabic_page_lines.saturating_add(1);
+                if bare_arabic_page_lines >= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn page_heading(line: &str, allow_bare_arabic: bool) -> Result<Option<(u32, String)>, String> {
     let line = line.trim();
-    if !line.starts_with('#') {
+    let (heading, is_markdown) = if line.starts_with('#') {
+        (line.trim_start_matches('#').trim_start(), true)
+    } else if allow_bare_arabic {
+        (line, false)
+    } else {
         return Ok(None);
-    }
-    let heading = line.trim_start_matches('#').trim_start();
-    if heading.get(..4).is_none_or(|prefix| !prefix.eq_ignore_ascii_case("page")) {
+    };
+    let (rest, is_arabic_kw) = if is_markdown && heading.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("page")) {
+        (heading.get(4..).ok_or("Invalid page heading boundary")?, false)
+    } else if let Some(rest) = heading.strip_prefix("الصفحة").or_else(|| heading.strip_prefix("صفحة")) {
+        (rest, true)
+    } else {
         return Ok(None);
-    }
-    let rest = heading.get(4..).ok_or("Invalid page heading boundary")?;
+    };
     if !rest.starts_with(char::is_whitespace) {
         return Ok(None);
     }
     let rest = rest.trim_start();
-    let boundary = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    let number = rest
-        .get(..boundary)
-        .ok_or("Invalid page number boundary")?
-        .parse::<u32>()
-        .map_err(|_| "Explicit PAGE headings require a number from 1 to 1000")?;
+    let boundary = rest.find(|c: char| script_digit_value(c).is_none()).unwrap_or(rest.len());
+    let digits_str = rest.get(..boundary).ok_or("Invalid page number boundary")?;
+    if digits_str.is_empty() {
+        return if is_markdown { Err("Explicit PAGE headings require a number from 1 to 1000".into()) } else { Ok(None) };
+    }
+    let mut number = 0u32;
+    for ch in digits_str.chars() {
+        let d = script_digit_value(ch).ok_or("Explicit PAGE headings require a number from 1 to 1000")?;
+        number = number.checked_mul(10).and_then(|n| n.checked_add(d)).ok_or("Explicit PAGE headings require a number from 1 to 1000")?;
+    }
     if !(1..=MAX_PAGES).contains(&number) {
         return Err("Explicit PAGE headings require a number from 1 to 1000".into());
     }
     let suffix = rest.get(boundary..).ok_or("Invalid page title boundary")?.trim_start();
-    let title = suffix
-        .strip_prefix('—')
-        .or_else(|| suffix.strip_prefix('–'))
-        .or_else(|| suffix.strip_prefix('-'))
-        .or_else(|| suffix.strip_prefix(':'))
-        .ok_or("Explicit PAGE headings require a dash or colon before the title")?
-        .trim();
-    if title.is_empty() || title.chars().count() > 512 {
+    if is_arabic_kw && is_markdown && suffix.is_empty() {
+        return Ok(Some((number - 1, format!("الصفحة {number}"))));
+    }
+    let stripped =
+        suffix.strip_prefix('—').or_else(|| suffix.strip_prefix('–')).or_else(|| suffix.strip_prefix('-')).or_else(|| suffix.strip_prefix(':'));
+    let Some(raw_title) = stripped else {
+        return if is_markdown { Err("Explicit PAGE headings require a dash or colon before the title".into()) } else { Ok(None) };
+    };
+    let title = raw_title.trim();
+    if title.is_empty() || base_char_count(title) > 512 || title.chars().count() > 1536 {
         return Err("Explicit page title is empty or exceeds 512 characters".into());
     }
     Ok(Some((number - 1, title.to_owned())))
@@ -181,11 +233,12 @@ fn page_fields(body: &str) -> Result<(Option<String>, Option<String>, Option<Str
     let mut active = None;
     for line in body.lines() {
         let value = if let Some((label, value)) = field_heading(line) {
-            active = if label.starts_with("English Print Copy") {
+            active = if label.starts_with("English Print Copy") || label.starts_with("النص الإنجليزي") {
                 Some(0)
-            } else if label.starts_with("Arabic Print Copy") {
+            } else if label.starts_with("Arabic Print Copy") || label.starts_with("النص العربي") || label.starts_with("النص المطبوع")
+            {
                 Some(1)
-            } else if label.contains("Illustration Prompt") {
+            } else if label.contains("Illustration Prompt") || label.contains("وصف الرسم") || label.contains("التوجيه البصري") {
                 Some(2)
             } else {
                 None
@@ -224,13 +277,14 @@ pub(crate) fn parse(brief: &str) -> Result<Option<ScriptContract>, String> {
     if brief.len() > MAX_BRIEF_BYTES || brief.contains('\0') {
         return Err("Page script exceeds the shared brief limit or contains a null character".into());
     }
+    let allow_bare = has_explicit_script_markers(brief);
     let mut headers = Vec::new();
     let mut offset = 0usize;
     let mut fenced = false;
     for line in brief.split_inclusive('\n') {
         if line.trim_start().starts_with("```") {
             fenced = !fenced;
-        } else if !fenced && let Some((page, title)) = page_heading(line)? {
+        } else if !fenced && let Some((page, title)) = page_heading(line, allow_bare)? {
             let expected = u32::try_from(headers.len()).map_err(|_| "Too many explicit page headings")?;
             if page != expected {
                 return Err(format!("Explicit page script must contain each page once in order; expected PAGE {:02}", u64::from(expected) + 1));
@@ -1558,5 +1612,25 @@ mod tests {
         });
         let compiled_paired = compile_native_plan(&paired_container_refs.to_string(), scope).unwrap();
         assert_eq!(compiled_paired.commands[4].params["story"], "$3.story");
+    }
+
+    #[test]
+    fn arabic_page_headings_and_indic_digits_parse_without_false_positive_prose() {
+        let ar_md = "## الصفحة ١ — غِلَافُ الكِتَابِ\n* **النص العربي:**\n  > مَرْحَبًا بِأَطْفَالِ الرَّوْضَةِ\n## صفحة 2: الحُرُوفُ\n* **النص العربي:**\n  > أ ب ت\n";
+        let parsed = parse(ar_md).unwrap().unwrap();
+        assert_eq!(parsed.pages.len(), 2);
+        assert_eq!(parsed.pages[0].page, 0);
+        assert_eq!(parsed.pages[0].title, "غِلَافُ الكِتَابِ");
+        assert_eq!(parsed.pages[0].arabic_print_copy.as_deref(), Some("مَرْحَبًا بِأَطْفَالِ الرَّوْضَةِ"));
+        assert_eq!(parsed.pages[1].page, 1);
+        assert_eq!(parsed.pages[1].title, "الحُرُوفُ");
+
+        let ar_bare = "صفحة 1: المقدمة\n* **النص العربي:**\n  > بِسْمِ اللَّهِ\nصفحة ٢: التمارين\n* **النص العربي:**\n  > نَشَاطٌ أَوَّلُ\n";
+        let parsed_bare = parse(ar_bare).unwrap().unwrap();
+        assert_eq!(parsed_bare.pages.len(), 2);
+        assert_eq!(parsed_bare.pages[1].page, 1);
+
+        // Casual prose mentioning "صفحة 1" without script structure must stay None.
+        assert!(parse("صمم لي صفحة 1 جميلة عن الحروف الهجائية للأطفال").unwrap().is_none());
     }
 }

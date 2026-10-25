@@ -26,7 +26,7 @@ pub struct UsageLedger {
 }
 
 fn validate_budget(budget: &BudgetSpec) -> Result<(), String> {
-    if !(256..=4_000_000).contains(&budget.token_limit)
+    if !(256..=16_000_000).contains(&budget.token_limit)
         || budget.max_output_tokens == 0
         || budget.max_output_tokens > 65_536
         || budget.max_requests == 0
@@ -122,6 +122,10 @@ impl UsageLedger {
         Ok(())
     }
 
+    pub fn remaining_requests(&self) -> u32 {
+        self.budget.max_requests.saturating_sub(self.summary.requests)
+    }
+
     /// Reserve before every external call. Text bytes conservatively approximate
     /// input tokens; image allowances are estimates and are labelled as such.
     pub fn reserve(
@@ -147,7 +151,8 @@ impl UsageLedger {
         if self.summary.requests >= self.budget.max_requests {
             return Err("AI request limit reached".into());
         }
-        let input = estimate_input_tokens(input_bytes)?.saturating_add(1024).saturating_add((images as u64).saturating_mul(8192));
+        let attachment_tokens = if image_call { 0 } else { (images as u64).saturating_mul(8192) };
+        let input = estimate_input_tokens(input_bytes)?.saturating_add(1024).saturating_add(attachment_tokens);
         let output =
             if image_call { 0 } else { u64::from(max_output_tokens.unwrap_or(self.budget.max_output_tokens).min(self.budget.max_output_tokens)) };
         let allowance = input.saturating_add(output);
@@ -528,5 +533,23 @@ mod tests {
         rates.image_per_request = None;
         rates.image_reserve_usd = Some(0.49);
         assert!(ledger.reserve(100, 1, ProviderKind::OpenAi, true, Some(&rates)).is_err());
+    }
+    #[test]
+    fn image_generation_does_not_charge_vision_attachment_tokens_and_supports_16m_token_ceiling() {
+        assert!(UsageLedger::new(BudgetSpec { token_limit: 16_000_000, ..Default::default() }).is_ok());
+        assert!(UsageLedger::new(BudgetSpec { token_limit: 16_000_001, ..Default::default() }).is_err());
+
+        let mut ledger = UsageLedger::new(BudgetSpec { token_limit: 256_000, max_requests: 64, ..Default::default() }).unwrap();
+        for _ in 0..32 {
+            let reservation = ledger.reserve(900, 1, ProviderKind::OpenAi, true, None).unwrap();
+            ledger.record(reservation, None);
+        }
+        assert_eq!(ledger.summary().requests, 32);
+        assert_eq!(ledger.remaining_requests(), 32);
+        assert!(ledger.summary().estimated_tokens < 60_000, "estimated={}", ledger.summary().estimated_tokens);
+
+        // Vision input attachments on text/review calls still reserve 8,192 tokens per image.
+        let vision = ledger.reserve_with_output(900, 2, ProviderKind::Gemini, false, None, Some(512)).unwrap();
+        assert_eq!(vision.input, 300 + 1024 + 2 * 8192);
     }
 }

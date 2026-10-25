@@ -60,6 +60,7 @@ pub struct NewDocument {
     pub pages: usize,
     pub start_page: u32,
     pub facing_pages: bool,
+    pub right_to_left_binding: bool,
     pub primary_text_frame: bool,
     pub columns: u32,
     pub gutter: f64,
@@ -79,6 +80,7 @@ impl Default for NewDocument {
             pages: 1,
             start_page: 1,
             facing_pages: true,
+            right_to_left_binding: false,
             primary_text_frame: false,
             columns: 1,
             gutter: 12.0,
@@ -114,6 +116,7 @@ impl Document {
             page_width: nd.width,
             page_height: nd.height,
             facing_pages: nd.facing_pages,
+            right_to_left_binding: nd.right_to_left_binding,
             primary_text_frame: nd.primary_text_frame,
             bleed: nd.bleed,
             slug: nd.slug,
@@ -177,6 +180,7 @@ impl Document {
         });
         // A-Parent.
         let parent_id = d.add_parent("A", "Parent", nd.columns, nd.gutter, nd.margins);
+        d.order_parent_pages();
         // Document pages.
         let pages: Vec<Page> = (0..nd.pages.max(1)).map(|_| d.make_page(Some(parent_id), nd.columns, nd.gutter, nd.margins)).collect();
         d.spreads = vec![Arc::new(Spread { id: SpreadId(d.alloc()), pages, items: vec![], parent: None, allow_shuffle: true })];

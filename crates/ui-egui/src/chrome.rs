@@ -83,6 +83,7 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
     let lang = app.ui.language.clone();
     let hint = crate::rtl::widget(ui, egui::RichText::new(crate::i18n::tr(&lang, "Search")).color(t.text_dim));
     let field = egui::Rect::from_min_max(r.min + vec2(19.0, 0.0), r.max - vec2(3.0, 0.0));
+    let mut search_layouter = crate::rtl::text_edit_layouter(false, Some(egui::FontId::proportional(11.0)), Some(t.text));
     let resp = ui
         .put(
             field,
@@ -95,6 +96,7 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
                 .hint_text(hint)
                 .desired_width(field.width())
                 .vertical_align(egui::Align::Center)
+                .layouter(&mut search_layouter)
                 // Return runs the highlighted match instead of leaving the field.
                 .return_key(None),
         )
@@ -311,7 +313,7 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                                             crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Delete Workspace")),
                                             |ui| {
                                                 for w in &customs {
-                                                    if ui.button(w).clicked() {
+                                                    if ui.button(crate::rtl::widget(ui, w.as_str())).clicked() {
                                                         let _ = app.run("window.deleteWorkspace", json!({"name": w}));
                                                         ui.close();
                                                     }
@@ -325,7 +327,19 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                             if icons::button(ui, "share", 22.0, false, crate::i18n::tr(&app.ui.language, "Share")).clicked() {
                                 app.status(crate::i18n::tr(&app.ui.language, "Export a PDF, IDML or package to share — no cloud account needed."));
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
+                            let next_lang = if app.ui.language == "ar" { "" } else { "ar" };
+                            let lang_btn_label = if app.ui.language == "ar" { "EN" } else { "العربية" };
+                            if ui
+                                .button(crate::rtl::widget(ui, lang_btn_label))
+                                .on_hover_ui(|ui| {
+                                    crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Interface Language"));
+                                })
+                                .clicked()
+                            {
+                                let _ = app.run("app.language", json!({"lang": next_lang}));
+                            }
+                            ui.add_space(6.0);
                             if ui.button("GitHub").clicked() {
                                 app.ui.pending_urls.push(crate::about::FORK_URL.into());
                             }
@@ -754,7 +768,7 @@ pub fn status_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
             ui.horizontal_centered(|ui| {
                 let small = egui::FontId::proportional(10.5);
                 if app.session.active().is_none() {
-                    ui.label(egui::RichText::new(&app.ui.status).font(small).color(t.text_dim));
+                    crate::rtl::label(ui, egui::RichText::new(&app.ui.status).font(small).color(t.text_dim));
                     return;
                 }
                 let z = app.view().map(|v| v.zoom).unwrap_or(1.0);
@@ -778,13 +792,13 @@ pub fn status_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                 let name = app.session.page_label(cur);
                 let (fr, fresp) = ui.allocate_exact_size(vec2(80.0, 14.0), Sense::click());
                 ui.painter().rect(fr, 0.0, t.input, Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
-                ui.painter().text(fr.left_center() + vec2(5.0, 0.0), egui::Align2::LEFT_CENTER, &name, small.clone(), t.text);
+                crate::rtl::paint(ui.painter(), fr.left_center() + vec2(5.0, 0.0), egui::Align2::LEFT_CENTER, &name, small.clone(), t.text);
                 ui.painter().text(fr.right_center() - vec2(5.0, 0.0), egui::Align2::RIGHT_CENTER, "▾", small.clone(), t.text);
                 egui::Popup::menu(&fresp).show(|ui| {
                     let names: Vec<String> = (0..n).map(|i| app.session.page_label(i)).collect();
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         for (i, nm) in names.iter().enumerate() {
-                            if ui.button(nm).clicked() {
+                            if ui.button(crate::rtl::widget(ui, nm.as_str())).clicked() {
                                 crate::canvas::go_to_page(app, i);
                                 ui.close();
                             }
@@ -833,7 +847,7 @@ pub fn status_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                     show_preflight(app);
                 }
                 ui.add_space(12.0);
-                ui.label(egui::RichText::new(&app.ui.status).font(small).color(t.text_dim));
+                crate::rtl::label(ui, egui::RichText::new(&app.ui.status).font(small).color(t.text_dim));
             });
         });
     let r = resp.response.rect;
@@ -985,8 +999,8 @@ fn recent_files(app: &mut DesignApp, ui: &mut egui::Ui) {
             let mut job = egui::text::LayoutJob::simple(name, semibold(12.0), color, cr.width() - 12.0);
             job.wrap.max_rows = 2;
             job.halign = egui::Align::Center;
-            let galley = ui.painter().layout_job(job);
-            ui.painter().galley(egui::pos2(cr.center().x, area.max.y + 8.0), galley, color);
+            let galley = crate::rtl::layout(ui.ctx(), job);
+            ui.painter().galley(egui::pos2(cr.center().x - galley.rect.center().x, area.max.y + 8.0), galley, color);
             if resp.clicked() {
                 open = Some(i);
             }

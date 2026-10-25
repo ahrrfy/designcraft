@@ -213,12 +213,16 @@ impl ProductionRunner {
         self.sequence = self.sequence.saturating_add(1);
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis();
         let id = format!("book-{stamp}-{}-{}", std::process::id(), self.sequence);
+        let spread_aligned = completed == 0 && task.settings.facing_pages && size == 2 && pages > 1;
+        let total_batches =
+            if spread_aligned { 1_u32.saturating_add(pages.saturating_sub(1).div_ceil(2)) } else { pages.saturating_sub(completed).div_ceil(size) };
         let snapshot = BatchSnapshot {
             job_id: id,
             total_pages: pages,
             pages_per_batch: size,
+            spread_aligned,
             current_batch: 1,
-            total_batches: pages.saturating_sub(completed).div_ceil(size),
+            total_batches,
             completed_pages: completed,
             document_uid: existing.map(|(uid, _)| uid),
             document_revision: existing.map(|(_, revision)| revision),
@@ -414,9 +418,9 @@ impl ProductionRunner {
         ensure_publication_idle(session)?;
         if let Some(target_uid) = self.batch.as_ref().and_then(|job| job.snapshot.document_uid)
             && let Some(target_doc) = session.documents().iter().find(|doc| doc.uid == target_uid)
-            && (target_doc.interaction.is_some() || target_doc.preview_stash.is_some())
+            && (target_doc.interaction.is_some() || target_doc.editing_parents || target_doc.preview_stash.is_some())
         {
-            return Err("Finish the current interaction, IME composition or preview before publishing AI production".to_string());
+            return Err("Finish the current interaction, IME composition or preview, or parent-page edit before publishing AI production".to_string());
         }
         let mut job = self.batch.take().ok_or("Batch checkpoint disappeared")?;
         let validation: Result<usize, String> = (|| {
@@ -543,6 +547,100 @@ impl ProductionRunner {
         // Consumes this exact approval before any next request is launched.
         job.snapshot.status = "running".into();
         self.launch_batch(job, base, context)
+    }
+
+    pub(super) fn refresh_batch_proofs(&mut self, session: &mut Session, id: &str) -> Result<(), String> {
+        if self.pending.is_some() {
+            return Err("A provider request is already active".into());
+        }
+        let job_view = self.batch.as_ref().ok_or("No live batch job is awaiting human proof review; recovered checkpoints cannot resume")?;
+        if job_view.snapshot.job_id != id || job_view.snapshot.status != "awaiting_human_proof" {
+            return Err("Batch job is not awaiting human proof review".into());
+        }
+        ensure_publication_idle(session)?;
+        if !Arc::ptr_eq(&job_view.publication_cache, &session.cache) {
+            return Err("Font cache changed after proof generation; start a new task against the current document".into());
+        }
+        if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job_view.prefs).map_err(|e| e.to_string())? {
+            return Err("Application preferences changed after proof generation; start a new task against the current document".into());
+        }
+        let Some(target_uid) = job_view.snapshot.document_uid else {
+            return Err("Batch proof document identifier is unavailable".into());
+        };
+        let Some(current) = session.documents().iter().find(|doc| doc.uid == target_uid).cloned() else {
+            return Err("Target book is no longer open; reopen it or cancel the batch".into());
+        };
+        if current.interaction.is_some() || current.editing_parents || current.preview_stash.is_some() {
+            return Err("Finish the current interaction, IME composition or preview, or parent-page edit before refreshing batch proofs".into());
+        }
+        let Some(baseline) = job_view.publication_base.as_ref() else {
+            return Err("Batch proof baseline is unavailable; recovered checkpoints cannot refresh proofs".into());
+        };
+        let last = job_view
+            .snapshot
+            .batches
+            .last()
+            .filter(|batch| batch.status == "awaiting_human_proof" && batch.page_count > 0)
+            .ok_or("Current batch proof report is unavailable")?;
+        let scope = worker::BatchScope { start: last.page_start, count: last.page_count };
+        verify_refresh_scope_authority(baseline, &current, scope, job_view.snapshot.completed_pages, job_view.snapshot.total_pages)?;
+        if job_view.snapshot.completed_pages < job_view.snapshot.total_pages {
+            let _ = crate::facing_pages::canonicalize(&current, &session.prefs)?;
+        }
+        let settings = job_view.task.settings.clone();
+        let prompt = job_view.task.prompt.clone();
+        let roots = job_view.roots.clone();
+        let current_batch = job_view.snapshot.current_batch;
+        let retry_sequence = job_view.retry_sequence;
+        let job_id = job_view.snapshot.job_id.clone();
+        let report_id = batch_report_id(job_view);
+        let (proofs, issues) = file_access::confine(roots.as_ref(), || {
+            worker::render_live_batch_proofs(&current, &session.prefs, &session.cache, &settings, &prompt, scope)
+        })?;
+        validate_batch_proof_set(&proofs, scope)?;
+        let directory_name =
+            if retry_sequence == 0 { format!("batch-{current_batch}") } else { format!("batch-{current_batch}-retry-{retry_sequence}") };
+        let directory = self.root.join("runs").join(&job_id).join(directory_name);
+        self.profile_access.check(&directory, file_access::Access::Write)?;
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        let mut new_paths = Vec::with_capacity(proofs.len());
+        let mut new_sha256 = Vec::with_capacity(proofs.len());
+        for proof in proofs {
+            let path = directory.join(proof.name);
+            write_profile(&self.profile_access, &path, &proof.bytes)?;
+            new_sha256.push(hash(&proof.bytes));
+            new_paths.push(path.to_string_lossy().into_owned());
+        }
+        let job = self.batch.as_mut().ok_or("Batch checkpoint disappeared")?;
+        let next_checkpoint = job.snapshot.checkpoint.checked_add(1).ok_or("Batch checkpoint overflow")?;
+        if let Some(last_mut) = job.snapshot.batches.last_mut() {
+            last_mut.proof_paths = new_paths.clone();
+            last_mut.proof_sha256 = new_sha256;
+        }
+        job.snapshot.document_revision = Some(current.revision);
+        job.snapshot.checkpoint = next_checkpoint;
+        job.publication_base = Some(current);
+        let updated_snapshot = job.snapshot.clone();
+        if let Some(report) = self.snapshot.reports.iter_mut().rev().find(|report| report.id == report_id) {
+            let trace = directory.join("trace.json").to_string_lossy().into_owned();
+            let had_trace = report.artifacts.iter().any(|p| p == &trace);
+            report.artifacts = new_paths;
+            if had_trace {
+                report.artifacts.push(trace);
+            }
+            report.issues = issues.clone();
+            report.message = "Refreshed batch proofs after native document edits; human approval is required".into();
+        }
+        self.persist_batch(&updated_snapshot)?;
+        write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports)?;
+        if session.doc().is_ok_and(|doc| doc.uid == target_uid) {
+            let _ = self.bind_production_draft(session, &job_id);
+        }
+        self.snapshot.current_issues = issues;
+        self.snapshot.batch = Some(updated_snapshot);
+        self.snapshot.stage = "awaiting_human_proof".into();
+        self.snapshot.message = "Refreshed batch proofs for edited document; review every page proof before continuing".into();
+        Ok(())
     }
 
     pub(super) fn cancel_batch(&mut self) {
@@ -693,62 +791,13 @@ impl ProductionRunner {
         }
         let first_plan = plans.first().ok_or("A review group must contain native plans")?;
         let actions = plans.iter().try_fold(0usize, |total, plan| total.checked_add(plan.commands.len())).ok_or("Review action count overflow")?;
-        let scope_end = scope
-            .start
-            .checked_add(scope.count)
-            .filter(|end| (1..=1000).contains(&scope.count) && *end <= 1000)
-            .ok_or("Invalid review proof page range")?;
-        let maximum_proofs = scope
-            .count
-            .checked_add(scope.count.div_ceil(32))
-            .and_then(|count| count.checked_add(1))
-            .and_then(|count| usize::try_from(count).ok())
-            .ok_or("Batch proof count overflow")?;
-        if proofs.len() != maximum_proofs {
-            return Err("Batch proof count or byte limit exceeded".into());
-        }
-        let mut total_bytes = 0usize;
-        let mut names = std::collections::BTreeSet::new();
-        for proof in &proofs {
-            let extension = Path::new(&proof.name).extension().and_then(|x| x.to_str());
-            if proof.name.contains(['/', '\\', ':'])
-                || !matches!(extension, Some("png" | "pdf" | "designcraft"))
-                || !names.insert(proof.name.as_str())
-            {
-                return Err("Invalid or duplicate batch proof artifact name".into());
-            }
-            let cap = if extension == Some("png") { MAX_PAGE_PROOF_BYTES } else { MAX_PROOF_FILE_BYTES };
-            if proof.bytes.len() > cap {
-                return Err("Batch proof file exceeds its byte limit".into());
-            }
-            total_bytes = total_bytes
-                .checked_add(proof.bytes.len())
-                .filter(|total| *total <= MAX_PROOF_TOTAL_BYTES)
-                .ok_or("Batch proofs exceed their aggregate byte limit")?;
-        }
-        let mut expected_names = std::collections::BTreeSet::from(["document.designcraft".to_owned()]);
-        for page in scope.start..scope_end {
-            expected_names.insert(format!("page-{}.png", page.saturating_add(1)));
-        }
-        let mut pdf_start = scope.start;
-        while pdf_start < scope_end {
-            let pdf_end = pdf_start.checked_add(32).ok_or("Review PDF page range overflow")?.min(scope_end);
-            expected_names.insert(if scope.count <= 32 {
-                "proof.pdf".into()
-            } else {
-                format!("proof-pages-{}-{pdf_end}.pdf", pdf_start.saturating_add(1))
-            });
-            pdf_start = pdf_end;
-        }
-        if names.len() != expected_names.len() || names.iter().any(|name| !expected_names.contains(*name)) {
-            return Err("Batch proofs must cover exactly every review page with one native document and complete PDF ranges".into());
-        }
+        validate_batch_proof_set(&proofs, scope)?;
         let first = job.snapshot.document_uid.is_none();
         let previous = session.active_index();
         if first {
             let profile = job.skills.iter().find_map(|skill| skill.design_profile.as_ref());
             session
-                .execute("file.new", &production_document_params(profile, job.snapshot.total_pages, &job.task.prompt)?)
+                .execute("file.new", &production_document_params(profile, job.snapshot.total_pages, &job.task.settings, &job.task.prompt)?)
                 .map_err(|e| e.to_string())?;
             initialize_print_document(session, &job.task.prompt)?;
             // Print preferences define the new document's creation baseline. Facing setup
@@ -783,13 +832,20 @@ impl ProductionRunner {
             let current = session.doc().map_err(|e| e.to_string())?;
             let mut base = current.clone();
             base.selection = Default::default();
+            let desired_rtl = book_binding(&job.task.settings, &job.task.prompt);
             let change_layout = job.task.settings.facing_pages && !base.doc.settings.facing_pages;
-            let facing = if change_layout {
-                Some(crate::facing_pages::formatted_proof_state(&base, &job.prefs, book_binding(&job.task.settings, &job.task.prompt))?)
+            let change_single_binding = !job.task.settings.facing_pages
+                && !base.doc.settings.facing_pages
+                && base.doc.spreads.iter().all(|s| s.items.is_empty())
+                && base.doc.settings.right_to_left_binding != desired_rtl;
+            let setup_projection = if change_layout {
+                Some(crate::facing_pages::formatted_proof_state(&base, &job.prefs, desired_rtl)?)
+            } else if change_single_binding {
+                Some(crate::facing_pages::single_page_proof_state(&base, &job.prefs, desired_rtl)?)
             } else {
                 None
             };
-            let projected_base = facing.as_ref().unwrap_or(&base);
+            let projected_base = setup_projection.as_ref().unwrap_or(&base);
             let canonical = crate::facing_pages::canonicalize(projected_base, &job.prefs)?;
             let required_min_ppi = crate::print_contract::PrintContract::from_prompt(&job.task.prompt)?.and_then(|contract| contract.min_image_ppi());
             let min_ppi = required_min_ppi.unwrap_or(150.0);
@@ -808,9 +864,11 @@ impl ProductionRunner {
             projected.prefs = job.prefs.clone();
             projected.add_document(base.clone());
             let mut group_params = json!({"chunks":chunks,"outputMode":job.task.settings.output_mode,"requirePreflight":true,"minPpi":min_ppi});
-            if change_layout {
-                group_params["documentSetup"] =
-                    json!({"facingPages":true,"binding":if book_binding(&job.task.settings,&job.task.prompt){"rightToLeft"}else{"leftToRight"}});
+            if change_layout || change_single_binding {
+                group_params["documentSetup"] = json!({
+                    "facingPages": job.task.settings.facing_pages,
+                    "binding": if desired_rtl { "rightToLeft" } else { "leftToRight" }
+                });
             }
             projected.execute("production.applyGroup", &group_params).map_err(|e| e.to_string())?;
             crate::facing_pages::validate_mapped_result(projected_base, projected.doc().map_err(|e| e.to_string())?, scope)?;
@@ -908,8 +966,413 @@ fn retry_candidate(job: &BatchJob) -> bool {
             .last()
             .is_some_and(|batch| batch.status == "failed" && batch.page_start == job.snapshot.completed_pages && batch.page_count > 0)
 }
+fn validate_batch_proof_set(proofs: &[worker::ProofArtifact], scope: worker::BatchScope) -> Result<(), String> {
+    let scope_end = scope
+        .start
+        .checked_add(scope.count)
+        .filter(|end| (1..=1000).contains(&scope.count) && *end <= 1000)
+        .ok_or("Invalid review proof page range")?;
+    let maximum_proofs = scope
+        .count
+        .checked_add(scope.count.div_ceil(32))
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or("Batch proof count overflow")?;
+    if proofs.len() != maximum_proofs {
+        return Err("Batch proof count or byte limit exceeded".into());
+    }
+    let mut total_bytes = 0usize;
+    let mut names = std::collections::BTreeSet::new();
+    for proof in proofs {
+        let extension = Path::new(&proof.name).extension().and_then(|x| x.to_str());
+        if proof.name.contains(['/', '\\', ':']) || !matches!(extension, Some("png" | "pdf" | "designcraft")) || !names.insert(proof.name.as_str()) {
+            return Err("Invalid or duplicate batch proof artifact name".into());
+        }
+        let cap = if extension == Some("png") { MAX_PAGE_PROOF_BYTES } else { MAX_PROOF_FILE_BYTES };
+        if proof.bytes.len() > cap {
+            return Err("Batch proof file exceeds its byte limit".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(proof.bytes.len())
+            .filter(|total| *total <= MAX_PROOF_TOTAL_BYTES)
+            .ok_or("Batch proofs exceed their aggregate byte limit")?;
+    }
+    let mut expected_names = std::collections::BTreeSet::from(["document.designcraft".to_owned()]);
+    for page in scope.start..scope_end {
+        expected_names.insert(format!("page-{}.png", page.saturating_add(1)));
+    }
+    let mut pdf_start = scope.start;
+    while pdf_start < scope_end {
+        let pdf_end = pdf_start.checked_add(32).ok_or("Review PDF page range overflow")?.min(scope_end);
+        expected_names.insert(if scope.count <= 32 {
+            "proof.pdf".into()
+        } else {
+            format!("proof-pages-{}-{pdf_end}.pdf", pdf_start.saturating_add(1))
+        });
+        pdf_start = pdf_end;
+    }
+    if names.len() != expected_names.len() || names.iter().any(|name| !expected_names.contains(*name)) {
+        return Err("Batch proofs must cover exactly every review page with one native document and complete PDF ranges".into());
+    }
+    Ok(())
+}
+
+fn page_geometry_matches(a: &designcraft_engine::doc::Page, b: &designcraft_engine::doc::Page) -> bool {
+    a.id == b.id
+        && a.width == b.width
+        && a.height == b.height
+        && a.x == b.x
+        && a.margins == b.margins
+        && a.columns == b.columns
+        && a.local_margins == b.local_margins
+        && a.parent == b.parent
+        && a.side == b.side
+        && a.overridden == b.overridden
+        && a.show_parent_items == b.show_parent_items
+        && a.liquid == b.liquid
+}
+
+fn rect_overlaps_interior(a: designcraft_geom::Rect, b: designcraft_geom::Rect) -> bool {
+    const EPS: f64 = 1e-3;
+    a.x0 + EPS < b.x1 && a.x1 - EPS > b.x0 && a.y0 + EPS < b.y1 && a.y1 - EPS > b.y0
+}
+
+fn validate_refresh_item_trees(state: &DocState) -> Result<(), String> {
+    const MAX_ITEMS: usize = 10_000;
+    const MAX_DEPTH: usize = 64;
+    let mut visited = 0usize;
+    let mut ids = std::collections::BTreeSet::new();
+    for spread in state.doc.spreads.iter().chain(&state.doc.parents) {
+        if spread.items.len() > MAX_ITEMS {
+            return Err("Spread item count exceeds batch proof inspection limit".into());
+        }
+        let mut pending: Vec<(&designcraft_engine::doc::Item, usize)> = spread.items.iter().map(|item| (item.as_ref(), 0usize)).collect();
+        while let Some((item, depth)) = pending.pop() {
+            visited = visited.checked_add(1).ok_or("Item count overflow")?;
+            if visited > MAX_ITEMS || depth > MAX_DEPTH || !ids.insert(item.id) {
+                return Err("Item tree exceeds batch proof inspection limit or repeats an item ID".into());
+            }
+            let children = item.children();
+            if pending.len().checked_add(children.len()).is_none_or(|n| n > MAX_ITEMS) {
+                return Err("Nested item tree exceeds batch proof inspection limit".into());
+            }
+            for child in children {
+                pending.push((child.as_ref(), depth.saturating_add(1)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_item_story_and_asset_refs(
+    item: &designcraft_engine::doc::Item,
+    stories: &mut std::collections::BTreeSet<designcraft_engine::doc::StoryId>,
+    assets: &mut std::collections::BTreeSet<designcraft_engine::doc::AssetId>,
+    depth: usize,
+) -> Result<(), String> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        return Err("Nested group depth exceeds batch proof inspection limit".into());
+    }
+    match &item.content {
+        designcraft_engine::doc::Content::Text(tf) => {
+            stories.insert(tf.story);
+        }
+        designcraft_engine::doc::Content::Graphic(g) => {
+            assets.insert(g.asset);
+        }
+        designcraft_engine::doc::Content::Group { items } => {
+            for child in items {
+                collect_item_story_and_asset_refs(child, stories, assets, depth.saturating_add(1))?;
+            }
+        }
+        designcraft_engine::doc::Content::Unassigned => {}
+    }
+    if let Some(poster) = item.media.as_ref().and_then(|m| m.poster) {
+        assets.insert(poster);
+    }
+    Ok(())
+}
+
+fn collect_story_sub_refs(
+    story: &designcraft_engine::doc::Story,
+    nested_stories: &mut std::collections::BTreeSet<designcraft_engine::doc::StoryId>,
+    assets: &mut std::collections::BTreeSet<designcraft_engine::doc::AssetId>,
+    depth: usize,
+) -> Result<(), String> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        return Err("Nested story depth exceeds batch proof inspection limit".into());
+    }
+    if let Some((linked_id, _)) = story.link {
+        nested_stories.insert(linked_id);
+    }
+    for anchored in &story.objects {
+        collect_item_story_and_asset_refs(&anchored.item, nested_stories, assets, depth.saturating_add(1))?;
+    }
+    for table in story.tables.values() {
+        for cell in &table.cells {
+            if let Some(g) = &cell.graphic {
+                assets.insert(g.asset);
+            }
+            collect_story_sub_refs(&cell.text, nested_stories, assets, depth.saturating_add(1))?;
+        }
+    }
+    for note in story.notes.iter().chain(&story.endnotes) {
+        collect_story_sub_refs(&note.text, nested_stories, assets, depth.saturating_add(1))?;
+    }
+    Ok(())
+}
+
+fn expand_story_transitive_refs(
+    doc: &designcraft_engine::doc::Document,
+    stories: &mut std::collections::BTreeSet<designcraft_engine::doc::StoryId>,
+    assets: &mut std::collections::BTreeSet<designcraft_engine::doc::AssetId>,
+) -> Result<(), String> {
+    const MAX_VISITED_STORIES: usize = 10_000;
+    let mut queue: Vec<designcraft_engine::doc::StoryId> = stories.iter().copied().collect();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(story_id) = queue.pop() {
+        if !visited.insert(story_id) {
+            continue;
+        }
+        if visited.len() > MAX_VISITED_STORIES {
+            return Err("Story reference graph exceeds batch proof inspection limit".into());
+        }
+        if let Some(story) = doc.stories.get(&story_id) {
+            let mut nested_stories = std::collections::BTreeSet::new();
+            collect_story_sub_refs(story, &mut nested_stories, assets, 0)?;
+            for nested in nested_stories {
+                if stories.insert(nested) {
+                    queue.push(nested);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_only_named<T: PartialEq>(base: &[T], curr: &[T], name_of: impl Fn(&T) -> &str) -> bool {
+    if curr.len() < base.len() || curr.get(..base.len()) != Some(base) {
+        return false;
+    }
+    let mut seen: std::collections::BTreeSet<&str> = base.iter().map(&name_of).collect();
+    curr.get(base.len()..).is_some_and(|extra| extra.iter().all(|item| !name_of(item).is_empty() && seen.insert(name_of(item))))
+}
+
+fn verify_sealed_swatches(base: &[designcraft_engine::doc::color::Swatch], curr: &[designcraft_engine::doc::color::Swatch]) -> Result<(), String> {
+    if curr.len() < base.len() || curr.get(..base.len()) != Some(base) {
+        return Err("Already-approved swatches cannot be modified, reordered or deleted before refreshing batch proofs".into());
+    }
+    let mut seen: std::collections::BTreeSet<&str> = base.iter().map(|s| s.name.as_str()).collect();
+    if let Some(extra) = curr.get(base.len()..) {
+        for swatch in extra {
+            let hidden_gradient =
+                !swatch.named && swatch.hidden && matches!(swatch.value, designcraft_engine::doc::color::SwatchValue::Gradient { .. });
+            if !hidden_gradient && (swatch.name.is_empty() || !seen.insert(swatch.name.as_str())) {
+                return Err("Appended swatch name collides with an already-approved swatch".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_sealed_styles(base: &designcraft_engine::doc::Styles, curr: &designcraft_engine::doc::Styles) -> Result<(), String> {
+    if !append_only_named(&base.paragraph, &curr.paragraph, |s| s.name.as_str())
+        || !append_only_named(&base.character, &curr.character, |s| s.name.as_str())
+        || !append_only_named(&base.object, &curr.object, |s| s.name.as_str())
+        || !append_only_named(&base.cell, &curr.cell, |s| s.name.as_str())
+        || !append_only_named(&base.table, &curr.table, |s| s.name.as_str())
+        || !append_only_named(&base.composite_fonts, &curr.composite_fonts, |s| s.name.as_str())
+        || !append_only_named(&base.mojikumi_tables, &curr.mojikumi_tables, |s| s.name.as_str())
+    {
+        return Err("Already-approved styles or typography tables cannot be modified, reordered or deleted before refreshing batch proofs".into());
+    }
+    if !base.export_tags.iter().all(|(k, v)| curr.export_tags.get(k) == Some(v)) {
+        return Err("Export tags on already-approved styles cannot be modified or removed".into());
+    }
+    let base_para_names: std::collections::BTreeSet<&str> = base.paragraph.iter().map(|s| s.name.as_str()).collect();
+    let base_char_names: std::collections::BTreeSet<&str> = base.character.iter().map(|s| s.name.as_str()).collect();
+    for key in curr.export_tags.keys() {
+        if !base.export_tags.contains_key(key) {
+            let targets_sealed = key.strip_prefix("p:").is_some_and(|name| base_para_names.contains(name))
+                || key.strip_prefix("c:").is_some_and(|name| base_char_names.contains(name));
+            if targets_sealed {
+                return Err("Export tags cannot be added retroactively to already-approved styles".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_refresh_scope_authority(
+    baseline: &DocState,
+    current: &DocState,
+    scope: worker::BatchScope,
+    completed_pages: u32,
+    total_pages: u32,
+) -> Result<(), String> {
+    validate_refresh_item_trees(baseline)?;
+    validate_refresh_item_trees(current)?;
+    let total = usize::try_from(total_pages).map_err(|_| "Invalid total page count")?;
+    let completed = usize::try_from(completed_pages).map_err(|_| "Invalid completed page count")?;
+    if baseline.uid != current.uid
+        || baseline.doc.spreads.len() != current.doc.spreads.len()
+        || baseline.doc.page_count() != total
+        || current.doc.page_count() != total
+    {
+        return Err("Edited document page count no longer matches the active book batch".into());
+    }
+    if baseline.doc.settings != current.doc.settings
+        || baseline.doc.parents != current.doc.parents
+        || baseline.doc.layers != current.doc.layers
+        || baseline.doc.sections != current.doc.sections
+        || baseline.doc.font_scope != current.doc.font_scope
+    {
+        return Err("Document setup, layers, sections or parent spreads changed after proof generation; cannot refresh batch proofs".into());
+    }
+    let start = usize::try_from(scope.start).map_err(|_| "Invalid batch proof page start")?;
+    let count = usize::try_from(scope.count).map_err(|_| "Invalid batch proof page count")?;
+    let end = start.checked_add(count).filter(|end| count > 0 && *end <= completed && completed <= total).ok_or("Invalid batch proof page range")?;
+
+    let has_sealed_authority = start > 0 || baseline.doc.parents.iter().any(|p| !p.items.is_empty());
+    if has_sealed_authority {
+        verify_sealed_swatches(&baseline.doc.swatches, &current.doc.swatches)?;
+        verify_sealed_styles(&baseline.doc.styles, &current.doc.styles)?;
+        if !append_only_named(&baseline.doc.stroke_styles, &current.doc.stroke_styles, |s| s.name.as_str()) {
+            return Err("Already-approved stroke styles cannot be modified, reordered or deleted before refreshing batch proofs".into());
+        }
+        let mut normalized = current.doc.as_ref().clone();
+        normalized.spreads = baseline.doc.spreads.clone();
+        normalized.stories = baseline.doc.stories.clone();
+        normalized.assets = baseline.doc.assets.clone();
+        normalized.swatches = baseline.doc.swatches.clone();
+        normalized.styles = baseline.doc.styles.clone();
+        normalized.stroke_styles = baseline.doc.stroke_styles.clone();
+        normalized.color_groups = baseline.doc.color_groups.clone();
+        normalized.user_words = baseline.doc.user_words.clone();
+        normalized.next_id = baseline.doc.next_id;
+        normalized.modified = baseline.doc.modified;
+        if &normalized != baseline.doc.as_ref() {
+            return Err(
+                "Document-wide print, note, variable, XML or interactive definitions cannot be modified after earlier batches are approved".into()
+            );
+        }
+    }
+
+    let mut sealed_stories = std::collections::BTreeSet::new();
+    let mut sealed_assets = std::collections::BTreeSet::new();
+    let mut scope_stories = std::collections::BTreeSet::new();
+    let mut scope_assets = std::collections::BTreeSet::new();
+    let mut scope_item_counts = vec![0usize; count];
+
+    let mut absolute = 0usize;
+    for (base_sp, curr_sp) in baseline.doc.spreads.iter().zip(&current.doc.spreads) {
+        if base_sp.id != curr_sp.id
+            || base_sp.parent != curr_sp.parent
+            || base_sp.allow_shuffle != curr_sp.allow_shuffle
+            || base_sp.pages.len() != curr_sp.pages.len()
+        {
+            return Err("Page geometry, margins, columns or parent overrides changed after proof generation; cannot refresh batch proofs".into());
+        }
+        for (offset, (pa, pb)) in base_sp.pages.iter().zip(&curr_sp.pages).enumerate() {
+            let abs = absolute.checked_add(offset).ok_or("Batch proof page index overflow")?;
+            if (start..end).contains(&abs) {
+                if !page_geometry_matches(pa, pb) {
+                    return Err(
+                        "Page geometry, margins, columns or parent overrides changed after proof generation; cannot refresh batch proofs".into()
+                    );
+                }
+            } else if pa != pb {
+                return Err("Already-approved or unproduced pages outside the current review batch cannot be modified".into());
+            }
+        }
+
+        let mut base_non_scope: Vec<(usize, &Arc<designcraft_engine::doc::Item>)> = Vec::new();
+        for item in &base_sp.items {
+            let offset = base_sp.page_at_x(item.bounds().center().x).ok_or("Baseline item has no owning page")?;
+            let abs = absolute.checked_add(offset).ok_or("Baseline item page index overflow")?;
+            if !(start..end).contains(&abs) {
+                base_non_scope.push((abs, item));
+                collect_item_story_and_asset_refs(item, &mut sealed_stories, &mut sealed_assets, 0)?;
+            }
+        }
+
+        let mut curr_non_scope: Vec<(usize, &Arc<designcraft_engine::doc::Item>)> = Vec::new();
+        for item in &curr_sp.items {
+            let bounds = item.visible_bounds();
+            if ![bounds.x0, bounds.y0, bounds.x1, bounds.y1].iter().all(|n| n.is_finite()) {
+                return Err("Edited artwork has non-finite bounds".into());
+            }
+            let offset = curr_sp.page_at_x(item.bounds().center().x).ok_or("Edited item has no owning page")?;
+            let abs = absolute.checked_add(offset).ok_or("Edited item page index overflow")?;
+            if abs >= completed {
+                return Err("Unproduced trailing pages must remain blank before refreshing batch proofs".into());
+            }
+            if (start..end).contains(&abs) {
+                if let Some(slot) = scope_item_counts.get_mut(abs.saturating_sub(start)) {
+                    *slot = slot.saturating_add(1);
+                }
+                for (page_offset, page) in curr_sp.pages.iter().enumerate() {
+                    let page_abs = absolute.checked_add(page_offset).ok_or("Batch proof page index overflow")?;
+                    if !(start..end).contains(&page_abs) && rect_overlaps_interior(bounds, page.bounds()) {
+                        return Err("Edited batch artwork cannot overlap an already-approved or unproduced page on a shared spread".into());
+                    }
+                }
+                collect_item_story_and_asset_refs(item, &mut scope_stories, &mut scope_assets, 0)?;
+            } else {
+                curr_non_scope.push((abs, item));
+            }
+        }
+
+        if base_non_scope != curr_non_scope {
+            return Err("Already-approved or unproduced pages outside the current review batch cannot be modified".into());
+        }
+        absolute = absolute.checked_add(base_sp.pages.len()).ok_or("Batch proof page count overflow")?;
+    }
+
+    if scope_item_counts.contains(&0) {
+        return Err("Reviewed batch pages cannot be blank; keep native content on every batch page or cancel".into());
+    }
+
+    for parent in &baseline.doc.parents {
+        for item in &parent.items {
+            collect_item_story_and_asset_refs(item, &mut sealed_stories, &mut sealed_assets, 0)?;
+        }
+    }
+    if has_sealed_authority {
+        if let Some(sid) = baseline.doc.endnote_story {
+            sealed_stories.insert(sid);
+        }
+        if let Some(sid) = baseline.doc.settings.primary_story {
+            sealed_stories.insert(sid);
+        }
+    }
+    expand_story_transitive_refs(&baseline.doc, &mut sealed_stories, &mut sealed_assets)?;
+    for story_id in &sealed_stories {
+        if baseline.doc.stories.get(story_id) != current.doc.stories.get(story_id) {
+            return Err("Already-approved text stories from earlier batches or parent spreads cannot be modified".into());
+        }
+    }
+    for asset_id in &sealed_assets {
+        if baseline.doc.assets.get(asset_id) != current.doc.assets.get(asset_id) {
+            return Err("Already-approved placed assets from earlier batches or parent spreads cannot be modified".into());
+        }
+    }
+    expand_story_transitive_refs(&current.doc, &mut scope_stories, &mut scope_assets)?;
+    if !sealed_stories.is_disjoint(&scope_stories) {
+        return Err("Current review batch frames cannot thread into an already-approved story".into());
+    }
+    Ok(())
+}
+
 fn scope(snapshot: &BatchSnapshot) -> Result<worker::BatchScope, String> {
-    let count = snapshot.total_pages.checked_sub(snapshot.completed_pages).ok_or("Invalid completed page count")?.min(snapshot.pages_per_batch);
+    let remaining = snapshot.total_pages.checked_sub(snapshot.completed_pages).ok_or("Invalid completed page count")?;
+    let count = if snapshot.spread_aligned && snapshot.pages_per_batch == 2 && snapshot.completed_pages == 0 && snapshot.total_pages > 1 {
+        1
+    } else {
+        remaining.min(snapshot.pages_per_batch)
+    };
     if count == 0 || snapshot.total_pages == 0 {
         return Err("No unproduced batch pages remain".into());
     }
@@ -2637,6 +3100,7 @@ mod tests {
             job_id: "job-usd-backfill".into(),
             total_pages: 2,
             pages_per_batch: 1,
+            spread_aligned: false,
             current_batch: 2,
             total_batches: 2,
             completed_pages: 1,
@@ -2700,5 +3164,576 @@ mod tests {
         let after_blocked = runner.handle(&mut session, AiRequest::Poll);
         assert_eq!(after_blocked.stage, "failed");
         assert!(after_blocked.message.contains("monetary budget"), "msg={}", after_blocked.message);
+    }
+
+    #[test]
+    fn ai28_spread_aligned_facing_batches_slice_cover_spreads_and_back_page() {
+        let mut snap_32 = BatchSnapshot {
+            job_id: "spread-32".into(),
+            total_pages: 32,
+            pages_per_batch: 2,
+            spread_aligned: true,
+            current_batch: 1,
+            total_batches: 1 + 31_u32.div_ceil(2),
+            completed_pages: 0,
+            status: "running".into(),
+            ..Default::default()
+        };
+        assert_eq!(snap_32.total_batches, 17);
+        let mut slices = Vec::new();
+        while snap_32.completed_pages < snap_32.total_pages {
+            let s = scope(&snap_32).unwrap();
+            slices.push((s.start, s.count));
+            snap_32.completed_pages += s.count;
+        }
+        assert_eq!(slices.len(), 17);
+        assert_eq!(slices[0], (0, 1));
+        assert_eq!(slices[1], (1, 2));
+        assert_eq!(slices[2], (3, 2));
+        assert_eq!(slices[15], (29, 2));
+        assert_eq!(slices[16], (31, 1));
+
+        let mut snap_5 = BatchSnapshot {
+            job_id: "spread-5".into(),
+            total_pages: 5,
+            pages_per_batch: 2,
+            spread_aligned: true,
+            current_batch: 1,
+            total_batches: 1 + 4_u32.div_ceil(2),
+            completed_pages: 0,
+            status: "running".into(),
+            ..Default::default()
+        };
+        assert_eq!(snap_5.total_batches, 3);
+        let mut odd_slices = Vec::new();
+        while snap_5.completed_pages < snap_5.total_pages {
+            let s = scope(&snap_5).unwrap();
+            odd_slices.push((s.start, s.count));
+            snap_5.completed_pages += s.count;
+        }
+        assert_eq!(odd_slices, vec![(0, 1), (1, 2), (3, 2)]);
+
+        // End-to-end start_batches sets spread_aligned=true and total_batches=4 on a 6-page facing-pages book with pages_per_batch=2.
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let mut req = task("http://127.0.0.1:9/".into(), 8);
+        req.target = TaskTarget::NewA4 { pages: 6 };
+        req.settings.facing_pages = true;
+        req.settings.pages_per_batch = 2;
+        let started = runner.handle(&mut session, AiRequest::Start(req));
+        let batch = started.batch.as_ref().expect("batch started");
+        assert!(batch.spread_aligned);
+        assert_eq!(batch.total_batches, 4);
+        let _ = runner.handle(&mut session, AiRequest::Cancel);
+        let _ = wait(&mut runner, &mut session);
+    }
+
+    #[test]
+    fn ai28_refresh_batch_proofs_rebinds_edited_document_and_gates_oversets() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        // Prepare local mock server for Batch 2 after approval.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let _ = stream.read(&mut buf);
+            let plan = json!({
+                "title": "Page 2",
+                "commands": [
+                    {"command": "frame.create", "params": {"spread": 1, "rect": [60, 60, 200, 160], "content": "text", "text": "Second page"}}
+                ]
+            });
+            let body = json!({
+                "message": {"content": plan.to_string()},
+                "done": true,
+                "done_reason": "stop",
+                "prompt_eval_count": 50,
+                "eval_count": 30
+            })
+            .to_string();
+            let resp =
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(resp.as_bytes()).unwrap();
+        });
+
+        waiting(&mut runner, &mut session, format!("http://{addr}"));
+        {
+            let job = runner.batch.as_mut().unwrap();
+            job.task.settings.budget.max_requests = 4;
+            let mut ledger = UsageLedger::new(job.task.settings.budget.clone()).unwrap();
+            let reservation = ledger.reserve(10, 0, ProviderKind::Ollama, false, None).unwrap();
+            ledger.record(reservation, Some(&Usage { input_tokens: Some(7), output_tokens: Some(3), ..Default::default() }));
+            job.ledger = Some(ledger);
+        }
+        let before_batch = runner.snapshot.batch.clone().unwrap();
+        let job_id = before_batch.job_id.clone();
+        assert_eq!(before_batch.checkpoint, 1);
+        let old_hashes = before_batch.batches[0].proof_sha256.clone();
+
+        // 1. Human makes a valid native edit on Page 1 during awaiting_human_proof.
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 0, "rect": [72, 220, 300, 280], "content": "text", "text": "Human typo correction", "caret": false}),
+            )
+            .unwrap();
+        assert_ne!(Some(session.doc().unwrap().revision), before_batch.document_revision);
+
+        // 2. Human accidentally introduces overset text on Page 1 -> RefreshBatchProofs rejects without killing the live batch!
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 0, "rect": [72, 300, 110, 320], "content": "text", "text": "Overflowing words ".repeat(40), "caret": false}),
+            )
+            .unwrap();
+        let rejected = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(rejected.stage, "awaiting_human_proof");
+        assert!(rejected.message.contains("Preflight rejected edited document"), "msg={}", rejected.message);
+        assert_eq!(rejected.batch.as_ref().unwrap().checkpoint, 1);
+
+        // 3. Human undoes the overset frame (preserving the valid typo correction) and refreshes proofs.
+        session.execute("edit.undo", &json!({})).unwrap();
+        let refreshed = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(refreshed.stage, "awaiting_human_proof", "msg={}", refreshed.message);
+        let updated_batch = refreshed.batch.as_ref().unwrap();
+        assert_eq!(updated_batch.checkpoint, 2);
+        assert_eq!(updated_batch.document_revision, Some(session.doc().unwrap().revision));
+        assert_ne!(updated_batch.batches[0].proof_sha256, old_hashes);
+
+        // 4. Stale checkpoint 1 is rejected without destroying the batch, while checkpoint 2 approves cleanly and launches Batch 2!
+        let stale = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint: 1 });
+        assert_eq!(stale.stage, "awaiting_human_proof");
+        assert!(stale.message.contains("does not match"), "msg={}", stale.message);
+
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint: 2 });
+        assert!(approved.busy, "msg={}", approved.message);
+        let finished = wait(&mut runner, &mut session);
+        assert_eq!(finished.stage, "awaiting_human_proof", "msg={}", finished.message);
+        assert_eq!(finished.batch.as_ref().unwrap().completed_pages, 2);
+        let batch2_checkpoint = finished.batch.as_ref().unwrap().checkpoint;
+        handle.join().unwrap();
+
+        // 5. While Batch 2 (page 2, index 1) is awaiting_human_proof, mutating sealed Page 1's story or items is rejected!
+        let page1_story = session.doc().unwrap().doc.spreads[0]
+            .items
+            .iter()
+            .find_map(|item| match &item.content {
+                designcraft_engine::doc::Content::Text(tf) => Some(tf.story),
+                _ => None,
+            })
+            .expect("Page 1 has a text story");
+        session.execute("story.setText", &json!({"story": page1_story, "text": "Tampered sealed Page 1 story"})).unwrap();
+        let story_tamper = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(story_tamper.stage, "awaiting_human_proof");
+        assert!(story_tamper.message.contains("Already-approved text stories"), "msg={}", story_tamper.message);
+        assert_eq!(story_tamper.batch.as_ref().unwrap().checkpoint, batch2_checkpoint);
+        session.execute("edit.undo", &json!({})).unwrap();
+
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 0, "rect": [72, 420, 220, 460], "content": "text", "text": "Tampered sealed Page 1 item", "caret": false}),
+            )
+            .unwrap();
+        let item_tamper = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(item_tamper.stage, "awaiting_human_proof");
+        assert!(item_tamper.message.contains("outside the current review batch"), "msg={}", item_tamper.message);
+        assert_eq!(item_tamper.batch.as_ref().unwrap().checkpoint, batch2_checkpoint);
+        session.execute("edit.undo", &json!({})).unwrap();
+
+        // 6. Legitimate human edit on Batch 2's own page (spread 1) refreshes cleanly and increments checkpoint.
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 1, "rect": [60, 200, 280, 260], "content": "text", "text": "Valid Batch 2 human edit", "caret": false}),
+            )
+            .unwrap();
+        let batch2_refreshed = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id });
+        assert_eq!(batch2_refreshed.stage, "awaiting_human_proof", "msg={}", batch2_refreshed.message);
+        assert_eq!(batch2_refreshed.batch.as_ref().unwrap().checkpoint, batch2_checkpoint + 1);
+    }
+
+    #[test]
+    fn ai28_facing_pages_refresh_batch_proofs_spine_bleed_and_sealed_definitions() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let spawn_slice_server = |slices: Vec<Vec<usize>>| -> (String, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                for spreads in slices {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let n = stream.read(&mut chunk).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some((headers, req_body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n") {
+                            let len = headers
+                                .lines()
+                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
+                                .unwrap_or(0);
+                            if req_body.len() >= len {
+                                break;
+                            }
+                        }
+                    }
+                    let commands: Vec<Value> = spreads
+                        .into_iter()
+                        .map(|page_idx| {
+                            json!({
+                                "command": "frame.create",
+                                "params": {
+                                    "spread": page_idx,
+                                    "rect": [60, 60, 220, 160],
+                                    "content": "text",
+                                    "text": format!("Facing page {}", page_idx + 1)
+                                }
+                            })
+                        })
+                        .collect();
+                    let plan = json!({
+                        "title": "Facing slice",
+                        "commands": commands
+                    });
+                    let body = json!({
+                        "message": {"content": plan.to_string()},
+                        "done": true,
+                        "done_reason": "stop",
+                        "prompt_eval_count": 40,
+                        "eval_count": 25
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                }
+            });
+            (format!("http://{addr}"), handle)
+        };
+
+        // Part A: 4-page facing_pages=true, pages_per_batch=2 (spread_aligned: Batch 1 = Page 1, Batch 2 = Pages 2-3, Batch 3 = Page 4).
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let (endpoint, server_a) = spawn_slice_server(vec![vec![0], vec![1, 2], vec![3]]);
+        let mut req = task(endpoint, 16);
+        req.target = TaskTarget::NewA4 { pages: 4 };
+        req.settings.facing_pages = true;
+        req.settings.pages_per_batch = 2;
+        let started = runner.handle(&mut session, AiRequest::Start(req));
+        assert!(started.busy);
+        let b1 = wait(&mut runner, &mut session);
+        assert_eq!(b1.stage, "awaiting_human_proof", "msg={}", b1.message);
+        let b1_snap = b1.batch.as_ref().unwrap();
+        assert!(b1_snap.spread_aligned);
+        assert_eq!(b1_snap.completed_pages, 1);
+        let job_id = b1_snap.job_id.clone();
+        let cp1 = b1_snap.checkpoint;
+
+        // editing_parents=true is rejected by both RefreshBatchProofs and ApproveBatch without destroying the batch.
+        session.doc_mut().unwrap().editing_parents = true;
+        let parent_refresh_err = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(parent_refresh_err.stage, "awaiting_human_proof");
+        assert!(parent_refresh_err.message.contains("parent-page edit"), "msg={}", parent_refresh_err.message);
+        let parent_approve_err = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint: cp1 });
+        assert_eq!(parent_approve_err.stage, "awaiting_human_proof");
+        assert!(parent_approve_err.message.contains("parent-page edit"), "msg={}", parent_approve_err.message);
+        session.doc_mut().unwrap().editing_parents = false;
+
+        // ID-allocating edit (frame.create) on Batch 1 cover (spread 0) succeeds on facing_pages=true and approves cleanly!
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 0, "rect": [60, 220, 280, 280], "content": "text", "text": "Cover subtitle edit", "caret": false}),
+            )
+            .unwrap();
+        let b1_refreshed = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(b1_refreshed.stage, "awaiting_human_proof", "msg={}", b1_refreshed.message);
+        let cp1_refreshed = b1_refreshed.batch.as_ref().unwrap().checkpoint;
+        assert_eq!(cp1_refreshed, cp1 + 1);
+
+        let b1_approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint: cp1_refreshed });
+        assert!(b1_approved.busy, "msg={}", b1_approved.message);
+        let b2 = wait(&mut runner, &mut session);
+        assert_eq!(b2.stage, "awaiting_human_proof", "msg={}", b2.message);
+        assert_eq!(b2.batch.as_ref().unwrap().completed_pages, 3);
+        let cp2 = b2.batch.as_ref().unwrap().checkpoint;
+
+        // During Batch 2 (Pages 2-3, start=1 > 0):
+        // (1) Mutating sealed Page 1 (spread 0) is rejected.
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 0, "rect": [60, 320, 240, 370], "content": "text", "text": "Unauthorized cover edit", "caret": false}),
+            )
+            .unwrap();
+        let cover_tamper = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(cover_tamper.stage, "awaiting_human_proof");
+        assert!(cover_tamper.message.contains("outside the current review batch"), "msg={}", cover_tamper.message);
+        session.execute("edit.undo", &json!({})).unwrap();
+
+        // (2) Mutating an existing swatch or paragraph style is rejected when start > 0.
+        let existing_swatch =
+            session.doc().unwrap().doc.swatches.iter().find(|s| !s.locked).map(|s| s.name.clone()).expect("unlocked default swatch");
+        session.execute("swatch.options", &json!({"name": existing_swatch, "color": "#123456"})).unwrap();
+        let swatch_tamper = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(swatch_tamper.stage, "awaiting_human_proof");
+        assert!(swatch_tamper.message.contains("Already-approved swatches"), "msg={}", swatch_tamper.message);
+        session.execute("edit.undo", &json!({})).unwrap();
+
+        session.execute("style.paragraph.edit", &json!({"name": "[Basic Paragraph]", "chars": {"size": 15}})).unwrap();
+        let style_tamper = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(style_tamper.stage, "awaiting_human_proof");
+        assert!(style_tamper.message.contains("Already-approved styles"), "msg={}", style_tamper.message);
+        session.execute("edit.undo", &json!({})).unwrap();
+
+        // (3) Appending a brand-new paragraph style + frame.create on Batch 2's facing spread (spread 1) succeeds and approves!
+        session.execute("style.paragraph.create", &json!({"name": "Batch2Callout", "chars": {"size": 11}})).unwrap();
+        session
+            .execute(
+                "frame.create",
+                &json!({"spread": 1, "rect": [60, 220, 280, 280], "content": "text", "text": "Spread left edit", "caret": false}),
+            )
+            .unwrap();
+        let b2_refreshed = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(b2_refreshed.stage, "awaiting_human_proof", "msg={}", b2_refreshed.message);
+        let cp2_refreshed = b2_refreshed.batch.as_ref().unwrap().checkpoint;
+        assert_eq!(cp2_refreshed, cp2 + 1);
+
+        let b2_approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint: cp2_refreshed });
+        assert!(b2_approved.busy, "msg={}", b2_approved.message);
+        let b3 = wait(&mut runner, &mut session);
+        assert_eq!(b3.stage, "awaiting_human_proof", "msg={}", b3.message);
+        assert_eq!(b3.batch.as_ref().unwrap().completed_pages, 4);
+        server_a.join().unwrap();
+
+        // Part B: Shared facing spread with pages_per_batch=1 (Page 2 sealed, Page 3 in-scope on spread 1) rejects spine-bleed overlap!
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut runner_b = ProductionRunner::open(dir_b.path()).unwrap();
+        let mut session_b = Session::new();
+        let (endpoint_b, server_b) = spawn_slice_server(vec![vec![0], vec![1], vec![2]]);
+        let mut req_b = task(endpoint_b, 16);
+        req_b.target = TaskTarget::NewA4 { pages: 4 };
+        req_b.settings.facing_pages = true;
+        req_b.settings.pages_per_batch = 1;
+        let _ = runner_b.handle(&mut session_b, AiRequest::Start(req_b));
+        let p1 = wait(&mut runner_b, &mut session_b);
+        let job_b = p1.batch.as_ref().unwrap().job_id.clone();
+        let cp_p1 = p1.batch.as_ref().unwrap().checkpoint;
+        let _ = runner_b.handle(&mut session_b, AiRequest::ApproveBatch { job_id: job_b.clone(), checkpoint: cp_p1 });
+        let p2 = wait(&mut runner_b, &mut session_b);
+        let cp_p2 = p2.batch.as_ref().unwrap().checkpoint;
+        let _ = runner_b.handle(&mut session_b, AiRequest::ApproveBatch { job_id: job_b.clone(), checkpoint: cp_p2 });
+        let p3 = wait(&mut runner_b, &mut session_b);
+        assert_eq!(p3.stage, "awaiting_human_proof", "msg={}", p3.message);
+        assert_eq!(p3.batch.as_ref().unwrap().completed_pages, 3);
+        let cp_p3 = p3.batch.as_ref().unwrap().checkpoint;
+        server_b.join().unwrap();
+
+        // Spread 1 holds sealed Page 2 (x = 0..595.28) and in-scope Page 3 (x = 595.28..1190.56).
+        // Frame centered at x=650 (owned by Page 3) with x0=560 (< 595.28) bleeds across the spine onto sealed Page 2 -> rejected!
+        session_b
+            .execute(
+                "frame.create",
+                &json!({"spread": 1, "rect": [560, 220, 740, 280], "content": "text", "text": "Spine bleed onto Page 2", "caret": false}),
+            )
+            .unwrap();
+        let bleed_rejected = runner_b.handle(&mut session_b, AiRequest::RefreshBatchProofs { job_id: job_b.clone() });
+        assert_eq!(bleed_rejected.stage, "awaiting_human_proof");
+        assert!(bleed_rejected.message.contains("shared spread"), "msg={}", bleed_rejected.message);
+        assert_eq!(bleed_rejected.batch.as_ref().unwrap().checkpoint, cp_p3);
+        session_b.execute("edit.undo", &json!({})).unwrap();
+
+        // Frame cleanly inside Page 3 (x = 660..860) refreshes cleanly!
+        session_b
+            .execute(
+                "frame.create",
+                &json!({"spread": 1, "rect": [660, 220, 860, 280], "content": "text", "text": "Clean Page 3 edit", "caret": false}),
+            )
+            .unwrap();
+        let p3_refreshed = runner_b.handle(&mut session_b, AiRequest::RefreshBatchProofs { job_id: job_b });
+        assert_eq!(p3_refreshed.stage, "awaiting_human_proof", "msg={}", p3_refreshed.message);
+        assert_eq!(p3_refreshed.batch.as_ref().unwrap().checkpoint, cp_p3 + 1);
+
+        // Part C: Transitive sub-story references (story.link, footnotes, endnotes, and table cell stories/graphics).
+        let mut scratch_session = Session::new();
+        scratch_session.execute("file.new", &json!({"pages": 1})).unwrap();
+        scratch_session.execute("frame.create", &json!({"spread": 0, "rect": [50, 50, 120, 120]})).unwrap();
+        let template_item = scratch_session.doc().unwrap().doc.spreads[0].items[0].as_ref().clone();
+        let mut doc = scratch_session.doc().unwrap().doc.as_ref().clone();
+
+        let linked_sid = designcraft_engine::doc::StoryId(701);
+        let cell_linked_sid = designcraft_engine::doc::StoryId(704);
+        let endnote_linked_sid = designcraft_engine::doc::StoryId(705);
+        let root_sid = designcraft_engine::doc::StoryId(700);
+        let note_asset = designcraft_engine::doc::AssetId(801);
+        let cell_asset = designcraft_engine::doc::AssetId(802);
+
+        let make_graphic = |asset: designcraft_engine::doc::AssetId| -> designcraft_engine::doc::Graphic {
+            serde_json::from_value(json!({
+                "asset": asset,
+                "size": [20.0, 20.0],
+                "xf": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+            }))
+            .unwrap()
+        };
+
+        let linked_story = designcraft_engine::doc::Story::new(linked_sid);
+        let cell_linked_story = designcraft_engine::doc::Story::new(cell_linked_sid);
+        let endnote_linked_story = designcraft_engine::doc::Story::new(endnote_linked_sid);
+        let mut root_story = designcraft_engine::doc::Story::new(root_sid);
+        root_story.link = Some((linked_sid, 1));
+
+        let mut note_story = designcraft_engine::doc::Story::new(designcraft_engine::doc::StoryId(702));
+        let mut anchored_graphic = template_item;
+        anchored_graphic.id = designcraft_engine::doc::ItemId(901);
+        anchored_graphic.content = designcraft_engine::doc::Content::Graphic(make_graphic(note_asset));
+        note_story.objects.push(Arc::new(designcraft_engine::doc::AnchoredObject { item: anchored_graphic, ..Default::default() }));
+        root_story.notes.push(Arc::new(designcraft_engine::doc::Footnote { id: 1, text: note_story }));
+
+        let mut endnote_story = designcraft_engine::doc::Story::new(designcraft_engine::doc::StoryId(703));
+        endnote_story.link = Some((endnote_linked_sid, 1));
+        root_story.endnotes.push(Arc::new(designcraft_engine::doc::Footnote { id: 2, text: endnote_story }));
+
+        let mut table = designcraft_engine::doc::Table::new(1, 1, 1, 0, 0, 100.0);
+        table.cells[0].graphic = Some(make_graphic(cell_asset));
+        table.cells[0].text.link = Some((cell_linked_sid, 1));
+        root_story.tables.insert(1, Arc::new(table));
+
+        doc.stories.insert(linked_sid, Arc::new(linked_story));
+        doc.stories.insert(cell_linked_sid, Arc::new(cell_linked_story));
+        doc.stories.insert(endnote_linked_sid, Arc::new(endnote_linked_story));
+        doc.stories.insert(root_sid, Arc::new(root_story));
+
+        let mut stories = std::collections::BTreeSet::from([root_sid]);
+        let mut assets = std::collections::BTreeSet::new();
+        expand_story_transitive_refs(&doc, &mut stories, &mut assets).unwrap();
+        assert!(stories.contains(&linked_sid));
+        assert!(stories.contains(&cell_linked_sid));
+        assert!(stories.contains(&endnote_linked_sid));
+        assert!(assets.contains(&note_asset));
+        assert!(assets.contains(&cell_asset));
+    }
+
+    #[test]
+    fn ai28_single_page_arabic_batch_publish_and_blank_reuse_set_rtl_binding_and_r2l_proof_pdf() {
+        for blank_reuse in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = ProductionRunner::open(dir.path()).unwrap();
+            let mut session = Session::new();
+            let existing = if blank_reuse {
+                session.execute("file.new", &json!({"pages": 2, "facingPages": false})).unwrap();
+                Some(session.doc().unwrap().clone())
+            } else {
+                None
+            };
+            let mut request = task("http://127.0.0.1:9/".into(), 2);
+            request.prompt = "أنشئ كتاب عمل عربي من صفحتين منفردتين في مادة العلوم.".into();
+            request.settings.facing_pages = false;
+            request.settings.right_to_left_binding = None;
+            request.settings.pages_per_batch = 2;
+            request.target = if blank_reuse { TaskTarget::ContinueBook } else { TaskTarget::NewA4 { pages: 2 } };
+
+            let (canonical, _) = task_document_context(&session, &request.target, None, &request.prompt, &request.settings).unwrap();
+            assert!(!canonical.doc.settings.facing_pages);
+            assert!(canonical.doc.settings.right_to_left_binding, "blank_reuse={blank_reuse}");
+
+            let plans: Vec<_> = (0..2u32)
+                .map(|page| ProductionPlan {
+                    title: format!("صفحة {}", page + 1),
+                    commands: vec![EngineAction { command: "frame.create".into(), params: json!({"spread": page, "rect": [60, 120, 240, 220]}) }],
+                    images: vec![],
+                })
+                .collect();
+            let mut proof_session = Session::new();
+            proof_session.prefs = session.prefs.clone();
+            proof_session.add_document(canonical);
+            let chunks: Vec<_> = plans.iter().map(|plan| json!({"commands": plan.commands, "label": plan.title})).collect();
+            proof_session
+                .execute("production.applyGroup", &json!({"chunks": chunks, "outputMode": "native_only", "requirePreflight": true}))
+                .unwrap();
+            let mut proofs = vec![worker::ProofArtifact {
+                name: "document.designcraft".into(),
+                bytes: designcraft_format::save(&proof_session.doc().unwrap().doc).unwrap(),
+            }];
+            use base64::Engine as _;
+            let pdf = proof_session.execute("file.exportPdf", &json!({"pages": [1, 2], "spreads": false, "bleed": false, "marks": false})).unwrap();
+            let pdf_bytes = base64::engine::general_purpose::STANDARD.decode(pdf["base64"].as_str().unwrap()).unwrap();
+            let pdf_raw = String::from_utf8_lossy(&pdf_bytes);
+            assert!(pdf_raw.contains("/Direction") && pdf_raw.contains("/R2L"), "blank_reuse={blank_reuse}");
+            proofs.push(worker::ProofArtifact { name: "proof.pdf".into(), bytes: pdf_bytes });
+            let mut renderer = designcraft_render::Renderer::new();
+            for page in 0..2usize {
+                let image =
+                    renderer.render_page(&proof_session.doc().unwrap().doc, &proof_session.cache, page, 0.25, false, &Default::default()).unwrap();
+                proofs.push(worker::ProofArtifact { name: format!("page-{}.png", page + 1), bytes: image.to_png() });
+            }
+
+            let ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
+            let job_id = if blank_reuse { "single-ar-blank-reuse" } else { "single-ar-new" };
+            let snapshot = BatchSnapshot {
+                job_id: job_id.into(),
+                total_pages: 2,
+                pages_per_batch: 2,
+                current_batch: 1,
+                total_batches: 1,
+                completed_pages: 0,
+                status: "running".into(),
+                document_uid: existing.as_ref().map(|d| d.uid),
+                document_revision: existing.as_ref().map(|d| d.revision),
+                ..Default::default()
+            };
+            runner.batch = Some(BatchJob {
+                task: request.clone(),
+                skills: vec![],
+                roots: None,
+                ledger: None,
+                before: Default::default(),
+                snapshot: snapshot.clone(),
+                prefs: session.prefs.clone(),
+                publication_cache: session.cache.clone(),
+                publication_base: existing.clone(),
+                retry_sequence: 0,
+            });
+            runner.snapshot.batch = Some(snapshot);
+            runner.snapshot.busy = true;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender
+                .send(worker::Message::FinishedWithLedger(
+                    worker::Outcome { result: Ok(worker::Product::BatchGroup { plans, proofs }), usage: Default::default() },
+                    Box::new(ledger),
+                ))
+                .unwrap();
+            runner.pending = Some(Pending {
+                roots: None,
+                worker: worker::Worker { receiver, cancel: Arc::new(AtomicBool::new(false)) },
+                id: format!("{job_id}-batch-1"),
+                started: Instant::now(),
+                task: Some(request.clone()),
+                expected: existing.as_ref().map(|d| (d.uid, d.revision)),
+                expected_prefs: None,
+                skills: vec![],
+                settings: request.settings,
+            });
+            let completed = runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(completed.stage, "awaiting_human_proof", "blank_reuse={blank_reuse}: {}", completed.message);
+            let published = session.doc().unwrap();
+            assert!(!published.doc.settings.facing_pages, "blank_reuse={blank_reuse}");
+            assert!(published.doc.settings.right_to_left_binding, "blank_reuse={blank_reuse}");
+        }
     }
 }

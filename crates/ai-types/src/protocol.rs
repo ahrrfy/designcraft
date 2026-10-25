@@ -103,6 +103,15 @@ pub struct TaskRequest {
 fn auto_skills() -> bool {
     true
 }
+/// Saved progress metadata preserved when binding a new-book draft to continuation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SavedProductionProgress {
+    #[serde(default)]
+    pub completed_pages: u32,
+    #[serde(default)]
+    pub target_total_pages: Option<u32>,
+}
 /// Recoverable instructions only. Reopening never restores a live worker or proof approval.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +121,8 @@ pub struct ProductionDraft {
     pub document_uid: Option<u64>,
     pub document_path: Option<String>,
     pub document_title: String,
+    #[serde(default)]
+    pub progress: SavedProductionProgress,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +169,10 @@ pub enum AiRequest {
     },
     /// Retry an unpublished failed group with its original cumulative admission ledger.
     RetryBatch {
+        job_id: String,
+    },
+    /// Re-run preflight and proof rendering for an edited checkpoint document without paid calls.
+    RefreshBatchProofs {
         job_id: String,
     },
     UpdateSettings(AiSettings),
@@ -342,6 +357,9 @@ pub struct BatchSnapshot {
     pub job_id: String,
     pub total_pages: u32,
     pub pages_per_batch: u32,
+    /// True when a new facing-pages 2-page batch job aligns Batch 1 to the single cover sheet.
+    #[serde(default)]
+    pub spread_aligned: bool,
     /// One-based batch number, including a currently running batch.
     pub current_batch: u32,
     pub total_batches: u32,

@@ -194,6 +194,12 @@ impl ProductionRunner {
             && let Some(parent) = exe.parent()
         {
             candidates.push(parent.join("skills"));
+            if let Some(grandparent) = parent.parent() {
+                candidates.push(grandparent.join("skills"));
+                if let Some(workspace_root) = grandparent.parent() {
+                    candidates.push(workspace_root.join("skills"));
+                }
+            }
         }
         #[cfg(debug_assertions)]
         candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills"));
@@ -302,6 +308,7 @@ impl ProductionRunner {
                 AiRequest::Poll
                     | AiRequest::Cancel
                     | AiRequest::ApproveBatch { .. }
+                    | AiRequest::RefreshBatchProofs { .. }
                     | AiRequest::InspectSkill { .. }
                     | AiRequest::RefreshCredentials
                     | AiRequest::RefreshResources
@@ -340,6 +347,7 @@ impl ProductionRunner {
                 self.snapshot.message = "Cancellation requested; a request already sent may still be billed".into();
             }
             AiRequest::ApproveBatch { job_id, checkpoint } => self.approve_batch(session, &job_id, checkpoint)?,
+            AiRequest::RefreshBatchProofs { job_id } => self.refresh_batch_proofs(session, &job_id)?,
             AiRequest::RetryBatch { job_id } => self.retry_batch(session, &job_id)?,
             AiRequest::UpdateSettings(settings) => {
                 validate_settings(&settings)?;
@@ -739,7 +747,7 @@ impl ProductionRunner {
         let count = remaining.min(task.settings.pages_per_batch.max(1)).min(32);
         let blueprint = crate::template_plan::curriculum_blueprint(&task.prompt, style, worker::BatchScope { start, count }, total)?;
         let rtl = if matches!(task.target, TaskTarget::ContinueBook) {
-            session.doc().map_err(|error| error.to_string())?.doc.settings.right_to_left_binding
+            base.doc.settings.right_to_left_binding
         } else {
             book_binding(&task.settings, &task.prompt)
         };
@@ -751,6 +759,18 @@ impl ProductionRunner {
 
     fn save_production_draft(&mut self, session: &Session, task: &TaskRequest) -> Result<(), String> {
         let current = if matches!(task.target, TaskTarget::NewA4 { .. }) { None } else { Some(session.doc().map_err(|e| e.to_string())?) };
+        let completed_pages = current
+            .map(|doc| {
+                crate::facing_pages::canonicalize(doc, &session.prefs)
+                    .map(|canon| u32::try_from(canon.doc.spreads.iter().take_while(|spread| !spread.items.is_empty()).count()).unwrap_or(0))
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let target_total_pages = match task.target {
+            TaskTarget::NewA4 { pages } => Some(pages),
+            TaskTarget::ContinueBook => current.and_then(|doc| u32::try_from(doc.doc.page_count()).ok()),
+            TaskTarget::CurrentDocument => None,
+        };
         self.sequence = self.sequence.saturating_add(1);
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis();
         let draft = ProductionDraft {
@@ -759,6 +779,7 @@ impl ProductionRunner {
             document_uid: current.map(|doc| doc.uid),
             document_path: current.and_then(|doc| doc.path.clone()),
             document_title: current.map(|doc| doc.title()).unwrap_or_default(),
+            progress: designcraft_ai_types::protocol::SavedProductionProgress { completed_pages, target_total_pages },
         };
         validate_production_draft(&draft)?;
         self.persist_production_draft(&draft)?;
@@ -777,11 +798,28 @@ impl ProductionRunner {
     fn bind_production_draft(&mut self, session: &Session, id: &str) -> Result<(), String> {
         let Some(mut draft) = self.snapshot.production_draft.clone() else { return Ok(()) };
         let current = session.doc().map_err(|e| e.to_string())?;
+        let prior_total = match draft.request.target {
+            TaskTarget::NewA4 { pages } => Some(pages),
+            _ => None,
+        };
+        let completed_pages = if let Some(job) = self.batch.as_ref().filter(|job| job.snapshot.job_id == id) {
+            job.snapshot.completed_pages
+        } else {
+            crate::facing_pages::canonicalize(current, &session.prefs)
+                .map(|canon| {
+                    u32::try_from(canon.doc.spreads.iter().take_while(|spread| !spread.items.is_empty()).count())
+                        .unwrap_or(draft.progress.completed_pages)
+                })
+                .unwrap_or(draft.progress.completed_pages)
+        };
         draft.id = id.into();
         draft.document_uid = Some(current.uid);
         draft.document_path = current.path.clone();
         draft.document_title = current.title();
         draft.request.target = TaskTarget::ContinueBook;
+        draft.progress.completed_pages = completed_pages;
+        draft.progress.target_total_pages =
+            draft.progress.target_total_pages.or(prior_total).or_else(|| u32::try_from(current.doc.page_count()).ok());
         draft.request.settings.facing_pages |= current.doc.settings.facing_pages;
         if current.doc.settings.facing_pages || current.doc.settings.right_to_left_binding {
             draft.request.settings.right_to_left_binding = Some(current.doc.settings.right_to_left_binding);
@@ -1139,7 +1177,9 @@ impl ProductionRunner {
                 std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
                 let trace = runs.join(format!("{}.json", report.id));
                 let page_params = match task.target {
-                    TaskTarget::NewA4 { pages } => Some(self.pinned_document_params_for_brief(&report.skills, pages, &task.prompt)?),
+                    TaskTarget::NewA4 { pages } => {
+                        Some(self.pinned_document_params_for_brief(&report.skills, pages, &task.settings, &task.prompt)?)
+                    }
                     _ => None,
                 };
                 let context = match task.target {
@@ -1232,9 +1272,9 @@ impl ProductionRunner {
 
     #[cfg(test)]
     fn pinned_document_params(&self, pins: &[(String, String)], pages: u32) -> Result<Value, String> {
-        self.pinned_document_params_for_brief(pins, pages, "")
+        self.pinned_document_params_for_brief(pins, pages, &AiSettings::default(), "")
     }
-    fn pinned_document_params_for_brief(&self, pins: &[(String, String)], pages: u32, brief: &str) -> Result<Value, String> {
+    fn pinned_document_params_for_brief(&self, pins: &[(String, String)], pages: u32, settings: &AiSettings, brief: &str) -> Result<Value, String> {
         let mut profile = None;
         for (id, revision) in pins {
             let record = self.registry.revision(id, revision).map_err(|e| e.to_string())?;
@@ -1246,7 +1286,7 @@ impl ProductionRunner {
                 profile = Some(selected);
             }
         }
-        production_document_params(profile, pages, brief)
+        production_document_params(profile, pages, settings, brief)
     }
 
     fn prepare_automatic_skills(&mut self, session: &Session, prompt: &str) -> Result<Vec<String>, String> {
@@ -2345,6 +2385,8 @@ fn validate_production_draft(draft: &ProductionDraft) -> Result<(), String> {
         || draft.request.skill_ids.len() > 8
         || draft.request.skill_ids.iter().any(|id| id.len() > 256)
         || matches!(draft.request.target, TaskTarget::NewA4 { pages } if !(1..=1000).contains(&pages))
+        || draft.progress.completed_pages > 1000
+        || draft.progress.target_total_pages.is_some_and(|pages| !(1..=1000).contains(&pages))
     {
         return Err("Saved production instructions contain invalid or oversized fields".into());
     }
@@ -2415,12 +2457,19 @@ fn task_document_context(
         TaskTarget::CurrentDocument => Ok((session.doc().map_err(|e| e.to_string())?.clone(), compact_context(session)?)),
         TaskTarget::ContinueBook => {
             let current = session.doc().map_err(|e| e.to_string())?;
-            let facing = if settings.facing_pages && !current.doc.settings.facing_pages {
-                Some(crate::facing_pages::formatted_proof_state(current, &session.prefs, book_binding(settings, brief))?)
+            let desired_rtl = book_binding(settings, brief);
+            let projected = if settings.facing_pages && !current.doc.settings.facing_pages {
+                Some(crate::facing_pages::formatted_proof_state(current, &session.prefs, desired_rtl)?)
+            } else if !settings.facing_pages
+                && !current.doc.settings.facing_pages
+                && current.doc.spreads.iter().all(|s| s.items.is_empty())
+                && current.doc.settings.right_to_left_binding != desired_rtl
+            {
+                Some(crate::facing_pages::single_page_proof_state(current, &session.prefs, desired_rtl)?)
             } else {
                 None
             };
-            let state = crate::facing_pages::canonicalize(facing.as_ref().unwrap_or(current), &session.prefs)?;
+            let state = crate::facing_pages::canonicalize(projected.as_ref().unwrap_or(current), &session.prefs)?;
             let mut scratch = Session::new();
             scratch.prefs = session.prefs.clone();
             scratch.add_document(state.clone());
@@ -2431,7 +2480,7 @@ fn task_document_context(
                 profile.validate()?;
             }
             let mut scratch = Session::new();
-            scratch.execute("file.new", &production_document_params(profile, *pages, brief)?).map_err(|e| e.to_string())?;
+            scratch.execute("file.new", &production_document_params(profile, *pages, settings, brief)?).map_err(|e| e.to_string())?;
             initialize_print_document(&mut scratch, brief)?;
             if settings.facing_pages {
                 initialize_facing_document(&mut scratch, settings, brief)?;
@@ -2443,10 +2492,16 @@ fn task_document_context(
         }
     }
 }
-fn production_document_params(profile: Option<&designcraft_ai_types::DesignProfile>, pages: u32, brief: &str) -> Result<Value, String> {
+fn production_document_params(
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    pages: u32,
+    settings: &AiSettings,
+    brief: &str,
+) -> Result<Value, String> {
+    let rtl = book_binding(settings, brief);
     match crate::print_contract::PrintContract::from_prompt(brief)? {
-        Some(contract) => contract.document_params(profile, pages),
-        None => Ok(crate::design::document_params(profile, pages)),
+        Some(contract) => contract.document_params_with_binding(profile, pages, rtl),
+        None => Ok(crate::design::document_params_with_binding(profile, pages, rtl)),
     }
 }
 fn initialize_print_document(session: &mut Session, brief: &str) -> Result<(), String> {
@@ -5035,5 +5090,89 @@ mod tests {
         let healed_draft = healed_open.snapshot.production_draft.as_ref().unwrap();
         assert!(healed_draft.request.settings.text_model.model.is_empty());
         assert_eq!(healed_draft.request.settings.image_model.model, "gemini-3.1-flash-image");
+    }
+
+    #[test]
+    fn ai28_bound_production_draft_preserves_target_total_pages_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let task = TaskRequest {
+            prompt: "Create a 32-page illustrated science workbook.".into(),
+            settings: AiSettings {
+                text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.1-pro".into(), endpoint: None },
+                pages_per_batch: 2,
+                facing_pages: true,
+                ..Default::default()
+            },
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 32 },
+            export_directory: None,
+        };
+        runner.save_production_draft(&session, &task).unwrap();
+        assert_eq!(runner.snapshot.production_draft.as_ref().unwrap().progress.target_total_pages, Some(32));
+        assert_eq!(runner.snapshot.production_draft.as_ref().unwrap().progress.completed_pages, 0);
+
+        session.execute("file.new", &json!({"pages": 32, "width": 595.2756, "height": 841.8898, "facingPages": true})).unwrap();
+        session.execute("frame.create", &json!({"spread": 0, "rect": [72, 72, 240, 140], "content": "text", "text": "Cover"})).unwrap();
+        runner.bind_production_draft(&session, "book-32-test").unwrap();
+
+        let reopened = ProductionRunner::open(dir.path()).unwrap();
+        let draft = reopened.snapshot.production_draft.as_ref().expect("bound draft persisted");
+        assert!(matches!(draft.request.target, TaskTarget::ContinueBook));
+        assert_eq!(draft.progress.completed_pages, 1);
+        assert_eq!(draft.progress.target_total_pages, Some(32));
+    }
+
+    #[test]
+    fn ai28_single_page_arabic_one_shot_publish_sets_rtl_binding_and_r2l_pdf() {
+        let dir = tempfile::tempdir().unwrap();
+        let export_dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let request = TaskRequest {
+            prompt: "صمّم صفحة غلاف عربية لكتاب علوم للصف الأول بعنوان عالم النباتات.".into(),
+            settings: AiSettings {
+                facing_pages: false,
+                right_to_left_binding: None,
+                pages_per_batch: 0,
+                output_mode: designcraft_ai_types::OutputMode::NativeOnly,
+                ..Default::default()
+            },
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: TaskTarget::NewA4 { pages: 1 },
+            export_directory: Some(export_dir.path().to_string_lossy().into_owned()),
+        };
+        let plan = designcraft_ai_types::protocol::ProductionPlan {
+            title: "غلاف كتاب العلوم".into(),
+            commands: vec![designcraft_ai_types::EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread": 0, "rect": [72, 72, 300, 160]}),
+            }],
+            images: vec![],
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(worker::Message::Finished(worker::Outcome { result: Ok(worker::Product::Plan(plan)), usage: Default::default() })).unwrap();
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            id: "oneshot-ar-single".into(),
+            started: std::time::Instant::now(),
+            task: Some(request.clone()),
+            expected: None,
+            expected_prefs: None,
+            skills: vec![],
+            settings: request.settings,
+        });
+        let snap = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(snap.stage, "completed", "msg={}", snap.message);
+        let doc = &session.doc().unwrap().doc;
+        assert!(!doc.settings.facing_pages);
+        assert!(doc.settings.right_to_left_binding, "single-page Arabic one-shot publish must set right_to_left_binding");
+        let pdf_bytes = std::fs::read(export_dir.path().join("production-oneshot-ar-single.pdf")).unwrap();
+        let pdf_raw = String::from_utf8_lossy(&pdf_bytes);
+        assert!(pdf_raw.contains("/Direction") && pdf_raw.contains("/R2L"), "expected /Direction /R2L in exported single-page Arabic PDF");
     }
 }

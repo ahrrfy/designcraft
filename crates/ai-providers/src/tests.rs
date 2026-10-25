@@ -415,7 +415,7 @@ mod native_tests {
             }),
         )
         .unwrap();
-        assert_eq!(gemini.error.as_deref(), Some("Gemini response did not finish normally"));
+        assert_eq!(gemini.error.as_deref(), Some("Gemini response did not finish normally (MAX_TOKENS)"));
         assert_eq!(gemini.text, "{\"title\":\"partial");
         assert_eq!(gemini.usage.output_tokens, Some(5));
         let gemini_complete = parse_generation(
@@ -573,5 +573,190 @@ mod native_tests {
         let prompt = "x".repeat(MAX_JSON_BYTES / 2);
         assert!(bind_comfy_workflow(&json!({"text":"{{prompt}}{{prompt}}{{prompt}}"}), &prompt, "").is_err());
         assert_eq!(bind_comfy_workflow(&json!({"text":"{{prompt}}"}), "task", "").unwrap(), json!({"text":"task"}));
+    }
+
+    #[test]
+    fn ai28_gemini_response_json_schema_validator_and_image_modalities() {
+        let closed_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "pages"],
+            "properties": {
+                "title": {"type": "string"},
+                "pages": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {
+                        "anyOf": [{
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["page", "illustrations"],
+                            "properties": {
+                                "page": {"type": "integer"},
+                                "illustrations": {
+                                    "type": "array",
+                                    "maxItems": 3,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {"slot": {"type": "string"}, "prompt": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        assert!(crate::native::gemini_supports_json_schema(&closed_schema));
+        let mut req = request();
+        req.json_schema = closed_schema.clone();
+        for model in ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-4-argon"] {
+            let sel = ModelSelection { provider: ProviderKind::Gemini, model: model.into(), endpoint: None };
+            let body = generation_body(&sel, &req).unwrap();
+            assert_eq!(body.pointer("/generationConfig/responseJsonSchema"), Some(&closed_schema), "{model}");
+            assert!(body.pointer("/contents/0/parts/0/text").and_then(Value::as_str).unwrap().contains("OUTPUT JSON CONTRACT:\n"));
+        }
+        // Reject empty {}, untyped nodes, invalid type arrays, additionalProperties: true, open objects, maxItems: 0,
+        // unsupported combinators (oneOf, allOf, not, const), invalid prefixItems, and depth > 32.
+        assert!(crate::native::gemini_supports_json_schema(&json!({
+            "anyOf": [{"type": "string"}, {"type": "integer"}]
+        })));
+        assert!(crate::native::gemini_supports_json_schema(&json!({
+            "type": "array",
+            "prefixItems": [{"type": "number"}, {"type": "number"}]
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "oneOf": [{"type": "string"}, {"type": "integer"}]
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "allOf": [{"type": "string"}]
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "not": {"type": "null"}
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({"const": "fixed"})));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "type": "array",
+            "prefixItems": []
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "type": "array",
+            "prefixItems": [{}]
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({})));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({"description": "any"})));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({"type": []})));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "additionalProperties": true
+        })));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({"type": "object"})));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({"type": "object", "properties": {}})));
+        assert!(!crate::native::gemini_supports_json_schema(&json!({
+            "type": "object",
+            "properties": {"empty": {"type": "array", "maxItems": 0, "items": {"type": "string"}}}
+        })));
+        let mut deep = json!({"type": "string"});
+        for _ in 0..34 {
+            deep = json!({"type": "object", "properties": {"nested": deep}});
+        }
+        assert!(!crate::native::gemini_supports_json_schema(&deep));
+
+        // Mixed-case Gemini print tiers ("Gemini-3.1-Flash-Image" @2K) and ratio validation without @tier; OpenAI DALL-E b64_json.
+        assert_eq!(gemini_print_size("Gemini-3.1-Flash-Image", "1:4", [900, 3600]).unwrap(), "1:4@2K");
+        assert_eq!(gemini_print_size("MODELS/Gemini-3.1-Flash-Image ", "1:4", [900, 3600]).unwrap(), "1:4@2K");
+        let mixed_tier = crate::native::image_generation_body(
+            ProviderKind::Gemini,
+            "Gemini-3.1-Flash-Image",
+            &ImageRequest {
+                prompt: "Clean studio icon".into(),
+                size: Some("1:4@2K".into()),
+                quality: None,
+                comfy: None,
+                resources: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(mixed_tier["generationConfig"]["imageConfig"]["aspectRatio"], "1:4");
+        assert_eq!(mixed_tier["generationConfig"]["imageConfig"]["imageSize"], "2K");
+        let img_req =
+            ImageRequest { prompt: "Clean studio icon".into(), size: Some("4:1".into()), quality: None, comfy: None, resources: Default::default() };
+        let gemini_lite = crate::native::image_generation_body(ProviderKind::Gemini, "gemini-3.1-flash-lite-image", &img_req).unwrap();
+        assert_eq!(gemini_lite["generationConfig"]["responseModalities"], json!(["IMAGE"]));
+        assert_eq!(gemini_lite["generationConfig"]["imageConfig"]["aspectRatio"], "4:1");
+        assert!(crate::native::image_generation_body(ProviderKind::Gemini, "gemini-2.5-flash-image", &img_req).is_err());
+
+        let dalle = crate::native::image_generation_body(
+            ProviderKind::OpenAi,
+            "dall-e-3",
+            &ImageRequest { size: Some("1792x1024".into()), ..img_req.clone() },
+        )
+        .unwrap();
+        assert_eq!(dalle["response_format"], "b64_json");
+        assert_eq!(dalle["size"], "1792x1024");
+        let gpt_img =
+            crate::native::image_generation_body(ProviderKind::OpenAi, "gpt-image-1", &ImageRequest { size: Some("1536x1024".into()), ..img_req })
+                .unwrap();
+        assert!(gpt_img.get("response_format").is_none());
+    }
+
+    #[test]
+    fn ai28_distinct_http_diagnostics_sanitized_reasons_and_bounded_429_503_retries() {
+        let cancel = AtomicBool::new(false);
+        for (status, expected) in [
+            (400, "AI provider HTTP 400: invalid request or unsupported model parameter"),
+            (404, "AI provider HTTP 404: model or endpoint not found"),
+            (422, "AI provider HTTP 422: request schema or parameters rejected"),
+            (502, "AI provider HTTP 502: provider temporarily unavailable"),
+        ] {
+            let (endpoint, server) = mock(vec![(status, "{\"error\":\"secret-detail\"}".into())]);
+            let err = list_models(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &cancel).unwrap_err();
+            assert_eq!(err, expected);
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+
+        // Sanitized finishReason / blockReason tokens vs hostile payloads.
+        let blocked = parse_generation(ProviderKind::Gemini, &json!({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}})).unwrap();
+        assert_eq!(blocked.error.as_deref(), Some("Gemini returned no candidate (PROHIBITED_CONTENT)"));
+        let hostile_reason =
+            parse_generation(ProviderKind::Gemini, &json!({"candidates": [{"finishReason": "secret/token leak", "content": {"parts": []}}]}))
+                .unwrap();
+        assert_eq!(hostile_reason.error.as_deref(), Some("Gemini response did not finish normally"));
+        let img_safety =
+            crate::native::parse_images(ProviderKind::Gemini, &json!({"candidates": [{"finishReason": "IMAGE_SAFETY"}]}), &cancel).unwrap();
+        assert_eq!(img_safety.error.as_deref(), Some("Gemini image response did not finish normally (IMAGE_SAFETY)"));
+
+        // Bounded HTTP 429 + 503 retry succeeds on attempt 3.
+        let ok_body = json!({"done":true,"message":{"content":"{}"},"prompt_eval_count":5,"eval_count":2}).to_string();
+        let (endpoint, server) = mock(vec![(429, "{}".into()), (503, "{}".into()), (200, ok_body)]);
+        let recovered = generate(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &request(), &cancel).unwrap();
+        assert_eq!(recovered.text, "{}");
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        // Exhausting 2 retries (3 total attempts) surfaces distinct 503 diagnostic.
+        let (endpoint, server) = mock(vec![(503, "{}".into()), (503, "{}".into()), (503, "{}".into())]);
+        let exhausted = generate(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &request(), &cancel).unwrap_err();
+        assert_eq!(exhausted, "AI provider HTTP 503: provider temporarily unavailable");
+        assert_eq!(server.join().unwrap().len(), 3);
+
+        // Cancellation aborts immediately without waiting for retry attempts.
+        let cancel_mid = std::sync::Arc::new(AtomicBool::new(false));
+        let (endpoint, server) = mock_cancellable(vec![(429, "{}".into())], Some(cancel_mid.clone()));
+        let cancelled = generate(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &request(), &cancel_mid).unwrap_err();
+        assert_eq!(cancelled, "AI request cancelled");
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        // ComfyUI prompt submission uses single-shot post_once: a 503 returns immediately (1 request, no un-cancellable retry backoff).
+        let (endpoint, server) = mock(vec![(503, "{}".into())]);
+        let comfy_sel = selection(ProviderKind::ComfyUi, Some(&endpoint));
+        let comfy_req =
+            ComfyRequest { workflow: json!({"1": {"class_type": "Node", "inputs": {"text": "ok"}}}), poll_interval_ms: 50, timeout_seconds: 5 };
+        let start = std::time::Instant::now();
+        let comfy_err = generate_comfy(&comfy_sel, None, &comfy_req, &cancel).unwrap_err();
+        assert_eq!(comfy_err, "AI provider HTTP 503: provider temporarily unavailable");
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 }

@@ -289,6 +289,18 @@ impl<'a> Ex<'a> {
                 .attr("HyphenationVendor", "Hunspell")
                 .attr("SpellingVendor", "Hunspell"),
         );
+        root.push(
+            El::new("Language")
+                .attr("Self", "Language/$ID/Arabic")
+                .attr("Name", "$ID/Arabic")
+                .attr("SingleQuotes", "\u{2018}\u{2019}")
+                .attr("DoubleQuotes", "\u{00AB}\u{00BB}")
+                .attr("PrimaryLanguageName", "$ID/Arabic")
+                .attr("SublanguageName", "$ID/")
+                .attr("Id", "293")
+                .attr("HyphenationVendor", "Hunspell")
+                .attr("SpellingVendor", "Hunspell"),
+        );
         let mut sets = std::collections::BTreeMap::new();
         for a in d.styles.paragraph.iter().map(|p| &p.para).chain(d.stories.values().flat_map(|s| s.paras.iter().map(|p| &p.para))) {
             if let Some(Some(k)) = &a.kinsoku
@@ -1341,7 +1353,9 @@ impl<'a> Ex<'a> {
             el.set("AppliedConditions", list.iter().map(|c| format!("Condition/{}", escape_id(c))).collect::<Vec<_>>().join(" "));
         }
         if let Some(v) = &a.language {
-            el.set("AppliedLanguage", format!("$ID/{v}"));
+            let raw = v.trim().strip_prefix("$ID/").unwrap_or(v.trim());
+            let idml_lang = if designcraft_doc::language_tag(raw).map(designcraft_doc::language_subtag) == Some("ar") { "Arabic" } else { raw };
+            el.set("AppliedLanguage", format!("$ID/{idml_lang}"));
         }
     }
 

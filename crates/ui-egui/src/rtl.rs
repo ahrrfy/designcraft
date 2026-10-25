@@ -1,5 +1,5 @@
-//! Read-only interface text: Unicode bidi run ordering followed by Arabic shaping.
-//! Source strings stay logical. Never use these galleys for editable text/caret mapping.
+//! Interface text bidi & Arabic shaping: read-only galleys (`widget`, `label`, `plain`) and
+//! logical-cursor-normalized editable galleys (`editable_layout`) for `egui::TextEdit`.
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{Align, Align2, Color32, FontFamily, FontId, Galley, Pos2, Rect, WidgetText};
 use std::{collections::HashMap, ops::Range, sync::Arc};
@@ -120,7 +120,7 @@ fn is_symbol_fallback(c: char) -> bool {
 }
 
 /// Reorder directional runs, not characters: the shaper needs logical Arabic to join letters.
-fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>) -> LayoutJob {
+fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>, has_arabic_fonts: (bool, bool)) -> LayoutJob {
     let mut visual = LayoutJob { break_on_newline: false, ..Default::default() };
     if line.is_empty() {
         if let Some(section) =
@@ -139,7 +139,7 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>) -> Layo
     };
     let (levels, runs) = bidi.visual_runs(para, line);
     for run in runs {
-        let rtl = levels[run.start].is_rtl();
+        let rtl = levels.get(run.start).is_some_and(|lvl| lvl.is_rtl());
         let mut sections: Vec<_> = job
             .sections
             .iter()
@@ -156,12 +156,18 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>) -> Layo
             let mut format = section.format.clone();
             if rtl {
                 let bold = format.font_id.family == FontFamily::Name("semibold".into());
-                format.font_id.family = FontFamily::Name(if bold { "arabic-semibold" } else { "arabic" }.into());
-                if bold {
+                if bold && has_arabic_fonts.1 {
+                    format.font_id.family = FontFamily::Name("arabic-semibold".into());
                     format.coords = egui::epaint::text::VariationCoords::new([(*b"wght", 600.0)]);
+                } else if has_arabic_fonts.0 {
+                    format.font_id.family = FontFamily::Name("arabic".into());
+                } else {
+                    format.font_id.family = FontFamily::Proportional;
                 }
             }
-            let raw = &job.text[range];
+            let Some(raw) = job.text.get(range) else {
+                continue;
+            };
             let cleaned: std::borrow::Cow<'_, str> = if raw.chars().any(is_bidi_isolate_control) {
                 std::borrow::Cow::Owned(raw.chars().filter(|c| !is_bidi_isolate_control(*c)).collect())
             } else {
@@ -193,7 +199,9 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>) -> Layo
                 }
                 let mut lead = section.leading_space;
                 for (start, end, sym) in pieces.into_iter().rev() {
-                    let sub = &text[start..end];
+                    let Some(sub) = text.get(start..end) else {
+                        continue;
+                    };
                     if sym {
                         let mut sym_format = format.clone();
                         sym_format.font_id.family = FontFamily::Proportional;
@@ -260,7 +268,7 @@ impl LayoutCache {
     }
 }
 
-fn layout(ctx: &egui::Context, job: LayoutJob) -> Arc<Galley> {
+pub(crate) fn layout(ctx: &egui::Context, job: LayoutJob) -> Arc<Galley> {
     if !may_have_rtl(&job.text) {
         return ctx.fonts_mut(|fonts| fonts.layout_job(job));
     }
@@ -289,17 +297,25 @@ pub(crate) fn matches_rtl_layout(ctx: &egui::Context, galley: &Galley) -> bool {
     sig(galley) == sig(&expected)
 }
 
+fn arabic_font_availability(ctx: &egui::Context) -> (bool, bool) {
+    ctx.fonts(|f| {
+        let families = f.families();
+        (families.contains(&FontFamily::Name("arabic".into())), families.contains(&FontFamily::Name("arabic-semibold".into())))
+    })
+}
+
 fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
     if !has_rtl(&job.text) {
         return ctx.fonts_mut(|fonts| fonts.layout_job(job));
     }
+    let has_arabic_fonts = arabic_font_availability(ctx);
     let original = Arc::new(job.clone());
     if !job.break_on_newline {
         // Single-line widgets show line separators as spaces; byte offsets stay unchanged.
         job.text = job.text.replace(['\n', '\r'], " ");
     }
     let bidi = BidiInfo::new(&job.text, None);
-    let shape = |range| ctx.fonts_mut(|fonts| fonts.layout_job(visual_line(&job, &bidi, range)));
+    let shape = |range| ctx.fonts_mut(|fonts| fonts.layout_job(visual_line(&job, &bidi, range, has_arabic_fonts)));
     // Wrap in logical reading order BEFORE applying bidi separately to each line.
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -313,7 +329,7 @@ fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
         }
         let mut line_start = start;
         let mut word_break = start;
-        for (offset, cluster) in job.text[start..content_end].grapheme_indices(true) {
+        for (offset, cluster) in job.text.get(start..content_end).unwrap_or("").grapheme_indices(true) {
             let index = start + offset;
             let boundary = index + cluster.len();
             if job.wrap.max_width.is_finite() && index > line_start && shape(line_start..boundary).size().x > job.wrap.max_width {
@@ -341,8 +357,10 @@ fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
             for section in &job.sections {
                 let start = range.start.max(section.byte_range.start.into());
                 let end = range.end.min(section.byte_range.end.into());
-                if start < end {
-                    last.append(&job.text[start..end], 0.0, section.format.clone());
+                if start < end
+                    && let Some(slice) = job.text.get(start..end)
+                {
+                    last.append(slice, 0.0, section.format.clone());
                 }
             }
             let format = last.sections.last().or(job.sections.first()).map(|s| s.format.clone()).unwrap_or_default();
@@ -352,7 +370,7 @@ fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
                 let mut candidate = last.clone();
                 candidate.append(&tail, 0.0, format.clone());
                 let info = BidiInfo::new(&candidate.text, base);
-                let shaped = ctx.fonts_mut(|fonts| fonts.layout_job(visual_line(&candidate, &info, 0..candidate.text.len())));
+                let shaped = ctx.fonts_mut(|fonts| fonts.layout_job(visual_line(&candidate, &info, 0..candidate.text.len(), has_arabic_fonts)));
                 if shaped.size().x <= job.wrap.max_width || last.text.is_empty() {
                     lines.push(shaped);
                     break;
@@ -378,6 +396,109 @@ fn layout_uncached(ctx: &egui::Context, mut job: LayoutJob) -> Arc<Galley> {
         galley.mesh_bounds |= row.visuals.mesh_bounds.translate(row.pos.to_vec2());
     }
     Arc::new(galley)
+}
+
+/// Lay out text for an editable [`egui::TextEdit`] while preserving both visual RTL run/word order
+/// and `epaint`'s strict 1-glyph-per-`char` cursor/selection invariants.
+pub fn editable_layout(ui: &egui::Ui, text: &str, wrap_width: f32, font_id: FontId, text_color: Color32, multiline: bool) -> Arc<Galley> {
+    if !has_rtl(text) {
+        let job = if multiline {
+            LayoutJob::simple(text.to_owned(), font_id, text_color, wrap_width)
+        } else {
+            LayoutJob::simple_singleline(text.to_owned(), font_id, text_color)
+        };
+        return ui.fonts_mut(|fonts| fonts.layout_job(job));
+    }
+    let mut job = if multiline {
+        LayoutJob::simple(text.to_owned(), font_id.clone(), text_color, wrap_width)
+    } else {
+        LayoutJob::simple_singleline(text.to_owned(), font_id.clone(), text_color)
+    };
+    let original = Arc::new(job.clone());
+    if !job.break_on_newline {
+        job.text = job.text.replace(['\n', '\r'], " ");
+    }
+    let ctx = ui.ctx();
+    let has_arabic_fonts = arabic_font_availability(ctx);
+    let bidi = BidiInfo::new(&job.text, None);
+    let shape = |range: Range<usize>| ctx.fonts_mut(|fonts| fonts.layout_job(visual_line(&job, &bidi, range, has_arabic_fonts)));
+    let mut ranges: Vec<(Range<usize>, bool)> = Vec::new();
+    let mut start = 0usize;
+    for paragraph in job.text.split_inclusive('\n') {
+        let end = start + paragraph.len();
+        let has_nl = paragraph.ends_with('\n');
+        let content_end = if has_nl { end - 1 } else { end };
+        if !job.wrap.max_width.is_finite() || shape(start..content_end).size().x <= job.wrap.max_width {
+            ranges.push((start..content_end, has_nl));
+            start = end;
+            continue;
+        }
+        let mut line_start = start;
+        let mut word_break = start;
+        for (offset, cluster) in job.text.get(start..content_end).unwrap_or("").grapheme_indices(true) {
+            let index = start + offset;
+            let boundary = index + cluster.len();
+            if job.wrap.max_width.is_finite() && index > line_start && shape(line_start..boundary).size().x > job.wrap.max_width {
+                let cut = if !job.wrap.break_anywhere && word_break > line_start { word_break } else { index };
+                ranges.push((line_start..cut, false));
+                line_start = cut;
+            }
+            if cluster.chars().all(char::is_whitespace) {
+                word_break = boundary;
+            }
+        }
+        ranges.push((line_start..content_end, has_nl));
+        start = end;
+    }
+    if job.text.ends_with('\n') {
+        ranges.push((start..start, false));
+    }
+    let lines: Vec<Arc<Galley>> = ranges.iter().map(|(range, _)| shape(range.clone())).collect();
+    let mut galley = Galley::concat(original, &lines, ctx.pixels_per_point());
+    let fallback_glyph = galley.rows.iter().find_map(|r| r.glyphs.first().copied()).or_else(|| {
+        ctx.fonts_mut(|fonts| fonts.layout_no_wrap(" ".to_owned(), font_id, text_color)).rows.first().and_then(|r| r.glyphs.first().copied())
+    });
+    let width = galley.rect.width();
+    galley.mesh_bounds = Rect::NOTHING;
+    for (placed, (range, hard_nl)) in galley.rows.iter_mut().zip(ranges.iter()) {
+        placed.pos.x += width - placed.size.x;
+        placed.ends_with_newline = *hard_nl;
+        galley.mesh_bounds |= placed.visuals.mesh_bounds.translate(placed.pos.to_vec2());
+        let slice = job.text.get(range.clone()).unwrap_or("");
+        let chars: Vec<char> = slice.chars().collect();
+        let row = Arc::make_mut(&mut placed.row);
+        if chars.is_empty() {
+            row.glyphs.clear();
+        } else if let Some(tmpl) = row.glyphs.first().copied().or(fallback_glyph) {
+            let n = chars.len();
+            let step = if n > 0 { row.size.x / (n as f32) } else { 0.0 };
+            let end_vtx = u32::try_from(row.visuals.glyph_vertex_range.end).unwrap_or(u32::MAX);
+            let mut normalized = Vec::with_capacity(n);
+            for (idx, ch) in chars.into_iter().enumerate() {
+                let mut g = tmpl;
+                g.chr = ch;
+                g.pos.x = (idx as f32) * step;
+                g.advance_width = step;
+                g.uv_rect = Default::default();
+                g.first_vertex = end_vtx;
+                normalized.push(g);
+            }
+            row.glyphs = normalized;
+        }
+    }
+    Arc::new(galley)
+}
+
+pub fn text_edit_layouter(
+    multiline: bool,
+    font_override: Option<FontId>,
+    color_override: Option<Color32>,
+) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> Arc<Galley> {
+    move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+        let font_id = font_override.clone().unwrap_or_else(|| egui::TextStyle::Body.resolve(ui.style()));
+        let text_color = color_override.unwrap_or_else(|| ui.visuals().text_color());
+        editable_layout(ui, text.as_str(), wrap_width, font_id, text_color, multiline)
+    }
 }
 
 #[cfg(test)]
@@ -555,7 +676,7 @@ mod tests {
             // A neutral-only final bracket must be mirrored even without an Arabic script run.
             let job = LayoutJob::simple_singleline("ملف (PDF 123)".to_owned(), FontId::proportional(15.0), Color32::WHITE);
             let bidi = BidiInfo::new(&job.text, None);
-            let visual_job = visual_line(&job, &bidi, 0..job.text.len());
+            let visual_job = visual_line(&job, &bidi, 0..job.text.len(), (true, true));
             assert!(visual_job.text.starts_with("(PDF 123"), "{}", visual_job.text);
             let p = row.glyphs.iter().find(|g| g.chr == 'P').unwrap();
             let three = row.glyphs.iter().find(|g| g.chr == '3').unwrap();
@@ -695,5 +816,31 @@ mod tests {
         let gx = |c| glyphs.iter().find(|g| g.chr == c && g.advance_width > 0.0).unwrap().pos.x;
         assert!(gx('ج') < gx('س') && gx('س') < gx('ف'), "multi-word Arabic must stay RTL without CRAFT_FONTS: {}", displayed(&galley));
         ctx.end_pass().textures_delta.clear();
+    }
+
+    #[test]
+    fn editable_layout_preserves_arabic_word_order_cursor_counts_and_selection_safety() {
+        with_fonts(|ctx| {
+            let sample = "بِسْمِ اللَّهِ الرَّحْمَنِ\nسطر ثانٍ 123 مع نص عربي طويل للالتفاف التلقائي\n";
+            egui::Area::new(egui::Id::new("rtl-editable-test")).show(ctx, |ui| {
+                let mut galley = editable_layout(ui, sample, 140.0, FontId::proportional(14.0), Color32::WHITE, true);
+                assert_eq!(galley.job.text, sample);
+                // Exact char count across soft-wrapped + hard-newline + combining-mark rows!
+                assert_eq!(galley.end().index, egui::text::CharIndex(sample.chars().count()));
+                // Visual mesh has vertices (non-empty shaped Arabic glyphs) and finite bounds.
+                assert!(galley.rows[0].visuals.mesh.vertices.len() >= 4);
+                assert!(galley.rect.is_finite());
+                assert!(galley.mesh_bounds.is_finite());
+                // Soft-wrapped rows must NOT pretend to have hard '\n'; only explicit '\n' rows do.
+                let hard_newlines = galley.rows.iter().filter(|r| r.ends_with_newline).count();
+                assert_eq!(hard_newlines, 2);
+                // Arbitrary selection highlight never panics or corrupts vertices.
+                let range = egui::text_selection::CCursorRange::two(
+                    egui::text::CCursor::new(2),
+                    egui::text::CCursor::new(sample.chars().count().saturating_sub(3)),
+                );
+                egui::text_selection::visuals::paint_text_selection(&mut galley, ui.visuals(), &range, None);
+            });
+        });
     }
 }

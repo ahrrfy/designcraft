@@ -24,7 +24,10 @@ param(
   [switch] $SkipBuild
 )
 $ErrorActionPreference = 'Stop'
-$Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
+$Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 
 function Invoke-Native([string] $What, [scriptblock] $Block) {
   Write-Output "==> $What"
@@ -36,7 +39,7 @@ function Invoke-Native([string] $What, [scriptblock] $Block) {
 $Version = $env:DESIGNCRAFT_VERSION
 if (-not $Version) {
   $inPkg = $false
-  foreach ($line in Get-Content (Join-Path $Root 'Cargo.toml')) {
+  foreach ($line in Get-Content -LiteralPath (Join-Path $Root 'Cargo.toml') -Encoding UTF8) {
     if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[workspace.package]'); continue }
     if ($inPkg -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $Version = $Matches[1]; break }
   }
@@ -84,9 +87,9 @@ foreach ($check in @(@('designcraft.exe', 2), @('designcraft-cli.exe', 3))) {
   Write-Output "ok $($check[0]): $Arch, PE subsystem $($h.Subsystem)"
 }
 $Stage = Join-Path $TargetDir "windows-package\$Arch"
-Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-Copy-Item (Join-Path $Bin 'designcraft.exe'), (Join-Path $Bin 'designcraft-cli.exe') $Stage
+Copy-Item -LiteralPath (Join-Path $Bin 'designcraft.exe'), (Join-Path $Bin 'designcraft-cli.exe') -Destination $Stage
 
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'designcraft.exe') (Join-Path $Stage 'designcraft-cli.exe')
 
@@ -98,37 +101,38 @@ Invoke-Native 'wix build' {
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
-Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
+$WixPdb = [IO.Path]::ChangeExtension($Msi, '.wixpdb')
+if (Test-Path -LiteralPath $WixPdb) { Remove-Item -LiteralPath $WixPdb -Force -ErrorAction SilentlyContinue }
 & (Join-Path $PSScriptRoot 'sign.ps1') $Msi
 
 # ---- portable zip ------------------------------------------------------------------------------
 $Portable = Join-Path $TargetDir "windows-package\designcraft-$Version-windows-$Arch-portable"
-Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $Portable) { Remove-Item -LiteralPath $Portable -Recurse -Force -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
-Copy-Item (Join-Path $Stage '*.exe') $Portable
+Copy-Item -LiteralPath (Join-Path $Stage 'designcraft.exe'), (Join-Path $Stage 'designcraft-cli.exe') -Destination $Portable
 # The marker that makes DesignCraft keep its data in .\DesignCraftData next to the exe instead of
 # %APPDATA% (#574; see apps/designcraft/src/profile.rs).
-Set-Content -Encoding ascii -Path (Join-Path $Portable 'portable.txt') -Value @(
+Set-Content -Encoding ascii -LiteralPath (Join-Path $Portable 'portable.txt') -Value @(
   'DesignCraft portable: preferences, logs and crash recovery are kept in the DesignCraftData folder',
   'next to designcraft.exe. Delete this file to use %APPDATA%\DesignCraft instead.'
 )
 foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
   $p = Join-Path $Root $f
-  if (Test-Path $p) { Copy-Item $p $Portable }
+  if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $Portable }
 }
 $SkillsDir = Join-Path $Root 'skills'
-if (Test-Path $SkillsDir) {
-  Copy-Item $SkillsDir (Join-Path $Portable 'skills') -Recurse
+if (Test-Path -LiteralPath $SkillsDir) {
+  Copy-Item -LiteralPath $SkillsDir -Destination (Join-Path $Portable 'skills') -Recurse
 }
 # Builds made with craft-fonts (CRAFT_FONTS_DIR) embed its fonts: ship their licences.
 if ($env:CRAFT_FONTS_DIR) {
   foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -ErrorAction SilentlyContinue) {
-    Copy-Item $ofl.FullName (Join-Path $Portable "OFL-$($ofl.Directory.Name).txt")
+    Copy-Item -LiteralPath $ofl.FullName -Destination (Join-Path $Portable "OFL-$($ofl.Directory.Name).txt")
   }
 }
 $Zip = Join-Path $Dist "designcraft-$Version-windows-$Arch-portable.zip"
-Remove-Item -Force $Zip -ErrorAction SilentlyContinue
-Compress-Archive -Path $Portable -DestinationPath $Zip
+if (Test-Path -LiteralPath $Zip) { Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue }
+Compress-Archive -LiteralPath $Portable -DestinationPath $Zip
 
 # Smoke-test the CLI when this machine can run it. An ARM64 build made on an x64 runner can't run
 # here; .github/workflows/windows-arm64.yml installs and runs it on ARM64 instead.
@@ -138,4 +142,4 @@ if ($Arch -ne 'arm64' -or $HostArch -eq 'arm64') {
 } else {
   Write-Output "skipping designcraft-cli --version: an $Arch build doesn't run on this $HostArch machine"
 }
-Get-Item $Msi, $Zip | Format-Table Name, Length
+Get-Item -LiteralPath $Msi, $Zip | Format-Table Name, Length

@@ -11,6 +11,7 @@ use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind, is_non_imag
 use serde_json::Value;
 
 const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
+const MAX_TOKEN_LIMIT: u64 = 16_000_000;
 
 pub(crate) fn is_non_text_model(model: &str) -> bool {
     designcraft_ai_types::is_non_text_model(model)
@@ -285,12 +286,7 @@ fn explicit_script_pages(brief: &str) -> Option<u32> {
 }
 
 pub(crate) fn is_retired_gemini_text_model(provider: ProviderKind, model: &str) -> bool {
-    if provider != ProviderKind::Gemini {
-        return false;
-    }
-    let normalized = model.trim().to_ascii_lowercase();
-    let name = normalized.strip_prefix("models/").unwrap_or(&normalized);
-    ["gemini-1.0", "gemini-1.5", "gemini-2.0", "gemini-2.5"].iter().any(|prefix| name.starts_with(prefix))
+    designcraft_ai_types::is_retired_gemini_model(provider, model)
 }
 
 /// Search-only normalization matching runtime style keyword matching; prompt text stays exact.
@@ -707,6 +703,23 @@ impl Default for AiUiState {
     }
 }
 
+fn rate_table_configured(rates: &TokenRates) -> bool {
+    rates.input_per_million > 0.0
+        || rates.output_per_million > 0.0
+        || rates.image_per_request.is_some_and(|v| v > 0.0)
+        || rates.image_reserve_usd.is_some_and(|v| v > 0.0)
+}
+
+fn has_configured_rates(settings: &AiSettings) -> bool {
+    let text_ok = settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
+    if settings.output_mode == OutputMode::NativeWithImages {
+        let image_rates = settings.image_rates.as_ref().or(settings.budget.rates.as_ref());
+        text_ok && image_rates.is_some_and(rate_table_configured)
+    } else {
+        text_ok
+    }
+}
+
 impl AiUiState {
     fn load_production_request(&mut self, request: &TaskRequest) {
         self.prompt = request.prompt.clone();
@@ -719,8 +732,7 @@ impl AiUiState {
         if let TaskTarget::NewA4 { pages } = request.target {
             self.pages = pages;
         }
-        self.rates_confirmed =
-            self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
+        self.rates_confirmed = has_configured_rates(&self.settings);
         self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
         self.workflow_error.clear();
         self.restored_target_unconfirmed = false;
@@ -729,8 +741,7 @@ impl AiUiState {
     fn sync_settings(&mut self, settings: AiSettings) {
         self.settings = settings;
         // Reuse explicitly configured prices; restarting does not require the same setup again.
-        self.rates_confirmed =
-            self.settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
+        self.rates_confirmed = has_configured_rates(&self.settings);
         self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
         self.workflow_error.clear();
         if self.settings.text_model.provider == ProviderKind::Ollama {
@@ -745,7 +756,23 @@ impl AiUiState {
         if !self.initialized && snapshot.available {
             self.sync_settings(snapshot.settings.clone());
             if let Some(draft) = &snapshot.production_draft {
+                let preserve_saved_settings = !snapshot.busy
+                    && snapshot.batch.is_none()
+                    && serde_json::to_value(&snapshot.settings).ok() != serde_json::to_value(AiSettings::default()).ok();
                 self.load_production_request(&draft.request);
+                if preserve_saved_settings {
+                    let mut merged = draft.request.settings.clone();
+                    merged.text_model = snapshot.settings.text_model.clone();
+                    merged.image_model = snapshot.settings.image_model.clone();
+                    merged.budget = snapshot.settings.budget.clone();
+                    merged.image_rates = snapshot.settings.image_rates.clone();
+                    merged.resources = snapshot.settings.resources.clone();
+                    merged.comfy_workflow = snapshot.settings.comfy_workflow.clone();
+                    self.sync_settings(merged);
+                }
+                if let Some(pages) = draft.progress.target_total_pages {
+                    self.pages = pages;
+                }
                 self.restored_target_unconfirmed = !self.new_document;
             }
             self.initialized = true;
@@ -1137,7 +1164,8 @@ impl AiUiState {
             }
             u32::try_from(if self.continue_book { document.remaining_pages } else { document.pages }).ok()?
         };
-        let review_pages = remaining.min(self.settings.pages_per_batch);
+        let spread_aligned_new = self.new_document && self.settings.facing_pages && self.settings.pages_per_batch == 2 && remaining > 1;
+        let review_pages = if spread_aligned_new { 1 } else { remaining.min(self.settings.pages_per_batch) };
         let sources_per_page = if self.settings.output_mode == OutputMode::NativeOnly {
             0
         } else {
@@ -1151,7 +1179,11 @@ impl AiUiState {
         (review_pages > 0).then_some(RequestEstimate {
             review_pages,
             remaining_pages: remaining,
-            remaining_groups: remaining.div_ceil(self.settings.pages_per_batch),
+            remaining_groups: if spread_aligned_new {
+                1u32.saturating_add(remaining.saturating_sub(1).div_ceil(2))
+            } else {
+                remaining.div_ceil(self.settings.pages_per_batch)
+            },
             book_allowance: remaining.saturating_mul(per_page),
             scripted: scripted_pages.is_some(),
             image_allowance,
@@ -1165,7 +1197,7 @@ impl AiUiState {
         let overhead_bytes: u64 = if profile.is_some() {
             96_000
         } else if self.automatic_skills || !self.selected_skills.is_empty() {
-            180_000
+            176 * 1024
         } else {
             48_000
         };
@@ -1178,7 +1210,7 @@ impl AiUiState {
         let sources_per_page = estimate.image_allowance.checked_div(estimate.review_pages).map_or(0, u64::from);
         let vision_per_page = if self.settings.output_mode == OutputMode::NativeWithImages {
             let workflow_tokens = self.settings.comfy_workflow.as_ref().map_or(0, |v| u64::try_from(v.to_string().len()).unwrap_or(0).div_ceil(3));
-            let image_call_tokens = 8_192u64.saturating_add(1_024).saturating_add(4_096).saturating_add(workflow_tokens);
+            let image_call_tokens = 2_048u64.saturating_add(1_024).saturating_add(workflow_tokens);
             let review_call_tokens = if self.settings.verify_generated_images {
                 8_192u64.saturating_add(1_024).saturating_add(4_096).saturating_add(u64::from(self.settings.budget.max_output_tokens.min(4096)))
             } else {
@@ -1191,8 +1223,8 @@ impl AiUiState {
         let per_page_tokens = text_per_page.saturating_add(vision_per_page);
         Some(TokenEstimate {
             per_page_tokens,
-            review_tokens: per_page_tokens.saturating_mul(u64::from(estimate.review_pages)).clamp(256, 4_000_000),
-            book_tokens: per_page_tokens.saturating_mul(u64::from(estimate.remaining_pages)).clamp(256, 4_000_000),
+            review_tokens: per_page_tokens.saturating_mul(u64::from(estimate.review_pages)).clamp(256, MAX_TOKEN_LIMIT),
+            book_tokens: per_page_tokens.saturating_mul(u64::from(estimate.remaining_pages)).clamp(256, MAX_TOKEN_LIMIT),
         })
     }
 
@@ -1254,8 +1286,9 @@ impl AiUiState {
                     let end = report.page_start.saturating_add(report.page_count).min(batch.total_pages);
                     (start, end.max(start))
                 } else {
+                    let step = if batch.spread_aligned && batch.completed_pages == 0 { 1 } else { batch.pages_per_batch.max(1) };
                     let start = batch.completed_pages.saturating_add(1).min(batch.total_pages);
-                    let end = batch.completed_pages.saturating_add(batch.pages_per_batch.max(1)).min(batch.total_pages);
+                    let end = batch.completed_pages.saturating_add(step).min(batch.total_pages);
                     (start, end.max(start))
                 }
             });
@@ -1413,6 +1446,7 @@ pub(crate) fn classify_diagnostic_alert(raw_error: &str) -> DiagnosticAlert {
         "status 404",
         "404 not found",
         "model, schema, or endpoint not supported",
+        "model or endpoint not found",
         "model not found",
         "was not found",
         "not found for api version",
@@ -1477,7 +1511,20 @@ pub(crate) fn classify_diagnostic_alert(raw_error: &str) -> DiagnosticAlert {
             "أعد المحاولة ليقوم المحرك بإعادة توزيع الإطارات تلقائياً داخل منطقة الأمان، أو اختر نمط تصميم معتمد.",
             "Retry the group so the engine reflows frames within the safe area, or select an approved design style.",
         )
-    } else if has(&["connect", "timeout", "timed out", "11434", "8188", "rate limit", "429", "502", "503"]) {
+    } else if has(&[
+        "connect",
+        "timeout",
+        "timed out",
+        "11434",
+        "8188",
+        "rate limit",
+        "rate or quota limit",
+        "temporarily unavailable",
+        "429",
+        "502",
+        "503",
+        "504",
+    ]) {
         (
             DiagnosticAlertKind::ConnectionOrRateLimit,
             "تنبيه الاتصال بالمزود — تعذّر الوصول للخادم أو تجاوز الحد الزمني",
@@ -1553,10 +1600,14 @@ pub fn dispatch(app: &mut DesignApp, request: AiRequest) -> Result<Value, String
         app.ui.ai.pending_models = Some(selection.clone());
     }
     let updated_settings = matches!(&request, AiRequest::UpdateSettings(_));
+    let refreshed_proofs = matches!(&request, AiRequest::RefreshBatchProofs { .. });
     let production_request = if let AiRequest::Start(request) = &request { Some(request.clone()) } else { None };
     let snapshot = host(&mut app.session, request);
     let result = serde_json::to_value(&snapshot).map_err(|e| e.to_string());
     app.ui.ai.accept(snapshot);
+    if refreshed_proofs {
+        app.ui.ai.sync_proof_document(app.session.active().map(|document| (document.uid, document.revision)));
+    }
     if updated_settings && app.ui.ai.snapshot.stage != "failed" {
         let next_settings = app.ui.ai.snapshot.settings.clone();
         app.ui.ai.sync_settings(next_settings);
@@ -1611,6 +1662,7 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
         },
         "run_skill_sample" => AiRequest::RunSkillSample { id: field("id")?, revision: field("revision")? },
         "run_design_template" => AiRequest::RunDesignTemplate { id: field("id")?, revision: field("revision")?, template: field("template")? },
+        "refresh_batch_proofs" => AiRequest::RefreshBatchProofs { job_id: field("job_id")? },
         "approve_skill" | "approve_batch" => {
             return Err("Approval requires the human review button in the desktop panel.".into());
         }
@@ -1662,9 +1714,23 @@ fn label(ui: &mut egui::Ui, arabic: bool, en: &str, ar: &str) {
 fn button(ui: &mut egui::Ui, arabic: bool, en: &str, ar: &str) -> bool {
     ui.button(rtl::widget(ui, text(arabic, en, ar))).clicked()
 }
+fn bidi_layouter(multiline: bool) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::Galley> {
+    move |ui, buf, wrap_width| {
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        let color = ui.visuals().text_color();
+        rtl::editable_layout(ui, buf.as_str(), wrap_width, font_id, color, multiline)
+    }
+}
 fn field(ui: &mut egui::Ui, arabic: bool, en: &str, ar: &str, value: &mut String) {
     label(ui, arabic, en, ar);
-    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+    let field_rtl = if value.trim().is_empty() { arabic } else { rtl::has_rtl(value) };
+    let mut layouter = bidi_layouter(false);
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .desired_width(f32::INFINITY)
+            .horizontal_align(if field_rtl { egui::Align::Max } else { egui::Align::Min })
+            .layouter(&mut layouter),
+    );
 }
 fn provider_name(p: ProviderKind) -> &'static str {
     match p {
@@ -1760,6 +1826,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     let mut open = state.open;
     let mut requests = Vec::new();
     let mut check_preview_update = false;
+    let mut toggle_language = false;
     let available = app.services.ai.is_some() && state.snapshot.available;
     let documents: Vec<_> =
         app.session.documents().iter().enumerate().map(|(index, document)| OpenDocument::from_document(index, document)).collect();
@@ -1788,6 +1855,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                 }
                 if button(ui, a, "Refresh", "تحديث") {
                     requests.push(AiRequest::Poll);
+                }
+                if ui.button(rtl::widget(ui, if a { "EN" } else { "العربية" })).clicked() {
+                    toggle_language = true;
                 }
             });
             ui.separator();
@@ -1894,6 +1964,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         state.review_pointer_press = None;
     }
     app.ui.ai = state;
+    if toggle_language && let Err(error) = app.run("app.language", serde_json::json!({"lang": if a { "" } else { "ar" }})) {
+        app.ui.ai.error = error;
+    }
     if check_preview_update && let Err(error) = app.run("app.checkPreviewUpdate", serde_json::json!({})) {
         app.ui.ai.error = error;
     }
@@ -2130,6 +2203,9 @@ fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, req
                     )
                     .clicked()
                 {
+                    if s.workflow_ready() {
+                        requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                    }
                     requests.push(AiRequest::SaveApiKey { selection: selection.clone(), key: std::mem::take(&mut s.api_key.0) });
                 }
                 if button(ui, a, "Refresh presence", "تحديث حالة المفاتيح") {
@@ -2211,6 +2287,12 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
             let owned_running = s.snapshot.local_server.as_ref().is_some_and(|server| server.owned && server.running);
             if ui.add_enabled(!owned_running && std::path::Path::new(&s.ollama_executable).is_absolute(), egui::Button::new(rtl::widget(ui, text(a, "Start selected Ollama", "تشغيل Ollama المحدد")))).clicked() {
                 s.local_ollama.endpoint = Some("http://127.0.0.1:11434".into());
+                if s.settings.text_model.provider == ProviderKind::Ollama {
+                    s.settings.text_model.endpoint = s.local_ollama.endpoint.clone();
+                    if s.workflow_ready() {
+                        requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                    }
+                }
                 requests.push(AiRequest::StartLocalOllama { executable: s.ollama_executable.clone() });
             }
             if ui.add_enabled(owned_running, egui::Button::new(rtl::widget(ui, text(a, "Stop owned process", "إيقاف العملية التابعة للتطبيق")))).clicked() { requests.push(AiRequest::StopLocalOllama); }
@@ -2258,6 +2340,9 @@ fn local_ai(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, can_
             let chosen = selection.clone();
             if ui.add_enabled(ready, egui::Button::new(rtl::widget(ui, text(a, if images { "Select for images" } else { "Select for text" }, if images { "اختيار لإنتاج الصور" } else { "اختيار لإنتاج النص" })))).clicked() {
                 if images { s.settings.image_model = chosen; } else { s.settings.text_model = chosen; }
+                if s.workflow_ready() {
+                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                }
             }
             if images {
                 label(ui, a, "Start your installed ComfyUI launcher, confirm its endpoint, then check connection. Configure API workflow in Providers and keys.", "شغّل ComfyUI بواسطة مشغّله المثبت وتحقق من عنوانه ثم افحص الاتصال. اضبط مخطط API في صفحة المزودين والمفاتيح.");
@@ -2378,22 +2463,28 @@ fn preserved_document_geometry<'a>(s: &AiUiState, documents: &'a [OpenDocument],
 }
 
 fn production_binding(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], selected: Option<usize>) {
-    if let Some(document) = preserved_document_geometry(s, documents, selected) {
-        if document.facing_pages {
-            let binding = text(
-                a,
-                if document.right_to_left_binding { "Right to left (RTL)" } else { "Left to right (LTR)" },
-                if document.right_to_left_binding {
-                    "من اليمين إلى اليسار (RTL)"
-                } else {
-                    "من اليسار إلى اليمين (LTR)"
-                },
-            );
-            rtl::label(ui, format!("{} {binding}", text(a, "Existing book binding:", "اتجاه تجليد الكتاب الحالي:")));
+    let fixed_document = preserved_document_geometry(s, documents, selected).or_else(|| {
+        if !s.new_document && s.continue_book && !s.settings.facing_pages {
+            documents.iter().find(|document| Some(document.index) == selected && !document.facing_pages && document.remaining_pages < document.pages)
         } else {
+            None
+        }
+    });
+    if let Some(document) = fixed_document {
+        let binding = text(
+            a,
+            if document.right_to_left_binding { "Right to left (RTL)" } else { "Left to right (LTR)" },
+            if document.right_to_left_binding {
+                "من اليمين إلى اليسار (RTL)"
+            } else {
+                "من اليسار إلى اليمين (LTR)"
+            },
+        );
+        if !document.facing_pages {
             label(ui, a, "Existing document uses single pages.", "يستخدم المستند الحالي صفحات منفردة.");
         }
-    } else if s.settings.facing_pages {
+        rtl::label(ui, format!("{} {binding}", text(a, "Existing book binding:", "اتجاه تجليد الكتاب الحالي:")));
+    } else {
         ui.horizontal_wrapped(|ui| {
             label(ui, a, "Book binding", "اتجاه التجليد");
             for (value, en, ar) in [
@@ -2405,12 +2496,21 @@ fn production_binding(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: 
             }
         });
         if s.settings.right_to_left_binding.is_none() {
-            label(
-                ui,
-                a,
-                "Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.",
-                "اتجاه التجليد تلقائي: العربية من اليمين إلى اليسار والإنجليزية من اليسار إلى اليمين. يبقى الغلاف منفرداً.",
-            );
+            if s.settings.facing_pages {
+                label(
+                    ui,
+                    a,
+                    "Automatic binding: Arabic reads right to left; English reads left to right. The cover stays single.",
+                    "اتجاه التجليد تلقائي: العربية من اليمين إلى اليسار والإنجليزية من اليسار إلى اليمين. يبقى الغلاف منفرداً.",
+                );
+            } else {
+                label(
+                    ui,
+                    a,
+                    "Automatic binding: Arabic sets RTL book direction and PDF reading order; English sets LTR.",
+                    "اتجاه التجليد تلقائي: العربية تضبط اتجاه الكتاب وتصدير PDF من اليمين إلى اليسار، والإنجليزية من اليسار إلى اليمين.",
+                );
+            }
         }
     }
 }
@@ -2469,9 +2569,13 @@ fn budget_targets_for_estimate(
     let retry_remaining_pages = active_batch
         .filter(|batch| batch.total_pages > batch.completed_pages)
         .map_or(estimate.remaining_pages, |batch| batch.total_pages.saturating_sub(batch.completed_pages));
-    let retry_review_pages = active_batch
-        .filter(|batch| batch.pages_per_batch > 0)
-        .map_or_else(|| retry_remaining_pages.min(estimate.review_pages), |batch| retry_remaining_pages.min(batch.pages_per_batch));
+    let retry_review_pages = active_batch.filter(|batch| batch.pages_per_batch > 0).map_or_else(
+        || retry_remaining_pages.min(estimate.review_pages),
+        |batch| {
+            let step = if batch.spread_aligned && batch.completed_pages == 0 { 1 } else { batch.pages_per_batch.max(1) };
+            retry_remaining_pages.min(step)
+        },
+    );
     let per_page_requests = estimate.allowance().checked_div(estimate.review_pages).unwrap_or(1);
 
     let book_requests = consumed_requests.saturating_add(retry_remaining_pages.saturating_mul(per_page_requests)).max(estimate.book_allowance);
@@ -2479,12 +2583,12 @@ fn budget_targets_for_estimate(
     let min_text_requests = consumed_requests.saturating_add(retry_review_pages).max(estimate.review_pages);
 
     let book_tokens = tokens.map(|t| {
-        let retry_book_tokens = t.per_page_tokens.saturating_mul(u64::from(retry_remaining_pages)).clamp(256, 4_000_000);
-        consumed_tokens.saturating_add(retry_book_tokens).max(t.book_tokens).clamp(256, 4_000_000)
+        let retry_book_tokens = t.per_page_tokens.saturating_mul(u64::from(retry_remaining_pages)).clamp(256, MAX_TOKEN_LIMIT);
+        consumed_tokens.saturating_add(retry_book_tokens).max(t.book_tokens).clamp(256, MAX_TOKEN_LIMIT)
     });
     let review_tokens = tokens.map(|t| {
-        let retry_review_tokens = t.per_page_tokens.saturating_mul(u64::from(retry_review_pages)).clamp(256, 4_000_000);
-        consumed_tokens.saturating_add(retry_review_tokens).max(t.review_tokens).clamp(256, 4_000_000)
+        let retry_review_tokens = t.per_page_tokens.saturating_mul(u64::from(retry_review_pages)).clamp(256, MAX_TOKEN_LIMIT);
+        consumed_tokens.saturating_add(retry_review_tokens).max(t.review_tokens).clamp(256, MAX_TOKEN_LIMIT)
     });
 
     BudgetTargets { consumed_requests, book_requests, review_requests, min_text_requests, book_tokens, review_tokens }
@@ -2537,7 +2641,11 @@ fn production_recovery(
             && let Some(document) = selected
         {
             let request = draft.request.clone();
+            let target_total_pages = draft.progress.target_total_pages;
             s.load_production_request(&request);
+            if let Some(pages) = target_total_pages {
+                s.pages = pages;
+            }
             s.new_document = false;
             s.continue_book = true;
             *activate_document = Some(document.index);
@@ -2574,6 +2682,9 @@ fn production_recovery(
             )
             .clicked()
         {
+            if s.workflow_ready() {
+                requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+            }
             requests.push(AiRequest::RetryBatch { job_id: batch.job_id.clone() });
         }
     }
@@ -2718,7 +2829,8 @@ fn render_diagnostic_alert_banner(
                             let estimated = budget_targets(s, documents, activate_document)
                                 .and_then(|targets| targets.book_tokens.zip(targets.review_tokens).map(|(b, r)| b.max(r)))
                                 .unwrap_or_else(|| consumed_tokens.saturating_add(256_000));
-                            s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).max(estimated).clamp(256_000, 4_000_000);
+                            s.settings.budget.token_limit =
+                                s.settings.budget.token_limit.saturating_mul(2).max(estimated).clamp(256_000, MAX_TOKEN_LIMIT);
                             requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                             s.clear_failure_alert();
                         }
@@ -2906,6 +3018,29 @@ fn production(
                 }
             });
         }
+        ui.horizontal_wrapped(|ui| {
+            let prev_mode = s.settings.output_mode;
+            ui.selectable_value(
+                &mut s.settings.output_mode,
+                OutputMode::NativeOnly,
+                rtl::widget(ui, text(a, "Editable elements", "عناصر قابلة للتحرير")),
+            );
+            ui.selectable_value(
+                &mut s.settings.output_mode,
+                OutputMode::NativeWithImages,
+                rtl::widget(ui, text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور")),
+            );
+            if s.settings.output_mode != prev_mode {
+                s.rates_confirmed = has_configured_rates(&s.settings);
+                if s.workflow_ready() {
+                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                }
+            }
+        });
+        if s.settings.output_mode == OutputMode::NativeWithImages {
+            model(ui, a, "production_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
+            image_inspection_setting(ui, s, a);
+        }
         label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
         ui.horizontal_wrapped(|ui| {
             label(ui, a, "Design style", "نمط التصميم");
@@ -2940,14 +3075,16 @@ fn production(
             }
         });
         // Keep room for the compact update row and the production action. Long
-        // briefs remain complete and scroll inside their own seven-row composer.
+        // briefs remain complete and scroll inside their own composer.
         let prompt_rtl = if s.prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.prompt) };
-        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(128.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
+            let mut layouter = bidi_layouter(true);
             ui.add(
                 egui::TextEdit::multiline(&mut s.prompt)
-                    .desired_rows(7)
+                    .desired_rows(4)
                     .desired_width(f32::INFINITY)
                     .horizontal_align(if prompt_rtl { egui::Align::Max } else { egui::Align::Min })
+                    .layouter(&mut layouter)
                     .hint_text(rtl::widget(
                         ui,
                         text(
@@ -3053,7 +3190,8 @@ fn production(
                     "Document file (.designcraft, .idml, .indd, .indt, .pdf, .docx, .rtf, .txt, .md, .xlsx)",
                     "ملف المستند (.designcraft أو .idml أو .indd أو .indt أو .pdf أو .docx أو .rtf أو .txt أو .md أو .xlsx)",
                 );
-                ui.add(egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0));
+                let mut open_path_layouter = bidi_layouter(false);
+                ui.add(egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0).layouter(&mut open_path_layouter));
                 if button(ui, a, "Open path", "فتح المسار") {
                     s.open_target_document_requested = true;
                 }
@@ -3401,22 +3539,6 @@ fn production(
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).open(s.expand_advanced_settings.take()).show(ui, |ui| {
             budgets(ui, s, a);
             ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(
-                    &mut s.settings.output_mode,
-                    OutputMode::NativeOnly,
-                    rtl::widget(ui, text(a, "Editable elements", "عناصر قابلة للتحرير")),
-                );
-                ui.selectable_value(
-                    &mut s.settings.output_mode,
-                    OutputMode::NativeWithImages,
-                    rtl::widget(ui, text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور")),
-                );
-            });
-            if s.settings.output_mode == OutputMode::NativeWithImages {
-                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
-                image_inspection_setting(ui, s, a);
-            }
             ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
             if s.automatic_skills {
                 egui::CollapsingHeader::new(rtl::widget(
@@ -3681,10 +3803,12 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
             });
             ui.allocate_ui_with_layout(egui::vec2(action_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_width(action_width);
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                rtl::label(ui, format!("{} {} / {}", text(a, "Pages reviewed:", "الصفحات المراجعة:"), reviewed_count, page_count));
-                if facing_pages {
-                    if ui.checkbox(&mut s.proof_pair_view, rtl::widget(ui, text(a, "Show facing pair", "عرض الصفحتين المتقابلتين"))).changed()
+                egui::ScrollArea::vertical().id_salt("ai_review_actions").max_height(height).show(ui, |ui| {
+                    ui.set_width(action_width);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    rtl::label(ui, format!("{} {} / {}", text(a, "Pages reviewed:", "الصفحات المراجعة:"), reviewed_count, page_count));
+                    if facing_pages
+                        && ui.checkbox(&mut s.proof_pair_view, rtl::widget(ui, text(a, "Show facing pair", "عرض الصفحتين المتقابلتين"))).changed()
                     {
                         s.review_pointer_press = None;
                     }
@@ -3692,105 +3816,137 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                     {
                         s.review_pointer_press = None;
                     }
-                }
-                if let Some(index) = selected {
-                    rtl::label(
-                        ui,
-                        format!(
-                            "{} {} / {} · {} {}",
-                            text(a, "Preview", "المعاينة"),
-                            index.saturating_add(1),
-                            page_count,
-                            text(a, "Document page", "صفحة المستند"),
-                            current.page_start.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)).saturating_add(1)
-                        ),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(index > 0, egui::Button::new(rtl::widget(ui, text(a, "Previous", "السابقة")))).clicked() {
-                            select_page = index.checked_sub(1).and_then(|previous| pages.get(previous)).map(|(path, _)| path.clone());
-                        }
-                        if ui
-                            .add_enabled(index.saturating_add(1) < page_count, egui::Button::new(rtl::widget(ui, text(a, "Next", "التالية"))))
-                            .clicked()
-                        {
-                            select_page = pages.get(index.saturating_add(1)).map(|(path, _)| path.clone());
-                        }
-                    });
-                    egui::ComboBox::from_id_salt("ai_proof_page")
-                        .selected_text(rtl::widget(
+                    if let Some(index) = selected {
+                        rtl::label(
                             ui,
-                            format!("{} {}", text(a, "Page", "الصفحة"), u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)),
-                        ))
-                        .show_ui(ui, |ui| {
-                            for (page_index, page) in pages.iter().enumerate() {
-                                let (path, _) = page;
-                                let reviewed = s.reviewed_proofs.contains(*page);
-                                let title = format!(
-                                    "{} {}{}",
-                                    text(a, "Page", "الصفحة"),
-                                    u64::from(current.page_start).saturating_add(page_index as u64).saturating_add(1),
-                                    if reviewed { text(a, " · Reviewed", " · تمت المراجعة") } else { "" }
-                                );
-                                if ui.selectable_label(page_index == index, rtl::widget(ui, title)).clicked() {
-                                    select_page = Some(path.clone());
-                                }
+                            format!(
+                                "{} {} / {} · {} {}",
+                                text(a, "Preview", "المعاينة"),
+                                index.saturating_add(1),
+                                page_count,
+                                text(a, "Document page", "صفحة المستند"),
+                                current.page_start.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)).saturating_add(1)
+                            ),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(index > 0, egui::Button::new(rtl::widget(ui, text(a, "Previous", "السابقة")))).clicked() {
+                                select_page = index.checked_sub(1).and_then(|previous| pages.get(previous)).map(|(path, _)| path.clone());
+                            }
+                            if ui
+                                .add_enabled(index.saturating_add(1) < page_count, egui::Button::new(rtl::widget(ui, text(a, "Next", "التالية"))))
+                                .clicked()
+                            {
+                                select_page = pages.get(index.saturating_add(1)).map(|(path, _)| path.clone());
                             }
                         });
-                }
-                if batch.status == "awaiting_human_proof" {
-                    if pair_visible {
-                        ui.push_id(("ai_review_pair", s.proof_path.as_deref()), |ui| {
-                            let response = ui.add_enabled(
-                                can_review_pair,
-                                egui::Button::new(rtl::widget(
+                        egui::ComboBox::from_id_salt("ai_proof_page")
+                            .selected_text(rtl::widget(
+                                ui,
+                                format!(
+                                    "{} {}",
+                                    text(a, "Page", "الصفحة"),
+                                    u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)
+                                ),
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (page_index, page) in pages.iter().enumerate() {
+                                    let (path, _) = page;
+                                    let reviewed = s.reviewed_proofs.contains(*page);
+                                    let title = format!(
+                                        "{} {}{}",
+                                        text(a, "Page", "الصفحة"),
+                                        u64::from(current.page_start).saturating_add(page_index as u64).saturating_add(1),
+                                        if reviewed { text(a, " · Reviewed", " · تمت المراجعة") } else { "" }
+                                    );
+                                    if ui.selectable_label(page_index == index, rtl::widget(ui, title)).clicked() {
+                                        select_page = Some(path.clone());
+                                    }
+                                }
+                            });
+                    }
+                    if batch.status == "awaiting_human_proof" {
+                        if pair_visible {
+                            ui.push_id(("ai_review_pair", s.proof_path.as_deref()), |ui| {
+                                let response = ui.add_enabled(
+                                    can_review_pair,
+                                    egui::Button::new(rtl::widget(
+                                        ui,
+                                        text(a, "I reviewed both displayed pages; next preview", "راجعت الصفحتين المعروضتين؛ المعاينة التالية"),
+                                    ))
+                                    .wrap(),
+                                );
+                                confirm_pair = AiUiState::fresh_review_gesture(
+                                    s.review_input_is_human,
+                                    s.proof_key.as_ref(),
+                                    &mut s.review_pointer_press,
+                                    &response,
+                                );
+                            });
+                            if !can_review_pair && !s.proof_full_resolution {
+                                label(
                                     ui,
-                                    text(a, "I reviewed both displayed pages; next preview", "راجعت الصفحتين المعروضتين؛ المعاينة التالية"),
-                                ))
-                                .wrap(),
-                            );
-                            confirm_pair = AiUiState::fresh_review_gesture(
+                                    a,
+                                    "Enable 100% image preview to confirm both facing pages together.",
+                                    "فعّل معاينة الصورة بحجم 100% لتأكيد الصفحتين المتقابلتين معاً.",
+                                );
+                            }
+                        }
+                        let review_label = if selected_reviewed {
+                            text(a, "Reviewed", "تمت المراجعة")
+                        } else {
+                            text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة")
+                        };
+                        // A held press on one page must never confirm a different preview.
+                        ui.push_id(("ai_review_page", s.proof_path.as_deref()), |ui| {
+                            let response = ui.add_enabled(can_review && !selected_reviewed, egui::Button::new(rtl::widget(ui, review_label)).wrap());
+                            confirm_page = AiUiState::fresh_review_gesture(
                                 s.review_input_is_human,
                                 s.proof_key.as_ref(),
                                 &mut s.review_pointer_press,
                                 &response,
                             );
                         });
+                        ui.separator();
+                        let (en, ar) = if batch.current_batch >= batch.total_batches {
+                            ("Approve final proof and finish", "اعتماد المراجعة النهائية وإنهاء المهمة")
+                        } else {
+                            ("Approve and generate next review group", "اعتماد وإنشاء مجموعة المراجعة التالية")
+                        };
+                        let response = ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar))).wrap());
+                        if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &response) {
+                            s.batch_approval_gesture = s.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
+                            requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
+                        }
+                        if page_count == 0 {
+                            label(ui, a, "Verified previews for every group page are required.", "يلزم توفر صور موثقة لجميع صفحات المجموعة.");
+                        } else if !s.proof_document_matches {
+                            label(
+                                ui,
+                                a,
+                                "Return to the proof's document revision. Changes require a new proof.",
+                                "ارجع إلى إصدار المستند المطابق للبروفة. التعديلات تتطلب بروفة جديدة.",
+                            );
+                            let same_book_edited = s.proof_document_version.map(|(uid, _)| uid).is_some()
+                                && s.proof_document_version.map(|(uid, _)| uid) == batch.document_uid;
+                            if same_book_edited
+                                && ui
+                                    .add_enabled(
+                                        !s.snapshot.busy,
+                                        egui::Button::new(rtl::widget(
+                                            ui,
+                                            text(a, "Refresh proofs for edited document", "تحديث البروفات للمستند المعدل"),
+                                        ))
+                                        .wrap(),
+                                    )
+                                    .clicked()
+                            {
+                                requests.push(AiRequest::RefreshBatchProofs { job_id: batch.job_id.clone() });
+                            }
+                        } else if reviewed_count < page_count {
+                            label(ui, a, "Confirm each displayed page to enable approval.", "أكد مراجعة كل صفحة معروضة لتفعيل الاعتماد.");
+                        }
                     }
-                    let review_label = if selected_reviewed {
-                        text(a, "Reviewed", "تمت المراجعة")
-                    } else {
-                        text(a, "I reviewed the displayed page", "أؤكد مراجعة الصفحة المعروضة")
-                    };
-                    // A held press on one page must never confirm a different preview.
-                    ui.push_id(("ai_review_page", s.proof_path.as_deref()), |ui| {
-                        let response = ui.add_enabled(can_review && !selected_reviewed, egui::Button::new(rtl::widget(ui, review_label)).wrap());
-                        confirm_page =
-                            AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &response);
-                    });
-                    ui.separator();
-                    let (en, ar) = if batch.current_batch >= batch.total_batches {
-                        ("Approve final proof and finish", "اعتماد المراجعة النهائية وإنهاء المهمة")
-                    } else {
-                        ("Approve and generate next review group", "اعتماد وإنشاء مجموعة المراجعة التالية")
-                    };
-                    let response = ui.add_enabled(can_approve, egui::Button::new(rtl::widget(ui, text(a, en, ar))).wrap());
-                    if AiUiState::fresh_review_gesture(s.review_input_is_human, s.proof_key.as_ref(), &mut s.review_pointer_press, &response) {
-                        s.batch_approval_gesture = s.proof_key.clone().map(|key| (key, ui.ctx().clone(), ui.ctx().cumulative_frame_nr()));
-                        requests.push(AiRequest::ApproveBatch { job_id: batch.job_id.clone(), checkpoint: batch.checkpoint });
-                    }
-                    if page_count == 0 {
-                        label(ui, a, "Verified previews for every group page are required.", "يلزم توفر صور موثقة لجميع صفحات المجموعة.");
-                    } else if !s.proof_document_matches {
-                        label(
-                            ui,
-                            a,
-                            "Return to the proof's document revision. Changes require a new proof.",
-                            "ارجع إلى إصدار المستند المطابق للبروفة. التعديلات تتطلب بروفة جديدة.",
-                        );
-                    } else if reviewed_count < page_count {
-                        label(ui, a, "Confirm each displayed page to enable approval.", "أكد مراجعة كل صفحة معروضة لتفعيل الاعتماد.");
-                    }
-                }
+                });
             });
         });
     } else if matches!(batch.status.as_str(), "failed" | "interrupted" | "cancelled") {
@@ -3839,7 +3995,7 @@ fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Ve
                 );
                 usage_line(ui, a, &report.usage, report.elapsed_ms);
                 for path in &report.proof_paths {
-                    ui.add(egui::Label::new(path).wrap());
+                    ui.add(egui::Label::new(rtl::widget(ui, path)).wrap());
                 }
             }
         });
@@ -3897,7 +4053,7 @@ fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
     let b = &mut s.settings.budget;
     egui::Grid::new("ai_limits").num_columns(2).show(ui, |ui| {
         label(ui, a, "Total tokens", "مجموع الرموز");
-        ui.add(egui::DragValue::new(&mut b.token_limit).range(256..=4_000_000));
+        ui.add(egui::DragValue::new(&mut b.token_limit).range(256..=MAX_TOKEN_LIMIT));
         ui.end_row();
         label(ui, a, "Output tokens per request", "رموز الإخراج لكل طلب");
         ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=65_536));
@@ -4269,7 +4425,8 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
                 });
             }
             label(ui, a, "SKILL.md — edits create a new draft", "SKILL.md — التعديل ينشئ مسودة جديدة");
-            ui.add(egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY));
+            let mut skill_md_layouter = bidi_layouter(true);
+            ui.add(egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY).layouter(&mut skill_md_layouter));
             label(ui, a, "Manifest JSON", "ملف الوصف JSON");
             ui.add(egui::TextEdit::multiline(&mut s.manifest_json).code_editor().desired_rows(5).desired_width(f32::INFINITY));
             let clean = s.skill_md == r.skill_md && s.manifest_json == r.manifest_json;
@@ -4330,9 +4487,18 @@ fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, docume
             &mut s.build_design_style,
             rtl::widget(ui, text(a, "Build a design style with multiple native page templates", "بناء نمط تصميم بقواعد وقوالب صفحات متعددة")),
         );
-        ui.add(egui::TextEdit::multiline(&mut s.skill_prompt).desired_rows(3).desired_width(f32::INFINITY));
+        let skill_rtl = if s.skill_prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.skill_prompt) };
+        let mut skill_layouter = bidi_layouter(true);
+        ui.add(
+            egui::TextEdit::multiline(&mut s.skill_prompt)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .horizontal_align(if skill_rtl { egui::Align::Max } else { egui::Align::Min })
+                .layouter(&mut skill_layouter),
+        );
         label(ui, a, "Reference paths (one per line)", "مسارات المراجع (مسار في كل سطر)");
-        ui.add(egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY));
+        let mut references_layouter = bidi_layouter(true);
+        ui.add(egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY).layouter(&mut references_layouter));
         ui.horizontal_wrapped(|ui| {
             let ready = !s.skill_prompt.trim().is_empty()
                 && !s.settings.text_model.model.trim().is_empty()
@@ -6696,6 +6862,7 @@ mod tests {
             document_uid: None,
             document_path: None,
             document_title: "Untitled".into(),
+            progress: Default::default(),
         });
         panel.state_mut().0.snapshot.batch = Some(BatchSnapshot {
             job_id: "failed-zero".into(),
@@ -6818,10 +6985,10 @@ mod tests {
         let tok_est = single_generic.token_estimate(&[], None).unwrap();
         // Exact worst-case ledger `reserve_with_output` sum for 1-page generic multi-skill + 1 image + 1 vision review:
         // text call (up to 176 KiB context + prompt): (180_224 + prompt.len()).div_ceil(3) + 1024 + 8192
-        // image call (~6 KiB prompt/style): 2000 + 1024 + 8192 = 11_216
+        // image call (~6 KiB prompt/style, image_call=true -> 0 attachment/output tokens): 2000 + 1024 = 3_024
         // vision review call (~6 KiB prompt/schema, 1 image, max_output=4096): 2000 + 1024 + 8192 + 4096 = 15_312
         let text_reserved = (176 * 1024u64 + single_generic.prompt.len() as u64).div_ceil(3) + 1024 + 8192;
-        let image_reserved = 2000u64 + 1024 + 8192;
+        let image_reserved = 2000u64 + 1024;
         let review_reserved = 2000u64 + 1024 + 8192 + 4096;
         assert!(
             tok_est.review_tokens >= text_reserved + image_reserved + review_reserved,
@@ -6972,8 +7139,8 @@ mod tests {
 
         let docs = vec![open_doc];
         let fresh_tokens = state.token_estimate(&docs, Some(0)).unwrap();
-        let expected_review_tokens = 120_000u64.saturating_add(fresh_tokens.review_tokens).clamp(256, 4_000_000);
-        let expected_book_tokens = 120_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256, 4_000_000);
+        let expected_review_tokens = 120_000u64.saturating_add(fresh_tokens.review_tokens).clamp(256, MAX_TOKEN_LIMIT);
+        let expected_book_tokens = 120_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256, MAX_TOKEN_LIMIT);
 
         let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1400.0)).build_ui_state(
             |ui, (s, reqs, selected, docs)| production(ui, s, false, true, docs, selected, reqs),
@@ -7035,7 +7202,7 @@ mod tests {
         panel.run_steps(3);
         panel.get_by_label("Raise Token Limit").click();
         panel.run_steps(3);
-        let expected_raised_tokens = 210_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256_000, 4_000_000);
+        let expected_raised_tokens = 210_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256_000, MAX_TOKEN_LIMIT);
         assert_eq!(panel.state().0.settings.budget.token_limit, expected_raised_tokens);
         assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == expected_raised_tokens));
 
@@ -7121,5 +7288,273 @@ mod tests {
         panel.run_steps(3);
         assert_eq!(panel.state().0.settings.budget.max_requests, 24, "4 consumed + 20 unpublished NewA4 batch pages = 24 (not 4 + 4 = 8)");
         assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.max_requests == 24));
+    }
+
+    #[test]
+    fn ai28_ui_refresh_edited_proofs_retired_gemini_and_bound_draft_pages() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        // 1. Expanded retired Gemini detection (gemini-3-pro-preview, imagen-3.0, gemini-2.5-flash).
+        assert!(is_retired_gemini_text_model(ProviderKind::Gemini, "gemini-3-pro-preview"));
+        assert!(is_retired_gemini_text_model(ProviderKind::Gemini, "imagen-3.0-generate-002"));
+        assert!(is_retired_gemini_text_model(ProviderKind::Gemini, "models/gemini-3.1-flash-lite-preview"));
+        assert!(!is_retired_gemini_text_model(ProviderKind::Gemini, "gemini-3.1-pro"));
+        assert!(!is_retired_gemini_text_model(ProviderKind::Gemini, "gemini-4-argon"));
+
+        // 2. 404 "model or endpoint not found" maps to InvalidModel.
+        assert_eq!(
+            classify_diagnostic_alert("Provider HTTP 404: model or endpoint not found (`gemini-2.5-flash`).").kind,
+            DiagnosticAlertKind::InvalidModel
+        );
+
+        // 3. Bound ContinueBook draft restores saved target_total_pages on accept().
+        let mut init_state = AiUiState::default();
+        init_state.accept(AiSnapshot {
+            available: true,
+            production_draft: Some(designcraft_ai_types::protocol::ProductionDraft {
+                id: "bound-32".into(),
+                request: TaskRequest {
+                    prompt: "Continue 32-page book".into(),
+                    settings: AiSettings::default(),
+                    skill_ids: vec![],
+                    auto_select_skills: false,
+                    target: TaskTarget::ContinueBook,
+                    export_directory: None,
+                },
+                document_uid: Some(77),
+                document_path: None,
+                document_title: "Book 32".into(),
+                progress: designcraft_ai_types::protocol::SavedProductionProgress { completed_pages: 4, target_total_pages: Some(32) },
+            }),
+            ..Default::default()
+        });
+        assert!(init_state.continue_book);
+        assert!(!init_state.new_document);
+        assert_eq!(init_state.pages, 32);
+
+        // 4. Refresh proofs button appears when the active document has the same UID but a newer edited revision.
+        let mut fixture = ProofFixture::new();
+        let document = fixture.app.ui.ai.proof_key.as_ref().unwrap().document;
+        fixture.app.ui.ai.sync_proof_document(Some((document.0, document.1 + 1)));
+        assert!(!fixture.app.ui.ai.proof_document_matches);
+
+        let mut harness = Harness::new_ui_state(
+            |ui, (s, reqs): &mut (AiUiState, Vec<AiRequest>)| {
+                batch_review(ui, s, false, reqs);
+            },
+            (fixture.app.ui.ai, Vec::<AiRequest>::new()),
+        );
+        harness.run_steps(2);
+        harness.get_by_label("Refresh proofs for edited document").click();
+        harness.run_steps(2);
+        assert!(matches!(
+            harness.state().1.last(),
+            Some(AiRequest::RefreshBatchProofs { job_id }) if job_id == "two-page-proof"
+        ));
+    }
+
+    #[test]
+    fn ai28_round1_review_fixes_16m_tokens_spread_aligned_estimates_and_http_alerts() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+
+        // 1. HTTP 504 / 429 / 400 / 422 diagnostic alert classifications.
+        assert_eq!(
+            classify_diagnostic_alert("AI provider HTTP 504: provider temporarily unavailable").kind,
+            DiagnosticAlertKind::ConnectionOrRateLimit
+        );
+        assert_eq!(classify_diagnostic_alert("AI provider HTTP 429: rate or quota limit reached").kind, DiagnosticAlertKind::ConnectionOrRateLimit);
+        assert_eq!(
+            classify_diagnostic_alert("AI provider HTTP 400: invalid request or unsupported model parameter").kind,
+            DiagnosticAlertKind::General
+        );
+        assert_eq!(classify_diagnostic_alert("AI provider HTTP 422: request schema or parameters rejected").kind, DiagnosticAlertKind::General);
+
+        // 2. 32-page facing_pages=true, pages_per_batch=2: cover Batch 1 is 1 page out of 17 batches.
+        let mut s = AiUiState {
+            new_document: true,
+            continue_book: false,
+            pages: 32,
+            prompt: "Design a 32-page illustrated science book.".into(),
+            ..Default::default()
+        };
+        s.settings.facing_pages = true;
+        s.settings.pages_per_batch = 2;
+        s.settings.output_mode = OutputMode::NativeOnly;
+        let est = s.request_estimate(&[], None).expect("request estimate");
+        assert_eq!(est.review_pages, 1);
+        assert_eq!(est.remaining_groups, 17);
+
+        s.snapshot.stage = "planning".into();
+        s.snapshot.message = "Preparing native production context".into();
+        s.snapshot.batch = Some(BatchSnapshot {
+            job_id: "spread-32".into(),
+            status: "running".into(),
+            total_pages: 32,
+            completed_pages: 0,
+            pages_per_batch: 2,
+            spread_aligned: true,
+            current_batch: 1,
+            total_batches: 17,
+            ..Default::default()
+        });
+        let en_line = s.live_status_line(false);
+        let ar_line = s.live_status_line(true);
+        assert!(en_line.contains("Batch 1 / 17 · Page 1 / 32"), "en_line={en_line}");
+        assert!(ar_line.contains("الدفعة 1 / 17 · الصفحة 1 / 32"), "ar_line={ar_line}");
+
+        // Failed retryable Batch 1 on spread_aligned book uses 1 page (not 2) in budget_targets_for_estimate.
+        s.snapshot.stage = "failed".into();
+        s.snapshot.message = "AI request limit reached".into();
+        s.snapshot.production_draft = Some(ProductionDraft {
+            id: "spread-32".into(),
+            request: TaskRequest {
+                prompt: s.prompt.clone(),
+                settings: s.settings.clone(),
+                skill_ids: vec![],
+                auto_select_skills: false,
+                target: TaskTarget::NewA4 { pages: 32 },
+                export_directory: None,
+            },
+            document_uid: None,
+            document_path: None,
+            document_title: "Book 32".into(),
+            progress: Default::default(),
+        });
+        if let Some(batch) = s.snapshot.batch.as_mut() {
+            batch.status = "failed".into();
+            batch.retryable = true;
+            batch.cumulative_usage.requests = 2;
+        }
+        let targets = budget_targets(&s, &[], None).expect("budget targets");
+        assert_eq!(targets.review_requests, 3, "2 consumed + 1 spread-aligned cover page = 3");
+
+        // 3. image_call_tokens matches ledger.rs (3_072 without workflow/verify) & 16M token ceiling scales above 4M.
+        s.settings.verify_generated_images = false;
+        let native_only_tokens = s.token_estimate(&[], None).unwrap().per_page_tokens;
+        s.settings.output_mode = OutputMode::NativeWithImages;
+        let with_images_tokens = s.token_estimate(&[], None).unwrap().per_page_tokens;
+        assert_eq!(with_images_tokens - native_only_tokens, 3_072);
+
+        s.pages = 120;
+        s.settings.budget.max_output_tokens = 32_768;
+        s.settings.budget.token_limit = 3_000_000;
+        let large_tokens = s.token_estimate(&[], None).unwrap();
+        assert!(large_tokens.book_tokens > 4_000_000 && large_tokens.book_tokens <= MAX_TOKEN_LIMIT, "book_tokens={}", large_tokens.book_tokens);
+        let large_targets = budget_targets(&s, &[], None).unwrap();
+        assert!(large_targets.book_tokens.unwrap() > 4_000_000);
+
+        s.snapshot.stage = "failed".into();
+        s.snapshot.message = "Token budget cannot admit another request".into();
+        let mut harness = Harness::builder().with_size(egui::vec2(1200.0, 900.0)).build_ui_state(
+            |ui, (st, reqs): &mut (AiUiState, Vec<AiRequest>)| {
+                render_diagnostic_alert_banner(ui, st, false, &[], None, reqs);
+            },
+            (s, Vec::<AiRequest>::new()),
+        );
+        harness.run_steps(2);
+        harness.get_by_label("Raise Token Limit").click();
+        harness.run_steps(2);
+        assert!(
+            harness.state().0.settings.budget.token_limit >= 6_000_000 && harness.state().0.settings.budget.token_limit <= MAX_TOKEN_LIMIT,
+            "raised={}",
+            harness.state().0.settings.budget.token_limit
+        );
+    }
+
+    #[test]
+    fn ai28_package5_settings_sync_output_mode_language_toggle_and_bidi_layouter() {
+        use egui_kittest::kittest::Queryable;
+
+        // 1. Inactive draft preserves saved user settings (models, budget, image_rates) while keeping draft batch/page settings.
+        let mut saved_settings = AiSettings::default();
+        saved_settings.text_model.model = "gemini-3.8-flash".into();
+        saved_settings.budget.max_requests = 48;
+        saved_settings.budget.rates = Some(TokenRates {
+            input_per_million: 1.25,
+            cached_input_per_million: 0.3,
+            output_per_million: 5.0,
+            cache_write_per_million: None,
+            image_per_request: None,
+            image_reserve_usd: None,
+        });
+        saved_settings.image_rates = Some(TokenRates {
+            input_per_million: 0.0,
+            cached_input_per_million: 0.0,
+            output_per_million: 0.0,
+            cache_write_per_million: None,
+            image_per_request: Some(0.04),
+            image_reserve_usd: None,
+        });
+
+        let mut draft_req = continuation_request(TaskTarget::NewA4 { pages: 12 });
+        draft_req.settings.output_mode = OutputMode::NativeWithImages;
+        draft_req.settings.text_model.model = "gemini-2.5-flash".into();
+        draft_req.settings.budget.max_requests = 4;
+
+        let mut state = AiUiState::default();
+        state.accept(AiSnapshot {
+            available: true,
+            settings: saved_settings,
+            production_draft: Some(ProductionDraft {
+                id: "old-draft".into(),
+                request: draft_req,
+                document_uid: None,
+                document_path: None,
+                document_title: "Draft".into(),
+                progress: Default::default(),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(state.settings.text_model.model, "gemini-3.8-flash");
+        assert_eq!(state.settings.budget.max_requests, 48);
+        assert_eq!(state.settings.pages_per_batch, 3);
+        assert!(state.rates_confirmed, "image_per_request + text rates satisfy NativeWithImages rate confirmation");
+
+        // 2. OutputMode toggle in main Tab 0 + 1-click language switch button in AI window top bar.
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() },
+        );
+        app.ui.ai.open = true;
+        app.ui.ai.snapshot.available = true;
+        app.ui.ai.initialized = true;
+        app.ui.ai.prompt = "صمّم كراسة علوم تفاعلية للأطفال من 8 صفحات".into();
+
+        let mut win = crate::test_window::open(app, egui::vec2(1280.0, 960.0));
+        win.run_steps(3);
+        assert_eq!(win.state().app.ui.ai.settings.output_mode, OutputMode::NativeOnly);
+        win.get_by_label("Editable elements and images").click();
+        win.run_steps(3);
+        assert_eq!(win.state().app.ui.ai.settings.output_mode, OutputMode::NativeWithImages);
+
+        // Single-page mode also exposes Book binding (RTL/LTR/Automatic).
+        assert!(!win.state().app.ui.ai.settings.facing_pages);
+        assert_eq!(win.state().app.ui.ai.settings.right_to_left_binding, None);
+        win.get_by_label("Right to left (RTL)").click();
+        win.run_steps(3);
+        assert_eq!(win.state().app.ui.ai.settings.right_to_left_binding, Some(true));
+
+        // Both the top app bar and the AI window expose the 1-click language toggle.
+        let toggles: Vec<_> = win.query_all_by_label("العربية").collect();
+        assert_eq!(toggles.len(), 2);
+        toggles.into_iter().last().unwrap().click();
+        win.run_steps(3);
+        assert_eq!(win.state().app.ui.language, "ar");
+        win.query_all_by_label("EN").next().unwrap().click();
+        win.run_steps(3);
+        assert_eq!(win.state().app.ui.language, "");
+
+        // 3. Single-page batch review exposes the 100% image preview toggle even when facing_pages == false.
+        let mut fixture = ProofFixture::new();
+        fixture.app.ui.ai.settings.facing_pages = false;
+        let mut single_review = fixture.panel();
+        single_review.run_steps(3);
+        assert!(single_review.query_by_label("Show facing pair").is_none(), "single-page review does not offer facing pairs");
+        assert!(!single_review.state().ui.ai.proof_full_resolution);
+        single_review.get_by_label("100% image preview").click();
+        single_review.run_steps(3);
+        assert!(single_review.state().ui.ai.proof_full_resolution, "single-page review must allow 100% image inspection");
     }
 }

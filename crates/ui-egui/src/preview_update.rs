@@ -152,6 +152,7 @@ impl UpdateResult {
         if stdout.len() as u64 > MAX_OUTPUT || stderr.len() as u64 > MAX_OUTPUT {
             return Err("Updater output exceeds 64 KiB.".into());
         }
+        let stdout = stdout.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(stdout);
         let value: Value = serde_json::from_slice(stdout).map_err(|error| format!("Invalid updater result: {error}"))?;
         let object = value.as_object().ok_or("Updater result must be one JSON object.")?;
         if object.len() != 4 || !["status", "selectedCommit", "targetExe", "ciUrl"].iter().all(|key| object.contains_key(*key)) {
@@ -700,5 +701,56 @@ mod tests {
         let manifest_file = outputs_dir.join("current-gemini-integrated-trial.json");
         std::fs::write(&manifest_file, "{}").unwrap();
         assert_eq!(super::discover_adjacent_launcher_layout(&exe_path), (Some(ACTIVE.to_string()), Some(manifest_file)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ai28_preview_update_subprocess_utf8_arabic_target_exe_and_bom_roundtrip_cleanly() {
+        use std::os::windows::process::CommandExt;
+        let bom_payload = format!(
+            "\u{feff}{}",
+            json!({
+                "status": "up_to_date",
+                "selectedCommit": ACTIVE,
+                "targetExe": std::env::temp_dir().join("designcraft.exe"),
+                "ciUrl": format!("https://github.com/ahrrfy/designcraft/commit/{ACTIVE}")
+            })
+        );
+        assert_eq!(super::UpdateResult::parse(true, bom_payload.as_bytes(), b"").unwrap().status, "up_to_date");
+
+        let temp = tempfile::tempdir().unwrap();
+        let arabic_dir = temp.path().join("برنامج التصميم الذكي").join("managed-updates").join("versions").join(STAGED);
+        let arabic_exe = arabic_dir.join("designcraft.exe");
+        let updater_script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/windows/update-native-preview.ps1");
+        let harness_script = temp.path().join("emit-update-json.ps1");
+        let ps_body = concat!(
+            "param([string]$UpdaterPath, [string]$TempDir, [string]$Staged)\r\n",
+            "$ErrorActionPreference = 'Stop'\r\n",
+            ". $UpdaterPath -LibraryOnly\r\n",
+            "$arabic = -join ([char[]]@(0x0628,0x0631,0x0646,0x0627,0x0645,0x062C,0x0020,0x0627,0x0644,0x062A,0x0635,0x0645,0x064A,0x0645,0x0020,0x0627,0x0644,0x0630,0x0643,0x064A))\r\n",
+            "$full = Join-Path $TempDir ($arabic + '\\managed-updates\\versions\\' + $Staged + '\\designcraft.exe')\r\n",
+            "Write-PreviewUpdateResult 'staged_waiting_for_app_close' $Staged $full 'https://github.com/ahrrfy/designcraft/actions/runs/999'\r\n",
+        );
+        std::fs::write(&harness_script, ps_body.as_bytes()).unwrap();
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let powershell = std::path::PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let output = std::process::Command::new(powershell)
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&harness_script)
+            .arg("-UpdaterPath")
+            .arg(&updater_script)
+            .arg("-TempDir")
+            .arg(temp.path())
+            .arg("-Staged")
+            .arg(STAGED)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+        let parsed = super::UpdateResult::parse(true, &output.stdout, &output.stderr).unwrap();
+        assert_eq!(parsed.status, "staged_waiting_for_app_close");
+        assert_eq!(parsed.commit.as_deref(), Some(STAGED));
+        let raw_json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(raw_json["targetExe"].as_str(), arabic_exe.to_str(), "Arabic path must survive OEMCP stdout without '?' replacement");
     }
 }

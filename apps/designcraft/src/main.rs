@@ -143,15 +143,114 @@ fn prefs_path() -> Option<std::path::PathBuf> {
     profile::config_dir().map(|b| b.join("ui.json"))
 }
 
+fn parse_lang_tag(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed == "ar" || trimmed.starts_with("ar-") || trimmed.starts_with("ar_") {
+        Some("ar")
+    } else if trimmed == "en" || trimmed.starts_with("en-") || trimmed.starts_with("en_") || trimmed == "c" || trimmed.starts_with("c.") {
+        Some("")
+    } else {
+        None
+    }
+}
+
+fn parse_initial_arabic_locale_signals(
+    env_lang: Option<&str>,
+    preferred_ui_languages: Option<&str>,
+    locale_name: Option<&str>,
+    acp: Option<&str>,
+    oemcp: Option<&str>,
+    user_profile_languages: Option<&str>,
+) -> &'static str {
+    if let Some(env_val) = env_lang
+        && let Some(resolved) = parse_lang_tag(env_val)
+    {
+        return resolved;
+    }
+    for candidate in [preferred_ui_languages, locale_name].into_iter().flatten() {
+        let first = candidate.split(['\0', '\r', '\n', ';', ',']).find(|s| !s.trim().is_empty()).unwrap_or("");
+        if parse_lang_tag(first) == Some("ar") {
+            return "ar";
+        }
+    }
+    if acp.is_some_and(|v| v.trim() == "1256") || oemcp.is_some_and(|v| v.trim() == "720") {
+        return "ar";
+    }
+    if let Some(langs) = user_profile_languages
+        && langs.split(['\0', '\r', '\n', ';', ',']).any(|entry| parse_lang_tag(entry) == Some("ar"))
+        && preferred_ui_languages.is_none_or(|p| p.trim().is_empty())
+        && locale_name.is_none_or(|l| l.trim().is_empty())
+    {
+        return "ar";
+    }
+    ""
+}
+
+#[cfg(target_os = "windows")]
+fn query_reg_value(key: &str, value_name: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("reg.exe").args(["query", key, "/v", value_name]).creation_flags(0x0800_0000).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let wanted = value_name.to_ascii_lowercase();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_ascii_lowercase().starts_with(&wanted)
+            && let Some((_, after_type)) = trimmed.split_once("REG_")
+            && let Some((_, val)) = after_type.split_once(char::is_whitespace)
+        {
+            return Some(val.trim().replace("\\0", "\0"));
+        }
+    }
+    None
+}
+
+fn detect_initial_ui_language() -> &'static str {
+    let env_lang = ["DESIGNCRAFT_LANG", "LC_ALL", "LANG"].into_iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()));
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(ref v) = env_lang
+            && let Some(resolved) = parse_lang_tag(v)
+        {
+            return resolved;
+        }
+        let pref_ui = query_reg_value(r"HKCU\Control Panel\Desktop", "PreferredUILanguages");
+        let locale = query_reg_value(r"HKCU\Control Panel\International", "LocaleName");
+        let acp = query_reg_value(r"HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage", "ACP");
+        let oemcp = query_reg_value(r"HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage", "OEMCP");
+        let profile_langs = query_reg_value(r"HKCU\Control Panel\International\User Profile", "Languages");
+        parse_initial_arabic_locale_signals(
+            env_lang.as_deref(),
+            pref_ui.as_deref(),
+            locale.as_deref(),
+            acp.as_deref(),
+            oemcp.as_deref(),
+            profile_langs.as_deref(),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        parse_initial_arabic_locale_signals(env_lang.as_deref(), None, None, None, None, None)
+    }
+}
+
 fn load_prefs(app: &mut DesignApp) {
     if no_prefs() {
         return;
     }
-    if let Some(p) = prefs_path()
-        && let Ok(bytes) = std::fs::read(&p)
-        && let Ok(ui) = designcraft_ui_egui::UiState::from_preferences_json(&bytes)
-    {
-        app.ui = ui;
+    if let Some(p) = prefs_path() {
+        if let Ok(bytes) = std::fs::read(&p) {
+            if let Ok(ui) = designcraft_ui_egui::UiState::from_preferences_json(&bytes) {
+                app.ui = ui;
+            }
+        } else if !p.exists() {
+            let detected = detect_initial_ui_language();
+            if !detected.is_empty() {
+                app.ui.language = detected.into();
+            }
+        }
     }
     // Engine preferences (Preferences dialog, favourites…) live beside the UI state.
     if let Some(p) = prefs_path().map(|p| p.with_file_name("prefs.json"))
@@ -169,10 +268,10 @@ fn save_prefs(app: &DesignApp) {
     if let Some(p) = prefs_path() {
         let _ = std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new(".")));
         if let Ok(bytes) = serde_json::to_vec_pretty(&app.ui) {
-            let _ = std::fs::write(&p, bytes);
+            let _ = designcraft_engine::atomic::write_atomic(&p, &bytes);
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&app.session.prefs) {
-            let _ = std::fs::write(p.with_file_name("prefs.json"), bytes);
+            let _ = designcraft_engine::atomic::write_atomic(&p.with_file_name("prefs.json"), &bytes);
         }
     }
 }
@@ -827,5 +926,14 @@ mod exit_recovery_tests {
         }
         let standard = open_filters("open")[0].extensions;
         assert!(!standard.contains(&"pdf") && !standard.contains(&"docx"));
+    }
+
+    #[test]
+    fn initial_arabic_locale_detection_honors_env_overrides_and_windows_arabic_codepage() {
+        assert_eq!(parse_initial_arabic_locale_signals(Some("en-US"), Some("ar-SA"), Some("ar-IQ"), Some("1256"), Some("720"), Some("ar-IQ")), "");
+        assert_eq!(parse_initial_arabic_locale_signals(Some("ar_IQ.UTF-8"), Some("en-US"), Some("en-US"), Some("1252"), Some("437"), None), "ar");
+        assert_eq!(parse_initial_arabic_locale_signals(None, None, Some("en-US"), Some("1256"), Some("720"), Some("en-US\0ar-IQ")), "ar");
+        assert_eq!(parse_initial_arabic_locale_signals(None, Some("ar-EG\0en-US"), Some("en-US"), Some("1252"), Some("437"), None), "ar");
+        assert_eq!(parse_initial_arabic_locale_signals(None, Some("en-US"), Some("en-US"), Some("1252"), Some("437"), Some("en-US\0ar-IQ")), "");
     }
 }

@@ -106,14 +106,14 @@ fn inspection_image(image: &GeneratedImage) -> Result<(ImageInput, bool), String
     if image.bytes.len() <= MAX_IMAGE_BYTES {
         return Ok((ImageInput { mime_type: image.mime_type.clone(), bytes: image.bytes.clone() }, false));
     }
-    if !matches!(image.mime_type.as_str(), "image/png" | "image/jpeg") {
-        return Err("Large illustration inspection requires normalized PNG or JPEG data".into());
+    if !matches!(image.mime_type.as_str(), "image/png" | "image/jpeg" | "image/webp") {
+        return Err("Large illustration inspection requires normalized PNG, JPEG or WebP data".into());
     }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
         .with_guessed_format()
         .map_err(|error| format!("Cannot identify illustration inspection source: {error}"))?;
-    if !matches!(reader.format(), Some(image::ImageFormat::Png | image::ImageFormat::Jpeg)) {
-        return Err("Large illustration inspection source is not PNG or JPEG".into());
+    if !matches!(reader.format(), Some(image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP)) {
+        return Err("Large illustration inspection source is not PNG, JPEG or WebP".into());
     }
     let dimensions = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
         .with_guessed_format()
@@ -340,6 +340,36 @@ mod tests {
         let decoded = image::load_from_memory(&inspection.bytes).unwrap().to_rgb8();
         assert!(decoded.width() <= MAX_INSPECTION_SIDE && decoded.height() <= MAX_INSPECTION_SIDE);
         assert!(decoded.pixels().all(|pixel| pixel.0.iter().all(|channel| *channel >= 250)));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&request.prompt).unwrap()["reduced_inspection_reference"], true);
+    }
+
+    #[test]
+    fn image_review_normalizes_large_webp_reference_within_provider_cap() {
+        let mut random = 0x9e37_79b9_u32;
+        let pixels = image::RgbaImage::from_fn(1536, 1536, |_, _| {
+            let mut pixel = [0_u8; 4];
+            for channel in &mut pixel {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                *channel = random as u8;
+            }
+            image::Rgba(pixel)
+        });
+        let mut encoded = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut encoded)
+            .encode(pixels.as_raw(), pixels.width(), pixels.height(), image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let image = GeneratedImage { bytes: encoded, filename: "print-original.webp".into(), mime_type: "image/webp".into() };
+        assert!(image.bytes.len() > MAX_IMAGE_BYTES && image.bytes.len() <= MAX_SOURCE_BYTES, "len={}", image.bytes.len());
+        let original_len = image.bytes.len();
+        let request = request(&placement(), &image, &settings()).unwrap();
+        let inspection = &request.images[0];
+        assert_eq!(image.bytes.len(), original_len);
+        assert_eq!(inspection.mime_type, "image/jpeg");
+        assert!(inspection.bytes.len() <= MAX_IMAGE_BYTES);
+        let decoded = image::load_from_memory(&inspection.bytes).unwrap();
+        assert!(decoded.width() <= MAX_INSPECTION_SIDE && decoded.height() <= MAX_INSPECTION_SIDE);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&request.prompt).unwrap()["reduced_inspection_reference"], true);
     }
 }

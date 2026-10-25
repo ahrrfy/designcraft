@@ -13,11 +13,13 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let has_text = app.session.active().is_some_and(|d| d.selection.text.is_some());
     let id = egui::Id::new("new_note_text");
     let mut draft: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let mut layouter = crate::rtl::text_edit_layouter(true, None, None);
     ui.add(
         egui::TextEdit::multiline(&mut draft)
             .hint_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Note text")))
             .desired_rows(2)
-            .desired_width(f32::INFINITY),
+            .desired_width(f32::INFINITY)
+            .layouter(&mut layouter),
     );
     if ui
         .add_enabled(
@@ -44,9 +46,9 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         ui.group(|ui| {
             let author = n["author"].as_str().unwrap_or("");
             if !author.is_empty() {
-                ui.label(egui::RichText::new(author).size(10.5).color(t.text_dim));
+                crate::rtl::label(ui, egui::RichText::new(author).size(10.5).color(t.text_dim));
             }
-            ui.label(n["text"].as_str().unwrap_or(""));
+            crate::rtl::label(ui, n["text"].as_str().unwrap_or(""));
             ui.horizontal(|ui| {
                 if ui.small_button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Go To"))).clicked() {
                     let _ = app.run("text.select", json!({"story": story, "anchor": at, "focus": at + 3}));

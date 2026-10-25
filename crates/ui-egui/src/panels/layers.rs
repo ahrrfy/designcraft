@@ -291,7 +291,8 @@ fn object_rows(
         };
         if !renaming {
             let clip = Rect::from_min_max(row.min, pos2(row.max.x - 26.0, row.max.y));
-            ui.painter().with_clip_rect(clip).text(
+            crate::rtl::paint(
+                &ui.painter().with_clip_rect(clip),
                 row.min + vec2(2.0 * COL_W + 30.0 + indent, ROW_H / 2.0),
                 egui::Align2::LEFT_CENTER,
                 &name,
@@ -412,7 +413,8 @@ pub fn show(app: &mut DesignApp, ui: &mut Ui) {
         // Layer colour chip and name.
         let chip = Rect::from_min_size(row.min + vec2(2.0 * COL_W + 18.0, 7.0), vec2(4.0, 10.0));
         ui.painter().rect_filled(chip, 0.0, lc);
-        ui.painter().text(
+        crate::rtl::paint(
+            ui.painter(),
             row.min + vec2(2.0 * COL_W + 28.0, ROW_H / 2.0),
             egui::Align2::LEFT_CENTER,
             &l.name,
@@ -536,7 +538,8 @@ pub fn show(app: &mut DesignApp, ui: &mut Ui) {
     ui.add_space(6.0);
     ui.spacing_mut().item_spacing.y = 4.0;
     ui.horizontal(|ui| {
-        ui.label(
+        crate::rtl::label(
+            ui,
             egui::RichText::new(format!(
                 "{}: {}, {}",
                 crate::i18n::tr(&app.ui.language, "Page"),
@@ -575,7 +578,8 @@ fn rename_field(ui: &mut Ui, r: Rect, key: RenameKey) -> Option<Option<String>> 
     if k != key {
         return None;
     }
-    let edit = ui.put(r, egui::TextEdit::singleline(&mut text).font(egui::FontId::proportional(11.0)).margin(vec2(2.0, 1.0)));
+    let mut layouter = crate::rtl::text_edit_layouter(false, Some(egui::FontId::proportional(11.0)), None);
+    let edit = ui.put(r, egui::TextEdit::singleline(&mut text).font(egui::FontId::proportional(11.0)).margin(vec2(2.0, 1.0)).layouter(&mut layouter));
     if !edit.has_focus() && !edit.lost_focus() {
         edit.request_focus();
     }

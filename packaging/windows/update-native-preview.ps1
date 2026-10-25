@@ -3,6 +3,9 @@ param(
     [switch]$LibraryOnly
 )
 $ErrorActionPreference = 'Stop'
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8NoBom
+$OutputEncoding = $utf8NoBom
 
 # This updater never executes scripts from a release or writes inside the user's
 # document/profile folders. Updates are side-by-side; the launcher pointer moves
@@ -196,6 +199,39 @@ function Assert-PreviewCommitStatusProof($CombinedStatus, [string]$SourceCommit,
     }
 }
 
+function Test-PreviewProcessRunning($Record, [string]$Path) {
+    $procs = @(Get-Process -Name designcraft -ErrorAction SilentlyContinue)
+    if ($procs.Count -eq 0) { return $false }
+    $managedRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path $Path -Parent) 'managed-updates')).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $knownPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($prop in @('executable', 'staged_executable', 'previous_executable')) {
+        $p = if ($null -ne $Record) { $Record.PSObject.Properties[$prop] } else { $null }
+        if ($null -ne $p -and -not [string]::IsNullOrWhiteSpace([string]$p.Value) -and [IO.Path]::IsPathRooted([string]$p.Value)) {
+            [void]$knownPaths.Add([IO.Path]::GetFullPath([string]$p.Value))
+        }
+    }
+    foreach ($proc in $procs) {
+        $procPath = ''
+        try {
+            $pathProp = $proc.PSObject.Properties['Path']
+            if ($null -ne $pathProp -and $null -ne $pathProp.Value) { $procPath = [string]$pathProp.Value }
+        } catch {
+            $procPath = ''
+        }
+        if ([string]::IsNullOrWhiteSpace($procPath)) { return $true }
+        $fullProcPath = ''
+        try {
+            $fullProcPath = [IO.Path]::GetFullPath($procPath)
+        } catch {
+            return $true
+        }
+        if ($knownPaths.Contains($fullProcPath) -or $fullProcPath.StartsWith($managedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 if ($LibraryOnly) { return }
 try {
 if (-not [IO.Path]::IsPathRooted($ManifestPath) -or -not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw 'An existing absolute launcher manifest is required.' }
@@ -265,7 +301,7 @@ try {
         Remove-Item -LiteralPath $archivePath
     }
     # Never terminate a live app, discard unsaved work, or resume an AI job.
-    $running = $null -ne (Get-Process -Name designcraft -ErrorAction SilentlyContinue)
+    $running = Test-PreviewProcessRunning $record $ManifestPath
     $status = Install-UpdatePointer $ManifestPath $destination $meta $running
     Write-PreviewUpdateResult $status $meta.sourceCommit (Join-Path $destination 'designcraft.exe') $meta.ciUrl
 } finally { if ($null -ne $lock) { $lock.Dispose() } }

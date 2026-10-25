@@ -4368,3 +4368,46 @@ fn cell_first_baseline_comes_from_cell_styles_table_regions_and_cells_and_round_
     let s2 = back.styles.cell.iter().find(|c| c.name == "Cap").unwrap();
     assert_eq!(s2.first_baseline, Some(FirstBaseline::CapHeight));
 }
+
+#[test]
+fn exports_arabic_language_declaration_and_maps_ar_bcp47_to_idml_arabic() {
+    for input_lang in ["ar", "ar-SA", "ar-EG", "$ID/Arabic"] {
+        let mut doc = Document::new(&designcraft_doc::build::NewDocument::default());
+        let (_, sid) = doc
+            .add_text_frame(
+                designcraft_doc::SpreadRef::Doc(0),
+                Rect::new(36.0, 36.0, 236.0, 136.0),
+                doc.default_layer(),
+                "مرحبا بالعالم",
+                Default::default(),
+            )
+            .unwrap();
+        {
+            let story = doc.story_mut(sid).unwrap();
+            story.direction = designcraft_doc::TextDirection::RightToLeft;
+            let len = story.text.len();
+            story.format_chars(0..len, |fmt| {
+                fmt.over.language = Some(input_lang.into());
+            });
+        }
+        let bytes = export_idml(&doc);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+        let mut designmap = String::new();
+        std::io::Read::read_to_string(&mut archive.by_name("designmap.xml").unwrap(), &mut designmap).unwrap();
+        assert!(designmap.contains(r#"Self="Language/$ID/Arabic""#), "{input_lang}: {designmap}");
+        assert!(designmap.contains(r#"Name="$ID/Arabic""#), "{input_lang}: {designmap}");
+
+        let mut story_xml = String::new();
+        let story_entry =
+            (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).find(|n| n.starts_with("Stories/Story_")).unwrap();
+        std::io::Read::read_to_string(&mut archive.by_name(&story_entry).unwrap(), &mut story_xml).unwrap();
+        assert!(story_xml.contains(r#"AppliedLanguage="$ID/Arabic""#), "{input_lang}: {story_xml}");
+        assert!(!story_xml.contains(r#"AppliedLanguage="$ID/$ID/"#), "{input_lang}: {story_xml}");
+        assert!(!story_xml.contains(r#"AppliedLanguage="$ID/ar"#), "{input_lang}: {story_xml}");
+
+        let round = import_idml(&bytes).unwrap();
+        let r_story = round.stories.values().next().unwrap();
+        let lang = r_story.runs().next().unwrap().1.over.language.as_deref().unwrap_or("");
+        assert_eq!(designcraft_doc::language_tag(lang), Some("ar"), "{input_lang}");
+    }
+}
