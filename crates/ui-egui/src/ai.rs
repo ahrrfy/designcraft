@@ -168,6 +168,7 @@ struct RequestEstimate {
 
 #[derive(Clone, Copy)]
 struct TokenEstimate {
+    per_page_tokens: u64,
     review_tokens: u64,
     book_tokens: u64,
 }
@@ -1189,6 +1190,7 @@ impl AiUiState {
         };
         let per_page_tokens = text_per_page.saturating_add(vision_per_page);
         Some(TokenEstimate {
+            per_page_tokens,
             review_tokens: per_page_tokens.saturating_mul(u64::from(estimate.review_pages)).clamp(256, 4_000_000),
             book_tokens: per_page_tokens.saturating_mul(u64::from(estimate.remaining_pages)).clamp(256, 4_000_000),
         })
@@ -2413,6 +2415,87 @@ fn production_binding(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: 
     }
 }
 
+fn matching_retryable_failed_batch<'a>(s: &'a AiUiState, documents: &[OpenDocument], selected: Option<usize>) -> Option<&'a BatchSnapshot> {
+    if s.snapshot.busy {
+        return None;
+    }
+    let (Some(batch), Some(draft)) = (&s.snapshot.batch, &s.snapshot.production_draft) else {
+        return None;
+    };
+    if batch.status != "failed" || !batch.retryable || batch.job_id != draft.id {
+        return None;
+    }
+    let unpublished_new_book = matches!(draft.request.target, TaskTarget::NewA4 { .. })
+        && batch.completed_pages == 0
+        && batch.document_uid.is_none()
+        && draft.document_uid.is_none();
+    let bound_book_matches = documents
+        .iter()
+        .any(|document| Some(document.index) == selected && Some(document.uid) == batch.document_uid && Some(document.uid) == draft.document_uid);
+    (unpublished_new_book || bound_book_matches).then_some(batch)
+}
+
+fn retryable_consumed_usage(s: &AiUiState, documents: &[OpenDocument], selected: Option<usize>) -> (u32, u64) {
+    let Some(batch) = matching_retryable_failed_batch(s, documents, selected) else {
+        return (0, 0);
+    };
+    let consumed_tokens = batch
+        .cumulative_usage
+        .input_tokens
+        .saturating_add(batch.cumulative_usage.output_tokens)
+        .saturating_add(batch.cumulative_usage.estimated_tokens);
+    (batch.cumulative_usage.requests, consumed_tokens)
+}
+
+#[derive(Clone, Copy)]
+struct BudgetTargets {
+    consumed_requests: u32,
+    book_requests: u32,
+    review_requests: u32,
+    min_text_requests: u32,
+    book_tokens: Option<u64>,
+    review_tokens: Option<u64>,
+}
+
+fn budget_targets_for_estimate(
+    s: &AiUiState,
+    documents: &[OpenDocument],
+    selected: Option<usize>,
+    estimate: &RequestEstimate,
+    tokens: Option<TokenEstimate>,
+) -> BudgetTargets {
+    let (consumed_requests, consumed_tokens) = retryable_consumed_usage(s, documents, selected);
+    let active_batch = matching_retryable_failed_batch(s, documents, selected);
+    let retry_remaining_pages = active_batch
+        .filter(|batch| batch.total_pages > batch.completed_pages)
+        .map_or(estimate.remaining_pages, |batch| batch.total_pages.saturating_sub(batch.completed_pages));
+    let retry_review_pages = active_batch
+        .filter(|batch| batch.pages_per_batch > 0)
+        .map_or_else(|| retry_remaining_pages.min(estimate.review_pages), |batch| retry_remaining_pages.min(batch.pages_per_batch));
+    let per_page_requests = estimate.allowance().checked_div(estimate.review_pages).unwrap_or(1);
+
+    let book_requests = consumed_requests.saturating_add(retry_remaining_pages.saturating_mul(per_page_requests)).max(estimate.book_allowance);
+    let review_requests = consumed_requests.saturating_add(retry_review_pages.saturating_mul(per_page_requests)).max(estimate.allowance());
+    let min_text_requests = consumed_requests.saturating_add(retry_review_pages).max(estimate.review_pages);
+
+    let book_tokens = tokens.map(|t| {
+        let retry_book_tokens = t.per_page_tokens.saturating_mul(u64::from(retry_remaining_pages)).clamp(256, 4_000_000);
+        consumed_tokens.saturating_add(retry_book_tokens).max(t.book_tokens).clamp(256, 4_000_000)
+    });
+    let review_tokens = tokens.map(|t| {
+        let retry_review_tokens = t.per_page_tokens.saturating_mul(u64::from(retry_review_pages)).clamp(256, 4_000_000);
+        consumed_tokens.saturating_add(retry_review_tokens).max(t.review_tokens).clamp(256, 4_000_000)
+    });
+
+    BudgetTargets { consumed_requests, book_requests, review_requests, min_text_requests, book_tokens, review_tokens }
+}
+
+fn budget_targets(s: &AiUiState, documents: &[OpenDocument], selected: Option<usize>) -> Option<BudgetTargets> {
+    let estimate = s.request_estimate(documents, selected)?;
+    let tokens = s.token_estimate(documents, selected);
+    Some(budget_targets_for_estimate(s, documents, selected, &estimate, tokens))
+}
+
 fn production_recovery(
     ui: &mut egui::Ui,
     s: &mut AiUiState,
@@ -2483,14 +2566,7 @@ fn production_recovery(
                 "تحتفظ إعادة المحاولة بالاستخدام التراكمي والنمط المثبّت وتقسيم الدفعات مع تطبيق حدود الميزانية والنماذج المتوافقة المحدّثة. لتغيير التعليمات أو النمط أو حجم الدفعة، جهّز الاستكمال واضغط إنتاج.",
             );
         }
-        let unpublished_new_book = matches!(draft.request.target, TaskTarget::NewA4 { .. })
-            && batch.completed_pages == 0
-            && batch.document_uid.is_none()
-            && draft.document_uid.is_none();
-        let target_matches = unpublished_new_book
-            || documents.iter().any(|document| {
-                Some(document.index) == *activate_document && Some(document.uid) == batch.document_uid && Some(document.uid) == draft.document_uid
-            });
+        let target_matches = matching_retryable_failed_batch(s, documents, *activate_document).is_some();
         if ui
             .add_enabled(
                 available && target_matches,
@@ -2625,10 +2701,10 @@ fn render_diagnostic_alert_banner(
                     }
                     DiagnosticAlertKind::RequestBudget => {
                         if ui.button(rtl::widget(ui, text(a, "Raise Request Allowance", "رفع حصة الطلبات تلقائياً"))).clicked() {
-                            let target = s
-                                .request_estimate(documents, activate_document)
-                                .map(|est| est.book_allowance.max(est.allowance()))
-                                .unwrap_or(32)
+                            let (consumed_requests, _) = retryable_consumed_usage(s, documents, activate_document);
+                            let target = budget_targets(s, documents, activate_document)
+                                .map(|targets| targets.book_requests.max(targets.review_requests))
+                                .unwrap_or_else(|| consumed_requests.saturating_add(32))
                                 .max(s.settings.budget.max_requests.saturating_mul(2))
                                 .min(MAX_REQUEST_ALLOWANCE);
                             s.settings.budget.max_requests = target;
@@ -2638,7 +2714,10 @@ fn render_diagnostic_alert_banner(
                     }
                     DiagnosticAlertKind::TokenBudget => {
                         if ui.button(rtl::widget(ui, text(a, "Raise Token Limit", "رفع سقف الرموز تلقائياً"))).clicked() {
-                            let estimated = s.token_estimate(documents, activate_document).map_or(0, |est| est.book_tokens.max(est.review_tokens));
+                            let (_, consumed_tokens) = retryable_consumed_usage(s, documents, activate_document);
+                            let estimated = budget_targets(s, documents, activate_document)
+                                .and_then(|targets| targets.book_tokens.zip(targets.review_tokens).map(|(b, r)| b.max(r)))
+                                .unwrap_or_else(|| consumed_tokens.saturating_add(256_000));
                             s.settings.budget.token_limit = s.settings.budget.token_limit.saturating_mul(2).max(estimated).clamp(256_000, 4_000_000);
                             requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                             s.clear_failure_alert();
@@ -3126,29 +3205,30 @@ fn production(
         );
         if let Some(estimate) = s.request_estimate(documents, *activate_document) {
             let tokens = s.token_estimate(documents, *activate_document);
+            let targets = budget_targets_for_estimate(s, documents, *activate_document, &estimate, tokens);
             if estimate.remaining_pages > estimate.review_pages {
                 rtl::label(ui, format!("{}: {} · {} {} · {} {}", text(a, "Remaining book requests (estimate, before repairs)", "طلبات بقية الكتاب (تقدير قبل الإصلاحات)"),
                     estimate.book_allowance, estimate.remaining_pages, text(a, "pages", "صفحة"), estimate.remaining_groups, text(a, "review groups", "مجموعات مراجعة")));
-                let need_book_requests = s.settings.budget.max_requests < estimate.book_allowance;
-                let need_book_tokens = tokens.is_some_and(|t| s.settings.budget.token_limit < t.book_tokens);
+                let need_book_requests = s.settings.budget.max_requests < targets.book_requests;
+                let need_book_tokens = targets.book_tokens.is_some_and(|target| s.settings.budget.token_limit < target);
                 if need_book_requests || need_book_tokens {
                     ui.horizontal_wrapped(|ui| {
                         if need_book_requests
                             && ui
                                 .add_enabled(
-                                    estimate.book_allowance <= MAX_REQUEST_ALLOWANCE,
+                                    targets.book_requests <= MAX_REQUEST_ALLOWANCE,
                                     egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for remaining book", "ضبط حصة الطلبات لبقية الكتاب"))),
                                 )
                                 .clicked()
                         {
-                            s.settings.budget.max_requests = estimate.book_allowance;
+                            s.settings.budget.max_requests = targets.book_requests;
                             requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                         }
-                        if let Some(t) = tokens
-                            && s.settings.budget.token_limit < t.book_tokens
+                        if let Some(target) = targets.book_tokens
+                            && s.settings.budget.token_limit < target
                             && ui.button(rtl::widget(ui, text(a, "Set token limit for remaining book", "ضبط سقف الرموز لبقية الكتاب"))).clicked()
                         {
-                            s.settings.budget.token_limit = t.book_tokens;
+                            s.settings.budget.token_limit = target;
                             requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                         }
                     });
@@ -3198,9 +3278,8 @@ fn production(
                     "يضيف فحص الصور طلب نص مدفوعاً لكل مصدر مولد غير مخزن؛ يفترض هذا التقدير عدم إعادة استخدام صور مخزنة.",
                 );
             }
-            if s.settings.budget.max_requests < estimate.review_pages {
-                rtl::label(
-                    ui,
+            if s.settings.budget.max_requests < targets.min_text_requests {
+                let warning = if targets.consumed_requests == 0 {
                     format!(
                         "{} {} {} {}.",
                         text(a, "Configured request limit", "حد الطلبات المحدد"),
@@ -3210,39 +3289,64 @@ fn production(
                         } else {
                             text(a, "is below the conservative planning allowance for this review:", "أقل من حصة التخطيط التحفظية لهذه المراجعة:")
                         },
-                        estimate.review_pages
-                    ),
-                );
+                        targets.min_text_requests
+                    )
+                } else if a {
+                    format!(
+                        "حد الطلبات المحدد {} {} {} (استُخدم منها {}).",
+                        s.settings.budget.max_requests,
+                        if estimate.scripted {
+                            "أقل من الحد الأدنى التراكمي لطلبات النص لإعادة محاولة هذه المراجعة:"
+                        } else {
+                            "أقل من الحصة التراكمية التحفظية لإعادة محاولة هذه المراجعة:"
+                        },
+                        targets.min_text_requests,
+                        targets.consumed_requests
+                    )
+                } else {
+                    format!(
+                        "Configured request limit {} {} {} ({} already used).",
+                        s.settings.budget.max_requests,
+                        if estimate.scripted {
+                            "is below the minimum cumulative text requests to retry this review:"
+                        } else {
+                            "is below the conservative cumulative allowance to retry this review:"
+                        },
+                        targets.min_text_requests,
+                        targets.consumed_requests
+                    )
+                };
+                rtl::label(ui, warning);
             }
-            if s.settings.budget.max_requests < estimate.allowance() {
+            if s.settings.budget.max_requests < targets.review_requests {
                 if ui
                     .add_enabled(
-                        estimate.allowance() <= MAX_REQUEST_ALLOWANCE,
+                        targets.review_requests <= MAX_REQUEST_ALLOWANCE,
                         egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for this review", "ضبط حصة الطلبات لهذه المراجعة"))),
                     )
                     .clicked()
                 {
-                    s.settings.budget.max_requests = estimate.allowance();
+                    s.settings.budget.max_requests = targets.review_requests;
                     requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                 }
-                if estimate.allowance() > MAX_REQUEST_ALLOWANCE {
+                if targets.review_requests > MAX_REQUEST_ALLOWANCE {
                     label(ui, a, "This provisional estimate exceeds the 10,000-request task ceiling.", "يتجاوز هذا التقدير الأولي سقف المهمة البالغ ١٠٬٠٠٠ طلب.");
                 }
             }
-            if let Some(tokens) = tokens
-                && s.settings.budget.token_limit < tokens.review_tokens
+            if let Some(target) = targets.review_tokens
+                && s.settings.budget.token_limit < target
             {
                 rtl::label(
                     ui,
                     egui::RichText::new(if a {
                         format!(
                             "سقف الرموز الحالي ({}) أقل من التقدير التحفظي لهذه المراجعة ({}).",
-                            s.settings.budget.token_limit, tokens.review_tokens
+                            s.settings.budget.token_limit, target
                         )
                     } else {
                         format!(
                             "Configured token limit ({}) is below the conservative estimate for this review ({}).",
-                            s.settings.budget.token_limit, tokens.review_tokens
+                            s.settings.budget.token_limit, target
                         )
                     })
                     .color(ui.visuals().warn_fg_color),
@@ -3251,7 +3355,7 @@ fn production(
                     .button(rtl::widget(ui, text(a, "Set token limit for this review", "ضبط سقف الرموز لهذه المراجعة")))
                     .clicked()
                 {
-                    s.settings.budget.token_limit = tokens.review_tokens;
+                    s.settings.budget.token_limit = target;
                     requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                 }
             }
@@ -6823,5 +6927,199 @@ mod tests {
         cont_panel.get_by_label("Produce").click();
         cont_panel.run_steps(3);
         assert!(matches!(cont_panel.state().1.last(), Some(AiRequest::Start(TaskRequest { target: TaskTarget::ContinueBook, .. }))));
+    }
+
+    #[test]
+    fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens() {
+        use designcraft_ai_types::protocol::UsageSummary;
+        use egui_kittest::kittest::Queryable;
+
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"pages": 20, "facingPages": false})).unwrap();
+        for spread in 0..8 {
+            session.execute("frame.create", &json!({"spread": spread, "rect": [20, 20, 100, 80]})).unwrap();
+        }
+        let doc = session.active().unwrap();
+        let open_doc = OpenDocument::from_document(0, doc);
+        assert_eq!(open_doc.pages, 20);
+        assert_eq!(open_doc.remaining_pages, 12);
+        assert!(open_doc.continuable);
+
+        let mut req = continuation_request(TaskTarget::ContinueBook);
+        req.settings.pages_per_batch = 2;
+        req.settings.budget.max_requests = 8;
+        req.settings.budget.token_limit = 120_000;
+
+        let mut snap = saved_production_snapshot(&req, doc);
+        snap.batch = Some(BatchSnapshot {
+            job_id: "saved-book".into(),
+            status: "failed".into(),
+            retryable: true,
+            completed_pages: 8,
+            total_pages: 20,
+            pages_per_batch: 2,
+            document_uid: Some(doc.uid),
+            document_revision: Some(doc.revision),
+            cumulative_usage: UsageSummary { requests: 8, input_tokens: 100_000, output_tokens: 20_000, ..Default::default() },
+            ..Default::default()
+        });
+
+        let mut state = AiUiState::default();
+        state.accept(snap);
+        state.restored_target_unconfirmed = false;
+        assert!(!state.new_document);
+        assert!(state.continue_book);
+
+        let docs = vec![open_doc];
+        let fresh_tokens = state.token_estimate(&docs, Some(0)).unwrap();
+        let expected_review_tokens = 120_000u64.saturating_add(fresh_tokens.review_tokens).clamp(256, 4_000_000);
+        let expected_book_tokens = 120_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256, 4_000_000);
+
+        let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1400.0)).build_ui_state(
+            |ui, (s, reqs, selected, docs)| production(ui, s, false, true, docs, selected, reqs),
+            (state, Vec::new(), Some(0usize), docs),
+        );
+        panel.run_steps(3);
+
+        // 1. Review request allowance includes 8 consumed requests + 2 review requests = 10.
+        assert!(
+            panel
+                .query_by_label(
+                    "Configured request limit 8 is below the conservative cumulative allowance to retry this review: 10 (8 already used)."
+                )
+                .is_some()
+        );
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 10);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.max_requests == 10));
+
+        // 2. Remaining book request allowance includes 8 consumed requests + 12 remaining requests = 20.
+        panel.state_mut().1.clear();
+        panel.get_by_label("Set request allowance for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 20);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.max_requests == 20));
+        assert!(panel.query_by_label("Set request allowance for remaining book").is_none());
+
+        // 3. Review and remaining-book token limits include the 120,000 consumed tokens on top of remaining estimates.
+        panel.state_mut().1.clear();
+        panel.get_by_label("Set token limit for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.token_limit, expected_review_tokens);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == expected_review_tokens));
+
+        panel.state_mut().1.clear();
+        panel.get_by_label("Set token limit for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.token_limit, expected_book_tokens);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == expected_book_tokens));
+
+        // Diagnostic alert quick fixes ("Raise Request Allowance" and "Raise Token Limit") also include consumed + estimated_tokens.
+        panel.state_mut().1.clear();
+        panel.state_mut().0.settings.budget.max_requests = 8;
+        panel.state_mut().0.snapshot.batch.as_mut().unwrap().cumulative_usage.requests = 12;
+        panel.state_mut().0.snapshot.stage = "failed".into();
+        panel.state_mut().0.snapshot.message = "AI request limit reached".into();
+        panel.run_steps(3);
+        panel.get_by_label("Raise Request Allowance").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 24, "12 consumed + 12 remaining = 24 (> 8 * 2)");
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.max_requests == 24));
+
+        panel.state_mut().1.clear();
+        panel.state_mut().0.settings.budget.token_limit = 100_000;
+        panel.state_mut().0.snapshot.batch.as_mut().unwrap().cumulative_usage.estimated_tokens = 90_000;
+        panel.state_mut().0.snapshot.stage = "failed".into();
+        panel.state_mut().0.snapshot.message = "Token budget cannot admit another request".into();
+        panel.run_steps(3);
+        panel.get_by_label("Raise Token Limit").click();
+        panel.run_steps(3);
+        let expected_raised_tokens = 210_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256_000, 4_000_000);
+        assert_eq!(panel.state().0.settings.budget.token_limit, expected_raised_tokens);
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == expected_raised_tokens));
+
+        // Mid-book NewA4 failure with new_document == true does not double-count the 8 already-completed pages.
+        panel.state_mut().1.clear();
+        panel.state_mut().0.new_document = true;
+        panel.state_mut().0.continue_book = false;
+        panel.state_mut().0.pages = 20;
+        panel.state_mut().0.settings.budget.max_requests = 8;
+        panel.state_mut().0.snapshot.batch.as_mut().unwrap().cumulative_usage.requests = 8;
+        panel.run_steps(3);
+        panel.get_by_label("Set request allowance for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 20, "8 consumed + 12 remaining = 20 without double-counting pages 1..8");
+
+        // 4. Once retryable becomes false (fresh task with new ledger), targets revert to 2 / 12 and fresh token estimates.
+        panel.state_mut().1.clear();
+        panel.state_mut().0.new_document = false;
+        panel.state_mut().0.continue_book = true;
+        panel.state_mut().0.snapshot.batch.as_mut().unwrap().retryable = false;
+        panel.state_mut().0.settings.budget.max_requests = 1;
+        panel.state_mut().0.settings.budget.token_limit = 1_000;
+        panel.run_steps(3);
+        assert!(panel.query_by_label("Configured request limit 1 is below the conservative planning allowance for this review: 2.").is_some());
+        panel.get_by_label("Set request allowance for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 2);
+        panel.get_by_label("Set request allowance for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 12);
+
+        panel.get_by_label("Set token limit for this review").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.token_limit, fresh_tokens.review_tokens);
+        panel.get_by_label("Set token limit for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.token_limit, fresh_tokens.book_tokens);
+
+        // 5. Edge case A: When budget_targets is None (e.g. CurrentDocument mode) and consumed_tokens >= token_limit * 2,
+        //    "Raise Token Limit" grants 256,000 fresh tokens of headroom above consumed_tokens.
+        panel.state_mut().1.clear();
+        panel.state_mut().0.new_document = false;
+        panel.state_mut().0.continue_book = false;
+        panel.state_mut().0.settings.budget.token_limit = 140_000;
+        {
+            let batch = panel.state_mut().0.snapshot.batch.as_mut().unwrap();
+            batch.retryable = true;
+            batch.cumulative_usage = UsageSummary { requests: 8, input_tokens: 250_000, output_tokens: 50_000, ..Default::default() };
+        }
+        panel.state_mut().0.snapshot.stage = "failed".into();
+        panel.state_mut().0.snapshot.message = "Token budget cannot admit another request".into();
+        panel.run_steps(3);
+        assert!(budget_targets(&panel.state().0, &panel.state().3, panel.state().2).is_none());
+        panel.get_by_label("Raise Token Limit").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.token_limit, 556_000, "300_000 consumed + 256_000 fallback headroom = 556_000");
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == 556_000));
+
+        // 6. Edge case B: Unpublished NewA4 retryable batch (total_pages = 20, completed_pages = 0, document_uid = None)
+        //    while new_document == false on a smaller open document (remaining_pages = 4) still uses batch.total_pages (20), not 4.
+        panel.state_mut().1.clear();
+        {
+            let state = &mut panel.state_mut().0;
+            state.new_document = false;
+            state.continue_book = true;
+            state.settings.budget.max_requests = 4;
+            let draft = state.snapshot.production_draft.as_mut().unwrap();
+            draft.request.target = TaskTarget::NewA4 { pages: 20 };
+            draft.document_uid = None;
+            draft.document_path = None;
+            let batch = state.snapshot.batch.as_mut().unwrap();
+            batch.completed_pages = 0;
+            batch.total_pages = 20;
+            batch.pages_per_batch = 2;
+            batch.document_uid = None;
+            batch.retryable = true;
+            batch.cumulative_usage.requests = 4;
+        }
+        panel.state_mut().3[0].pages = 6;
+        panel.state_mut().3[0].remaining_pages = 4;
+        panel.run_steps(3);
+        panel.get_by_label("Set request allowance for remaining book").click();
+        panel.run_steps(3);
+        assert_eq!(panel.state().0.settings.budget.max_requests, 24, "4 consumed + 20 unpublished NewA4 batch pages = 24 (not 4 + 4 = 8)");
+        assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.max_requests == 24));
     }
 }
