@@ -350,7 +350,7 @@ impl Runner<'_> {
             }
             if let Some(contract) = &self.print {
                 self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
-            } else if let Some(explicit_contract) = explicit_arabic_font_contract(request.settings.arabic_font.as_deref(), &request.prompt) {
+            } else if let Some(explicit_contract) = explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt) {
                 self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, &explicit_contract)?)?;
             }
             self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
@@ -941,7 +941,7 @@ impl Runner<'_> {
                         if let Some(contract) = &self.print {
                             self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
                         } else if let Some(explicit_contract) =
-                            explicit_arabic_font_contract(request.settings.arabic_font.as_deref(), &request.prompt)
+                            explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt)
                         {
                             self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, &explicit_contract)?)?;
                         }
@@ -1714,7 +1714,8 @@ impl Runner<'_> {
                 prepare_editorial_plan_with_mode(&mut raw, &request.prompt, &context, None, request.settings.arabic_tashkeel)?;
                 if let Some(contract) = &self.print {
                     step_notes.extend(crate::native_print_fonts::apply(&mut raw, base, prefs, contract)?);
-                } else if let Some(explicit_contract) = explicit_arabic_font_contract(request.settings.arabic_font.as_deref(), &request.prompt) {
+                } else if let Some(explicit_contract) = explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt)
+                {
                     step_notes.extend(crate::native_print_fonts::apply(&mut raw, base, prefs, &explicit_contract)?);
                 } else if let Some(auto_contract) = auto_preferred_arabic_font_contract(base, &raw) {
                     let mut candidate = raw.clone();
@@ -2499,8 +2500,9 @@ fn strip_arabic_vowels_with_byte_map(text: &mut String) -> Option<Vec<usize>> {
     Some(map)
 }
 
-fn extract_arabic_font_from_prompt(prompt: &str) -> Option<String> {
+fn extract_arabic_fonts_from_prompt(prompt: &str) -> Vec<String> {
     let lower = prompt.to_lowercase();
+    let mut found = Vec::new();
     for (needles, canonical) in [
         (&["خط الجزيرة", "الجزيرة", "al-jazeera", "aljazeera"][..], "Al-Jazeera-Arabic"),
         (&["خط سلطان", "سلطاني", "سلطان", "sultan"][..], "Sultan"),
@@ -2511,15 +2513,39 @@ fn extract_arabic_font_from_prompt(prompt: &str) -> Option<String> {
         (&["خط تجوال", "tajawal"][..], "Tajawal"),
     ] {
         if needles.iter().any(|kw| lower.contains(kw)) {
-            return Some(canonical.to_owned());
+            found.push(canonical.to_owned());
         }
+    }
+    found
+}
+
+fn resolve_installed_arabic_font_request(base: &DocState, setting_font: Option<&str>, prompt: &str) -> Option<String> {
+    let scoped = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+    if let Some(explicit) = setting_font.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(matched) = scoped.resolve_arabic_font(explicit)
+    {
+        return Some(matched.regular_family);
+    }
+    let prompt_candidates = extract_arabic_fonts_from_prompt(prompt);
+    for candidate in &prompt_candidates {
+        if let Some(matched) = scoped.resolve_arabic_font(candidate) {
+            return Some(matched.regular_family);
+        }
+    }
+    let lower = prompt.to_lowercase();
+    let asks_arabic_font_upgrade = !prompt_candidates.is_empty()
+        || ["تبديل الخط", "تغيير الخط", "الخط العربي", "خط واضح", "مثل خط", "replace arabic font", "change arabic font"]
+            .iter()
+            .any(|kw| lower.contains(kw));
+    if asks_arabic_font_upgrade {
+        return scoped.preferred_arabic_font().map(|m| m.regular_family);
     }
     None
 }
 
-fn explicit_arabic_font_contract(setting_font: Option<&str>, prompt: &str) -> Option<crate::print_contract::PrintContract> {
-    let candidate = setting_font.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).or_else(|| extract_arabic_font_from_prompt(prompt))?;
-    Some(crate::print_contract::PrintContract { arabic_fonts: vec![candidate], ..Default::default() })
+fn explicit_arabic_font_contract(base: &DocState, setting_font: Option<&str>, prompt: &str) -> Option<crate::print_contract::PrintContract> {
+    let resolved = resolve_installed_arabic_font_request(base, setting_font, prompt)?;
+    Some(crate::print_contract::PrintContract { arabic_fonts: vec![resolved], ..Default::default() })
 }
 
 fn auto_preferred_arabic_font_contract(base: &DocState, plan: &ProductionPlan) -> Option<crate::print_contract::PrintContract> {
@@ -2629,22 +2655,7 @@ fn try_build_whole_book_polish_plan(
     let wants_light_tashkeel = !wants_strip_tashkeel
         && (has(&["تشكيل خفيف", "خفف التشكيل", "تقليل التشكيل", "light tashkeel", "lighten diacritics"])
             || request.settings.arabic_tashkeel == designcraft_ai_types::ArabicTashkeelMode::Light);
-    let requested_font = request
-        .settings
-        .arabic_font
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| extract_arabic_font_from_prompt(&request.prompt))
-        .or_else(|| {
-            if has(&["تبديل الخط", "تغيير الخط", "الخط العربي", "خط واضح", "replace arabic font", "change arabic font"])
-            {
-                designcraft_fonts::FontDb::global().scoped(base.doc.font_scope).preferred_arabic_font().map(|m| m.regular_family)
-            } else {
-                None
-            }
-        });
+    let requested_font = resolve_installed_arabic_font_request(base, request.settings.arabic_font.as_deref(), &request.prompt);
     let wants_numbering = has(&["ترقيم", "الترقيم", "الوحدات والصفحات", "رقم الوحدة", "unit badge", "page number", "numbering"]);
     let wants_rtl_cells = has(&[
         "الكلمات وبين الصور",
@@ -9777,6 +9788,12 @@ mod tests {
         assert_eq!(plan.commands.len(), 1);
         assert_eq!(plan.commands[0].command, "book.polishArabic");
         assert_eq!(plan.commands[0].params["tashkeel"], json!("none"));
-        assert_eq!(plan.commands[0].params["arabicFont"], json!("Al-Jazeera-Arabic"));
+        let scoped = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+        let expected_font = scoped.resolve_arabic_font("Al-Jazeera-Arabic").or_else(|| scoped.preferred_arabic_font()).map(|m| m.regular_family);
+        if let Some(expected) = expected_font {
+            assert_eq!(plan.commands[0].params["arabicFont"], json!(expected));
+        } else {
+            assert!(plan.commands[0].params.get("arabicFont").is_none());
+        }
     }
 }
