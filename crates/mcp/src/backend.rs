@@ -1,10 +1,13 @@
 //! Where MCP tool calls end up: a control-channel method call.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// Maximum accepted control-channel reply line (64 MiB, accommodating high-DPI PNG Base64 replies).
+const MAX_CONTROL_REPLY: usize = 64 * 1024 * 1024;
 
 /// Something that answers control-channel methods (`engine.execute`, `document.inspect`,
 /// `ui.pointer`, `ui.render`, …). See `designcraft_ui_egui::control` for the full list.
@@ -26,6 +29,7 @@ pub trait Backend {
 /// A running DesignCraft app, reached through its loopback control port.
 pub struct Remote {
     addr: String,
+    token: Option<String>,
     conn: Option<(BufReader<TcpStream>, TcpStream)>,
     next_id: u64,
 }
@@ -33,7 +37,8 @@ pub struct Remote {
 impl Remote {
     /// Connect to `addr` (`127.0.0.1:7979`), failing fast when nothing is listening.
     pub fn connect(addr: &str) -> std::io::Result<Self> {
-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1 };
+        let token = std::env::var("DESIGNCRAFT_CONTROL_TOKEN").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let mut r = Self { addr: addr.to_string(), token, conn: None, next_id: 1 };
         r.reconnect()?;
         Ok(r)
     }
@@ -51,6 +56,7 @@ impl Remote {
                     s.set_nodelay(true).ok();
                     // The app answers within 60 s (its own timeout); leave headroom.
                     s.set_read_timeout(Some(Duration::from_secs(90))).ok();
+                    s.set_write_timeout(Some(Duration::from_secs(30))).ok();
                     let read = s.try_clone()?;
                     self.conn = Some((BufReader::new(read), s));
                     return Ok(());
@@ -88,11 +94,15 @@ impl Remote {
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
-        let mut reply = String::new();
-        if reader.read_line(&mut reply)? == 0 {
+        let mut raw = Vec::new();
+        let limit = u64::try_from(MAX_CONTROL_REPLY).unwrap_or(u64::MAX).saturating_add(1);
+        if reader.take(limit).read_until(b'\n', &mut raw)? == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "control channel closed"));
         }
-        Ok(reply)
+        if raw.len() > MAX_CONTROL_REPLY && raw.last() != Some(&b'\n') {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control reply exceeded 64 MiB limit"));
+        }
+        String::from_utf8(raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -100,7 +110,11 @@ impl Backend for Remote {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let line = json!({"id": id, "method": method, "params": params}).to_string();
+        let mut payload = json!({"id": id, "method": method, "params": params});
+        if let (Some(tok), Some(obj)) = (self.token.as_deref(), payload.as_object_mut()) {
+            obj.insert("token".into(), Value::String(tok.to_string()));
+        }
+        let line = payload.to_string();
         if let Err(e) = self.prepare_connection() {
             self.conn = None;
             return Err(format!("DesignCraft app at {} is not reachable: {e}; nothing was sent", self.addr));

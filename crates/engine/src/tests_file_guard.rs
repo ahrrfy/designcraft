@@ -79,12 +79,12 @@ const ALLOWED: &[(&str, &str)] = &[
         "`OutputRoot` checks the folder against the write root before it creates anything and then only writes inside it. Its reads are of the font files that draw the document's text (installed fonts and the `Document Fonts` folder), never of a path a command names",
     ),
     (
-        "fonts/src/fontdb.rs",
-        "the installed-font scan reads the platform's fixed font folders (`system_font_dirs`: no command parameter or document field names one), and `load_document_fonts` asks the caller's `allow` check about its folder and each font file before opening either",
+        "ai-runtime/src/resources.rs",
+        "Read-only Linux /sys/class/drm sysfs probes for local GPU VRAM telemetry using fixed kernel device entries; never reads or writes user, document, or command-named paths.",
     ),
     (
-        "mcp/src/tools.rs",
-        "`screenshot` reads back the PNG the connected app just wrote. Connected mode cannot be combined with the roots (the CLI refuses the pair), and the app's own engine checks the path it writes",
+        "fonts/src/fontdb.rs",
+        "the installed-font scan reads the platform's fixed font folders (`system_font_dirs`: no command parameter or document field names one), and `load_document_fonts` asks the caller's `allow` check about its folder and each font file before opening either",
     ),
 ];
 

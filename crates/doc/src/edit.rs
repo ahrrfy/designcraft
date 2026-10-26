@@ -275,7 +275,7 @@ impl Document {
         let mut item = Item::new(id, layer, Shape::Rectangle, shapes::rectangle(rect));
         item.object_style = self.styles.default_text_frame.clone();
         // Applied before the content exists, so the frame keeps default text frame options.
-        if let Some(os) = self.styles.object_style(&self.styles.default_text_frame) {
+        if let Some(os) = self.styles.resolve_object_style(&self.styles.default_text_frame) {
             os.apply_to(&mut item);
         }
         item.content = Content::Text(TextFrame { story: sid, options: TextFrameOptions::default() });

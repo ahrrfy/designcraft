@@ -60,16 +60,24 @@ pub fn mime(bytes: &[u8]) -> &'static str {
     }
 }
 
+struct StaticBytes(&'static [u8]);
+
+impl AsRef<[u8]> for StaticBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
 fn svg_options() -> &'static usvg::Options<'static> {
     static OPTS: OnceLock<usvg::Options<'static>> = OnceLock::new();
     OPTS.get_or_init(|| {
         let mut db = usvg::fontdb::Database::new();
         for f in designcraft_fonts::bundled() {
-            db.load_font_data(f.to_vec());
+            db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(StaticBytes(f))));
         }
         // Japanese text in SVGs: the craft-fonts faces (none without CRAFT_FONTS_DIR).
         for f in designcraft_fonts::japanese_document_fonts() {
-            db.load_font_data(f.bytes.to_vec());
+            db.load_font_source(usvg::fontdb::Source::Binary(Arc::new(StaticBytes(f.bytes))));
         }
         db.set_serif_family("Source Serif 4");
         db.set_sans_serif_family("Source Sans 3");
@@ -268,11 +276,74 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
     if let Some(raster) = decode_cmyk_tiff(bytes) {
         return to_display_rgba(Pixels::Cmyk(raster), embedded_icc(bytes).as_deref(), &DisplayColour::active());
     }
-    let img = image::load_from_memory(bytes).ok()?;
+    if let Some((rgba, icc)) = decode_fast_png(bytes) {
+        let Some(icc) = icc else { return Some(rgba) };
+        return to_display_rgba(Pixels::Rgb(rgba), Some(&icc), &DisplayColour::active());
+    }
+    let (img, icc) = {
+        use image::ImageDecoder;
+        let mut d = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+        let icc = d.icc_profile().ok().flatten();
+        let img = image::DynamicImage::from_decoder(d).ok()?;
+        (img, icc)
+    };
     let rgba = decode_to_rgba8(&img);
-    let Some(icc) = embedded_icc(bytes) else { return Some(rgba) };
+    let Some(icc) = icc else { return Some(rgba) };
     let px = if img.color().has_color() { Pixels::Rgb(rgba) } else { Pixels::Gray(rgba) };
     to_display_rgba(px, Some(&icc), &DisplayColour::active())
+}
+
+/// Inspect PNG headers before `IDAT`: returns `Some((width, height))` only for plain 8-bit
+/// non-interlaced RGB8/RGBA8 PNGs without palette/`tRNS`/`cICP`/`sRGB`/`gAMA`/`cHRM`/APNG chunks
+/// so `zune_png` stays 100% bit-exact with `image` and never hits `zune_png`'s palette path.
+fn fast_png_header(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !bytes.starts_with(&SIG) || bytes.len() < 33 || bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    let ihdr_len = u32::from_be_bytes(bytes.get(8..12)?.try_into().ok()?);
+    if ihdr_len != 13 {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let h = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    let depth = *bytes.get(24)?;
+    let color = *bytes.get(25)?;
+    let rest = bytes.get(26..29)?;
+    if depth != 8 || !matches!(color, 2 | 6) || rest != [0, 0, 0] || w == 0 || h == 0 || w > 65_535 || h > 65_535 {
+        return None;
+    }
+    let out_bytes = usize::try_from(w).ok()?.checked_mul(usize::try_from(h).ok()?)?.checked_mul(4)?;
+    if out_bytes > (512 << 20) {
+        return None;
+    }
+    let mut pos = 8usize;
+    while let Some(hdr) = bytes.get(pos..pos.checked_add(8)?) {
+        let len = usize::try_from(u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]])).ok()?;
+        let kind = &hdr[4..8];
+        let next = pos.checked_add(12)?.checked_add(len)?;
+        if next > bytes.len() {
+            return None;
+        }
+        if kind == b"IDAT" {
+            return Some((w, h));
+        }
+        if matches!(kind, b"PLTE" | b"tRNS" | b"cICP" | b"sRGB" | b"gAMA" | b"cHRM" | b"acTL" | b"fcTL") {
+            return None;
+        }
+        pos = next;
+    }
+    None
+}
+
+fn decode_fast_png(bytes: &[u8]) -> Option<(image::RgbaImage, Option<Vec<u8>>)> {
+    let (w, h) = fast_png_header(bytes)?;
+    let opts = zune_core::options::DecoderOptions::default().png_set_add_alpha_channel(true).set_max_width(65_535).set_max_height(65_535);
+    let mut decoder = zune_png::PngDecoder::new_with_options(zune_core::bytestream::ZCursor::new(bytes), opts);
+    let raw = decoder.decode_raw().ok()?;
+    let icc = decoder.info().and_then(|i| i.icc_profile.clone());
+    let rgba = image::RgbaImage::from_raw(w, h, raw)?;
+    Some((rgba, icc))
 }
 
 /// The ICC profile embedded in a PNG, JPEG, TIFF or WebP.
@@ -802,5 +873,35 @@ mod tests {
         assert_eq!(mime(&bmp), "image/bmp");
         assert_eq!(pixel_size(&bmp), Some((3, 2)));
         assert_eq!(decode_rgba(&bmp).unwrap().get_pixel(1, 1).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn fast_png_and_single_pass_decoder_preserve_rgb8_rgba8_and_svg_zero_copy_fonts() {
+        // RGB8 PNG takes the `zune_png` fast path and expands alpha to 255 identically to `image`.
+        let mut rgb_png = Vec::new();
+        image::RgbImage::from_fn(5, 4, |x, y| image::Rgb([(x * 40) as u8, (y * 50) as u8, 177]))
+            .write_to(&mut std::io::Cursor::new(&mut rgb_png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(fast_png_header(&rgb_png), Some((5, 4)));
+        let expected_rgb = image::load_from_memory(&rgb_png).unwrap().to_rgba8();
+        assert_eq!(decode_rgba(&rgb_png).unwrap(), expected_rgb);
+
+        // RGBA8 PNG takes the `zune_png` fast path with exact straight-alpha parity.
+        let mut rgba_png = Vec::new();
+        image::RgbaImage::from_fn(4, 3, |x, y| image::Rgba([12, (x * 60) as u8, 220, (y * 80) as u8]))
+            .write_to(&mut std::io::Cursor::new(&mut rgba_png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(fast_png_header(&rgba_png), Some((4, 3)));
+        let expected_rgba = image::load_from_memory(&rgba_png).unwrap().to_rgba8();
+        assert_eq!(decode_rgba(&rgba_png).unwrap(), expected_rgba);
+
+        // Bundled SVG font database wraps static slices directly without heap-cloning font data.
+        let opts = svg_options();
+        let bundled_ptrs: Vec<*const u8> = designcraft_fonts::bundled().iter().map(|b| b.as_ptr()).collect();
+        assert!(
+            opts.fontdb
+                .faces()
+                .any(|f| { matches!(&f.source, usvg::fontdb::Source::Binary(b) if bundled_ptrs.contains(&b.as_ref().as_ref().as_ptr())) })
+        );
     }
 }

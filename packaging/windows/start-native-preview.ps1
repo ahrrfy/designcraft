@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$ManifestPath,
     [string]$ExecutablePath,
+    [switch]$EnableControl,
     [switch]$ValidateOnly,
     [switch]$Hidden,
     [switch]$LibraryOnly
@@ -115,7 +116,8 @@ if ($ValidateOnly) {
     $taskRecord = Resolve-PreviewLaunch $ManifestPath $ExecutablePath -ValidateOnly
     $taskBook = if ($taskRecord.document_path) { $taskRecord.document_path } else { $taskRecord.repaired_native_book }
     $taskExecutable = if ($ExecutablePath) { $ExecutablePath } else { $taskRecord.executable }
-    [pscustomobject]@{profile=$taskRecord.profile; document=$taskBook; executable=$taskExecutable; port=$taskRecord.port; validation_only=$true}
+    $taskUseControl = $EnableControl.IsPresent -or ($taskRecord.PSObject.Properties['enable_control'] -and [bool]$taskRecord.enable_control)
+    [pscustomobject]@{profile=$taskRecord.profile; document=$taskBook; executable=$taskExecutable; port=$taskRecord.port; control_enabled=$taskUseControl; validation_only=$true}
     return
 }
 # Share the updater lock through promotion and process creation. A concurrent
@@ -137,7 +139,24 @@ try {
     $taskExecutable = if ($ExecutablePath) { $ExecutablePath } else { $taskRecord.executable }
     $taskBook = if ($taskRecord.document_path) { $taskRecord.document_path } else { $taskRecord.repaired_native_book }
     Set-PreviewLaunchEnvironment $ManifestPath $taskRecord
-    $taskArguments = @('--control', [string]$taskPort)
+    $taskUseControl = $EnableControl.IsPresent -or ($taskRecord.PSObject.Properties['enable_control'] -and [bool]$taskRecord.enable_control)
+    $taskArguments = @()
+    if ($taskUseControl) {
+        $tokenBytes = New-Object byte[] 32
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($tokenBytes) } finally { $rng.Dispose() }
+        $controlToken = -join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
+        $env:DESIGNCRAFT_CONTROL_TOKEN = $controlToken
+        $tokenFile = Join-Path $taskRecord.profile 'control.token'
+        [IO.Directory]::CreateDirectory($taskRecord.profile) | Out-Null
+        [IO.File]::WriteAllText($tokenFile, $controlToken, $utf8NoBom)
+        $taskArguments += @('--control', [string]$taskPort)
+    } else {
+        Remove-Item Env:DESIGNCRAFT_CONTROL_TOKEN -ErrorAction SilentlyContinue
+        if ($taskRecord.profile) {
+            Remove-Item -LiteralPath (Join-Path $taskRecord.profile 'control.token') -Force -ErrorAction SilentlyContinue
+        }
+    }
     if ($taskBook) { $taskArguments += (Format-QuotedWinArg $taskBook) }
     # Automated starts stay hidden; a user-initiated interactive launch is visible.
     $taskStyle = if ($Hidden) { 'Hidden' } else { 'Normal' }

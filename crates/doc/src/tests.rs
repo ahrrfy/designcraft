@@ -351,3 +351,61 @@ fn placed_pdf_without_a_crop_choice_loads_with_the_crop_box() {
     // A box with no area shows the whole page.
     assert_eq!(Asset { pdf_box: Some([0.5, 0.5, 0.5, 0.9]), ..back }.shown_box(), None);
 }
+
+#[test]
+fn check_rejects_bad_sizes_duplicate_story_frames_and_invalid_xml_tags() {
+    let mut base = Document::new(&crate::build::NewDocument::default());
+    let lid = base.default_layer();
+    let (fid, sid) = base.add_text_frame(SpreadRef::Doc(0), Rect::new(20.0, 20.0, 200.0, 200.0), lid, "hello", ParaFormat::default()).unwrap();
+    base.check().unwrap();
+
+    // Duplicate ItemIds in Story::frames.
+    let mut dup_frames = base.clone();
+    dup_frames.story_mut(sid).unwrap().frames.push(fid);
+    assert!(dup_frames.check().is_err());
+
+    // Non-positive or non-finite character sizes in runs or styles.
+    for bad in [0.0, -8.0, f64::NAN, f64::INFINITY] {
+        let mut d = base.clone();
+        d.story_mut(sid).unwrap().format_chars(0..5, |f| f.over.size = Some(bad));
+        assert!(d.check().is_err(), "run size {bad}");
+
+        let mut d2 = base.clone();
+        d2.styles_mut().paragraph[0].chars.size = Some(bad);
+        assert!(d2.check().is_err(), "style size {bad}");
+    }
+
+    // Invalid XML tag names in root, tags, style_map, Item::xml_tag and CharAttrs::xml_tag.
+    for bad_tag in ["<script>", "a/b", "has space", "quote\"x", "amp&x", "apos'x", "-leading"] {
+        let mut d = base.clone();
+        d.xml.root = bad_tag.into();
+        assert!(d.check().is_err(), "root `{bad_tag}`");
+
+        let mut d = base.clone();
+        d.xml.tags.push(crate::XmlTag { name: bad_tag.into(), color: [0, 0, 0] });
+        assert!(d.check().is_err(), "tags `{bad_tag}`");
+
+        let mut d = base.clone();
+        d.xml.style_map.push(("Body".into(), bad_tag.into()));
+        assert!(d.check().is_err(), "style_map `{bad_tag}`");
+
+        let mut d = base.clone();
+        d.item_mut(fid).unwrap().xml_tag = bad_tag.into();
+        assert!(d.check().is_err(), "item `{bad_tag}`");
+
+        let mut d = base.clone();
+        d.story_mut(sid).unwrap().format_chars(0..5, |f| f.over.xml_tag = Some(bad_tag.into()));
+        assert!(d.check().is_err(), "char `{bad_tag}`");
+    }
+    let mut empty_tag_entry = base.clone();
+    empty_tag_entry.xml.tags.push(crate::XmlTag { name: String::new(), color: [0, 0, 0] });
+    assert!(empty_tag_entry.check().is_err());
+
+    // Default unset empty xml_tag and valid XML Names pass.
+    let mut ok = base;
+    ok.xml.root = "Article_1".into();
+    ok.xml.tags.push(crate::XmlTag { name: "ns:Section-2.0".into(), color: [10, 20, 30] });
+    ok.item_mut(fid).unwrap().xml_tag = "ns:Section-2.0".into();
+    ok.story_mut(sid).unwrap().format_chars(0..5, |f| f.over.xml_tag = Some(String::new()));
+    ok.check().unwrap();
+}

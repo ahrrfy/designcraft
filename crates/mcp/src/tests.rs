@@ -386,8 +386,11 @@ fn fake_app() -> (String, std::sync::mpsc::Receiver<Value>) {
             let reply = match req["method"].as_str().unwrap() {
                 "ui.screenshot" => {
                     let px = designcraft_render::Rendered { width: 3, height: 3, pixels: vec![0; 36] };
-                    std::fs::write(p["path"].as_str().unwrap(), px.to_png()).unwrap();
-                    json!({"ok": true, "result": {"path": p["path"], "width": 3, "height": 3}})
+                    let png = px.to_png();
+                    if let Some(path) = p.get("path").and_then(Value::as_str) {
+                        std::fs::write(path, &png).unwrap();
+                    }
+                    json!({"ok": true, "result": {"path": p.get("path"), "width": 3, "height": 3, "pngBase64": designcraft_engine::cmd::base64_encode(&png)}})
                 }
                 "ui.click" => json!({"ok": true, "result": null}),
                 "ui.inspect" => json!({"ok": true, "result": {"tool": "selection"}}),
@@ -413,7 +416,7 @@ fn connect_mode_forwards_to_the_app() {
     assert!(image_of(&r).starts_with(PNG_MAGIC));
     let got = seen.recv().unwrap();
     assert_eq!(got["method"], "ui.screenshot");
-    assert!(!std::path::Path::new(got["params"]["path"].as_str().unwrap()).exists(), "temp screenshot is removed");
+    assert!(got["params"].get("path").is_none(), "screenshot streams pngBase64 without temp files");
 
     ok(&mut s, "click", json!({"x": 10, "y": 20, "count": 2}));
     let got = seen.recv().unwrap();
@@ -676,4 +679,51 @@ fn every_forwarded_key_is_in_the_tool_schema() {
         }
     }
     assert!(missing.is_empty(), "keys missing from tool schemas: {missing:#?}");
+}
+
+#[test]
+fn bounded_line_reader_rejects_oversized_frame_and_recovers_next_line() {
+    let payload = format!("{}\n{{\"ok\":true}}\n", "x".repeat(128));
+    let mut cursor = std::io::Cursor::new(payload.into_bytes());
+    let mut buf = Vec::new();
+    assert_eq!(crate::server::read_bounded_line(&mut cursor, &mut buf, 64).unwrap(), Some(false));
+    assert_eq!(crate::server::read_bounded_line(&mut cursor, &mut buf, 64).unwrap(), Some(true));
+    assert_eq!(std::str::from_utf8(&buf).unwrap(), "{\"ok\":true}");
+    assert_eq!(crate::server::read_bounded_line(&mut cursor, &mut buf, 64).unwrap(), None);
+}
+
+#[test]
+fn screenshot_streams_base64_and_never_reads_caller_path_directly() {
+    struct SandboxScreenshotBackend {
+        wrote: Option<(String, Vec<u8>)>,
+    }
+    impl Backend for SandboxScreenshotBackend {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            assert_eq!(method, "ui.screenshot");
+            assert!(params.get("path").is_none(), "ui.screenshot must stream base64 instead of writing arbitrary paths: {params}");
+            Ok(json!({"pngBase64": base64_encode(PNG_MAGIC), "width": 16, "height": 16}))
+        }
+        fn has_ui(&self) -> bool {
+            true
+        }
+        fn describe(&self) -> String {
+            "sandbox-screenshot".into()
+        }
+        fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), String> {
+            if path.contains("forbidden") {
+                return Err("sandbox denied write".into());
+            }
+            self.wrote = Some((path.to_string(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    let secret_file = tmp("existing-local-secret.txt");
+    std::fs::write(&secret_file, b"TOP-SECRET-BYTES").unwrap();
+    let mut s = Server::new(Box::new(SandboxScreenshotBackend { wrote: None }));
+    let res = call(&mut s, "screenshot", json!({"path": "forbidden/secret.png"}));
+    assert_eq!(res["isError"], true, "sandbox rejection must fail screenshot save");
+    let png = image_of(&call(&mut s, "screenshot", json!({"path": secret_file.to_str().unwrap()})));
+    assert_eq!(png, PNG_MAGIC);
+    let _ = std::fs::remove_file(&secret_file);
 }

@@ -1094,8 +1094,13 @@ impl Exporter<'_> {
             let mut stops: Vec<Stop> = Vec::new();
             let mut last = 0.0f32;
             for (o, c, a) in expanded {
+                if !o.is_finite() {
+                    continue;
+                }
+                last = last.clamp(0.0, 1.0);
                 let o = o.clamp(last, 1.0);
                 last = o;
+                let a = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
                 let color = if mixed && !matches!(c, Color::Rgb { .. }) {
                     let [r, g, b] = c.to_rgb();
                     rgb::Color::new(q(r), q(g), q(b)).into()
@@ -2156,5 +2161,38 @@ mod eps_tests {
         }
         assert_eq!(booklet_pairs_directed(4, BookletKind::SaddleStitch, false), vec![(Some(3), Some(0)), (Some(1), Some(2))]);
         assert_eq!(booklet_pairs_directed(4, BookletKind::SaddleStitch, true), vec![(Some(0), Some(3)), (Some(2), Some(1))]);
+    }
+
+    #[test]
+    fn extreme_gradient_stops_export_without_panicking() {
+        use designcraft_color::gradient::{Gradient, GradientKind, GradientStop};
+        use designcraft_color::{Swatch, SwatchValue};
+        let mut doc = Document::new(&designcraft_doc::build::NewDocument::default());
+        doc.swatches.push(Swatch {
+            name: "ExtremeGrad".into(),
+            value: SwatchValue::Gradient {
+                gradient: Gradient {
+                    kind: GradientKind::Linear,
+                    stops: vec![
+                        GradientStop { offset: -3e38, color: Color::WHITE, opacity: 1.0, midpoint: 0.0 },
+                        GradientStop { offset: 3e38, color: Color::BLACK, opacity: 1.0, midpoint: 0.0 },
+                    ],
+                },
+            },
+            locked: false,
+            named: true,
+            hidden: false,
+        });
+        let id = designcraft_doc::ItemId(doc.alloc());
+        let mut item = designcraft_doc::Item::new(
+            id,
+            doc.default_layer(),
+            designcraft_doc::Shape::Rectangle,
+            designcraft_geom::shapes::rectangle(Rect::new(36.0, 36.0, 200.0, 200.0)),
+        );
+        item.fill = designcraft_doc::Fill::swatch("ExtremeGrad");
+        doc.insert_item(designcraft_doc::SpreadRef::Doc(0), item, None).unwrap();
+        let bytes = export_pdf(&doc, &Cache::new(), &PdfOptions::default()).unwrap();
+        assert!(bytes.starts_with(b"%PDF"));
     }
 }

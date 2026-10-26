@@ -147,6 +147,8 @@ mod tests {
         check_geometry(Some(&base), session.doc().unwrap(), &profile).unwrap();
         assert!(check_geometry(None, session.doc().unwrap(), &profile).is_err());
         let mut image = designcraft_ai_types::protocol::ImagePlacement {
+            family_id: None,
+            slot_id: None,
             repeat_rects: Vec::new(),
             repeat_groups: Vec::new(),
             prompt: "Tree".into(),

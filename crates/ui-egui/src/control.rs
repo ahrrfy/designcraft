@@ -418,13 +418,34 @@ fn handle_request(app: &mut DesignApp, ctx: &egui::Context, req: &ControlRequest
                 Ok(page) => page,
                 Err(e) => return err(e),
             };
-            let scale = p.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+            let scale = match p.get("scale") {
+                None => 1.0,
+                Some(v) => match v.as_f64().filter(|s| s.is_finite() && (0.05..=16.0).contains(s)) {
+                    Some(s) => s,
+                    None => return err("`scale` must be a finite number between 0.05 and 16.0"),
+                },
+            };
+            let bleed = p.get("bleed").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(pg) = st.doc.page(page) {
+                let extra = if bleed {
+                    let [top, bottom, inside, outside] = st.doc.settings.bleed;
+                    (inside.max(0.0) + outside.max(0.0), top.max(0.0) + bottom.max(0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                let b = pg.bounds();
+                let est_w = ((b.width().max(1.0) + extra.0) * scale).ceil();
+                let est_h = ((b.height().max(1.0) + extra.1) * scale).ceil();
+                if !est_w.is_finite() || !est_h.is_finite() || est_w * est_h > 64_000_000.0 {
+                    return err("requested render exceeds the 64-megapixel safety cap; lower `scale`");
+                }
+            }
             let Some(img) = app.canvas.renderer.render_page(
                 &st.doc,
                 &app.session.cache,
                 page,
                 scale,
-                p.get("bleed").and_then(Value::as_bool).unwrap_or(false),
+                bleed,
                 &designcraft_render::RenderOptions { printing_only: true, ..Default::default() },
             ) else {
                 return err("no such page");
@@ -453,12 +474,12 @@ fn handle_request(app: &mut DesignApp, ctx: &egui::Context, req: &ControlRequest
 
 pub fn save_screenshot(app: &mut DesignApp, image: &egui::ColorImage, path: Option<&str>) -> Value {
     let [w, h] = image.size;
-    let Some(path) = path else {
-        return json!({"ok": true, "result": {"width": w, "height": h}});
-    };
     let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
     let img = designcraft_render::Rendered { width: w as u32, height: h as u32, pixels: rgba };
     let png = img.to_png();
+    let Some(path) = path else {
+        return json!({"ok": true, "result": {"width": w, "height": h, "pngBase64": designcraft_engine::cmd::base64_encode(&png)}});
+    };
     match app.services.write.as_mut() {
         Some(wr) => match wr(path, &png) {
             Ok(()) => json!({"ok": true, "result": {"path": path, "width": w, "height": h}}),
@@ -850,5 +871,44 @@ mod deferred_clipboard_tests {
             })
             .collect();
         assert_eq!(kinds, ["ime", "key", "key", "paste"]);
+    }
+
+    #[test]
+    fn ui_render_clamps_scale_and_save_screenshot_returns_base64_without_path() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.session.execute("file.new", &json!({"pages": 1})).unwrap();
+        let ctx = egui::Context::default();
+        let call_ctrl = |app: &mut DesignApp, method: &str, params: Value| -> Value {
+            let (req, _) = ControlRequest::new(method, params);
+            match handle(app, &ctx, &req) {
+                Outcome::Done(v) => v,
+                Outcome::Screenshot { .. } => panic!("unexpected screenshot"),
+            }
+        };
+        for bad_scale in [json!(0.0), json!(-1.0), json!(32.0), json!("nan")] {
+            let r = call_ctrl(&mut app, "ui.render", json!({"scale": bad_scale}));
+            assert_eq!(r["ok"], false, "bad scale {bad_scale} must be rejected: {r}");
+        }
+        let ok_render = call_ctrl(&mut app, "ui.render", json!({"scale": 0.25}));
+        assert_eq!(ok_render["ok"], true, "{ok_render}");
+
+        let shot = egui::ColorImage::filled([2, 2], egui::Color32::WHITE);
+        let saved = save_screenshot(&mut app, &shot, None);
+        assert_eq!(saved["ok"], true);
+        assert!(saved["result"]["pngBase64"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // Malformed powerZoom `at` arrays must never panic on short slices.
+        crate::canvas::apply_view_request(&mut app, &json!({"powerZoom": "start", "at": []}));
+        app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        let doc_uid = app.session.active().unwrap().uid;
+        app.views.insert(doc_uid, crate::View::default());
+        crate::canvas::apply_view_request(&mut app, &json!({"powerZoom": "move", "at": [12.0]}));
+        crate::canvas::apply_view_request(&mut app, &json!({"zoomAt": []}));
+        crate::canvas::apply_view_request(&mut app, &json!({"zoomAt": [12.0]}));
+        for bad_factor in [json!(0.0), json!(-1.0), json!("nan")] {
+            crate::canvas::apply_view_request(&mut app, &json!({"zoomAt": [100.0, 100.0], "factor": bad_factor}));
+        }
+        let v = app.view().unwrap();
+        assert!(v.zoom.is_finite() && v.zoom > 0.0 && v.origin.x.is_finite() && v.origin.y.is_finite());
     }
 }

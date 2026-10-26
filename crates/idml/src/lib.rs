@@ -138,19 +138,39 @@ pub(crate) fn sniff_image(b: &[u8]) -> (Option<&'static str>, Option<(u32, u32)>
     }
     if b.starts_with(&[0xFF, 0xD8]) {
         let mut i = 2;
-        while i + 9 < b.len() {
+        while i < b.len() {
             if b[i] != 0xFF {
                 i += 1;
                 continue;
             }
-            let m = b[i + 1];
-            let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
-            if matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
-                let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
-                let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
-                return (Some("image/jpeg"), Some((w, h)));
+            while b.get(i) == Some(&0xFF) {
+                i += 1;
             }
-            i += 2 + len;
+            let Some(&m) = b.get(i) else { break };
+            i += 1;
+            if m == 0x00 || matches!(m, 0x01 | 0xD0..=0xD8) {
+                continue;
+            }
+            if m == 0xD9 || m == 0xDA {
+                break;
+            }
+            let Some(len_bytes) = b.get(i..i + 2) else { break };
+            let len = usize::from(u16::from_be_bytes([len_bytes[0], len_bytes[1]]));
+            if len < 2 {
+                break;
+            }
+            if matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+                if len >= 7
+                    && let Some(sof) = b.get(i + 3..i + 7)
+                {
+                    let h = u32::from(u16::from_be_bytes([sof[0], sof[1]]));
+                    let w = u32::from(u16::from_be_bytes([sof[2], sof[3]]));
+                    return (Some("image/jpeg"), Some((w, h)));
+                }
+                break;
+            }
+            let Some(next) = i.checked_add(len) else { break };
+            i = next;
         }
         return (Some("image/jpeg"), None);
     }

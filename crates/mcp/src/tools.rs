@@ -519,21 +519,16 @@ fn render_page(b: &mut dyn Backend, a: &Args) -> Result<ToolResult, String> {
 
 fn screenshot(b: &mut dyn Backend, a: &Args) -> Result<ToolResult, String> {
     need_ui(b, "screenshot")?;
-    // The app writes the capture to disk (loopback: same machine), then we read it back.
+    // Receive the captured PNG directly over the control channel without touching unconfined temp
+    // or local paths; if `path` was requested, persist it through the backend's sandboxed writer.
+    let r = b.call("ui.screenshot", json!({}))?;
+    let b64 = r.get("pngBase64").and_then(Value::as_str).ok_or("screenshot returned no image")?.to_string();
     let keep = a.get("path").and_then(Value::as_str);
-    let target = match keep {
-        Some(p) => p.to_string(),
-        None => std::env::temp_dir()
-            .join(format!("designcraft-mcp-{}-{}.png", std::process::id(), std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis())))
-            .to_string_lossy()
-            .to_string(),
-    };
-    let r = b.call("ui.screenshot", json!({"path": target}))?;
-    let png = std::fs::read(&target).map_err(|e| format!("read {target}: {e}"))?;
-    if keep.is_none() {
-        std::fs::remove_file(&target).ok();
+    if let Some(path) = keep {
+        let png = designcraft_engine::cmd::base64_decode(&b64);
+        b.write_file(path, &png)?;
     }
-    Ok(ToolResult::image(designcraft_engine::cmd::base64_encode(&png), &json!({"width": r.get("width"), "height": r.get("height"), "path": keep})))
+    Ok(ToolResult::image(b64, &json!({"width": r.get("width"), "height": r.get("height"), "path": keep})))
 }
 
 fn pointer(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {

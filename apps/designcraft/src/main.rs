@@ -495,6 +495,7 @@ fn main() -> std::process::ExitCode {
     // Session) is captured; see `logging`.
     let logger = logging::install();
     let mut control_port = control_port_from("DESIGNCRAFT_CONTROL_PORT", std::env::var("DESIGNCRAFT_CONTROL_PORT").ok());
+    let mut control_token: Option<String> = None;
     let mut files = Vec::new();
     let mut sample = false;
     let mut skip = Vec::new();
@@ -502,6 +503,7 @@ fn main() -> std::process::ExitCode {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--control" => control_port = control_port_from("--control", args.next()),
+            "--control-token" => control_token = args.next(),
             "--sample" => sample = true,
             "--version" => {
                 println!("designcraft {}", env!("CARGO_PKG_VERSION"));
@@ -625,6 +627,9 @@ fn main() -> std::process::ExitCode {
                         info.driver,
                         info.driver_info
                     );
+                    if !matches!(info.device_type, eframe::wgpu::DeviceType::Cpu) {
+                        designcraft_ai_runtime::set_active_gpu_adapter(&info.name, 0);
+                    }
                     created.started_with(info.backend);
                     created.created(&cc.egui_ctx);
                     if !skip.is_empty() {
@@ -658,7 +663,7 @@ fn main() -> std::process::ExitCode {
                 app.integrated_titlebar = cfg!(target_os = "macos");
                 app.custom_titlebar = cfg!(target_os = "windows");
                 if let Some(port) = control_port {
-                    let rx = control_server::start(port, cc.egui_ctx.clone());
+                    let rx = control_server::start(port, control_server::configured_token(control_token), cc.egui_ctx.clone());
                     app = app.with_control(rx);
                 }
                 if sample {

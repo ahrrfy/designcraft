@@ -91,7 +91,9 @@ macro_rules! attr_set {
 
         impl $props {
             pub fn apply(&mut self, a: &$attrs) {
+                let guard = self.before_apply_guard();
                 $( if let Some(v) = &a.$field { self.$field = v.clone(); } )*
+                self.after_apply_guard(guard);
             }
             /// The attributes where `self` and `other` differ, with `other`'s values.
             pub fn delta(&self, other: &$props) -> $attrs {
@@ -1176,6 +1178,27 @@ attr_set! {
     }
 }
 
+/// Upper bound on resolved character point size.
+pub const MAX_CHAR_SIZE: f64 = 10_000.0;
+
+impl CharProps {
+    fn before_apply_guard(&self) -> f64 {
+        if self.size.is_finite() && self.size > 0.0 { self.size.min(MAX_CHAR_SIZE) } else { 12.0 }
+    }
+    fn after_apply_guard(&mut self, prev_size: f64) {
+        if self.size.is_finite() && self.size > 0.0 {
+            self.size = self.size.min(MAX_CHAR_SIZE);
+        } else {
+            self.size = prev_size;
+        }
+    }
+}
+
+impl ParaProps {
+    fn before_apply_guard(&self) {}
+    fn after_apply_guard(&mut self, (): ()) {}
+}
+
 attr_set! {
     /// Paragraph attributes (Paragraph panel / paragraph styles).
     ParaAttrs / ParaProps {
@@ -1778,5 +1801,19 @@ mod tests {
         assert_eq!(expand_list_text("^2.^#.^>x^^^", "4"), ".4.\u{2002}x^^");
         assert_eq!(expand_list_text("a\nb^p", "1"), "ab");
         assert_eq!(ParaProps::default().bullet_label(), "\u{2022}\t");
+    }
+
+    #[test]
+    fn char_props_apply_sanitizes_invalid_point_sizes() {
+        let mut p = CharProps { size: 18.0, ..Default::default() };
+        for bad in [0.0, -12.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            p.apply(&CharAttrs { size: Some(bad), ..Default::default() });
+            assert_eq!(p.size, 18.0, "bad={bad}");
+        }
+        p.apply(&CharAttrs { size: Some(50_000.0), ..Default::default() });
+        assert_eq!(p.size, MAX_CHAR_SIZE);
+        let mut corrupt = CharProps { size: -5.0, ..Default::default() };
+        corrupt.apply(&CharAttrs::default());
+        assert_eq!(corrupt.size, 12.0);
     }
 }

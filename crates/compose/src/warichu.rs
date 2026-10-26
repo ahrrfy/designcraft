@@ -174,7 +174,7 @@ fn layout(styles: &[RunStyle], line: &mut [PlacedGlyph], members: &[usize]) -> f
     let before = st.warichu_chars_before as usize;
     let after = st.warichu_chars_after as usize;
     let n = line_count(members.len(), st.warichu_lines as usize, before, after);
-    let scale = (st.warichu_size / 100.0).clamp(0.05, 4.0);
+    let scale = if st.warichu_size.is_finite() { (st.warichu_size / 100.0).clamp(0.05, 4.0) } else { 0.5 };
     let old_x0 = members.iter().map(|&k| line[k].x).fold(f64::INFINITY, f64::min);
     let old_right = members.iter().map(|&k| line[k].x + line[k].adv).fold(f64::NEG_INFINITY, f64::max);
     let old_span = old_right - old_x0;
@@ -218,11 +218,13 @@ fn layout(styles: &[RunStyle], line: &mut [PlacedGlyph], members: &[usize]) -> f
         return 0.0;
     }
     let rows = counts.len().max(1);
-    let small = st.size * scale;
+    let safe_size = if st.size.is_finite() { st.size.abs() } else { 0.0 };
+    let small = safe_size * scale;
     // 0 is the default (one small em). Any other value, including a negative one, is added to
     // that em and then clamped so the rows cannot swap order.
     // Bounded, so a hostile value can't move a row to an infinite or huge coordinate.
-    let spacing = if st.warichu_line_spacing.is_finite() { st.warichu_line_spacing.clamp(-16.0 * st.size, 16.0 * st.size) } else { 0.0 };
+    let limit = if st.size.is_finite() { (16.0 * st.size.abs()).max(0.0) } else { 0.0 };
+    let spacing = if st.warichu_line_spacing.is_finite() && limit.is_finite() { st.warichu_line_spacing.clamp(-limit, limit) } else { 0.0 };
     let gap = if spacing == 0.0 { small } else { (small + spacing).max(0.0) };
     let mut off = 0_usize;
     for (li, &c) in counts.iter().enumerate() {
@@ -277,5 +279,38 @@ mod tests {
         assert_eq!(line_count(10, 2, usize::MAX, 1), 1);
         assert_eq!(line_count(10, 3, 1, usize::MAX), 1);
         assert_eq!(line_count(10, 2, 3, 3), 2);
+    }
+
+    #[test]
+    fn negative_or_non_finite_size_with_warichu_does_not_panic() {
+        use designcraft_doc::build::NewDocument;
+        use designcraft_doc::geom::Rect;
+        use designcraft_doc::{Document, ParaFormat, SpreadRef};
+        let mut doc = Document::new(&NewDocument::default());
+        let lid = doc.default_layer();
+        let (_, sid) =
+            doc.add_text_frame(SpreadRef::Doc(0), Rect::new(36.0, 36.0, 300.0, 200.0), lid, "割注テスト文字列", ParaFormat::default()).unwrap();
+        let len = doc.story(sid).unwrap().len();
+        doc.story_mut(sid).unwrap().format_chars(0..len, |f| {
+            f.over.size = Some(-12.0);
+            f.over.h_scale = Some(-1.0);
+            f.over.warichu = Some(true);
+            f.over.warichu_line_spacing = Some(4.0);
+        });
+        let mut composed = crate::compose_story(&doc, sid, &Default::default());
+        assert!(!composed.frames.is_empty());
+
+        // Also exercise `warichu::place` directly with unsanitized negative/non-finite `RunStyle::size`.
+        for bad_size in [-12.0, -1e308, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            if let Some(st) = composed.styles.first_mut() {
+                st.size = bad_size;
+                st.warichu = true;
+                st.warichu_size = 50.0;
+                st.warichu_line_spacing = 4.0;
+            }
+            if let Some(line) = composed.frames.first_mut().and_then(|f| f.lines.first_mut()) {
+                let _ = place(&composed.styles, &mut line.glyphs);
+            }
+        }
     }
 }

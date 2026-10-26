@@ -620,6 +620,8 @@ pub struct DesignApp {
     last_time: f64,
     /// When recovery data was last written (seconds, egui time).
     pub last_recovery: f64,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_recovery_state: Vec<(u64, usize, bool)>,
     /// The egui context (set by the first frame): copied text goes to the system clipboard through it.
     egui_ctx: Option<egui::Context>,
     /// A control-channel request is being handled: commands it runs never read or write the
@@ -705,6 +707,8 @@ impl DesignApp {
             native_shortcuts: Default::default(),
             last_time: 0.0,
             last_recovery: 0.0,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_recovery_state: Vec::new(),
             egui_ctx: None,
             in_control: false,
             object_clip_text: None,
@@ -1167,10 +1171,17 @@ impl DesignApp {
         #[cfg(not(target_arch = "wasm32"))]
         if self.session.recovery_dir.is_some() && now - self.last_recovery > (self.session.prefs.recovery_minutes * 60.0).max(5.0) {
             self.last_recovery = now;
-            if self.session.documents().iter().any(|d| d.is_dirty())
-                && let Err(e) = self.session.execute("file.recovery.save", &json!({}))
-            {
-                self.status(crate::i18n::tr(&self.ui.language, "Couldn't write recovery data: {error}").replace("{error}", &e.to_string()));
+            let rec_state: Vec<(u64, usize, bool)> =
+                self.session.documents().iter().map(|d| (d.uid, std::sync::Arc::as_ptr(&d.doc) as usize, d.is_dirty())).collect();
+            if !rec_state.iter().any(|(_, _, dirty)| *dirty) {
+                self.last_recovery_state.clear();
+            } else if rec_state != self.last_recovery_state {
+                match self.session.execute("file.recovery.save", &json!({})) {
+                    Ok(_) => self.last_recovery_state = rec_state,
+                    Err(e) => {
+                        self.status(crate::i18n::tr(&self.ui.language, "Couldn't write recovery data: {error}").replace("{error}", &e.to_string()));
+                    }
+                }
             }
         }
         let dt = now - self.last_time;

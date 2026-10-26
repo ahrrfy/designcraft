@@ -188,6 +188,32 @@ impl DesignProfile {
         }
         Ok(())
     }
+
+    /// Resolves a declared `DesignImageSlot` by explicit `(family_id, slot_id)` first,
+    /// then unambiguous `slot_id`, and finally legacy `(purpose == label, rect)` fallback.
+    pub fn resolve_image_slot(&self, family_id: Option<&str>, slot_id: Option<&str>, label: &str, rect: [f64; 4]) -> Option<&DesignImageSlot> {
+        if let (Some(fid), Some(sid)) = (family_id, slot_id) {
+            return self
+                .page_families
+                .iter()
+                .find(|family| family.id == fid)
+                .and_then(|family| family.image_slots.iter().find(|slot| slot.id == sid));
+        }
+        if let Some(sid) = slot_id {
+            let mut matches = self.page_families.iter().flat_map(|family| &family.image_slots).filter(|slot| slot.id == sid);
+            let first = matches.next()?;
+            return matches.next().is_none().then_some(first);
+        }
+        if let Some(fid) = family_id {
+            return self.page_families.iter().find(|family| family.id == fid).and_then(|family| {
+                family.image_slots.iter().find(|slot| slot.purpose == label && slot.rect.iter().zip(rect).all(|(a, b)| (a - b).abs() <= 0.01))
+            });
+        }
+        self.page_families
+            .iter()
+            .flat_map(|family| &family.image_slots)
+            .find(|slot| slot.purpose == label && slot.rect.iter().zip(rect).all(|(a, b)| (a - b).abs() <= 0.01))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,5 +333,28 @@ mod tests {
         assert!(settings.design_style.is_none());
         assert!(!settings.allow_paid_repairs);
         assert_eq!(settings.pages_per_batch, 2);
+    }
+
+    #[test]
+    fn wave3_resolve_image_slot_prefers_explicit_family_and_slot_ids_before_geometric_fallback() {
+        let mut p = profile();
+        let slot_a: DesignImageSlot = serde_json::from_value(serde_json::json!({
+            "id": "hero-art",
+            "purpose": "Lesson scene",
+            "rect": [54.0, 180.0, 214.0, 280.0],
+            "crop": [0.0, 0.0, 0.5, 1.0],
+            "source_aspect_ratio": 2.0,
+            "views": [{"rect": [230.0, 180.0, 390.0, 280.0], "crop": [0.5, 0.0, 1.0, 1.0]}]
+        }))
+        .unwrap();
+        p.page_families[0].image_slots = vec![slot_a.clone()];
+        let page_w = p.page_mm[0] * 72.0 / 25.4;
+        let mirrored_rect = [page_w - slot_a.rect[2], slot_a.rect[1], page_w - slot_a.rect[0], slot_a.rect[3]];
+        // Geometric fallback misses mirrored RTL rect, whereas explicit (family_id, slot_id) resolves cleanly.
+        assert!(p.resolve_image_slot(None, None, "Lesson scene", mirrored_rect).is_none());
+        let resolved = p.resolve_image_slot(Some("activity"), Some("hero-art"), "Renamed label", mirrored_rect).unwrap();
+        assert_eq!(resolved, &slot_a);
+        // Legacy fallback without IDs still works when purpose and rect match.
+        assert_eq!(p.resolve_image_slot(None, None, "Lesson scene", slot_a.rect), Some(&slot_a));
     }
 }

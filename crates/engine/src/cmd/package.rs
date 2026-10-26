@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::File;
-#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
 
 use super::{CommandSpec, bad, cmd, has_doc, str_param};
@@ -173,8 +171,9 @@ impl OutputRoot {
     }
 
     fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        crate::file_access::check_read(from).map_err(EngineError::Other)?;
         if self.validate_file_entry(to)?
-            && std::fs::canonicalize(to).is_ok_and(|target| std::fs::canonicalize(from).is_ok_and(|source| source == target))
+            && std::fs::canonicalize(to).is_ok_and(|target| crate::io::canonicalize(from).is_ok_and(|source| source == target))
         {
             return Ok(());
         }
@@ -185,7 +184,7 @@ impl OutputRoot {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut source = File::open(from).map_err(|e| path_error(from, e))?;
+            let mut source = crate::io::open(from).map_err(|e| path_error(from, e))?;
             let permissions = Some(source.metadata().map_err(|e| path_error(from, e))?.permissions());
             let mut target = self.temporary_file(to, permissions)?;
             std::io::copy(&mut source, &mut target).map_err(|e| path_error(to, e))?;
@@ -335,6 +334,9 @@ fn copy_font(root: &OutputRoot, face: &FontFace, dir: &Path, copied: &mut Vec<Pa
     if copied.contains(from) {
         return String::new();
     }
+    if let Err(e) = crate::file_access::check_read(from) {
+        return format!(" — not copied: {e}");
+    }
     let name = safe_component(&from.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), "font");
     let to = dir.join(unique_name(font_file_name(name, face.data()), taken));
     match root.validate_directory(dir).and_then(|_| root.copy(from, &to)) {
@@ -375,7 +377,8 @@ fn drawn_faces(cs: &ComposedStory, depth: usize, out: &mut Vec<FaceRef>) {
     for f in &cs.frames {
         for g in f.lines.iter().flat_map(|l| &l.glyphs).filter(|g| g.visible) {
             if !out.iter().any(|o| o.id() == g.face.id()) {
-                out.push(g.face);
+                #[allow(clippy::clone_on_copy)]
+                out.push(g.face.clone());
             }
         }
         for c in f.tables.iter().flat_map(|t| &t.cells) {
@@ -918,6 +921,67 @@ mod tests {
         assert!(s.execute("file.package", &json!({"dir": redirected.to_string_lossy(), "idml": false})).is_err());
         assert!(!outside.join("Annual.designcraft").exists());
         std::fs::remove_dir(&redirected).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn package_and_output_root_copy_obey_automation_read_roots() {
+        use crate::file_access::{AutomationRoots, confine};
+
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("dc-package-read-root-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let allowed_read = base.join("allowed-read");
+        let secret_dir = base.join("secret");
+        let allowed_write = base.join("allowed-write");
+        std::fs::create_dir_all(&allowed_read).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::create_dir_all(&allowed_write).unwrap();
+
+        let secret_file = secret_dir.join("secret.bin");
+        std::fs::write(&secret_file, b"top-secret").unwrap();
+        let public_file = allowed_read.join("public.bin");
+        std::fs::write(&public_file, b"ok-bytes").unwrap();
+
+        // 1. Direct `OutputRoot::copy` refuses files outside `AutomationRoots.read`.
+        let copy_out = allowed_write.join("DirectCopy");
+        let roots = AutomationRoots::new(Some(&allowed_read), Some(&allowed_write)).unwrap();
+        confine(roots.as_ref(), || {
+            let root = OutputRoot::new(copy_out.clone()).unwrap();
+            let denied_dst = copy_out.join("leaked.bin");
+            let err = root.copy(&secret_file, &denied_dst).unwrap_err().to_string();
+            assert!(err.contains("outside the read root"), "{err}");
+            assert!(!denied_dst.exists(), "denied source must not be copied");
+
+            let ok_dst = copy_out.join("allowed.bin");
+            root.copy(&public_file, &ok_dst).unwrap();
+            assert_eq!(std::fs::read(&ok_dst).unwrap(), b"ok-bytes");
+        });
+
+        // 2. `file.package` refuses to exfiltrate a document/installed font outside `AutomationRoots.read`.
+        const FAMILY: &str = "DC Package Confined Font";
+        let doc_dir = secret_dir.join("doc");
+        let doc_fonts = doc_dir.join(designcraft_fonts::DOCUMENT_FONTS_FOLDER);
+        std::fs::create_dir_all(&doc_fonts).unwrap();
+        std::fs::write(doc_fonts.join("confined.ttf"), designcraft_fonts::testing::font_with(FAMILY, &['A', 'B']).unwrap()).unwrap();
+
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"title": "ConfinedPkg", "width": 144, "height": 144})).unwrap();
+        s.execute("frame.create", &json!({"rect": [12, 12, 120, 80], "content": "text", "text": "AB", "caret": false})).unwrap();
+        s.execute("type.char", &json!({"attrs": {"fontFamily": FAMILY, "size": 12}})).unwrap();
+        let doc_file = doc_dir.join("ConfinedPkg.designcraft");
+        s.execute("file.saveAs", &json!({"path": doc_file.to_string_lossy()})).unwrap();
+        s.execute("file.close", &json!({})).unwrap();
+        // Opened before confinement so the session holds a live font face pointing into `secret_dir`.
+        s.execute("file.open", &json!({"path": doc_file.to_string_lossy()})).unwrap();
+
+        let pkg_dir = allowed_write.join("Packaged");
+        let res =
+            confine(roots.as_ref(), || s.execute("file.package", &json!({"dir": pkg_dir.to_string_lossy(), "idml": false, "pdf": false})).unwrap());
+        let report = res["report"].as_str().unwrap();
+        assert!(report.contains("not copied") && report.contains("outside the read root"), "{report}");
+        assert!(!pkg_dir.join(designcraft_fonts::DOCUMENT_FONTS_FOLDER).join("confined.ttf").exists(), "font outside read root must not be copied");
+        drop(s);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

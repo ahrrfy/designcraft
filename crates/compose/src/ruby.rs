@@ -415,7 +415,7 @@ pub(crate) fn reserve(db: &ScopedFonts<'_>, styles: &mut Vec<RunStyle>, glyphs: 
             i = j;
             continue;
         };
-        let Some((face, parent_size)) = glyphs.get(first).map(|g| (g.face, g.size)) else {
+        let Some((face, parent_size)) = glyphs.get(first).map(|g| (g.face.clone(), g.size)) else {
             i = j;
             continue;
         };
@@ -428,7 +428,7 @@ pub(crate) fn reserve(db: &ScopedFonts<'_>, styles: &mut Vec<RunStyle>, glyphs: 
                 return Side::Edge;
             }
             match styles.get(g.style as usize) {
-                Some(s) if s.ruby.is_some() => Side::Ruby { free: unit_free(db, g.face, g.adv, s, mono, fallback, vertical) },
+                Some(s) if s.ruby.is_some() => Side::Ruby { free: unit_free(db, g.face.clone(), g.adv, s, mono, fallback, vertical) },
                 _ => Side::Char { ch: g.ch, adv: g.adv },
             }
         };
@@ -589,12 +589,12 @@ pub(crate) fn annotate(
         let x0 = base.iter().map(|b| b.x - b.dx).fold(f64::MAX, f64::min);
         let x1 = base.iter().map(|b| b.x - b.dx + b.adv).fold(f64::MIN, f64::max);
         let width = (x1 - x0).max(0.0);
-        let shaped = shape_ruby(db, first.face, &reading, &spec, st.size, fallback, vertical);
+        let shaped = shape_ruby(db, first.face.clone(), &reading, &spec, st.size, fallback, vertical);
         let mono = st.ruby_unit.is_some();
         let side = |b: Option<&PlacedGlyph>| -> Side {
             let Some(b) = b.filter(|b| b.visible) else { return Side::Edge };
             match styles.get(b.style as usize) {
-                Some(s) if s.ruby.is_some() => Side::Ruby { free: unit_free(db, b.face, b.adv, s, mono, glyph_fallback, vertical) },
+                Some(s) if s.ruby.is_some() => Side::Ruby { free: unit_free(db, b.face.clone(), b.adv, s, mono, glyph_fallback, vertical) },
                 _ => Side::Char { ch: text.get(b.byte..).and_then(|s| s.chars().next()).unwrap_or(' '), adv: b.adv },
             }
         };
@@ -643,7 +643,7 @@ pub(crate) fn annotate(
         for (r, off) in shaped.glyphs.iter().zip(offsets) {
             extra.push(PlacedGlyph {
                 rendered_char: r.ch,
-                face: shaped.face,
+                face: shaped.face.clone(),
                 gid: r.gid,
                 x: x0 + off + spec.x_offset,
                 y: y + r.y,

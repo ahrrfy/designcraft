@@ -22,8 +22,25 @@ use serde_json::{Value, json};
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
+/// Idle read/write socket timeout so unclosed peers cannot hold all 16 slots forever.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+pub fn configured_token(explicit: Option<String>) -> Option<Arc<str>> {
+    explicit.or_else(|| std::env::var("DESIGNCRAFT_CONTROL_TOKEN").ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).map(Arc::from)
+}
+
+pub fn start(port: u16, token: Option<Arc<str>>, ctx: egui::Context) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
@@ -33,11 +50,11 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     eprintln!("designcraft: control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx));
+    std::thread::spawn(move || accept_loop(listener, tx, ctx, token));
     rx
 }
 
-fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
+fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: Option<Arc<str>>) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -48,16 +65,19 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         let tx = tx.clone();
         let ctx = ctx.clone();
         let open = Arc::clone(&open);
+        let token = token.clone();
         std::thread::spawn(move || {
-            serve(stream, &tx, &ctx);
+            serve(stream, &tx, &ctx, token.as_deref());
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, token: Option<&str>) {
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let Ok(read) = stream.try_clone() else { return };
-    serve_lines(read, stream, |method, params| {
+    serve_lines_with_token(read, stream, token, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
         tx.send(req).ok()?;
         ctx.request_repaint();
@@ -77,7 +97,7 @@ enum Line {
     Reject(String),
 }
 
-fn parse_line(bytes: &[u8]) -> Line {
+fn parse_line(bytes: &[u8], expected_token: Option<&str>) -> Line {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Line::Reject("not a control request (invalid UTF-8); closing the connection".into());
     };
@@ -95,6 +115,12 @@ fn parse_line(bytes: &[u8]) -> Line {
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         return Line::Reject("not a control request (missing string `method`); closing the connection".into());
     };
+    if let Some(expected) = expected_token {
+        let provided = obj.get("token").and_then(Value::as_str).unwrap_or("");
+        if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+            return Line::Reject("unauthorized control request (missing or invalid `token`); closing the connection".into());
+        }
+    }
     Line::Request {
         id: obj.get("id").cloned().unwrap_or(Value::Null),
         method: method.to_string(),
@@ -129,14 +155,19 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
 /// not a request, or `handle` returns `None` (app gone). `handle` gets `(method, params)` and
 /// returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+#[cfg(test)]
+fn serve_lines<R: Read, W: Write>(read: R, out: W, handle: impl FnMut(String, Value) -> Option<Value>) {
+    serve_lines_with_token(read, out, None, handle);
+}
+
+fn serve_lines_with_token<R: Read, W: Write>(read: R, mut out: W, token: Option<&str>, mut handle: impl FnMut(String, Value) -> Option<Value>) {
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
     loop {
         let reject = match read_bounded_line(&mut reader, &mut buf, MAX_LINE) {
             Ok(false) => return,
             Err(e) => e,
-            Ok(true) => match parse_line(&buf) {
+            Ok(true) => match parse_line(&buf, token) {
                 Line::Blank => continue,
                 Line::Reject(e) => e,
                 Line::Request { id, method, params } => {
@@ -266,7 +297,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, _rx) = channel::<ControlRequest>();
-        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default()));
+        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default(), None));
         // Idle connections are accepted in order and held open.
         let held: Vec<TcpStream> = (0..16).map(|_| TcpStream::connect(addr).unwrap()).collect();
         let mut extra = TcpStream::connect(addr).unwrap();
@@ -275,5 +306,33 @@ mod tests {
         BufReader::new(&mut extra).read_line(&mut line).unwrap();
         assert!(line.contains("too many control connections"), "{line}");
         drop(held);
+    }
+
+    #[test]
+    fn token_authentication_rejects_missing_or_wrong_tokens_and_accepts_exact_match() {
+        let run_auth = |input: &[u8]| {
+            let mut out = Vec::new();
+            let mut calls = Vec::new();
+            serve_lines_with_token(input, &mut out, Some("secret-token-123"), |m, _p| {
+                calls.push(m);
+                Some(json!({"ok": true, "result": null}))
+            });
+            let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            (replies, calls)
+        };
+
+        let (r_missing, calls_missing) = run_auth(b"{\"id\":1,\"method\":\"ui.inspect\"}\n");
+        assert!(calls_missing.is_empty());
+        assert_eq!(r_missing[0]["ok"], false);
+        assert!(r_missing[0]["error"].as_str().unwrap().contains("unauthorized"));
+
+        let (r_wrong, calls_wrong) = run_auth(b"{\"id\":1,\"method\":\"ui.inspect\",\"token\":\"wrong\"}\n");
+        assert!(calls_wrong.is_empty());
+        assert_eq!(r_wrong[0]["ok"], false);
+
+        let (r_ok, calls_ok) = run_auth(b"{\"id\":2,\"method\":\"ui.inspect\",\"token\":\"secret-token-123\"}\n");
+        assert_eq!(calls_ok, ["ui.inspect"]);
+        assert_eq!(r_ok[0]["ok"], true);
+        assert_eq!(r_ok[0]["id"], 2);
     }
 }

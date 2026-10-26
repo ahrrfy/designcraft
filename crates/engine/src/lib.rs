@@ -517,6 +517,7 @@ impl Session {
         if i < self.docs.len() {
             self.reset_find_scope();
             self.docs.remove(i);
+            designcraft_render::trim_unused_images();
             self.active = if self.docs.is_empty() { None } else { Some(i.min(self.docs.len() - 1)) };
             if self.docs.is_empty() {
                 // Retire this document generation's cache. In-flight render jobs may still
@@ -629,7 +630,7 @@ impl Session {
         }
         self.keep_guide_selection_valid(before.as_ref(), id);
         self.record_undo_step(spec, before, nested);
-        if spec.journal {
+        if spec.journal && !nested {
             self.journal.push((id.to_string(), params.clone()));
         }
         self.discard_stale_find_scope();

@@ -98,7 +98,9 @@ pub fn fit(app: &mut DesignApp, rect: Rect, what: &str) {
         let center = app.view().map(|v| v.origin.x + rect.width() as f64 / 2.0 / v.zoom).unwrap_or(0.0);
         let c = slot.to_spread(Point::new(center, slot.bounds.center().y));
         let pi = sp.page_at_x(c.x).unwrap_or(0);
-        b = slot.xf.transform_rect_bbox(sp.pages[pi].bounds());
+        if let Some(pg) = sp.pages.get(pi) {
+            b = slot.xf.transform_rect_bbox(pg.bounds());
+        }
     }
     if what == "all" {
         b = layout.slots.iter().map(|s| s.bounds).reduce(|a, b| a.union(b)).unwrap_or(b);
@@ -202,7 +204,7 @@ pub fn current_page(app: &DesignApp) -> Option<usize> {
     let v = app.view()?;
     let r = app.canvas_rect?;
     let c = slot.to_spread(Point::new(v.origin.x + r.width() as f64 / 2.0 / v.zoom, slot.bounds.center().y));
-    let pi = st.doc.spreads[si].page_at_x(c.x).unwrap_or(0);
+    let pi = st.doc.spreads.get(si)?.page_at_x(c.x).unwrap_or(0);
     Some(st.doc.first_page_of_spread(si) + pi)
 }
 
@@ -325,7 +327,11 @@ pub fn apply_view_request(app: &mut DesignApp, p: &Value) {
     // Power Zoom (Hand tool, Alt-press): zoom out to the spread, aim a view-sized rectangle, zoom
     // back in where it was released.
     if let Some(phase) = p.get("powerZoom").and_then(Value::as_str) {
-        let at = p.get("at").and_then(Value::as_array).map(|a| Point::new(a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0)));
+        let at = p
+            .get("at")
+            .and_then(Value::as_array)
+            .and_then(|a| Some(Point::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?)))
+            .filter(|pt| pt.x.is_finite() && pt.y.is_finite());
         match phase {
             "start" => {
                 if let (Some(v), Some(rect)) = (app.view().copied(), app.canvas_rect) {
@@ -352,17 +358,30 @@ pub fn apply_view_request(app: &mut DesignApp, p: &Value) {
     }
     if let Some(d) = p.get("pan").and_then(Value::as_array) {
         let (dx, dy) = (d.first().and_then(Value::as_f64).unwrap_or(0.0), d.get(1).and_then(Value::as_f64).unwrap_or(0.0));
-        if let Some(v) = app.view_mut() {
+        if dx.is_finite()
+            && dy.is_finite()
+            && let Some(v) = app.view_mut()
+            && v.zoom.is_finite()
+            && v.zoom > 0.0
+        {
             v.origin = Point::new(v.origin.x - dx / v.zoom, v.origin.y - dy / v.zoom);
         }
     }
     if let (Some(a), Some(rect)) = (p.get("zoomAt").and_then(Value::as_array), app.canvas_rect)
+        && let (Some(cx), Some(cy)) = (a.first().and_then(Value::as_f64), a.get(1).and_then(Value::as_f64))
+        && cx.is_finite()
+        && cy.is_finite()
         && let Some(v) = app.view()
     {
-        let c = Point::new(a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0));
-        let xf = Xf::new(rect, v);
-        let s = xf.to_screen(c);
-        zoom_at(app, s, p.get("factor").and_then(Value::as_f64).unwrap_or(2.0));
+        let factor = match p.get("factor") {
+            None => Some(2.0),
+            Some(fv) => fv.as_f64().filter(|f| f.is_finite() && *f > 0.0),
+        };
+        if let Some(factor) = factor {
+            let xf = Xf::new(rect, v);
+            let s = xf.to_screen(Point::new(cx, cy));
+            zoom_at(app, s, factor);
+        }
     }
 }
 

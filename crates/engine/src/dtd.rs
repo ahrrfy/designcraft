@@ -7,6 +7,9 @@ use std::collections::HashMap;
 /// bound: each pass replaces whole strings, so references can inflate multiplicatively).
 const MAX_EXPANDED_BYTES: usize = 1024 * 1024;
 
+/// Maximum element nesting depth accepted when validating an XML document against a DTD.
+pub const MAX_XML_DEPTH: usize = 256;
+
 /// A content particle: a name, a sequence, a choice, or one of those repeated (`?`, `*`, `+`).
 #[derive(Clone, Debug, PartialEq)]
 enum Cp {
@@ -105,6 +108,10 @@ fn tokens(s: &str) -> Vec<String> {
 /// recurse once per level.
 const MAX_CONTENT_MODEL_DEPTH: usize = 64;
 
+fn valid_dtd_name(n: &str) -> bool {
+    !n.is_empty() && !n.contains(['%', ';', '"', '\''])
+}
+
 /// Parse a content particle from `t[*i..]`, inside `depth` enclosing groups.
 fn particle(t: &[String], i: &mut usize, depth: usize) -> Result<Cp, String> {
     let base = match t.get(*i).map(String::as_str) {
@@ -134,7 +141,7 @@ fn particle(t: &[String], i: &mut usize, depth: usize) -> Result<Cp, String> {
             }
             if sep == Some("|") { Cp::Choice(items) } else { Cp::Seq(items) }
         }
-        Some(n) if !"),|?*+".contains(n) => {
+        Some(n) if !"),|?*+".contains(n) && valid_dtd_name(n) => {
             *i += 1;
             Cp::Name(n.to_string())
         }
@@ -158,7 +165,16 @@ fn parse_model(s: &str) -> Result<Model, String> {
     }
     if s.contains("#PCDATA") {
         let t = tokens(&s.replace("#PCDATA", " #PCDATA "));
-        return Ok(Model::Mixed(t.into_iter().filter(|x| !"()|*".contains(x.as_str()) && x != "#PCDATA").collect()));
+        let mut names = Vec::new();
+        for x in t {
+            if !"()|*".contains(x.as_str()) && x != "#PCDATA" {
+                if !valid_dtd_name(&x) {
+                    return Err(format!("unexpected `{x}` in mixed content model"));
+                }
+                names.push(x);
+            }
+        }
+        return Ok(Model::Mixed(names));
     }
     let t = tokens(s);
     let mut i = 0;
@@ -238,8 +254,10 @@ pub fn parse(src: &str) -> Result<Dtd, String> {
                 let rest = rest.trim_start();
                 let name: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
                 let val = rest[name.len()..].trim();
-                let q = val.chars().next().unwrap_or('"');
-                if let Some(v) = val.strip_prefix(q).and_then(|v| v.find(q).map(|e| &v[..e])) {
+                if !name.is_empty()
+                    && let Some(q @ ('"' | '\'')) = val.chars().next()
+                    && let Some(v) = val.strip_prefix(q).and_then(|v| v.find(q).map(|e| &v[..e]))
+                {
                     ents.push((name, v.to_string()));
                 }
             }
@@ -258,7 +276,7 @@ pub fn parse(src: &str) -> Result<Dtd, String> {
             let mut words = Vec::new();
             let mut cur = String::new();
             let mut quote = None;
-            let mut group = 0;
+            let mut group: usize = 0;
             for c in rest.chars() {
                 match (quote, c) {
                     (Some(q), c) if c == q => {
@@ -275,6 +293,9 @@ pub fn parse(src: &str) -> Result<Dtd, String> {
                         cur.push(c);
                     }
                     (None, ')') => {
+                        if group == 0 {
+                            return Err("<!ATTLIST>: unmatched `)`".into());
+                        }
                         group -= 1;
                         cur.push(c);
                     }
@@ -392,6 +413,15 @@ struct Node {
     text: bool,
 }
 
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut stack = std::mem::take(&mut self.children);
+        while let Some(mut node) = stack.pop() {
+            stack.append(&mut node.children);
+        }
+    }
+}
+
 fn read_tree(xml: &str) -> Result<Node, String> {
     use quick_xml::events::Event;
     let mut r = quick_xml::Reader::from_str(xml);
@@ -404,8 +434,16 @@ fn read_tree(xml: &str) -> Result<Node, String> {
     };
     loop {
         match r.read_event().map_err(|e| e.to_string())? {
-            Event::Start(e) => stack.push(node(&e)),
+            Event::Start(e) => {
+                if stack.len() >= MAX_XML_DEPTH {
+                    return Err(format!("XML nesting exceeds maximum depth of {MAX_XML_DEPTH}"));
+                }
+                stack.push(node(&e));
+            }
             Event::Empty(e) => {
+                if stack.len() >= MAX_XML_DEPTH {
+                    return Err(format!("XML nesting exceeds maximum depth of {MAX_XML_DEPTH}"));
+                }
                 let n = node(&e);
                 match stack.last_mut() {
                     Some(p) => p.children.push(n),
@@ -437,44 +475,51 @@ fn read_tree(xml: &str) -> Result<Node, String> {
     }
 }
 
-fn check(dtd: &Dtd, n: &Node, path: &str, out: &mut Vec<Problem>) {
-    let mut problem = |m: String| out.push(Problem { path: path.to_string(), message: m });
-    match dtd.model(&n.name) {
-        None => problem(format!("`{}` isn't declared in the DTD", n.name)),
-        Some(Model::Any) => {}
-        Some(Model::Empty) => {
-            if n.text || !n.children.is_empty() {
-                problem(format!("`{}` should be empty", n.name));
+fn check(dtd: &Dtd, root: &Node, root_path: &str, out: &mut Vec<Problem>) {
+    let mut work: Vec<(&Node, String)> = vec![(root, root_path.to_string())];
+    while let Some((n, path)) = work.pop() {
+        let mut problem = |m: String| out.push(Problem { path: path.clone(), message: m });
+        match dtd.model(&n.name) {
+            None => problem(format!("`{}` isn't declared in the DTD", n.name)),
+            Some(Model::Any) => {}
+            Some(Model::Empty) => {
+                if n.text || !n.children.is_empty() {
+                    problem(format!("`{}` should be empty", n.name));
+                }
             }
-        }
-        Some(Model::Mixed(allowed)) => {
-            for c in &n.children {
-                if !allowed.contains(&c.name) {
-                    problem(format!("`{}` isn't allowed in `{}`", c.name, n.name));
+            Some(Model::Mixed(allowed)) => {
+                for c in &n.children {
+                    if !allowed.contains(&c.name) {
+                        problem(format!("`{}` isn't allowed in `{}`", c.name, n.name));
+                    }
+                }
+            }
+            Some(Model::Children(cp)) => {
+                if n.text {
+                    problem(format!("`{}` can't contain text", n.name));
+                }
+                let seq: Vec<&str> = n.children.iter().map(|c| c.name.as_str()).collect();
+                if !ends(cp, &seq, 0, &mut EndsMemo::new()).contains(&seq.len()) {
+                    let got = if seq.is_empty() { "nothing".to_string() } else { seq.join(", ") };
+                    problem(format!("`{}` contains {got}; the DTD asks for {}", n.name, show(cp)));
                 }
             }
         }
-        Some(Model::Children(cp)) => {
-            if n.text {
-                problem(format!("`{}` can't contain text", n.name));
-            }
-            let seq: Vec<&str> = n.children.iter().map(|c| c.name.as_str()).collect();
-            if !ends(cp, &seq, 0, &mut EndsMemo::new()).contains(&seq.len()) {
-                let got = if seq.is_empty() { "nothing".to_string() } else { seq.join(", ") };
-                problem(format!("`{}` contains {got}; the DTD asks for {}", n.name, show(cp)));
+        for a in dtd.required.get(&n.name).into_iter().flatten() {
+            if !n.attrs.contains(a) {
+                problem(format!("`{}` is missing the required attribute `{a}`", n.name));
             }
         }
-    }
-    for a in dtd.required.get(&n.name).into_iter().flatten() {
-        if !n.attrs.contains(a) {
-            problem(format!("`{}` is missing the required attribute `{a}`", n.name));
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut next: Vec<(&Node, String)> = Vec::with_capacity(n.children.len());
+        for c in &n.children {
+            let k = seen.entry(c.name.as_str()).or_default();
+            *k += 1;
+            next.push((c, format!("{path}/{}[{k}]", c.name)));
         }
-    }
-    let mut seen: HashMap<&str, usize> = HashMap::new();
-    for c in &n.children {
-        let k = seen.entry(c.name.as_str()).or_default();
-        *k += 1;
-        check(dtd, c, &format!("{path}/{}[{k}]", c.name), out);
+        for item in next.into_iter().rev() {
+            work.push(item);
+        }
     }
 }
 
@@ -742,5 +787,50 @@ mod tests {
         let problems = validate(&dtd, &format!("<r>{}</r>", "<a/>".repeat(41)));
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].message.starts_with("`r` contains a, a, a"), "{problems:?}");
+    }
+
+    #[test]
+    fn xml_nested_25000_deep_is_rejected_without_stack_overflow() {
+        let dtd = parse("<!ELEMENT a (a?)>").unwrap();
+        let xml = format!("{}{}", "<a>".repeat(25_000), "</a>".repeat(25_000));
+        let problems = validate(&dtd, &xml);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].message.contains(&format!("XML nesting exceeds maximum depth of {MAX_XML_DEPTH}")), "{problems:?}");
+
+        // Boundary: MAX_XML_DEPTH nested elements validate cleanly; MAX_XML_DEPTH + 1 (Start or Empty) fails.
+        let ok_xml = format!("{}{}", "<a>".repeat(MAX_XML_DEPTH), "</a>".repeat(MAX_XML_DEPTH));
+        assert_eq!(validate(&dtd, &ok_xml), vec![]);
+        let ok_empty = format!("{}<a/>{}", "<a>".repeat(MAX_XML_DEPTH - 1), "</a>".repeat(MAX_XML_DEPTH - 1));
+        assert_eq!(validate(&dtd, &ok_empty), vec![]);
+        let over_start = format!("{}{}", "<a>".repeat(MAX_XML_DEPTH + 1), "</a>".repeat(MAX_XML_DEPTH + 1));
+        assert!(validate(&dtd, &over_start)[0].message.contains("XML nesting exceeds maximum depth"));
+        let over_empty = format!("{}<a/>{}", "<a>".repeat(MAX_XML_DEPTH), "</a>".repeat(MAX_XML_DEPTH));
+        assert!(validate(&dtd, &over_empty)[0].message.contains("XML nesting exceeds maximum depth"));
+    }
+
+    #[test]
+    fn deep_node_tree_check_and_drop_are_iterative() {
+        let dtd = parse("<!ELEMENT a (a?)>").unwrap();
+        let mut cur = Node { name: "a".into(), attrs: vec![], children: vec![], text: false };
+        for _ in 1..25_000 {
+            cur = Node { name: "a".into(), attrs: vec![], children: vec![cur], text: false };
+        }
+        let mut problems = Vec::new();
+        check(&dtd, &cur, "a", &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
+        drop(cur);
+    }
+
+    #[test]
+    fn unquoted_parameter_entity_and_unmatched_attlist_paren_do_not_corrupt_parse() {
+        // `SYSTEM "SYS"` starts with `'S'`; previously `'S'` was treated as the quote delimiter.
+        let src = "<!ENTITY % ext SYSTEM \"SYS\">\n<!ELEMENT root EMPTY>";
+        let dtd = parse(src).unwrap();
+        assert_eq!(dtd.element_names().collect::<Vec<_>>(), ["root"]);
+        // Referencing an unquoted entity fails model parsing instead of expanding garbage.
+        assert!(parse("<!ENTITY % bad x_EMPTY_x>\n<!ELEMENT root %bad;>").is_err());
+        // Unmatched `)` in <!ATTLIST> returns a clean error instead of `group` going negative.
+        let err = parse("<!ELEMENT root EMPTY>\n<!ATTLIST root kind ) CDATA #REQUIRED>").unwrap_err();
+        assert!(err.contains("unmatched `)`"), "{err}");
     }
 }

@@ -33,12 +33,15 @@
     <!-- Shared native setup UI, including install/uninstall completion. -->
 
     <StandardDirectory Id="ProgramFiles6432Folder">
-      <Directory Id="INSTALLFOLDER" Name="DesignCraft" />
+      <Directory Id="INSTALLFOLDER" Name="DesignCraft">
+        <Directory Id="SKILLSDIR" Name="skills" />
+      </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
 
     <Feature Id="Main" Title="DesignCraft" Level="1">
       <ComponentGroupRef Id="DesigncraftFiles" />
+      <ComponentGroupRef Id="DesigncraftSkills" />
       <ComponentGroupRef Id="CraftInstallerSettings" />
     </Feature>
     <!-- Shared full UI; app installation policy remains below. -->
@@ -76,6 +79,10 @@
       <Component Id="DesigncraftCli">
         <File Id="DesigncraftCliExe" Source="$(var.BinDir)\designcraft-cli.exe" KeyPath="yes" />
       </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="DesigncraftSkills" Directory="SKILLSDIR">
+      <Files Include="$(var.SkillsDir)\**" />
     </ComponentGroup>
   </Fragment>
 </Wix>

@@ -32,6 +32,43 @@ impl BatchJob {
     }
 }
 
+pub(crate) fn layout_relevant_prefs_value(prefs: &Prefs) -> Result<Value, String> {
+    let mut value = serde_json::to_value(prefs).map_err(|e| e.to_string())?;
+    if let Some(obj) = value.as_object_mut() {
+        for non_layout_key in [
+            "recentFiles",
+            "recent_files",
+            "recentFilesMax",
+            "recent_files_max",
+            "recentFonts",
+            "recent_fonts",
+            "favoriteFonts",
+            "favorite_fonts",
+            "showHiddenCharacters",
+            "show_hidden_characters",
+            "highlightHj",
+            "highlight_hj",
+            "highlightKeeps",
+            "highlight_keeps",
+            "highlightCustomTracking",
+            "highlight_custom_tracking",
+            "highlightSubstitutedFonts",
+            "highlight_substituted_fonts",
+            "showAddedText",
+            "show_added_text",
+            "showNoteAnchors",
+            "show_note_anchors",
+            "recoveryMinutes",
+            "recovery_minutes",
+            "showFontNamesInEnglish",
+            "show_font_names_in_english",
+        ] {
+            obj.remove(non_layout_key);
+        }
+    }
+    Ok(value)
+}
+
 pub(super) fn recover_snapshot(access: &std::sync::Arc<file_access::AutomationRoots>, root: &Path) -> Result<Option<BatchSnapshot>, String> {
     let Some(value) = read_json(access, &root.join("batch-checkpoint.json"), 8 * 1024 * 1024)? else { return Ok(None) };
     let mut snapshot: BatchSnapshot = serde_json::from_value(value).map_err(|e| format!("Batch checkpoint: {e}"))?;
@@ -147,15 +184,14 @@ impl ProductionRunner {
                     && published.editing_parents == current.editing_parents
             })
             || !Arc::ptr_eq(&job.publication_cache, &session.cache)
-            || serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&session.prefs).map_err(|e| e.to_string())?
+            || layout_relevant_prefs_value(&job.prefs)? != layout_relevant_prefs_value(&session.prefs)?
         {
             return Ok(());
         }
         // Native selection/navigation may bump the session revision. Rebind only
-        // the exact still-pinned document allocation; changed content never passes.
+        // the exact still-pinned document allocation in memory (no disk I/O on selection clicks).
         let mut snapshot = job.snapshot.clone();
         snapshot.document_revision = Some(current.revision);
-        self.persist_batch(&snapshot)?;
         if let Some(job) = &mut self.batch {
             job.snapshot = snapshot.clone();
         }
@@ -422,26 +458,26 @@ impl ProductionRunner {
         {
             return Err("Finish the current interaction, IME composition or preview, or parent-page edit before publishing AI production".to_string());
         }
-        let mut job = self.batch.take().ok_or("Batch checkpoint disappeared")?;
-        let validation: Result<usize, String> = (|| {
-            if !Arc::ptr_eq(&job.publication_cache, &session.cache) {
+        let (target_index, next_launch) = {
+            let job_ref = self.batch.as_ref().ok_or("Batch checkpoint disappeared")?;
+            if !Arc::ptr_eq(&job_ref.publication_cache, &session.cache) {
                 return Err("Font cache changed after proof generation; approval is invalid".to_string());
             }
-            if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? {
+            if layout_relevant_prefs_value(&session.prefs)? != layout_relevant_prefs_value(&job_ref.prefs)? {
                 return Err("Application preferences changed after proof generation; approval is invalid".to_string());
             }
-            let Some(target_index) = session.documents().iter().position(|doc| Some(doc.uid) == job.snapshot.document_uid) else {
+            let Some(target_index) = session.documents().iter().position(|doc| Some(doc.uid) == job_ref.snapshot.document_uid) else {
                 return Err(
                     "The book changed after proof generation; approval is invalid. Start a new task against the corrected document".to_string()
                 );
             };
             let current = session.documents().get(target_index).ok_or("Approved book disappeared")?;
-            if Some(current.revision) != job.snapshot.document_revision {
+            if Some(current.revision) != job_ref.snapshot.document_revision {
                 return Err(
                     "The book changed after proof generation; approval is invalid. Start a new task against the corrected document".to_string()
                 );
             }
-            let proof = job.snapshot.batches.last().ok_or("Batch proof is unavailable")?;
+            let proof = job_ref.snapshot.batches.last().ok_or("Batch proof is unavailable")?;
             if proof.proof_paths.is_empty() || proof.proof_paths.len() != proof.proof_sha256.len() {
                 return Err("Batch proof evidence is incomplete".into());
             }
@@ -461,47 +497,26 @@ impl ProductionRunner {
                     return Err("Batch proof bytes changed after generation; approval is invalid".into());
                 }
             }
-            Ok(target_index)
-        })();
-        let target_index = match validation {
-            Ok(idx) => idx,
-            Err(error) => {
-                job.snapshot.status = "failed".into();
-                self.snapshot.batch = Some(job.snapshot.clone());
-                self.snapshot.stage = "failed".into();
-                let _ = self.persist_batch(&job.snapshot);
-                return Err(error);
-            }
-        };
-        let next_launch = if job.snapshot.completed_pages < job.snapshot.total_pages {
-            let prep: Result<(DocState, Value, u32), String> = (|| {
+            let next_launch = if job_ref.snapshot.completed_pages < job_ref.snapshot.total_pages {
                 let target_doc = session.documents().get(target_index).ok_or("Approved book disappeared")?;
                 let mut base = crate::facing_pages::canonicalize(target_doc, &session.prefs)?;
                 base.selection = Default::default();
                 let mut projected = Session::new();
                 projected.prefs = session.prefs.clone();
                 projected.add_document(base.clone());
-                let mut next_job_view = job.clone();
+                let mut next_job_view = job_ref.clone();
                 if let Some(last) = next_job_view.snapshot.batches.last_mut() {
                     last.status = "approved".into();
                 }
                 let context = batch_context(&projected, &next_job_view, &self.root)?;
-                let next_batch = job.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
-                Ok((base, context, next_batch))
-            })();
-            match prep {
-                Ok(ready) => Some(ready),
-                Err(error) => {
-                    job.snapshot.status = "failed".into();
-                    self.snapshot.batch = Some(job.snapshot.clone());
-                    self.snapshot.stage = "failed".into();
-                    let _ = self.persist_batch(&job.snapshot);
-                    return Err(error);
-                }
-            }
-        } else {
-            None
+                let next_batch = job_ref.snapshot.current_batch.checked_add(1).ok_or("Batch index overflow")?;
+                Some((base, context, next_batch))
+            } else {
+                None
+            };
+            (target_index, next_launch)
         };
+        let mut job = self.batch.take().ok_or("Batch checkpoint disappeared")?;
         let unapproved_job = job.clone();
         let unapproved_reports = self.snapshot.reports.clone();
         if let Some(last) = job.snapshot.batches.last_mut() {
@@ -521,27 +536,55 @@ impl ProductionRunner {
             self.batch = Some(unapproved_job);
             return Err(io_err);
         }
-        if session.active_index() != Some(target_index) {
+        let previous_active = session.active_index();
+        if previous_active != Some(target_index) {
             session.set_active(target_index);
         }
         let Some((base, context, next_batch)) = next_launch else {
-            job.snapshot.status = "completed".into();
             // Final proof approval is deliberately a local transition: no worker or provider call.
             let exported = file_access::confine(job.roots.as_ref(), || self.export_finished_batch(session, &job.task, &job.snapshot.job_id));
-            self.snapshot.stage = if exported.is_ok() { "completed" } else { "failed" }.into();
-            if exported.is_err() {
-                job.snapshot.status = "failed".into();
-            }
-            self.snapshot.message = "All batches approved; no additional provider request was sent".into();
-            self.snapshot.batch = Some(job.snapshot.clone());
-            self.persist_batch(&job.snapshot)?;
-            if let Ok(paths) = &exported {
-                if let Some(report) = self.snapshot.reports.iter_mut().find(|report| report.id == approved_id) {
-                    report.artifacts.extend(paths.iter().cloned());
+            let paths = match exported {
+                Ok(paths) => paths,
+                Err(export_err) => {
+                    if let Some(prev) = previous_active
+                        && session.active_index() != Some(prev)
+                    {
+                        session.set_active(prev);
+                    }
+                    self.snapshot.reports = unapproved_reports;
+                    self.snapshot.batch = Some(unapproved_job.snapshot.clone());
+                    self.snapshot.stage = "awaiting_human_proof".into();
+                    let _ = self.persist_batch(&unapproved_job.snapshot);
+                    let _ = write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports);
+                    self.batch = Some(unapproved_job);
+                    return Err(export_err);
                 }
-                write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports)?;
+            };
+            job.snapshot.status = "completed".into();
+            if let Some(report) = self.snapshot.reports.iter_mut().find(|report| report.id == approved_id) {
+                report.artifacts.extend(paths);
             }
-            return exported.map(|_| ());
+            if let Err(io_err) = self
+                .persist_batch(&job.snapshot)
+                .and_then(|()| write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports))
+            {
+                if let Some(prev) = previous_active
+                    && session.active_index() != Some(prev)
+                {
+                    session.set_active(prev);
+                }
+                self.snapshot.reports = unapproved_reports;
+                self.snapshot.batch = Some(unapproved_job.snapshot.clone());
+                self.snapshot.stage = "awaiting_human_proof".into();
+                let _ = self.persist_batch(&unapproved_job.snapshot);
+                let _ = write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports);
+                self.batch = Some(unapproved_job);
+                return Err(io_err);
+            }
+            self.snapshot.stage = "completed".into();
+            self.snapshot.message = "All batches approved; no additional provider request was sent".into();
+            self.snapshot.batch = Some(job.snapshot);
+            return Ok(());
         };
         job.snapshot.current_batch = next_batch;
         // Consumes this exact approval before any next request is launched.
@@ -561,7 +604,7 @@ impl ProductionRunner {
         if !Arc::ptr_eq(&job_view.publication_cache, &session.cache) {
             return Err("Font cache changed after proof generation; start a new task against the current document".into());
         }
-        if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job_view.prefs).map_err(|e| e.to_string())? {
+        if layout_relevant_prefs_value(&session.prefs)? != layout_relevant_prefs_value(&job_view.prefs)? {
             return Err("Application preferences changed after proof generation; start a new task against the current document".into());
         }
         let Some(target_uid) = job_view.snapshot.document_uid else {
@@ -786,7 +829,7 @@ impl ProductionRunner {
         if !Arc::ptr_eq(&job.publication_cache, &session.cache) {
             return Err("Font cache changed during generation; proof no longer matches publication".into());
         }
-        if serde_json::to_value(&session.prefs).map_err(|e| e.to_string())? != serde_json::to_value(&job.prefs).map_err(|e| e.to_string())? {
+        if layout_relevant_prefs_value(&session.prefs)? != layout_relevant_prefs_value(&job.prefs)? {
             return Err("Application preferences changed during generation; proof no longer matches publication".into());
         }
         let first_plan = plans.first().ok_or("A review group must contain native plans")?;
@@ -2290,7 +2333,13 @@ mod tests {
             let rejected = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
             assert!(!rejected.busy);
             assert!(runner.pending.is_none());
-            assert!(runner.batch.is_none());
+            if change == "cancel" {
+                assert!(runner.batch.is_none());
+            } else {
+                assert!(runner.batch.is_some(), "{change} validation refusal must preserve live batch authority");
+                assert_eq!(rejected.stage, "awaiting_human_proof");
+                assert_eq!(rejected.batch.as_ref().unwrap().status, "awaiting_human_proof");
+            }
             assert!(Arc::ptr_eq(&before, &session.doc().unwrap().doc));
             assert_eq!(rejected.batch.as_ref().unwrap().cumulative_usage.requests, 1);
         }
@@ -2359,7 +2408,8 @@ mod tests {
         assert!(rejected.message.contains("Font cache changed"), "{}", rejected.message);
         assert!(!rejected.busy);
         assert!(runner.pending.is_none());
-        assert!(runner.batch.is_none());
+        assert!(runner.batch.is_some());
+        assert_eq!(rejected.stage, "awaiting_human_proof");
         assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
         assert_eq!(before.is_dirty(), session.doc().unwrap().is_dirty());
         assert_eq!(before.revision, session.doc().unwrap().revision);
@@ -2829,14 +2879,15 @@ mod tests {
             std::fs::write(dir.path().join("fixture-proof.png"), b"tampered-bytes").unwrap();
 
             let failed = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
-            assert_eq!(failed.stage, "failed");
-            assert_eq!(failed.batch.as_ref().unwrap().status, "failed");
+            assert_eq!(failed.stage, "awaiting_human_proof");
+            assert_eq!(failed.batch.as_ref().unwrap().status, "awaiting_human_proof");
+            assert!(runner.batch.is_some(), "recoverable proof validation error must preserve self.batch");
             assert!(failed.message.contains("Batch proof bytes changed"));
             assert_eq!(session.active_index(), Some(1), "failed approval must not switch the user's active tab");
         }
 
-        // 2. Post-validation continuity overflow (`current_batch == u32::MAX`) must NOT leave snapshot.batch
-        // claiming `awaiting_human_proof` while `self.batch` is `None`, nor switch active tab.
+        // 2. Post-validation continuity overflow (`current_batch == u32::MAX`) must keep `self.batch` and
+        // `snapshot.batch` consistent (`Some` + `awaiting_human_proof`) and never switch active tab.
         {
             let dir = tempfile::tempdir().unwrap();
             let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -2847,8 +2898,9 @@ mod tests {
             assert_eq!(session.active_index(), Some(1));
 
             let failed = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
-            assert_eq!(failed.stage, "failed");
-            assert_eq!(failed.batch.as_ref().unwrap().status, "failed", "snapshot.batch must not remain stuck on awaiting_human_proof");
+            assert_eq!(failed.stage, "awaiting_human_proof");
+            assert_eq!(failed.batch.as_ref().unwrap().status, "awaiting_human_proof");
+            assert!(runner.batch.is_some(), "self.batch and snapshot.batch must stay consistent");
             assert_eq!(session.active_index(), Some(1));
         }
 
@@ -3070,7 +3122,7 @@ mod tests {
             text_model: ModelSelection {
                 provider: ProviderKind::Gemini,
                 model: "gemini-3.8-flash".into(),
-                endpoint: Some("https://127.0.0.1:9/".into()),
+                endpoint: Some("https://gemini.example.invalid:9/".into()),
             },
             pages_per_batch: 1,
             ..Default::default()
@@ -3735,5 +3787,88 @@ mod tests {
             assert!(!published.doc.settings.facing_pages, "blank_reuse={blank_reuse}");
             assert!(published.doc.settings.right_to_left_binding, "blank_reuse={blank_reuse}");
         }
+    }
+
+    #[test]
+    fn bug01_non_layout_prefs_and_mru_changes_do_not_invalidate_approve_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        if let Some(snap) = runner.batch.as_mut().map(|job| {
+            job.snapshot.completed_pages = job.snapshot.total_pages;
+            job.snapshot.clone()
+        }) {
+            runner.persist_batch(&snap).unwrap();
+            runner.snapshot.batch = Some(snap);
+        }
+
+        // Mutate MRU and screen-only UI preference fields before ApproveBatch.
+        session.prefs.note_recent_file("/tmp/another-book.designcraft");
+        session.prefs.recent_files_max = 42;
+        session.prefs.show_hidden_characters = !session.prefs.show_hidden_characters;
+        session.prefs.highlight_hj = !session.prefs.highlight_hj;
+        session.prefs.highlight_keeps = !session.prefs.highlight_keeps;
+        session.prefs.recent_fonts.push("Inter".into());
+        session.prefs.favorite_fonts.push("Lora".into());
+        session.prefs.show_added_text = !session.prefs.show_added_text;
+        session.prefs.show_note_anchors = !session.prefs.show_note_anchors;
+        session.prefs.recovery_minutes = 7.5;
+        session.prefs.show_font_names_in_english = !session.prefs.show_font_names_in_english;
+
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint });
+        assert_eq!(approved.stage, "completed", "msg={}", approved.message);
+        assert_eq!(approved.batch.as_ref().unwrap().status, "completed");
+    }
+
+    #[test]
+    fn bug01_validation_error_in_approve_batch_preserves_batch_for_refresh_and_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let (job_id, checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        if let Some(snap) = runner.batch.as_mut().map(|job| {
+            job.snapshot.completed_pages = job.snapshot.total_pages;
+            job.snapshot.clone()
+        }) {
+            runner.persist_batch(&snap).unwrap();
+            runner.snapshot.batch = Some(snap);
+        }
+
+        // Edit page 1 without refreshing proofs first -> ApproveBatch rejects, but preserves self.batch!
+        session
+            .execute("frame.create", &json!({"spread": 0, "rect": [60, 220, 260, 280], "content": "text", "text": "Human typo fix", "caret": false}))
+            .unwrap();
+        let rejected = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: job_id.clone(), checkpoint });
+        assert_eq!(rejected.stage, "awaiting_human_proof", "msg={}", rejected.message);
+        assert_eq!(rejected.batch.as_ref().unwrap().status, "awaiting_human_proof");
+        assert!(runner.batch.is_some(), "Recoverable validation error in approve_batch must keep self.batch alive");
+
+        // User refreshes batch proofs and approves cleanly without losing the batch job!
+        let refreshed = runner.handle(&mut session, AiRequest::RefreshBatchProofs { job_id: job_id.clone() });
+        assert_eq!(refreshed.stage, "awaiting_human_proof", "msg={}", refreshed.message);
+        let new_checkpoint = refreshed.batch.as_ref().unwrap().checkpoint;
+        assert_eq!(new_checkpoint, checkpoint + 1);
+
+        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id, checkpoint: new_checkpoint });
+        assert_eq!(approved.stage, "completed", "msg={}", approved.message);
+        assert_eq!(approved.batch.as_ref().unwrap().status, "completed");
+    }
+
+    #[test]
+    fn bug01_selection_revision_bumps_rebind_in_memory_without_rewriting_batch_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let (_job_id, _checkpoint) = waiting(&mut runner, &mut session, "http://127.0.0.1:9/".into());
+        let checkpoint_file = dir.path().join("batch-checkpoint.json");
+        let saved_before = std::fs::read_to_string(&checkpoint_file).unwrap();
+
+        // Simulate selection-only revision bump on the exact pinned `Arc<Document>`.
+        session.active_mut().unwrap().bump_revision();
+        let bumped_rev = session.doc().unwrap().revision;
+        let polled = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(polled.batch.as_ref().unwrap().document_revision, Some(bumped_rev));
+        assert_eq!(std::fs::read_to_string(&checkpoint_file).unwrap(), saved_before, "selection-only bump must not rewrite batch-checkpoint.json");
     }
 }

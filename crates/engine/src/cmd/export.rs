@@ -517,11 +517,8 @@ fn threaded(d: &designcraft_doc::Document, it: &designcraft_doc::Item) -> bool {
 }
 
 /// Soft effects other than the gradient feather (which PDF export draws itself).
-fn raster_effects(it: &designcraft_doc::Item) -> bool {
-    let e = &it.effects;
-    // Knockout groups too: PDF output here has no knockout transparency groups.
-    it.knockout
-        || e.drop_shadow.on
+fn has_soft_effects(e: &designcraft_doc::Effects) -> bool {
+    e.drop_shadow.on
         || e.feather > 0.0
         || e.inner_shadow.on
         || e.outer_glow.on
@@ -531,10 +528,20 @@ fn raster_effects(it: &designcraft_doc::Item) -> bool {
         || e.directional_feather.on
 }
 
+/// Soft effects other than the gradient feather (on the item or its resolved object style), or a
+/// knockout group.
+fn raster_effects(d: &designcraft_doc::Document, it: &designcraft_doc::Item) -> bool {
+    // Knockout groups too: PDF output here has no knockout transparency groups.
+    it.knockout
+        || has_soft_effects(&it.effects)
+        || d.styles.object_effects(&it.object_style).is_some_and(has_soft_effects)
+        || super::style::resolved_object_style(&d.styles, &it.object_style).and_then(|s| s.effects).as_ref().is_some_and(has_soft_effects)
+}
+
 /// A copy of `d` where spread-level objects with soft effects are 300 ppi images of their whole
 /// appearance (transparent around them, so they composite over what's behind).
 fn rasterize_effects(d: &designcraft_doc::Document, cache: &designcraft_compose::Cache) -> (Option<designcraft_doc::Document>, usize) {
-    rasterize_where(d, cache, 300.0, true, |it| raster_effects(it) && !threaded(d, it))
+    rasterize_where(d, cache, 300.0, true, |it| raster_effects(d, it) && !threaded(d, it))
 }
 
 /// A copy of `d` where the spread-level objects `pred` picks are images of their appearance at
@@ -560,14 +567,30 @@ fn rasterize_where(
     let mut n = 0;
     for (si, id) in todo {
         let Some(it) = d.item(id) else { continue };
-        let reach = it.bounds().inflate(
-            designcraft_render::effect_outset(it) + it.stroke.extent() + 2.0,
-            designcraft_render::effect_outset(it) + it.stroke.extent() + 2.0,
-        );
+        let style_fx = (!has_soft_effects(&it.effects))
+            .then(|| {
+                super::style::resolved_object_style(&d.styles, &it.object_style)
+                    .and_then(|s| s.effects)
+                    .or_else(|| d.styles.object_effects(&it.object_style).cloned())
+                    .filter(has_soft_effects)
+            })
+            .flatten();
+        let outset = match &style_fx {
+            Some(fx) => {
+                let mut tmp = it.clone();
+                tmp.effects = fx.clone();
+                designcraft_render::effect_outset(&tmp)
+            }
+            None => designcraft_render::effect_outset(it),
+        };
+        let reach = it.bounds().inflate(outset + it.stroke.extent() + 2.0, outset + it.stroke.extent() + 2.0);
         // Just this object on its spread, no paper.
         let mut solo = d.clone();
         let sp = std::sync::Arc::make_mut(&mut solo.spreads[si]);
         sp.items.retain(|x| x.id == id);
+        if let (Some(fx), Some(only)) = (style_fx, sp.items.first_mut()) {
+            std::sync::Arc::make_mut(only).effects = fx;
+        }
         for pg in &mut sp.pages {
             pg.show_parent_items = false;
         }
@@ -752,13 +775,30 @@ pub(super) fn pdf_report(s: &Session, p: &Value) -> Result<designcraft_pdf::Expo
     let doc: &designcraft_doc::Document = &boxed;
     let r = designcraft_pdf::export_pdf_with_report(doc, &s.cache, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
     let mut r = r;
-    // Transparency Blend Space: the page group of pages with transparency.
+    let std_name = match opts.standard {
+        designcraft_pdf::Standard::PdfX4 => Some("PDF/X-4"),
+        designcraft_pdf::Standard::PdfA2b => Some("PDF/A-2b"),
+        designcraft_pdf::Standard::None => None,
+    };
+    // Transparency Blend Space: the page group of pages with transparency. PDF/X-4 and PDF/A-2b
+    // already finalize and validate their transparency groups inside `export_pdf_with_report`.
     let spreads = designcraft_pdf::sheet_spreads(doc, &opts);
     let blended: Vec<bool> = spreads.iter().map(|si| doc.spreads.get(*si).is_some_and(|sp| sp.items.iter().any(|it| transparent(it)))).collect();
     if blended.iter().any(|b| *b) {
-        match designcraft_pdf::add_blend_space(&r.bytes, &blended, doc.settings.blend_space == designcraft_doc::BlendSpace::Cmyk) {
-            Some(b) => r.bytes = b,
-            None => r.warnings.push("the transparency blend space couldn't be set".into()),
+        match opts.standard {
+            designcraft_pdf::Standard::None => {
+                match designcraft_pdf::add_blend_space(&r.bytes, &blended, doc.settings.blend_space == designcraft_doc::BlendSpace::Cmyk) {
+                    Some(b) => r.bytes = b,
+                    None => r.warnings.push("the transparency blend space couldn't be set".into()),
+                }
+            }
+            designcraft_pdf::Standard::PdfX4 if doc.settings.blend_space != designcraft_doc::BlendSpace::Cmyk => {
+                r.warnings.push("PDF/X-4: RGB transparency blend space was left out (blended in CMYK)".into());
+            }
+            designcraft_pdf::Standard::PdfA2b if doc.settings.blend_space == designcraft_doc::BlendSpace::Cmyk => {
+                r.warnings.push("PDF/A-2b: CMYK transparency blend space was left out".into());
+            }
+            _ => {}
         }
     }
     // Interactive PDF view options.
@@ -790,27 +830,51 @@ pub(super) fn pdf_report(s: &Session, p: &Value) -> Result<designcraft_pdf::Expo
         }
     }
     if !cat.is_empty() {
-        match designcraft_pdf::add_catalog_entries(&r.bytes, &cat) {
-            Some(b) => r.bytes = b,
-            None => r.warnings.push("the PDF view options couldn't be set".into()),
+        if let Some(label) = std_name {
+            r.warnings.push(format!("{label}: interactive view options were left out"));
+        } else {
+            match designcraft_pdf::add_catalog_entries(&r.bytes, &cat) {
+                Some(b) => r.bytes = b,
+                None => r.warnings.push("the PDF view options couldn't be set".into()),
+            }
         }
     }
     // Flip pages every N seconds (presentation).
-    if let Some(secs) = p.get("advanceSeconds").and_then(Value::as_f64).filter(|s| *s > 0.0) {
-        let n = designcraft_pdf::sheet_spreads(doc, &opts).len();
-        let dur: Vec<Option<String>> = (0..n).map(|_| Some(format!("/Dur {secs:.2}"))).collect();
-        match designcraft_pdf::add_page_entries(&r.bytes, &dur) {
-            Some(b) => r.bytes = b,
-            None => r.warnings.push("page timings couldn't be set".into()),
+    if let Some(secs) = p.get("advanceSeconds").and_then(Value::as_f64).filter(|s| s.is_finite() && *s > 0.0 && *s <= 86_400.0) {
+        if let Some(label) = std_name {
+            r.warnings.push(format!("{label}: page advance timings (/Dur) were left out"));
+        } else {
+            let n = r.pages;
+            let dur: Vec<Option<String>> = (0..n).map(|_| Some(format!("/Dur {secs:.2}"))).collect();
+            match designcraft_pdf::add_page_entries(&r.bytes, &dur) {
+                Some(b) => r.bytes = b,
+                None => r.warnings.push("page timings couldn't be set".into()),
+            }
         }
     }
-    // Page transitions (each spread's first page holds them).
-    let trans: Vec<Option<designcraft_doc::PageTransition>> =
-        spreads.into_iter().map(|si| doc.spreads.get(si).and_then(|sp| sp.pages.first()).and_then(|pg| pg.transition)).collect();
+    // Page transitions: per exported page when exporting pages, or per spread's first page when
+    // exporting spreads.
+    let trans: Vec<Option<designcraft_doc::PageTransition>> = if opts.spreads {
+        spreads.into_iter().map(|si| doc.spreads.get(si).and_then(|sp| sp.pages.first()).and_then(|pg| pg.transition)).collect()
+    } else {
+        let pages: Vec<usize> = opts.pages.clone().unwrap_or_else(|| (0..doc.page_count()).collect());
+        pages
+            .into_iter()
+            .map(|abs| {
+                let (si, pi) = doc.page_loc(abs)?;
+                let sp = doc.spreads.get(si)?;
+                sp.pages.get(pi).and_then(|pg| pg.transition).or_else(|| sp.pages.first().and_then(|pg| pg.transition))
+            })
+            .collect()
+    };
     if trans.iter().any(Option::is_some) {
-        match designcraft_pdf::add_transitions(&r.bytes, &trans) {
-            Some(b) => r.bytes = b,
-            None => r.warnings.push("page transitions couldn't be added to this PDF".into()),
+        if let Some(label) = std_name {
+            r.warnings.push(format!("{label}: page transitions (/Trans) were left out"));
+        } else {
+            match designcraft_pdf::add_transitions(&r.bytes, &trans) {
+                Some(b) => r.bytes = b,
+                None => r.warnings.push("page transitions couldn't be added to this PDF".into()),
+            }
         }
     }
     if fx_count > 0 {
@@ -1337,5 +1401,106 @@ mod pptx_tests {
         s.execute("object.exportOptions", &json!({"ids": [r["id"]], "rasterize": true})).unwrap();
         let x = shapes(&mut s);
         assert!(x.contains("<p:pic>") && !x.contains("prst=\"ellipse\""), "{x}");
+    }
+}
+
+#[cfg(test)]
+mod pdf_fixes_tests {
+    use designcraft_doc::{ItemId, PageTransition, TransitionKind};
+    use serde_json::json;
+
+    use crate::Session;
+    use crate::cmd::base64_decode;
+
+    #[test]
+    fn object_style_and_based_on_soft_effects_rasterize_in_pdf_export() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.object.create", &json!({"name": "Shadow Base", "dropShadow": {"on": true, "distance": 6, "size": 8, "opacity": 0.5}}))
+            .unwrap();
+        s.execute("style.object.create", &json!({"name": "Shadow Child", "basedOn": "Shadow Base", "fill": "[Black]"})).unwrap();
+        let id = ItemId(s.execute("frame.create", &json!({"rect": [72, 72, 180, 180]})).unwrap()["id"].as_u64().unwrap());
+        s.execute("style.object.apply", &json!({"name": "Shadow Child", "ids": [id.0]})).unwrap();
+        // Simulate an unmaterialised/imported style reference where item.effects itself is unset.
+        s.edit(|d, _| {
+            d.item_mut(id).unwrap().effects = Default::default();
+            Ok(())
+        })
+        .unwrap();
+
+        let r = s.execute("file.exportPdf", &json!({})).unwrap();
+        assert!(
+            r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("1 object(s) with soft effects")),
+            "expected soft-effect rasterisation warning, got: {}",
+            r["warnings"]
+        );
+    }
+
+    #[test]
+    fn facing_pages_export_maps_page_transitions_per_exported_page() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": true})).unwrap();
+        s.edit(|d, _| {
+            let (s1, p1) = d.page_loc(1).unwrap();
+            std::sync::Arc::make_mut(&mut d.spreads[s1]).pages[p1].transition =
+                Some(PageTransition { kind: TransitionKind::Dissolve, duration: 1.0, horizontal: true });
+            let (s2, p2) = d.page_loc(2).unwrap();
+            std::sync::Arc::make_mut(&mut d.spreads[s2]).pages[p2].transition =
+                Some(PageTransition { kind: TransitionKind::Wipe, duration: 2.0, horizontal: true });
+            Ok(())
+        })
+        .unwrap();
+
+        let all = s.execute("file.exportPdf", &json!({"spreads": false})).unwrap();
+        let all_text = String::from_utf8_lossy(&base64_decode(all["base64"].as_str().unwrap())).into_owned();
+        assert!(all_text.contains("/Trans<</Type/Trans/S/Dissolve/D 1.00>>"), "{all_text}");
+        assert!(all_text.contains("/Trans<</Type/Trans/S/Wipe/Di 0/D 2.00>>"), "{all_text}");
+
+        let page3_only = s.execute("file.exportPdf", &json!({"pages": "3", "spreads": false})).unwrap();
+        let page3_text = String::from_utf8_lossy(&base64_decode(page3_only["base64"].as_str().unwrap())).into_owned();
+        assert!(page3_text.contains("/Trans<</Type/Trans/S/Wipe/Di 0/D 2.00>>"), "{page3_text}");
+        assert!(!page3_text.contains("/S/Dissolve"), "{page3_text}");
+    }
+
+    #[test]
+    fn pdfx4_and_pdfa2b_skip_disallowed_post_validation_mutations_with_warnings() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let id = s.execute("frame.create", &json!({"rect": [72, 72, 200, 200]})).unwrap()["id"].clone();
+        s.execute("object.fill", &json!({"swatch": "[Black]", "ids": [id]})).unwrap();
+        s.execute("object.opacity", &json!({"ids": [id], "opacity": 0.5})).unwrap();
+        s.edit(|d, _| {
+            let (s0, p0) = d.page_loc(0).unwrap();
+            std::sync::Arc::make_mut(&mut d.spreads[s0]).pages[p0].transition =
+                Some(PageTransition { kind: TransitionKind::Fade, duration: 1.5, horizontal: true });
+            Ok(())
+        })
+        .unwrap();
+
+        s.execute("edit.transparencyBlendSpace", &json!({"space": "rgb"})).unwrap();
+        let x4 = s.execute("file.exportPdf", &json!({"standard": "x4", "fullScreen": true, "advanceSeconds": 4})).unwrap();
+        let x4_bytes = base64_decode(x4["base64"].as_str().unwrap());
+        let x4_errs = designcraft_pdf::check_pdfx4(&x4_bytes);
+        assert!(x4_errs.is_empty(), "PDF/X-4 validation must remain intact: {x4_errs:?}");
+        let x4_text = String::from_utf8_lossy(&x4_bytes);
+        assert!(!x4_text.contains("/FullScreen") && !x4_text.contains("/Dur ") && !x4_text.contains("/Trans<"), "{x4_text}");
+        assert!(!designcraft_pdf::has_rgb_groups(&x4_bytes));
+        let x4_warn = x4["warnings"].to_string();
+        assert!(x4_warn.contains("RGB transparency blend space was left out"), "{x4_warn}");
+        assert!(x4_warn.contains("interactive view options were left out"), "{x4_warn}");
+        assert!(x4_warn.contains("page advance timings (/Dur) were left out"), "{x4_warn}");
+        assert!(x4_warn.contains("page transitions (/Trans) were left out"), "{x4_warn}");
+
+        s.execute("edit.transparencyBlendSpace", &json!({"space": "cmyk"})).unwrap();
+        let a2b = s.execute("file.exportPdf", &json!({"standard": "a2b", "fullScreen": true, "advanceSeconds": 4})).unwrap();
+        let a2b_bytes = base64_decode(a2b["base64"].as_str().unwrap());
+        let a2b_text = String::from_utf8_lossy(&a2b_bytes);
+        assert!(!a2b_text.contains("/FullScreen") && !a2b_text.contains("/Dur ") && !a2b_text.contains("/Trans<"), "{a2b_text}");
+        assert!(!a2b_text.contains("/CS/DeviceCMYK"), "{a2b_text}");
+        let a2b_warn = a2b["warnings"].to_string();
+        assert!(a2b_warn.contains("CMYK transparency blend space was left out"), "{a2b_warn}");
+        assert!(a2b_warn.contains("interactive view options were left out"), "{a2b_warn}");
+        assert!(a2b_warn.contains("page advance timings (/Dur) were left out"), "{a2b_warn}");
+        assert!(a2b_warn.contains("page transitions (/Trans) were left out"), "{a2b_warn}");
     }
 }

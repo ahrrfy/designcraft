@@ -47,7 +47,7 @@ pub use assets::{find_same_asset, insert_asset, remap_story_assets, story_asset_
 pub use attrs::*;
 pub use datamerge::{
     DataField, DataFieldKind, DataMerge, DataSource, Delimiter, Fingerprint, MergeOptions, Placeholder, PlaceholderAnchor, PlaceholderRole,
-    SourceStatus,
+    SharedVec, SourceStatus,
 };
 pub use designcraft_color as color;
 pub use designcraft_geom as geom;
@@ -929,6 +929,67 @@ impl Document {
 
     /// Validate structural invariants (ids unique, threads consistent, stories well-formed).
     pub fn check(&self) -> Result<()> {
+        fn valid_xml_name(n: &str) -> bool {
+            let mut c = n.chars();
+            c.next().is_some_and(|f| f.is_alphabetic() || matches!(f, '_' | ':'))
+                && n.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+        }
+        let check_chars = |c: &CharAttrs, owner: &str| -> Result<()> {
+            if let Some(sz) = c.size
+                && (!sz.is_finite() || sz <= 0.0)
+            {
+                return Err(DocError::Invalid(format!("invalid character size {sz} in {owner}")));
+            }
+            if let Some(tag) = &c.xml_tag
+                && !tag.is_empty()
+                && !valid_xml_name(tag)
+            {
+                return Err(DocError::Invalid(format!("invalid XML tag `{tag}` in {owner}")));
+            }
+            Ok(())
+        };
+        fn check_story_attrs(st: &Story, depth: usize, check_chars: &impl Fn(&CharAttrs, &str) -> Result<()>) -> Result<()> {
+            if depth > 32 {
+                return Err(DocError::Invalid("excessively nested story content".into()));
+            }
+            for p in &st.paras {
+                check_chars(&p.chars, "paragraph format")?;
+            }
+            for r in &st.chars {
+                check_chars(&r.format.over, "character run")?;
+            }
+            for t in st.tables.values() {
+                for cell in &t.cells {
+                    check_story_attrs(&cell.text, depth + 1, check_chars)?;
+                }
+            }
+            for n in &st.notes {
+                check_story_attrs(&n.text, depth + 1, check_chars)?;
+            }
+            for n in &st.endnotes {
+                check_story_attrs(&n.text, depth + 1, check_chars)?;
+            }
+            Ok(())
+        }
+        if !self.xml.root.is_empty() && !valid_xml_name(&self.xml.root) {
+            return Err(DocError::Invalid(format!("invalid XML root tag `{}`", self.xml.root)));
+        }
+        for t in &self.xml.tags {
+            if !valid_xml_name(&t.name) {
+                return Err(DocError::Invalid(format!("invalid XML tag `{}`", t.name)));
+            }
+        }
+        for (_, tag) in &self.xml.style_map {
+            if !valid_xml_name(tag) {
+                return Err(DocError::Invalid(format!("invalid XML style-map tag `{tag}`")));
+            }
+        }
+        for ps in &self.styles.paragraph {
+            check_chars(&ps.chars, &format!("paragraph style {}", ps.name))?;
+        }
+        for cs in &self.styles.character {
+            check_chars(&cs.chars, &format!("character style {}", cs.name))?;
+        }
         for f in &self.styles.composite_fonts {
             if f.entries.iter().any(|e| {
                 ![e.relative_size, e.horizontal_scale, e.vertical_scale].iter().all(|v| v.is_finite() && *v > 0.0) || !e.baseline_shift.is_finite()
@@ -945,22 +1006,34 @@ impl Document {
         for sp in self.spreads.iter().chain(self.parents.iter()) {
             for it in &sp.items {
                 let mut dup = None;
+                let mut bad_tag = None;
                 it.walk(&mut |i| {
                     if !ids.insert(i.id.0) {
                         dup = Some(i.id);
+                    }
+                    if !i.xml_tag.is_empty() && !valid_xml_name(&i.xml_tag) {
+                        bad_tag = Some(i.xml_tag.clone());
                     }
                 });
                 if let Some(d) = dup {
                     return Err(DocError::Invalid(format!("duplicate item id {d}")));
                 }
+                if let Some(t) = bad_tag {
+                    return Err(DocError::Invalid(format!("invalid item XML tag `{t}`")));
+                }
             }
         }
         for (sid, st) in &self.stories {
             st.check().map_err(DocError::Invalid)?;
+            check_story_attrs(st, 0, &check_chars)?;
             if st.id != *sid {
                 return Err(DocError::Invalid(format!("story key {sid} != id {}", st.id)));
             }
+            let mut seen_frames = std::collections::HashSet::new();
             for f in &st.frames {
+                if !seen_frames.insert(*f) {
+                    return Err(DocError::Invalid(format!("duplicate frame {f} in story {sid}")));
+                }
                 let item = self.item(*f).or_else(|| self.anchored_item(*f)).ok_or(DocError::NoItem(*f))?;
                 match item.text_frame().map(|t| t.story) {
                     Some(s) if s == *sid => {}
@@ -989,6 +1062,13 @@ impl Document {
         for (owner, item) in embedded {
             if !ids.insert(item.id.0) {
                 return Err(DocError::Invalid(format!("duplicate item id {}", item.id)));
+            }
+            if !item.xml_tag.is_empty() && {
+                let mut c = item.xml_tag.chars();
+                !(c.next().is_some_and(|f| f.is_alphabetic() || matches!(f, '_' | ':'))
+                    && item.xml_tag.chars().all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':')))
+            } {
+                return Err(DocError::Invalid(format!("invalid item XML tag `{}`", item.xml_tag)));
             }
             if let Some(tf) = item.text_frame() {
                 if !self.stories.get(&tf.story).is_some_and(|s| s.frames.contains(&item.id)) {

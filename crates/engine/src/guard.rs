@@ -35,22 +35,104 @@ pub fn install_panic_hook() {
 impl Session {
     /// Run command `id` (`f`) inside the guard.
     pub(crate) fn guarded(&mut self, id: &str, f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
-        // The whole command transaction: every open document with its undo/redo history and
-        // selection, which one is active, and the journal (nested commands journal too).
-        let docs = self.docs.clone();
+        // Most commands only append to `history.undo`: moving `undo` out while cloning `self.docs`
+        // avoids cloning up to 1,000 `HistoryEntry` items per open document on every command and
+        // 60 Hz tool preview. Temporarily lifting `history.limit` prevents `push_undo` from
+        // shifting index 0 during `f`, so panic rollback is an O(1) `truncate` and success trims
+        // back to the saved limit afterwards.
+        let borrow_undo = self.new_document_preview.is_none()
+            && !matches!(
+                id,
+                "edit.undo" | "edit.redo" | "file.revert" | "file.close" | "file.new" | "script.run" | "production.apply" | "production.applyGroup"
+            )
+            && crate::cmd::find_command(id).is_some();
+        let mut saved_undo: Vec<(u64, usize, usize)> = Vec::new();
+        let mut taken_undo: Vec<Vec<crate::HistoryEntry>> = Vec::new();
+        if borrow_undo {
+            saved_undo.reserve(self.docs.len());
+            taken_undo.reserve(self.docs.len());
+            for d in &mut self.docs {
+                saved_undo.push((d.uid, d.history.undo.len(), d.history.limit));
+                taken_undo.push(std::mem::take(&mut d.history.undo));
+            }
+        }
+        let mut docs = self.docs.clone();
+        if borrow_undo {
+            for (d, undo) in self.docs.iter_mut().zip(taken_undo) {
+                d.history.undo = undo;
+                d.history.limit = usize::MAX;
+            }
+        }
         let active = self.active;
         let journal = self.journal.len();
+        let ui_requests = self.ui_requests.len();
         let in_undo_step = self.in_undo_step;
+        let prepared_print = self.prepared_print.clone();
+        let prefs = self.prefs.clone();
+        let last_selection_tool = self.last_selection_tool;
+        let clipboard = self.clipboard.clone();
+        let clipboard_origin = self.clipboard_origin;
+        let text_clipboard = self.text_clipboard.clone();
+        let loaded = self.loaded;
+        let untitled = self.untitled;
+        let transforms = self.transforms.clone();
+        let text_drag = self.text_drag;
+        let text_unit = self.text_unit;
+        let typing_format = self.typing_format.clone();
+        let library = self.library.clone();
+        let book = self.book.clone();
+        let conveyor = self.conveyor.clone();
+        let new_document_preview = self.new_document_preview;
+        let text_link_checks = self.text_link_checks.clone();
         match catch_unwind(AssertUnwindSafe(|| f(self))) {
-            Ok(r) => r,
+            Ok(r) => {
+                for (uid, _, limit) in saved_undo {
+                    if let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid) {
+                        d.history.limit = limit;
+                        let max = limit.max(1);
+                        if d.history.undo.len() > max {
+                            let excess = d.history.undo.len() - max;
+                            d.history.undo.drain(..excess);
+                        }
+                    }
+                }
+                r
+            }
             Err(payload) => {
                 let msg = panic_message(payload.as_ref());
-                // Keep the documents as they were before the command: a nested edit that
-                // succeeded before the panic is rolled back with its history entry, a document
-                // opened or switched by the command is gone, and redo it cleared is back.
+                // Keep the documents and session state as they were before the command: a nested
+                // edit that succeeded before the panic is rolled back with its history entry, a
+                // document opened or switched by the command is gone, and redo it cleared is back.
+                for (uid, orig_len, limit) in saved_undo {
+                    if let (Some(src), Some(dst)) = (self.docs.iter_mut().find(|d| d.uid == uid), docs.iter_mut().find(|d| d.uid == uid)) {
+                        let mut undo = std::mem::take(&mut src.history.undo);
+                        undo.truncate(orig_len);
+                        dst.history.undo = undo;
+                        dst.history.limit = limit;
+                    }
+                }
                 self.docs = docs;
                 self.active = active;
                 self.journal.truncate(journal);
+                self.ui_requests.truncate(ui_requests);
+                self.prepared_print = prepared_print;
+                self.prefs = prefs;
+                self.last_selection_tool = last_selection_tool;
+                self.clipboard = clipboard;
+                self.clipboard_origin = clipboard_origin;
+                self.text_clipboard = text_clipboard;
+                self.loaded = loaded;
+                self.untitled = untitled;
+                self.transforms = transforms;
+                self.text_drag = text_drag;
+                self.text_unit = text_unit;
+                self.typing_format = typing_format;
+                self.library = library;
+                self.book = book;
+                self.conveyor = conveyor;
+                self.new_document_preview = new_document_preview;
+                self.text_link_checks = text_link_checks;
+                self.reset_find_scope();
                 if let Some(st) = self.active_mut() {
                     st.interaction = None;
                     st.bump_revision();
@@ -171,5 +253,62 @@ mod tests {
         assert!(err.to_string().contains("boom"), "{err}");
         assert_eq!(s.docs.len(), 1, "the document the command opened is gone");
         assert_eq!(s.active, Some(0), "the document from before the command is active");
+    }
+
+    #[test]
+    fn guarded_avoids_cloning_undo_history_and_rolls_back_session_fields_on_panic() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("frame.create", &json!({"rect": [36, 36, 120, 120]})).unwrap();
+        let id = s.execute("frame.create", &json!({"rect": [140, 36, 220, 120]})).unwrap()["id"].as_u64().unwrap();
+        assert_eq!(s.active().unwrap().history.undo.len(), 2);
+
+        // `undo[1].doc` is only held by `history.undo[1]` (`undo[0].doc` is also `saved_doc`): if
+        // `guarded` cloned `history.undo`, its `Arc` strong count inside a command/preview would be > 2.
+        let entry_doc = s.active().unwrap().history.undo[1].doc.clone();
+        assert_eq!(std::sync::Arc::strong_count(&entry_doc), 2);
+        s.guarded("transform.move", |_| {
+            assert_eq!(std::sync::Arc::strong_count(&entry_doc), 2);
+            Ok(json!(null))
+        })
+        .unwrap();
+        s.begin_interaction("Move").unwrap();
+        s.preview("transform.move", json!({"ids": [id], "dx": 10, "dy": 5})).unwrap();
+        assert_eq!(std::sync::Arc::strong_count(&entry_doc), 2);
+        s.cancel_interaction();
+
+        // Snapshot session-level fields and verify a panicking command rolls every one of them back.
+        let orig_smart = s.prefs.smart_text_reflow;
+        let orig_origin = s.clipboard_origin;
+        let orig_untitled = s.untitled;
+        let err = s
+            .guarded("frame.create", |s| {
+                s.prefs.smart_text_reflow = !orig_smart;
+                s.clipboard_origin = 999.0;
+                s.text_clipboard = Some((std::sync::Arc::new(designcraft_doc::Story::new(designcraft_doc::StoryId(1))), "leaked".into()));
+                s.loaded = Some(crate::LoadedGraphic { asset: designcraft_doc::AssetId(77), size: (10.0, 10.0) });
+                s.book = Some(crate::cmd::book::Book { path: "panic.dcbook".into(), documents: vec![], style_source: 0 });
+                s.library = Some(crate::cmd::library::Library { path: Some("panic.dclib".into()), items: vec![] });
+                s.conveyor.push(("leaked".into(), vec![1, 2, 3]));
+                s.untitled = 42;
+                s.transforms.0.push(("transform.move".into(), json!({"dx": 5})));
+                s.ui_requests.push(crate::UiRequest::View { params: json!({"fit": true}) });
+                s.execute("frame.create", &json!({"rect": [36, 200, 120, 280]}))?;
+                panic!("rollback everything");
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("rollback everything"), "{err}");
+        assert_eq!(s.active().unwrap().history.undo.len(), 2, "borrowed undo restored and truncated");
+        assert_eq!(std::sync::Arc::strong_count(&entry_doc), 2);
+        assert_eq!(s.prefs.smart_text_reflow, orig_smart);
+        assert_eq!(s.clipboard_origin, orig_origin);
+        assert!(s.text_clipboard.is_none());
+        assert!(s.loaded.is_none());
+        assert!(s.book.is_none());
+        assert!(s.library.is_none());
+        assert!(s.conveyor.is_empty());
+        assert_eq!(s.untitled, orig_untitled);
+        assert!(s.transforms.0.is_empty());
+        assert!(s.ui_requests.is_empty());
     }
 }

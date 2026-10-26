@@ -382,9 +382,9 @@ impl ProductionRunner {
                 }
                 self.snapshot.message = "AI settings saved; API keys remain outside settings and reports".into();
             }
-            AiRequest::SetApiKey { provider, key } => {
+            AiRequest::SetApiKey { provider, mut key } => {
+                let secret = SecretString::new(key.take());
                 let selection = self.configured_key_selection(provider)?;
-                let secret = SecretString::new(key);
                 if !secret.expose().trim().is_empty() {
                     self.store_session_key(&selection, secret)?;
                 } else {
@@ -393,8 +393,8 @@ impl ProductionRunner {
                 self.refresh_credentials();
                 self.snapshot.message = "Session credential updated".into();
             }
-            AiRequest::SaveApiKey { selection, key } => {
-                let secret = SecretString::new(key);
+            AiRequest::SaveApiKey { selection, mut key } => {
+                let secret = SecretString::new(key.take());
                 self.vault.save(&selection, &secret)?;
                 self.store_session_key(&selection, secret)?;
                 self.refresh_credentials();
@@ -1056,8 +1056,7 @@ impl ProductionRunner {
             file_access::confine(pending.roots.as_ref(), || {
                 let product = outcome.result?;
                 if let Some(expected) = &pending.expected_prefs
-                    && serde_json::to_value(expected).map_err(|e| e.to_string())?
-                        != serde_json::to_value(&session.prefs).map_err(|e| e.to_string())?
+                    && batch::layout_relevant_prefs_value(expected)? != batch::layout_relevant_prefs_value(&session.prefs)?
                 {
                     return Err(
                         "Application preferences changed during generation; result was not published. Run the task again with current preferences"

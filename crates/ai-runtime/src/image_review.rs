@@ -157,7 +157,9 @@ pub(crate) fn parse(text: &str) -> Result<ReviewVerdict, String> {
     if text.len() > MAX_RESPONSE_BYTES {
         return Err("Illustration review response exceeds 16 KiB".into());
     }
-    let review: ReviewVerdict = serde_json::from_str(text).map_err(|error| format!("Invalid illustration review response: {error}"))?;
+    let mut de = serde_json::Deserializer::from_str(text);
+    let review: ReviewVerdict =
+        serde_path_to_error::deserialize(&mut de).map_err(|error| format!("Invalid illustration review response: {error}"))?;
     if review.reasons.len() > MAX_REASONS
         || review.reasons.iter().any(|reason| reason.trim().is_empty() || reason.contains('\0') || reason.chars().count() > MAX_REASON_CHARS)
     {
@@ -184,6 +186,8 @@ mod tests {
 
     fn placement() -> ImagePlacement {
         ImagePlacement {
+            family_id: None,
+            slot_id: None,
             repeat_rects: Vec::new(),
             repeat_groups: Vec::new(),
             prompt: "Five monkeys in a tree. Header 64 pt; frame ratio 2:3.".into(),

@@ -288,6 +288,7 @@ impl Session {
         let Some(it) = st.interaction.clone() else { return Err(EngineError::Other("no interaction".into())) };
         st.doc = it.doc.clone();
         st.selection = it.selection.clone();
+        let journal_len = self.journal.len();
         // Not through `execute`: a preview is part of the gesture (an IME composition included),
         // not a command that ends it.
         let r = self.guarded(cmd, |s| s.execute_unguarded(cmd, &params));
@@ -297,17 +298,29 @@ impl Session {
             i.preview = Some((cmd.to_string(), params));
         }
         // Journal only the committed result.
-        if r.is_ok() {
-            self.journal.pop();
-        }
+        self.journal.truncate(journal_len);
         r.map(|_| ())
     }
 
     pub fn commit_interaction(&mut self) -> Result<()> {
-        let st = self.doc_mut()?;
-        let Some(it) = st.interaction.take() else { return Ok(()) };
-        if !Arc::ptr_eq(&it.doc, &st.doc) {
-            record_undo(st, HistoryEntry { label: it.label, doc: it.doc, selection: it.selection });
+        let Some(it) = self.doc_mut()?.interaction.take() else { return Ok(()) };
+        let changed = self.active().is_some_and(|st| !Arc::ptr_eq(&it.doc, &st.doc));
+        if changed {
+            if self.prefs.smart_text_reflow {
+                self.smart_reflow();
+            }
+            if let Some(st) = self.active_mut()
+                && st.doc.spreads.iter().any(|sp| sp.items.iter().any(|i| i.live_caption.is_some()))
+            {
+                let mut d = (*st.doc).clone();
+                if crate::cmd::captions::refresh_live(&mut d) {
+                    st.doc = Arc::new(d);
+                    st.bump_revision();
+                }
+            }
+            if let Some(st) = self.active_mut() {
+                record_undo(st, HistoryEntry { label: it.label, doc: it.doc, selection: it.selection });
+            }
         }
         if let Some((c, p)) = it.preview {
             self.journal.push((c, p));

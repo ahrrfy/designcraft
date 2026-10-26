@@ -97,7 +97,8 @@ Copy-Item -LiteralPath (Join-Path $Bin 'designcraft.exe'), (Join-Path $Bin 'desi
 $Msi = Join-Path $Dist "designcraft-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
   wix build (Join-Path $PSScriptRoot 'designcraft.wxs') (Join-Path $PSScriptRoot 'installer-ui.wxs') -arch $Arch `
-    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\designcraft.ico')" `
+    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "SkillsDir=$(Join-Path $Root 'skills')" `
+    -d "IconPath=$(Join-Path $Root 'assets\app-icon\designcraft.ico')" `
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.

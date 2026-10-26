@@ -399,7 +399,7 @@ impl Runner<'_> {
         let mut crops = vec![(placement.rect, slot.and_then(|slot| slot.crop))];
         if let Some(slot) = slot {
             for view in &slot.views {
-                crops.push((view.rect, Some(view.crop)));
+                crops.push((resolved_slot_view_rect(placement, slot, profile, view.rect), Some(view.crop)));
             }
         } else {
             crops.extend(placement.repeat_rects.iter().map(|rect| (*rect, None)));
@@ -1318,7 +1318,7 @@ impl Runner<'_> {
             let declared = declared_image_slot(placement, profile);
             let mut views = vec![(placement.rect, declared.and_then(|slot| slot.crop))];
             if let Some(slot) = declared {
-                views.extend(slot.views.iter().map(|view| (view.rect, Some(view.crop))));
+                views.extend(slot.views.iter().map(|view| (resolved_slot_view_rect(placement, slot, profile, view.rect), Some(view.crop))));
             } else {
                 views.extend(placement.repeat_rects.iter().map(|rect| (*rect, None)));
             }
@@ -2947,6 +2947,8 @@ fn plan_schema(catalog: &Value, mode: OutputMode) -> Result<Value, String> {
         "images":{"type":"array","maxItems":if mode==OutputMode::NativeOnly {0} else {MAX_IMAGES},"items":{"type":"object","additionalProperties":false,"required":["prompt","page","rect","label"],"properties":{
             "prompt":{"type":"string","minLength":1,"maxLength":8192},"page":{"type":"integer","minimum":0,"maximum":999},
             "rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":-15552,"maximum":15552}},"label":{"type":"string","minLength":1,"maxLength":256},
+            "family_id":{"type":"string","minLength":1,"maxLength":64},
+            "slot_id":{"type":"string","minLength":1,"maxLength":64},
             "repeat_rects":{"type":"array","maxItems":23,"items":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":0,"maximum":15552}}},
             "repeat_groups":{"type":"array","maxItems":4,"items":{"type":"integer","minimum":1,"maximum":20}}}}}
     }}))
@@ -2957,7 +2959,8 @@ fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     }
     let value: Value = serde_json::from_str(text).map_err(|e| format!("Invalid structured JSON: {e}"))?;
     bounded_json(&value, MAX_JSON)?;
-    serde_json::from_value(value).map_err(|e| format!("Invalid structured response: {e}"))
+    let mut de = serde_json::Deserializer::from_str(text);
+    serde_path_to_error::deserialize(&mut de).map_err(|e| format!("Invalid structured response: {e}"))
 }
 fn validate_actions(actions: &[EngineAction], catalog: &Value, mode: OutputMode) -> Result<(), String> {
     let allowed = allowed_commands(catalog, mode)?;
@@ -2987,6 +2990,8 @@ fn parse_plan(text: &str, mode: OutputMode, catalog: &Value) -> Result<Productio
             || image.prompt.len() > 8192
             || image.label.trim().is_empty()
             || image.label.len() > 256
+            || image.family_id.as_deref().is_some_and(|s| s.trim().is_empty() || s.len() > 64)
+            || image.slot_id.as_deref().is_some_and(|s| s.trim().is_empty() || s.len() > 64)
             || image.page > 999
             || image.rect.iter().any(|n| !n.is_finite() || n.abs() > 15552.0)
             || image.rect[2] <= image.rect[0]
@@ -3722,11 +3727,29 @@ fn declared_image_slot<'a>(
     placement: &designcraft_ai_types::protocol::ImagePlacement,
     profile: Option<&'a designcraft_ai_types::DesignProfile>,
 ) -> Option<&'a designcraft_ai_types::design::DesignImageSlot> {
-    profile?.page_families.iter().flat_map(|family| &family.image_slots).find(|slot| {
-        (slot.crop.is_some() || slot.source_aspect_ratio.is_some() || !slot.views.is_empty())
-            && slot.purpose == placement.label
-            && slot.rect.iter().zip(placement.rect).all(|(a, b)| (a - b).abs() <= 0.01)
-    })
+    profile?
+        .resolve_image_slot(placement.family_id.as_deref(), placement.slot_id.as_deref(), &placement.label, placement.rect)
+        .filter(|slot| slot.crop.is_some() || slot.source_aspect_ratio.is_some() || !slot.views.is_empty())
+}
+
+fn resolved_slot_view_rect(
+    placement: &designcraft_ai_types::protocol::ImagePlacement,
+    slot: &designcraft_ai_types::design::DesignImageSlot,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    view_rect: [f64; 4],
+) -> [f64; 4] {
+    if let Some(prof) = profile {
+        let page_w = prof.page_mm[0] * 72.0 / 25.4;
+        let is_mirrored = page_w.is_finite()
+            && page_w > 0.0
+            && (placement.rect[0] - slot.rect[0]).abs() > 0.05
+            && (placement.rect[0] - (page_w - slot.rect[2])).abs() <= 0.05
+            && (placement.rect[2] - (page_w - slot.rect[0])).abs() <= 0.05;
+        if is_mirrored {
+            return [page_w - view_rect[2], view_rect[1], page_w - view_rect[0], view_rect[3]];
+        }
+    }
+    view_rect
 }
 
 fn authored_image_frame(commands: &[EngineAction], page: usize, rect: [f64; 4], filled: &BTreeSet<usize>) -> Option<usize> {
@@ -3817,7 +3840,7 @@ fn image_command_budget(plan: &ProductionPlan, profile: Option<&designcraft_ai_t
         let declared = declared_image_slot(image, profile);
         let mut views = vec![image.rect];
         if let Some(slot) = declared {
-            views.extend(slot.views.iter().map(|v| v.rect));
+            views.extend(slot.views.iter().map(|v| resolved_slot_view_rect(image, slot, profile, v.rect)));
         } else {
             views.extend(image.repeat_rects.iter().copied());
         }
@@ -3919,19 +3942,23 @@ fn preflight_profile_image_ratios(profile: &designcraft_ai_types::DesignProfile,
     if settings.output_mode != OutputMode::NativeWithImages {
         return Ok(());
     }
-    for slot in profile.page_families.iter().flat_map(|family| &family.image_slots) {
-        let _ = image_request_size(
-            &designcraft_ai_types::protocol::ImagePlacement {
-                repeat_rects: Vec::new(),
-                repeat_groups: Vec::new(),
-                prompt: String::new(),
-                page: 0,
-                rect: slot.rect,
-                label: slot.purpose.clone(),
-            },
-            Some(profile),
-            &settings.image_model,
-        )?;
+    for family in &profile.page_families {
+        for slot in &family.image_slots {
+            let _ = image_request_size(
+                &designcraft_ai_types::protocol::ImagePlacement {
+                    family_id: Some(family.id.clone()),
+                    slot_id: Some(slot.id.clone()),
+                    repeat_rects: Vec::new(),
+                    repeat_groups: Vec::new(),
+                    prompt: String::new(),
+                    page: 0,
+                    rect: slot.rect,
+                    label: slot.purpose.clone(),
+                },
+                Some(profile),
+                &settings.image_model,
+            )?;
+        }
     }
     Ok(())
 }
@@ -4038,13 +4065,15 @@ fn skill_schema(catalog: &Value) -> Result<Value, String> {
 
 fn design_profile_schema() -> Value {
     let rules = json!({"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":512}});
-    let text_slots = json!({"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["id","purpose","command","max_chars"],"properties":{"id":{"type":"string","maxLength":64},"purpose":{"type":"string","maxLength":256},"command":{"type":"integer","minimum":0,"maximum":511},"max_chars":{"type":"integer","minimum":1,"maximum":256}}}});
-    let image_slots = json!({"type":"array","maxItems":4,"items":{"type":"object","additionalProperties":false,"required":["id","purpose","rect"],"properties":{"id":{"type":"string","maxLength":64},"purpose":{"type":"string","maxLength":256},"rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number"}}}}});
+    let text_slots = json!({"type":"array","minItems":1,"maxItems":24,"items":{"type":"object","additionalProperties":false,"required":["id","purpose","command","max_chars"],"properties":{"id":{"type":"string","maxLength":64},"purpose":{"type":"string","maxLength":256},"command":{"type":"integer","minimum":0,"maximum":511},"max_chars":{"type":"integer","minimum":1,"maximum":256}}}});
+    let crop_rect = json!({"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":0.0,"maximum":1.0}});
+    let image_views = json!({"type":"array","maxItems":7,"items":{"type":"object","additionalProperties":false,"required":["rect","crop"],"properties":{"rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number"}},"crop":crop_rect}}});
+    let image_slots = json!({"type":"array","maxItems":4,"items":{"type":"object","additionalProperties":false,"required":["id","purpose","rect"],"properties":{"id":{"type":"string","maxLength":64},"purpose":{"type":"string","maxLength":256},"rect":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number"}},"crop":crop_rect,"source_aspect_ratio":{"type":"number","minimum":0.25,"maximum":4.0},"views":image_views}}});
     json!({"type":["object","null"],"additionalProperties":false,
     "required":["name","keywords","age_range","page_mm","margin_mm","palette","typography","layout","pedagogy","illustration","page_families","corrections"],
     "properties":{
         "name":{"type":"string","minLength":1,"maxLength":160},
-        "keywords":{"type":"array","minItems":1,"maxItems":24,"items":{"type":"string","minLength":1,"maxLength":80}},
+        "keywords":{"type":"array","minItems":1,"maxItems":48,"items":{"type":"string","minLength":1,"maxLength":80}},
         "age_range":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"integer","minimum":0,"maximum":99}},
         "page_mm":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"number","minimum":40,"maximum":1000}},
         "margin_mm":{"type":"number","minimum":0,"maximum":100},
@@ -4523,6 +4552,8 @@ mod tests {
                 title: "Page 16".into(),
                 commands: vec![],
                 images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                    family_id: None,
+                    slot_id: None,
                     repeat_rects: Vec::new(),
                     repeat_groups: Vec::new(),
                     prompt: "One complete classroom illustration".into(),
@@ -6020,6 +6051,8 @@ mod tests {
             commands: vec![],
             images: vec![
                 designcraft_ai_types::protocol::ImagePlacement {
+                    family_id: None,
+                    slot_id: None,
                     repeat_rects: Vec::new(),
                     repeat_groups: Vec::new(),
                     prompt: "Tree".into(),
@@ -6028,6 +6061,8 @@ mod tests {
                     label: "tree".into(),
                 },
                 designcraft_ai_types::protocol::ImagePlacement {
+                    family_id: None,
+                    slot_id: None,
                     repeat_rects: Vec::new(),
                     repeat_groups: Vec::new(),
                     prompt: "Atlas".into(),
@@ -6663,6 +6698,8 @@ mod tests {
             title: "Capacity test".into(),
             commands: vec![EngineAction { command: "frame.create".into(), params: json!({"rect":[60,60,100,100]}) }; 510],
             images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                family_id: None,
+                slot_id: None,
                 repeat_rects: Vec::new(),
                 repeat_groups: Vec::new(),
                 prompt: "Tree".into(),
@@ -6695,6 +6732,8 @@ mod tests {
             provider: &provider,
         };
         let image = designcraft_ai_types::protocol::ImagePlacement {
+            family_id: None,
+            slot_id: None,
             repeat_rects: Vec::new(),
             repeat_groups: Vec::new(),
             prompt: "Tree".into(),
@@ -7248,6 +7287,8 @@ mod tests {
                 },
             ],
             images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                family_id: None,
+                slot_id: None,
                 repeat_rects: Vec::new(),
                 repeat_groups: Vec::new(),
                 prompt: "A tree illustration".into(),
@@ -7490,6 +7531,8 @@ mod tests {
             ..Default::default()
         };
         let placement = designcraft_ai_types::protocol::ImagePlacement {
+            family_id: None,
+            slot_id: None,
             repeat_rects: Vec::new(),
             repeat_groups: Vec::new(),
             prompt: "One original scene reused".into(),
@@ -7655,6 +7698,8 @@ mod tests {
             title: "Review scene".into(),
             commands: vec![],
             images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                family_id: None,
+                slot_id: None,
                 repeat_rects: Vec::new(),
                 repeat_groups: Vec::new(),
                 prompt: "Five monkeys sitting in a tree".into(),
@@ -8851,6 +8896,8 @@ mod tests {
 
         // 2. OpenAI and Gemini aspect-ratio sizing.
         let mk_place = |rect: [f64; 4]| designcraft_ai_types::protocol::ImagePlacement {
+            family_id: None,
+            slot_id: None,
             prompt: "hero".into(),
             page: 0,
             rect,
@@ -8987,6 +9034,8 @@ mod tests {
         }
         let cache_dir = tempfile::tempdir().unwrap();
         let placement = designcraft_ai_types::protocol::ImagePlacement {
+            family_id: None,
+            slot_id: None,
             page: 0,
             rect: [72.0, 120.0, 172.0, 220.0],
             prompt: "Clean geometric studio emblem".into(),
@@ -9095,5 +9144,70 @@ mod tests {
         assert!(err.contains("AI request limit reached"), "err={err}");
         assert_eq!(provider.calls.get(), 0);
         assert_eq!(ledger.summary().requests, 0);
+    }
+
+    #[test]
+    fn wave3_schema_sync_rtl_slot_resolution_and_serde_path_diagnostics() {
+        // 1. design_profile_schema is synced with DesignProfile limits and shared-atlas fields.
+        let dp_schema = design_profile_schema();
+        assert_eq!(dp_schema["properties"]["keywords"]["maxItems"], json!(48));
+        let fam_props = &dp_schema["properties"]["page_families"]["items"]["properties"];
+        assert_eq!(fam_props["text_slots"]["maxItems"], json!(24));
+        let img_props = &fam_props["image_slots"]["items"]["properties"];
+        assert!(img_props.get("crop").is_some());
+        assert!(img_props.get("source_aspect_ratio").is_some());
+        assert!(img_props.get("views").is_some());
+
+        // 2. RTL-mirrored placement resolves declared_image_slot via explicit (family_id, slot_id).
+        let mut profile = design_profile_fixture();
+        profile.page_families[0].image_slots = vec![
+            serde_json::from_value(json!({
+                "id": "atlas",
+                "purpose": "shared art",
+                "rect": [60.0, 180.0, 160.0, 280.0],
+                "crop": [0.0, 0.0, 0.5, 1.0],
+                "source_aspect_ratio": 1.5,
+                "views": [{"rect": [200.0, 180.0, 300.0, 280.0], "crop": [0.5, 0.0, 1.0, 1.0]}]
+            }))
+            .unwrap(),
+        ];
+        let page_w = profile.page_mm[0] * 72.0 / 25.4;
+        let mirrored_primary = [page_w - 160.0, 180.0, page_w - 60.0, 280.0];
+        let mirrored_view = [page_w - 300.0, 180.0, page_w - 200.0, 280.0];
+        let rtl_placement = designcraft_ai_types::protocol::ImagePlacement {
+            family_id: Some(profile.page_families[0].id.clone()),
+            slot_id: Some("atlas".into()),
+            repeat_rects: vec![],
+            repeat_groups: vec![],
+            prompt: "Mirrored two-part illustration".into(),
+            page: 0,
+            rect: mirrored_primary,
+            label: "adapted purpose".into(),
+        };
+        let resolved = declared_image_slot(&rtl_placement, Some(&profile)).unwrap();
+        assert_eq!(resolved.id, "atlas");
+        let mapped_view = resolved_slot_view_rect(&rtl_placement, resolved, Some(&profile), resolved.views[0].rect);
+        assert!((mapped_view[0] - mirrored_view[0]).abs() < 1e-6 && (mapped_view[2] - mirrored_view[2]).abs() < 1e-6);
+
+        // 3. serde_path_to_error surfaces exact JSON paths across worker, image_review, and script_contract.
+        let catalog = designcraft_engine::cmd::production::catalog();
+        let bad_plan = json!({
+            "title": "Bad Plan",
+            "commands": [{"command": "frame.create", "params": {"rect": [0, 0, 100, 100]}}],
+            "images": [{"prompt": "art", "page": 0, "rect": [10.0, 10.0, "not-a-number", 50.0], "label": "art"}]
+        });
+        let plan_err = parse_plan(&bad_plan.to_string(), OutputMode::NativeWithImages, &catalog).unwrap_err();
+        assert!(plan_err.contains("images[0].rect[2]"), "plan_err={plan_err}");
+
+        let review_err = crate::image_review::parse(r#"{"verdict":"pass","reasons":[123]}"#).unwrap_err();
+        assert!(review_err.contains("reasons[0]"), "review_err={review_err}");
+
+        let native_err = crate::script_contract::compile_native_content(
+            r#"{"title":"T","commands":[{"command":99,"params":{}}]}"#,
+            BatchScope { start: 0, count: 1 },
+            None,
+        )
+        .unwrap_err();
+        assert!(native_err.contains("commands[0].command"), "native_err={native_err}");
     }
 }

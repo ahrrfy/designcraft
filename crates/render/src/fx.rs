@@ -414,14 +414,22 @@ impl Renderer {
         if !spread.is_finite() {
             return;
         }
-        if !f.mt && spread <= MAX_BLUR_SPREAD {
+        let Some(o) = offscreen(f.view.transform_rect_bbox(reach), spread, ctx.width(), ctx.height()) else { return };
+        let off_pixels = usize::from(o.width) * usize::from(o.height);
+        let ctx_pixels = usize::from(ctx.width()) * usize::from(ctx.height());
+        if !f.mt && spread <= MAX_BLUR_SPREAD && off_pixels.saturating_mul(4) >= ctx_pixels {
             push_clip(ctx, f, clip);
             draw(self, ctx, f);
             pop_clip(ctx, clip);
             return;
         }
-        let Some(o) = offscreen(f.view.transform_rect_bbox(reach), spread, ctx.width(), ctx.height()) else { return };
-        let mut off = RenderContext::new_with(o.width, o.height, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() });
+        let mut off = match self.fx_ctx.take() {
+            Some(mut c) if c.width() == o.width && c.height() == o.height && c.render_settings().num_threads == 0 => {
+                c.reset();
+                c
+            }
+            _ => RenderContext::new_with(o.width, o.height, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() }),
+        };
         let view = Affine::scale(1.0 / o.scale) * Affine::translate((-o.x0, -o.y0)) * f.view;
         let shifted = Frame { mt: false, view, px: f.px * o.scale, ..*f };
         // Clip where the result is at full resolution: offscreen unless that is reduced.
@@ -430,11 +438,23 @@ impl Renderer {
         draw(self, &mut off, &shifted);
         pop_clip(&mut off, inner);
         off.flush();
-        let mut pm = vello_cpu::Pixmap::new(o.width, o.height);
+        let mut pm = match self.fx_pm.take() {
+            Some(arc) if arc.width() == o.width && arc.height() == o.height => match std::sync::Arc::try_unwrap(arc) {
+                Ok(mut p) => {
+                    p.data_as_u8_slice_mut().fill(0);
+                    p
+                }
+                Err(_) => vello_cpu::Pixmap::new(o.width, o.height),
+            },
+            _ => vello_cpu::Pixmap::new(o.width, o.height),
+        };
         off.render(&mut pm, &mut self.resources);
+        self.fx_ctx = Some(off);
+        let pm_arc = std::sync::Arc::new(pm);
+        self.fx_pm = Some(pm_arc.clone());
         push_clip(ctx, f, outer);
         ctx.set_transform(Affine::translate((o.x0, o.y0)) * Affine::scale(o.scale));
-        ctx.set_paint(vello_cpu::Image { image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(pm)), sampler: peniko::ImageSampler::default() });
+        ctx.set_paint(vello_cpu::Image { image: vello_cpu::ImageSource::Pixmap(pm_arc), sampler: peniko::ImageSampler::default() });
         ctx.fill_rect(&Rect::new(0.0, 0.0, f64::from(o.width), f64::from(o.height)));
         pop_clip(ctx, outer);
         ctx.set_transform(Affine::IDENTITY);
@@ -484,7 +504,12 @@ fn offscreen(reach: Rect, spread: f64, width: u16, height: u16) -> Option<Offscr
     {
         return None;
     }
-    let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height)).inflate(spread, spread);
+    let viewport = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+    let visible_reach = reach.inflate(spread, spread).intersect(viewport);
+    if visible_reach.width() <= 0.0 || visible_reach.height() <= 0.0 {
+        return None;
+    }
+    let screen = viewport.inflate(spread, spread);
     let r = reach.inflate(spread, spread).intersect(screen);
     let (x0, y0) = (r.x0.floor(), r.y0.floor());
     let scale = (spread / MAX_BLUR_SPREAD).max(1.0);
@@ -612,5 +637,44 @@ mod tests {
                 assert_eq!(rendered.pixels.len(), (rendered.width * rendered.height * 4) as usize);
             }
         }
+    }
+
+    #[test]
+    fn off_viewport_items_skip_offscreen_and_small_4k_badges_clip_scratch_surface() {
+        // Item completely outside viewport even after +spread: no offscreen allocation.
+        assert_eq!(offscreen(Rect::new(-100.0, -100.0, -25.0, -25.0), 10.0, 3840, 2160), None);
+        // Item just outside [-5..-1] whose +10px blur bleeds into [0..9] IS rendered.
+        assert!(offscreen(Rect::new(-5.0, 100.0, -1.0, 140.0), 10.0, 3840, 2160).is_some());
+
+        // Small badge on a 4K single-threaded surface allocates only the clipped badge+spread box
+        // and reuses `fx_ctx` / `fx_pm` across frames while matching multithreaded pixels.
+        let mut doc = designcraft_doc::Document::new(&Default::default());
+        let mut badge = Item::new(
+            designcraft_doc::ItemId(42),
+            designcraft_doc::LayerId(1),
+            designcraft_doc::Shape::Rectangle,
+            designcraft_geom::shapes::rectangle(Rect::new(40.0, 40.0, 90.0, 80.0)),
+        );
+        badge.fill = designcraft_doc::Fill::swatch("[Black]");
+        badge.effects.drop_shadow.on = true;
+        badge.effects.drop_shadow.size = 6.0;
+        badge.effects.drop_shadow.distance = 4.0;
+        doc.insert_item(designcraft_doc::SpreadRef::Doc(0), badge, None).unwrap();
+
+        let cache = crate::Cache::new();
+        let opts = crate::RenderOptions::default();
+        let placed = [crate::Placed { spread: designcraft_doc::SpreadRef::Doc(0), xf: Affine::IDENTITY }];
+        let mut r_st = Renderer::new();
+        r_st.threads = 0;
+        let img1 = r_st.render(&doc, &cache, &placed, 3840, 2160, Affine::IDENTITY, &opts);
+        let fx_dims = r_st.fx_ctx.as_ref().map(|c| (c.width(), c.height())).expect("clipped fx_ctx allocated");
+        assert!(fx_dims.0 < 200 && fx_dims.1 < 200, "expected clipped offscreen surface, got {fx_dims:?}");
+        let img2 = r_st.render(&doc, &cache, &placed, 3840, 2160, Affine::IDENTITY, &opts);
+        assert_eq!(img1.pixels, img2.pixels, "reused fx scratch surface must produce identical pixels");
+
+        let mut r_mt = Renderer::new();
+        r_mt.threads = 2;
+        let img_mt = r_mt.render(&doc, &cache, &placed, 3840, 2160, Affine::IDENTITY, &opts);
+        assert_eq!(img1.pixels, img_mt.pixels, "single-threaded clipped offscreen must match multithreaded pixel-for-pixel");
     }
 }

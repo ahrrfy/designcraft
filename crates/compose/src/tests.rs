@@ -4484,7 +4484,7 @@ fn cjk_fallback_follows_the_language() {
         d.settings.glyph_fallback = true;
         d.story_mut(sid).unwrap().format_chars(0..4, |f| f.over.language = Some(language.into()));
         let cs = compose_story(&d, sid, &ComposeOptions::default());
-        let face_at = |byte: usize| all_lines(&cs).iter().flat_map(|l| l.glyphs.iter()).find(|g| g.byte == byte).map(|g| g.face).unwrap();
+        let face_at = |byte: usize| all_lines(&cs).iter().flat_map(|l| l.glyphs.iter()).find(|g| g.byte == byte).map(|g| g.face.clone()).unwrap();
         (face_at(0), face_at(1))
     };
     assert_eq!(faces_of("Chinese: Simplified").1.family, "Songti SC");
@@ -4523,7 +4523,7 @@ fn missing_glyphs_are_the_fonts_box_unless_fallback_is_on() {
     d.story_mut(sid).unwrap().format_chars(0..text.len(), |f| f.over.language = Some("Japanese".into()));
     let glyph_at = |d: &Document, byte: usize| {
         let cs = compose_story(d, sid, &ComposeOptions::default());
-        all_lines(&cs).iter().flat_map(|l| l.glyphs.iter()).find(|g| g.byte == byte).map(|g| (g.face, g.gid, g.adv)).unwrap()
+        all_lines(&cs).iter().flat_map(|l| l.glyphs.iter()).find(|g| g.byte == byte).map(|g| (g.face.clone(), g.gid, g.adv)).unwrap()
     };
     assert!(!d.settings.glyph_fallback, "new documents draw missing glyphs as InDesign does");
     let (face, gid, adv) = glyph_at(&d, 1);
@@ -4580,12 +4580,12 @@ fn a_mark_starting_a_run_is_shaped_with_its_base() {
             }
         });
         let cs = compose_story(&d, sid, &ComposeOptions::default());
-        all_lines(&cs).iter().flat_map(|l| l.glyphs.iter()).map(|g| (g.face, g.gid, g.byte)).collect::<Vec<_>>()
+        all_lines(&cs).iter().flat_map(|l| l.glyphs.iter()).map(|g| (g.face.clone(), g.gid, g.byte)).collect::<Vec<_>>()
     };
     // A missing font: its substitute lacks both, so the letter comes from a fallback font, and the
     // mark from the same font, in its letter's cluster.
     let g = glyphs("DC Test No Such Family", None);
-    let (base, dot) = (g[0], g[1]);
+    let (base, dot) = (&g[0], &g[1]);
     assert_ne!(base.1, 0, "{g:?}");
     assert_eq!((dot.0.family.as_str(), dot.2), (base.0.family.as_str(), 0), "the sin dot goes with its shin: {g:?}");
     assert_ne!(dot.1, 0, "{g:?}");
@@ -4639,7 +4639,7 @@ fn each_document_shapes_words_in_its_own_fonts() {
         let glyphs: Vec<&PlacedGlyph> =
             all_lines(&cs).into_iter().flat_map(|l| l.glyphs.iter()).filter(|g| text[g.byte..].starts_with('a')).collect();
         assert_eq!(glyphs.len(), 4);
-        let face = glyphs[0].face;
+        let face = glyphs[0].face.clone();
         let drawn = designcraft_fonts::FontDb::global().face(designcraft_fonts::FALLBACK_FAMILY, "Regular").glyph_for(glyph);
         assert!(glyphs.iter().all(|g| g.face == face && g.gid == drawn), "scope {scope}: {glyph}");
         faces.push(face);
@@ -4894,7 +4894,7 @@ fn latin_in_vertical_text_turns_as_a_run() {
     for family in vertical_families() {
         let (l, _) = vertical_line(family, "日本Ab", |_| {});
         let latin: Vec<_> = l.glyphs.iter().filter(|g| g.byte >= "日本".len()).collect();
-        let face = latin[0].face;
+        let face = latin[0].face.clone();
         assert_eq!(latin.iter().map(|g| g.gid).collect::<Vec<_>>(), [face.glyph_for('A'), face.glyph_for('b')], "{family}");
         assert!(latin.iter().all(|g| !g.upright && g.vertical_xf(l.baseline).is_none()), "{family}");
         assert!((latin[0].adv - face.advance(latin[0].gid) * latin[0].sx).abs() < 1e-9, "{family}: horizontal advance");
@@ -7309,4 +7309,48 @@ fn rule_above_offset_is_measured_from_the_baseline() {
     assert!((rule.y1 - (second.baseline - 10.0)).abs() < 1e-6, "{rule:?}, baseline {}", second.baseline);
     assert!((rule.height() - 1.5).abs() < 1e-6);
     assert!(rule.y0 > first.baseline, "the rule stays below the row above: {rule:?}, its baseline {}", first.baseline);
+}
+
+#[test]
+fn baseline_grid_relative_to_top_margin_offsets_from_page_margin() {
+    let para = ParaAttrs { grid_align: Some(GridAlign::AllLines), ..Default::default() };
+    let (mut d, sid, fid) = doc_with("Line one\nLine two", Rect::new(36.0, 0.0, 300.0, 400.0), para);
+    Arc::make_mut(&mut d.spreads[0]).pages[0].margins.top = 50.0;
+    d.settings.baseline_grid.start = 10.0;
+    d.settings.baseline_grid.increment = 14.0;
+    d.settings.baseline_grid.relative_to = designcraft_doc::GridRelative::TopOfPage;
+
+    let top_page = compose_story(&d, sid, &ComposeOptions::default());
+    let b_page = top_page.frame(fid).unwrap().lines[0].baseline;
+
+    d.settings.baseline_grid.relative_to = designcraft_doc::GridRelative::TopMargin;
+    let top_margin = compose_story(&d, sid, &ComposeOptions::default());
+    let b_margin = top_margin.frame(fid).unwrap().lines[0].baseline;
+    assert!((b_margin - 60.0).abs() < 1e-6, "expected first grid line at 50 + 10 = 60, got {b_margin}");
+    assert!((b_margin - b_page).abs() > 20.0, "TopMargin ({b_margin}) should differ from TopOfPage ({b_page})");
+
+    // Custom per-frame baseline grid overrides document `relative_to`.
+    d.item_mut(fid).unwrap().text_frame_mut().unwrap().options.baseline_grid = Some((14.0, 20.0));
+    let custom = compose_story(&d, sid, &ComposeOptions::default());
+    let b_custom = custom.frame(fid).unwrap().lines[0].baseline;
+    assert!((b_custom - 20.0).abs() < 1e-6, "custom frame baseline grid should ignore page top margin, got {b_custom}");
+}
+
+#[test]
+fn cache_recomposes_when_page_margins_or_geometry_change() {
+    let para = ParaAttrs { grid_align: Some(GridAlign::AllLines), ..Default::default() };
+    let (mut d, sid, _) = doc_with("Line one\nLine two", Rect::new(36.0, 0.0, 300.0, 400.0), para);
+    d.settings.baseline_grid.start = 6.0;
+    d.settings.baseline_grid.increment = 12.0;
+    d.settings.baseline_grid.relative_to = designcraft_doc::GridRelative::TopMargin;
+    let cache = Cache::new();
+    let a = cache.get(&d, sid, None);
+    Arc::make_mut(&mut d.spreads[0]).pages[0].margins.top = 72.0;
+    let b = cache.get(&d, sid, None);
+    assert!(!Arc::ptr_eq(&a, &b), "changing page top margin must invalidate story cache");
+    assert!((b.frames[0].lines[0].baseline - 78.0).abs() < 1e-6);
+
+    Arc::make_mut(&mut d.spreads[0]).pages[0].width = 500.0;
+    let c = cache.get(&d, sid, None);
+    assert!(!Arc::ptr_eq(&b, &c), "changing page width must invalidate story cache");
 }

@@ -3184,6 +3184,8 @@ mod tests {
                     session.execute("frame.create", &obstacle).unwrap();
                 }
                 "image" => plan.images.push(designcraft_ai_types::protocol::ImagePlacement {
+                    family_id: None,
+                    slot_id: None,
                     repeat_rects: Vec::new(),
                     repeat_groups: Vec::new(),
                     prompt: "Synthetic obstacle".into(),

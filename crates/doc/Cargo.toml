@@ -13,6 +13,7 @@ designcraft-geom = { workspace = true }
 designcraft-color = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ecow = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 

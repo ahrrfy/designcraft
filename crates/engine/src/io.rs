@@ -12,6 +12,9 @@ pub use craft_docpath::Refused;
 pub use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
+/// Maximum number of bytes any unbounded file-reading helper in [`crate::io`] will read (512 MiB).
+pub const MAX_READ_BYTES: u64 = 512 * 1024 * 1024;
+
 /// The path to open for a path stored in a document (a link, a data source, a book chapter),
 /// resolved against `document`, the path of the file it came from, when there is one.
 ///
@@ -56,12 +59,44 @@ fn touch(path: &Path) {
     let _ = path;
 }
 
-/// The bytes of the file at `path`, inside the automation read root when there is one.
+fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, Metadata)> {
+    // Check `stat` before `open` so a Unix FIFO without a writer cannot block in `open(2)`, then
+    // verify `fstat` on the opened handle so a concurrent swap to a directory/FIFO/device is caught.
+    let pre = std::fs::metadata(path)?;
+    if !pre.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok((file, meta))
+}
+
+fn read_regular_capped(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let (file, meta) = open_regular(path)?;
+    let too_large =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, format!("file exceeds maximum read size of {} MiB", max_bytes / (1024 * 1024)));
+    if meta.len() > max_bytes {
+        return Err(too_large());
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len().min(64 * 1024 * 1024)).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(too_large());
+    }
+    Ok(buf)
+}
+
+/// The bytes of the regular file at `path` (capped at [`MAX_READ_BYTES`]), inside the automation
+/// read root when there is one.
 pub fn read_file(path: impl AsRef<Path>) -> Result<Vec<u8>, String> {
     let path = path.as_ref();
     touch(path);
     crate::file_access::check_read(path)?;
-    std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+    read_regular_capped(path, MAX_READ_BYTES).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// [`read_file`] with the file system's own error, for callers that tell "missing" from other
@@ -70,37 +105,49 @@ pub fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     let path = path.as_ref();
     touch(path);
     crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
-    std::fs::read(path)
+    read_regular_capped(path, MAX_READ_BYTES)
 }
 
-/// [`read`] that stops past `cap` bytes: at most `cap + 1` bytes are read, so a device or a file
-/// that grows while it is read can't exhaust memory. The caller compares the length with `cap`.
+/// [`read`] that stops past `cap` bytes (clamped to [`MAX_READ_BYTES`]): at most `cap + 1` bytes
+/// are read from a verified regular file, so a device or a file that grows while it is read can't
+/// exhaust memory. The caller compares the length with `cap`.
 pub fn read_capped(path: impl AsRef<Path>, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let path = path.as_ref();
     touch(path);
     crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+    let (file, _) = open_regular(path)?;
+    let limit = cap.min(MAX_READ_BYTES);
     let mut b = Vec::new();
-    std::fs::File::open(path)?.take(cap.saturating_add(1)).read_to_end(&mut b)?;
+    file.take(limit.saturating_add(1)).read_to_end(&mut b)?;
     Ok(b)
 }
 
-/// The file at `path` opened for reading, inside the automation read root when there is one, for
-/// callers that read only part of it. A refused path is a `PermissionDenied` error carrying the
-/// roots' message.
+/// The regular file at `path` opened for reading, inside the automation read root when there is
+/// one, for callers that read only part of it. A refused path is a `PermissionDenied` error
+/// carrying the roots' message.
 pub fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     let path = path.as_ref();
     touch(path);
     crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
-    std::fs::File::open(path)
+    open_regular(path).map(|(file, _)| file)
 }
 
-/// The text of the file at `path`, inside the automation read root when there is one.
-pub fn read_to_string(path: impl AsRef<Path>) -> Result<String, String> {
+/// Open the regular file at `path` for reading together with its `fstat` byte length, inside the
+/// automation read root when there is one.
+pub fn open_with_len(path: impl AsRef<Path>) -> Result<(std::fs::File, u64), String> {
     let path = path.as_ref();
     touch(path);
     crate::file_access::check_read(path)?;
-    std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+    open_regular(path).map(|(file, meta)| (file, meta.len())).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The text of the regular file at `path` (capped at [`MAX_READ_BYTES`]), inside the automation
+/// read root when there is one.
+pub fn read_to_string(path: impl AsRef<Path>) -> Result<String, String> {
+    let path = path.as_ref();
+    let bytes = read_file(path)?;
+    String::from_utf8(bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
@@ -176,4 +223,45 @@ pub fn read_dir(path: impl AsRef<Path>) -> std::io::Result<std::fs::ReadDir> {
     touch(path);
     crate::file_access::check_read(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     std::fs::read_dir(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_helpers_reject_directories_and_files_above_max_read_bytes() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("dc-io-cap-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Non-regular file (directory) is rejected before/after open.
+        let dir_err = read_file(&dir).unwrap_err();
+        assert!(dir_err.contains("not a regular file"), "{dir_err}");
+        assert!(read(&dir).is_err());
+        assert!(read_capped(&dir, 64).is_err());
+        assert!(open(&dir).is_err());
+
+        // Regular file within cap reads cleanly.
+        let small = dir.join("small.txt");
+        std::fs::write(&small, b"hello world").unwrap();
+        assert_eq!(read_file(&small).unwrap(), b"hello world");
+        assert_eq!(read_to_string(&small).unwrap(), "hello world");
+
+        // Sparse file reporting `MAX_READ_BYTES + 1` is rejected without reading 512 MiB into RAM.
+        let huge = dir.join("huge.bin");
+        if std::fs::File::create(&huge).and_then(|f| f.set_len(MAX_READ_BYTES + 1)).is_ok() {
+            let err = read_file(&huge).unwrap_err();
+            assert!(err.contains("exceeds maximum read size"), "{err}");
+            assert!(read(&huge).is_err());
+            assert!(read_to_string(&huge).is_err());
+        }
+
+        // `read_regular_capped` also catches a file whose bytes exceed a smaller cap via `Read::take`.
+        let over_custom = read_regular_capped(&small, 5).unwrap_err();
+        assert_eq!(over_custom.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

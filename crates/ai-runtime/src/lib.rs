@@ -21,4 +21,5 @@ mod script_contract;
 mod template_plan;
 pub mod vault;
 mod worker;
+pub use resources::{clear_active_gpu_adapter, set_active_gpu_adapter};
 pub use runtime::ProductionRunner;

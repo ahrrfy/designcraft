@@ -1651,3 +1651,64 @@ fn a_line_fits_when_its_baseline_does() {
     assert!(!overset(&mut s, 78.5), "the line is set; its descenders hang below the frame");
     assert!(overset(&mut s, 50.0), "a baseline below the frame still oversets the line");
 }
+
+#[test]
+fn composite_commands_journal_once_and_replay_identically() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    let a = s.execute("frame.create", &json!({"rect": [36, 36, 120, 120]})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("frame.create", &json!({"rect": [140, 36, 220, 120]})).unwrap()["id"].as_u64().unwrap();
+    // `edit.duplicate` internally runs nested commands (`edit.copy` + `edit.paste` / `transform.move`);
+    // nested commands must not also append to `s.journal`.
+    s.execute("selection.set", &json!({"ids": [a]})).unwrap();
+    s.execute("edit.duplicate", &json!({})).unwrap();
+    let dup_id = s.doc().unwrap().selection.items[0].0;
+    s.execute("object.group", &json!({"ids": [a, b, dup_id]})).unwrap();
+
+    let expected_items = s.doc().unwrap().doc.spreads[0].items.len();
+    let mut replayed = Session::new();
+    for (cmd, params) in s.journal.clone() {
+        replayed.execute(&cmd, &params).unwrap();
+    }
+    assert_eq!(replayed.doc().unwrap().doc.spreads[0].items.len(), expected_items);
+    assert_eq!(replayed.doc().unwrap().doc.spreads[0].items[0].children().len(), 3);
+}
+
+#[test]
+fn interactive_preview_preserves_prior_journal_and_commit_refreshes_live_captions_and_smart_reflow() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 200, "facingPages": false, "primaryTextFrame": true})).unwrap();
+    let initial_journal_len = s.journal.len();
+
+    // 1. A non-journaled command run inside `preview` must not pop an earlier journal entry.
+    s.begin_interaction("Inspect").unwrap();
+    s.preview("document.inspect", json!({})).unwrap();
+    assert_eq!(s.journal.len(), initial_journal_len, "preview must truncate rather than pop earlier journal entries");
+    s.cancel_interaction();
+    assert_eq!(s.journal.len(), initial_journal_len);
+
+    // 2. Committing an interaction runs Smart Text Reflow before recording the undo step.
+    let primary_story = s.doc().unwrap().doc.settings.primary_story.unwrap();
+    let primary_frame = s.doc().unwrap().doc.story(primary_story).unwrap().frames[0];
+    s.execute("story.setText", &json!({"story": primary_story.0, "text": "word ".repeat(120)})).unwrap();
+    // Shrink the primary text frame via an interactive gesture so it oversets and triggers Smart Text Reflow on commit.
+    let old_bounds = s.doc().unwrap().doc.item(primary_frame).unwrap().bounds();
+    let pages_before = s.doc().unwrap().doc.page_count();
+    let undo_before = s.doc().unwrap().history.undo.len();
+    s.begin_interaction("Resize Primary Frame").unwrap();
+    s.preview(
+        "transform.resize",
+        json!({
+            "ids": [primary_frame.0],
+            "from": [old_bounds.x0, old_bounds.y0, old_bounds.x1, old_bounds.y1],
+            "to": [old_bounds.x0, old_bounds.y0, old_bounds.x0 + 60.0, old_bounds.y0 + 40.0]
+        }),
+    )
+    .unwrap();
+    assert_eq!(s.doc().unwrap().doc.page_count(), pages_before, "smart reflow waits until commit");
+    s.commit_interaction().unwrap();
+    assert!(s.doc().unwrap().doc.page_count() > pages_before, "commit_interaction runs smart_reflow");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo_before + 1, "one undo step covers gesture + smart reflow");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.page_count(), pages_before, "single undo reverts both gesture and reflowed pages");
+}

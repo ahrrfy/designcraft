@@ -1,7 +1,7 @@
 //! Paragraph → styled, positioned glyphs (before line breaking).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock};
 
 use designcraft_doc::{Capitalization, CharProps, Kerning, Leading, Position, Story, Styles, story};
 use designcraft_fonts::{FaceRef, Feature, FontFace, ScopedFonts, ShapedGlyph, feature};
@@ -727,20 +727,26 @@ fn shape_run(
     if p.kerning == Kerning::Optical {
         crate::optical::kern_run(db, run, p.tracking / 1000.0 * p.size);
     }
-    let em = p.size * p.h_scale;
+    let em = if p.size.is_finite() && p.h_scale.is_finite() { p.size * p.h_scale } else { 0.0 };
     for g in run.iter_mut().filter(|g| g.adv > 0.0 && !g.ch.is_control()) {
+        if !g.adv.is_finite() || g.adv <= 0.0 || !g.dx.is_finite() || !g.sx.is_finite() {
+            continue;
+        }
         let (mut left, mut right) = (0.0, 0.0);
-        if p.tsume > 0.0 && !g.ch.is_whitespace() {
+        if p.tsume.is_finite() && p.tsume > 0.0 && !g.ch.is_whitespace() {
             let outline = db.outline(&g.face, g.gid);
             if !outline.elements().is_empty() {
                 let bounds = designcraft_geom::Shape::bounding_box(&*outline);
+                if !g.adv.is_finite() || g.adv <= 0.0 || !g.dx.is_finite() || !g.sx.is_finite() || !bounds.x0.is_finite() || !bounds.x1.is_finite() {
+                    continue;
+                }
                 left = (g.dx + bounds.x0 * g.sx).clamp(0.0, g.adv);
-                right = (g.adv - g.dx - bounds.x1 * g.sx).clamp(0.0, g.adv - left);
+                right = (g.adv - g.dx - bounds.x1 * g.sx).clamp(0.0, (g.adv - left).max(0.0));
             }
         }
-        let tsume = p.tsume.clamp(0.0, 1.0);
-        let before = p.leading_aki.unwrap_or(0.0).clamp(0.0, 100.0) * em;
-        let after = p.trailing_aki.unwrap_or(0.0).clamp(0.0, 100.0) * em;
+        let tsume = if p.tsume.is_finite() { p.tsume.clamp(0.0, 1.0) } else { 0.0 };
+        let before = p.leading_aki.filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, 100.0) * em;
+        let after = p.trailing_aki.filter(|v| v.is_finite()).unwrap_or(0.0).clamp(0.0, 100.0) * em;
         g.dx += before - left * tsume;
         g.adv += before + after - (left + right) * tsume;
     }
@@ -965,34 +971,88 @@ fn shape_run_raw(
     flush(seg_start, range.end, &seg_face, out);
 }
 
-type WordMap = HashMap<Box<str>, Arc<[ShapedGlyph]>>;
-type WordKey = (u32, bool, bool, String, Option<&'static str>);
+type WordCacheKey = (u32, bool, bool, Arc<[([u8; 4], u32)]>, Option<&'static str>, Box<str>);
 
-/// Shaped words (font units) by (face, vertical, caps, features, language), then text. Lookups
-/// take read locks and misses are shaped outside any lock, so parallel composition doesn't
-/// serialize here.
-static WORD_CACHE: RwLock<Vec<(WordKey, Arc<RwLock<WordMap>>)>> = RwLock::new(Vec::new());
-const WORD_CACHE_MAX: usize = 50_000;
+/// Lock-sharded S3-FIFO word shaping cache (font units) keyed by `(face, vertical, caps, features,
+/// language, word)`. Caches single words (LTR and RTL) as well as space-delimited words in both
+/// LTR and pure-RTL (`Arabic` / `Hebrew`) runs without global `clear()` thrash.
+static WORD_CACHE: LazyLock<quick_cache::sync::Cache<WordCacheKey, Arc<[ShapedGlyph]>>> = LazyLock::new(|| quick_cache::sync::Cache::new(32_768));
 
-fn word_map(key: WordKey) -> Arc<RwLock<WordMap>> {
-    if let Some((_, m)) = WORD_CACHE.read().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.0 == key) {
-        return m.clone();
+const MAX_CACHED_WORD_BYTES: usize = 64;
+const MAX_JOIN_CONTEXT_CHARS: usize = 32;
+
+/// True when `src` is a pure single-script RTL (`Arabic` or `Hebrew`) space-delimited run whose
+/// `split_inclusive(' ')` pieces each infer the identical RTL bidi level and script as `src`
+/// (letters, combining tashkeel/niqqud `NSM`, tatweel, and single word spaces; no digits or mixed
+/// scripts).
+fn can_split_rtl_words(src: &str) -> bool {
+    use unicode_bidi::BidiClass::{AL, NSM, R};
+    use unicode_script::{Script, UnicodeScript};
+    let Some(first) = src.chars().next() else { return false };
+    let run_script = first.script();
+    if !matches!(run_script, Script::Arabic | Script::Hebrew) {
+        return false;
     }
-    let mut w = WORD_CACHE.write().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, m)) = w.iter().find(|e| e.0 == key) {
-        return m.clone();
+    for piece in src.split_inclusive(' ') {
+        if piece.len() > MAX_CACHED_WORD_BYTES {
+            return false;
+        }
+        let body = piece.strip_suffix(' ').unwrap_or(piece);
+        let mut chars = body.chars();
+        let Some(lead) = chars.next() else {
+            return false;
+        };
+        if !matches!(unicode_bidi::bidi_class(lead), AL | R) || lead.script() != run_script {
+            return false;
+        }
+        for c in chars {
+            if !matches!(unicode_bidi::bidi_class(c), AL | R | NSM) {
+                return false;
+            }
+            let sc = c.script();
+            if sc != run_script && !matches!(sc, Script::Common | Script::Inherited) {
+                return false;
+            }
+        }
     }
-    if w.len() > 64 {
-        w.clear();
-    }
-    let m = Arc::new(RwLock::new(HashMap::new()));
-    w.push((key, m.clone()));
-    m
+    true
 }
 
-/// Shape `src` word by word through a cache (like a browser's word cache): the text is split
-/// after each U+0020 so repeated words are shaped once. Shaping does not cross word spaces in the
-/// scripts we lay out, and clusters stay byte offsets into `src`.
+/// Intra-word text immediately preceding `run` (empty across `' '` or control characters such as
+/// paragraph breaks `'\n'`, capped to [`MAX_JOIN_CONTEXT_CHARS`] characters). Keeps cursive Arabic
+/// joins across mid-word style changes while avoiding passing entire stories into HarfBuzz.
+fn join_before<'a>(before: &'a str, run: &str) -> &'a str {
+    if run.chars().next().is_none_or(|c| c == ' ' || c.is_control()) {
+        return "";
+    }
+    let mut bytes = 0usize;
+    for (count, ch) in before.chars().rev().enumerate() {
+        if count >= MAX_JOIN_CONTEXT_CHARS || ch == ' ' || ch.is_control() {
+            break;
+        }
+        bytes += ch.len_utf8();
+    }
+    before.get(before.len().saturating_sub(bytes)..).unwrap_or("")
+}
+
+/// Intra-word text immediately following `run` (symmetric to [`join_before`]).
+fn join_after<'a>(after: &'a str, run: &str) -> &'a str {
+    if run.chars().next_back().is_none_or(|c| c == ' ' || c.is_control()) {
+        return "";
+    }
+    let mut bytes = 0usize;
+    for (count, ch) in after.chars().enumerate() {
+        if count >= MAX_JOIN_CONTEXT_CHARS || ch == ' ' || ch.is_control() {
+            break;
+        }
+        bytes += ch.len_utf8();
+    }
+    after.get(..bytes).unwrap_or("")
+}
+
+/// Shape `src` word by word through [`WORD_CACHE`]: single words (LTR and RTL) and space-delimited
+/// runs without mid-word boundary context reuse cached glyph slices, with clusters preserved as
+/// byte offsets into `src`.
 fn shape_cached(
     face: &FontFace,
     src: &str,
@@ -1011,34 +1071,38 @@ fn shape_cached(
             designcraft_fonts::shape_with_context(face, s, feats, map, context)
         }
     };
-    if src.len() < 2 || !src.contains(' ') || src.chars().any(designcraft_fonts::is_rtl) {
+    if src.is_empty() || !before.is_empty() || !after.is_empty() {
         return shape(src, ShapeContext { before, after, language: lang });
     }
-    let words = word_map((face.id(), vertical, caps, format!("{feats:?}"), lang));
-    let pieces: Vec<&str> = src.split_inclusive(' ').collect();
-    let mut found: Vec<Option<Arc<[ShapedGlyph]>>> = {
-        let r = words.read().unwrap_or_else(|e| e.into_inner());
-        pieces.iter().map(|p| r.get(*p).cloned()).collect()
+    let feats_key: Arc<[([u8; 4], u32)]> =
+        if feats.is_empty() { Arc::from(&[][..]) } else { feats.iter().map(|f| (f.tag.to_be_bytes(), f.value)).collect() };
+    let shape_piece = |piece: &str| -> Arc<[ShapedGlyph]> {
+        let key = (face.id(), vertical, caps, feats_key.clone(), lang, Box::<str>::from(piece));
+        if let Some(hit) = WORD_CACHE.get(&key) {
+            return hit;
+        }
+        let glyphs: Arc<[ShapedGlyph]> = shape(piece, ShapeContext { language: lang, ..Default::default() }).into();
+        WORD_CACHE.insert(key, glyphs.clone());
+        glyphs
     };
-    let mut fresh: Vec<(Box<str>, Arc<[ShapedGlyph]>)> = Vec::new();
-    for (k, f) in found.iter_mut().enumerate() {
-        if f.is_none() {
-            let g: Arc<[ShapedGlyph]> = shape(pieces[k], ShapeContext { language: lang, ..Default::default() }).into();
-            fresh.push((pieces[k].into(), g.clone()));
-            *f = Some(g);
+    if !src.contains(' ') {
+        if src.len() > MAX_CACHED_WORD_BYTES {
+            return shape(src, ShapeContext { language: lang, ..Default::default() });
         }
+        return shape_piece(src).to_vec();
     }
-    if !fresh.is_empty() {
-        let mut w = words.write().unwrap_or_else(|e| e.into_inner());
-        if w.len() + fresh.len() > WORD_CACHE_MAX {
-            w.clear();
-        }
-        w.extend(fresh);
+    let splittable = if src.chars().any(designcraft_fonts::is_rtl) {
+        can_split_rtl_words(src)
+    } else {
+        src.split_inclusive(' ').all(|p| p.len() <= MAX_CACHED_WORD_BYTES)
+    };
+    if !splittable {
+        return shape(src, ShapeContext { language: lang, ..Default::default() });
     }
     let mut out = Vec::with_capacity(src.len());
-    let mut start = 0;
-    for (piece, glyphs) in pieces.iter().zip(found) {
-        let glyphs = glyphs.unwrap_or_else(|| Arc::from(Vec::new()));
+    let mut start = 0usize;
+    for piece in src.split_inclusive(' ') {
+        let glyphs = shape_piece(piece);
         out.extend(glyphs.iter().map(|g| ShapedGlyph { cluster: g.cluster + start, ..*g }));
         start += piece.len();
     }
@@ -1184,11 +1248,15 @@ fn shape_segment(
     let mut shaped: Vec<ShapedGlyph> = Vec::new();
     let mut upright: Vec<bool> = Vec::new();
     for (r, up) in upright_runs(src, vertical && !p.tate_chu_yoko, mode.rotate_roman) {
+        let run_src = &src[r.clone()];
         let around = match replacement {
-            None => (text.get(..range.start + r.start).unwrap_or(""), text.get(range.start + r.end..).unwrap_or("")),
+            None => (
+                join_before(text.get(..range.start + r.start).unwrap_or(""), run_src),
+                join_after(text.get(range.start + r.end..).unwrap_or(""), run_src),
+            ),
             Some(_) => ("", ""),
         };
-        let g = shape_cached(face, &src[r.clone()], if up { &upright_feats } else { &feats }, lang, caps, up, around);
+        let g = shape_cached(face, run_src, if up { &upright_feats } else { &feats }, lang, caps, up, around);
         upright.extend(std::iter::repeat_n(up, g.len()));
         shaped.extend(g.into_iter().map(|g| ShapedGlyph { cluster: g.cluster + r.start, ..g }));
     }
@@ -1234,7 +1302,7 @@ fn shape_segment(
         let mark_x = if mark { p.diacritic_x_offset.clamp(-1000.0, 1000.0) / 1000.0 * p.size * hs } else { 0.0 };
         let mark_y = if mark { p.diacritic_y_offset.clamp(-1000.0, 1000.0) / 1000.0 * p.size * p.v_scale } else { 0.0 };
         out.push(Glyph {
-            face: fref,
+            face: fref.clone(),
             gid: sg.gid,
             byte,
             len: if first_in_cluster || replacement.is_some() { len } else { 0 },
@@ -1418,5 +1486,85 @@ fn digit_mode(p: &designcraft_doc::CharProps, arabic_context: Option<bool>) -> d
         Some(false) => Digits::Arabic,
         Some(true) if Digits::Native.map('0', &p.language) == '0' => Digits::Hindi,
         _ => Digits::Native,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use designcraft_fonts::{FontDb, ShapeContext};
+
+    #[test]
+    fn word_cache_matches_uncached_arabic_and_ltr_bit_for_bit() {
+        let db = FontDb::global();
+        let mut faces = vec![db.face(designcraft_fonts::DEFAULT_FAMILY, "Regular")];
+        if let Some(ar_face) = db.fallback_for('\u{0628}', 0, Some("ar")) {
+            faces.push(ar_face);
+        }
+        let samples = [
+            // Multi-word Arabic with tashkeel (fatha, kasra, damma, sukun, shadda).
+            "\u{0628}\u{0650}\u{0633}\u{0652}\u{0645}\u{0650} \u{0627}\u{0644}\u{0644}\u{0647}\u{0650} \u{0627}\u{0644}\u{0631}\u{0651}\u{064e}\u{062d}\u{0652}\u{0645}\u{064e}\u{0646}\u{0650} \u{0627}\u{0644}\u{0631}\u{0651}\u{064e}\u{062d}\u{0650}\u{064a}\u{0645}\u{0650}",
+            // Lam-Alef ligatures (plain and hamza variants) + repeated words.
+            "\u{0644}\u{0627} \u{0625}\u{0644}\u{0647} \u{0625}\u{0644}\u{0627} \u{0627}\u{0644}\u{0644}\u{0647} \u{0644}\u{0623}\u{0644}\u{0626} \u{0644}\u{0627} \u{0625}\u{0644}\u{0647}",
+            // Tatweel / kashida inside multi-word Arabic.
+            "\u{0645}\u{0640}\u{0640}\u{0631}\u{062d}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0640}\u{0627}\u{0644}\u{0645} \u{0645}\u{0640}\u{0640}\u{0631}\u{062d}\u{0628}\u{0627}",
+            // Single Arabic word (cached via single-word fast path).
+            "\u{0627}\u{0644}\u{0645}\u{0633}\u{062a}\u{0642}\u{0628}\u{0644}",
+            // Arabic with digits and mixed Latin (falls back cleanly when bidi levels mix).
+            "\u{0639}\u{0627}\u{0645} \u{0662}\u{0660}\u{0662}\u{0666} DesignCraft \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}",
+            // Multi-word LTR with kerning and ligatures.
+            "office waffles typography office waffles",
+        ];
+
+        for face in &faces {
+            for &sample in &samples {
+                let expected =
+                    designcraft_fonts::shape_with_context(face, sample, &[], |c| c, ShapeContext { language: Some("ar"), ..Default::default() });
+                let cold = shape_cached(face, sample, &[], Some("ar"), false, false, ("", ""));
+                let warm = shape_cached(face, sample, &[], Some("ar"), false, false, ("", ""));
+                assert_eq!(cold, expected, "cold mismatch in {} for {sample:?}", face.family);
+                assert_eq!(warm, expected, "warm mismatch in {} for {sample:?}", face.family);
+            }
+        }
+        assert!(can_split_rtl_words(samples[0]));
+        assert!(can_split_rtl_words(samples[1]));
+        assert!(can_split_rtl_words(samples[2]));
+        assert!(!can_split_rtl_words(samples[4]), "mixed script/digits must bypass piece splitting");
+    }
+
+    #[test]
+    fn join_context_stops_at_word_and_paragraph_boundaries_but_keeps_mid_word_joins() {
+        assert_eq!(join_before("first paragraph\n", "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}"), "");
+        assert_eq!(join_after("\nnext paragraph", "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}"), "");
+        assert_eq!(join_before("word ", "\u{0628}\u{0627}\u{0628}"), "");
+        assert_eq!(join_after(" word", "\u{0628}\u{0627}\u{0628}"), "");
+        // Mid-word style change: "\u{0639}\u{0633}" + "\u{0644}" keeps intra-word joining context.
+        assert_eq!(join_before("prev \u{0639}\u{0633}", "\u{0644} next"), "\u{0639}\u{0633}");
+        assert_eq!(join_after("\u{0644} next\n", "prev \u{0639}\u{0633}"), "\u{0644}");
+    }
+
+    #[test]
+    fn tsume_and_aki_handle_hostile_non_finite_and_negative_metrics_without_panicking() {
+        use designcraft_doc::build::NewDocument;
+        use designcraft_doc::{Document, ParaFormat, SpreadRef};
+        let mut doc = Document::new(&NewDocument::default());
+        let layer = doc.default_layer();
+        let (_, sid) = doc
+            .add_text_frame(
+                SpreadRef::Doc(0),
+                designcraft_geom::Rect::new(36.0, 36.0, 300.0, 200.0),
+                layer,
+                "Hello \u{65e5}\u{672c}\u{8a9e}",
+                ParaFormat::default(),
+            )
+            .unwrap();
+        doc.story_mut(sid).unwrap().format_chars(0..15, |f| {
+            f.over.tsume = Some(f64::NAN);
+            f.over.leading_aki = Some(Some(f64::INFINITY));
+            f.over.trailing_aki = Some(Some(f64::NEG_INFINITY));
+            f.over.h_scale = Some(-200.0);
+        });
+        let cs = crate::compose_story(&doc, sid, &crate::ComposeOptions::default());
+        assert!(!cs.frames.is_empty());
     }
 }

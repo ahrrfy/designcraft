@@ -761,7 +761,7 @@ pub(crate) fn compile_native_plan(text: &str, scope: BatchScope) -> Result<Produ
     compile_native_content(text, scope, None)
 }
 
-fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) -> Result<ProductionPlan, String> {
+pub(crate) fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) -> Result<ProductionPlan, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Content {
@@ -777,7 +777,8 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
     if text.len() > MAX_BRIEF_BYTES {
         return Err("Native content plan exceeds 1 MiB".into());
     }
-    let content: Content = serde_json::from_str(text).map_err(|error| format!("Invalid native content plan: {error}"))?;
+    let mut de = serde_json::Deserializer::from_str(text);
+    let content: Content = serde_path_to_error::deserialize(&mut de).map_err(|error| format!("Invalid native content plan: {error}"))?;
     if content.commands.len() > MAX_ACTIONS {
         return Err("Native content plan exceeds 512 commands".into());
     }
