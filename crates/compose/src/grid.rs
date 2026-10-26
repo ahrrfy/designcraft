@@ -51,9 +51,9 @@ pub(crate) fn reference_offset(line: &[Glyph], r: Reference) -> f64 {
     }
 }
 
-/// Index of the first grid line at or below `y`.
+/// Index of the first grid line at or below `y` (`start + n * inc` for `n >= 0`).
 fn index_at(y: f64, start: f64, inc: f64) -> f64 {
-    ((y - start) / inc - 1e-6).ceil()
+    ((y - start) / inc - 1e-6).ceil().max(0.0)
 }
 
 /// Grid lines a block of reference points `span` apart needs, at least `n`.

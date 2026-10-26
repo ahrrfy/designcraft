@@ -30,10 +30,44 @@ fn may_have_rtl(text: &str) -> bool {
 }
 
 pub(crate) fn has_rtl(text: &str) -> bool {
-    may_have_rtl(text) && BidiInfo::new(text, None).has_rtl()
+    if text.is_ascii() {
+        return false;
+    }
+    let mut strong_rtl = false;
+    let mut needs_uba = false;
+    let mut has_lro = false;
+    for c in text.chars() {
+        match bidi_class(c) {
+            BidiClass::R | BidiClass::AL => strong_rtl = true,
+            BidiClass::LRO => {
+                has_lro = true;
+                needs_uba = true;
+            }
+            BidiClass::AN
+            | BidiClass::LRE
+            | BidiClass::RLE
+            | BidiClass::RLO
+            | BidiClass::PDF
+            | BidiClass::LRI
+            | BidiClass::RLI
+            | BidiClass::FSI
+            | BidiClass::PDI => needs_uba = true,
+            _ => {}
+        }
+    }
+    if strong_rtl && !has_lro {
+        return true;
+    }
+    (strong_rtl || needs_uba) && BidiInfo::new(text, None).has_rtl()
 }
 
 /// Resolve translated labels through bidi, without changing IDs, commands or stored text.
+fn widget_rtl_known(ui: &egui::Ui, text: WidgetText) -> WidgetText {
+    let mut job = (*text.into_layout_job(ui.style(), egui::FontSelection::Default, Align::Center)).clone();
+    job.wrap = TextWrapping::from_wrap_mode_and_width(ui.wrap_mode(), ui.available_width());
+    WidgetText::Galley(layout(ui.ctx(), job))
+}
+
 pub fn widget(ui: &egui::Ui, text: impl Into<WidgetText>) -> WidgetText {
     let text = text.into();
     if !has_rtl(text.text()) {
@@ -64,7 +98,7 @@ pub fn label(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> egui::Response {
         return ui.label(text);
     }
     let selectable = false;
-    let rendered = widget(ui, text.clone());
+    let rendered = widget_rtl_known(ui, text.clone());
     let elided = matches!(&rendered, WidgetText::Galley(galley) if galley.elided);
     let response = ui.add(egui::Label::new(rendered).selectable(selectable).show_tooltip_when_elided(!rtl));
     if rtl && elided {
@@ -274,7 +308,7 @@ fn visual_line(job: &LayoutJob, bidi: &BidiInfo<'_>, line: Range<usize>, has_ara
     visual_line_with_pieces(job, bidi, line, has_arabic_fonts).0
 }
 
-const MAX_CACHED_LABELS: usize = 256;
+const MAX_CACHED_LABELS: usize = 2048;
 const MAX_CACHED_TEXT_BYTES: usize = 4096;
 
 #[derive(Clone)]

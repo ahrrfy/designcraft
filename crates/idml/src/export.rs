@@ -2319,6 +2319,28 @@ impl<'a> Ex<'a> {
         let mut paras = Vec::new();
         let ranges = s.para_ranges();
         let n = ranges.len();
+        let mut counted_to = 0usize;
+        let mut anchor_count = 0usize;
+        let mut object_count = 0usize;
+        let mut index_count = 0usize;
+        let mut xref_count = 0usize;
+        let mut note_count = 0usize;
+        let mut advance_counts = |target: usize| -> (usize, usize, usize, usize, usize) {
+            if let Some(slice) = s.text.get(counted_to..target) {
+                for ch in slice.chars() {
+                    match ch {
+                        designcraft_doc::ANCHOR_MARK => anchor_count += 1,
+                        designcraft_doc::OBJECT_MARK => object_count += 1,
+                        designcraft_doc::INDEX_MARK => index_count += 1,
+                        designcraft_doc::XREF_MARK => xref_count += 1,
+                        designcraft_doc::FOOTNOTE_REF => note_count += 1,
+                        _ => {}
+                    }
+                }
+                counted_to = target;
+            }
+            (anchor_count, object_count, index_count, xref_count, note_count)
+        };
         for (pi, r) in ranges.into_iter().enumerate() {
             let pf = s.paras.get(pi).cloned().unwrap_or_default();
             let mut psr = self.psr_el(&pf);
@@ -2386,7 +2408,7 @@ impl<'a> Ex<'a> {
                     } else if ch == designcraft_doc::ANCHOR_MARK {
                         flush_text(&mut cur, &mut pending);
                         flush_content(&mut pending, &mut out);
-                        let k = s.text[..seg_start + ci].matches(designcraft_doc::ANCHOR_MARK).count();
+                        let k = advance_counts(seg_start + ci).0;
                         if let Some(a) = s.anchors.get(k) {
                             out.push(Node::El(
                                 El::new("HyperlinkTextDestination")
@@ -2400,7 +2422,7 @@ impl<'a> Ex<'a> {
                         // An anchored object: the item inside the range with its anchoring settings.
                         flush_text(&mut cur, &mut pending);
                         flush_content(&mut pending, &mut out);
-                        let k = s.text[..seg_start + ci].matches(designcraft_doc::OBJECT_MARK).count();
+                        let k = advance_counts(seg_start + ci).1;
                         if let Some(o) = s.objects.get(k) {
                             let mut e = self.item_el(&o.item, o.item.xf);
                             use designcraft_doc::anchored::AnchorAlign as A;
@@ -2446,7 +2468,7 @@ impl<'a> Ex<'a> {
                     } else if ch == designcraft_doc::INDEX_MARK {
                         flush_text(&mut cur, &mut pending);
                         flush_content(&mut pending, &mut out);
-                        let k = s.text[..seg_start + ci].matches(designcraft_doc::INDEX_MARK).count();
+                        let k = advance_counts(seg_start + ci).2;
                         if let Some(r) = s.index_refs.get(k).filter(|r| !r.topics.is_empty()) {
                             use designcraft_doc::index::IndexRange as R;
                             for n in 1..=r.topics.len() {
@@ -2489,7 +2511,7 @@ impl<'a> Ex<'a> {
                             c.children.append(&mut out);
                             csrs.push(c);
                         }
-                        let k = s.text[..seg_start + ci].matches(designcraft_doc::XREF_MARK).count();
+                        let k = advance_counts(seg_start + ci).3;
                         if let Some(x) = s.xrefs.get(k) {
                             let me = self.fresh();
                             let fmt = self.d.xref_formats.iter().position(|ff| ff.name == x.format).map_or("n".to_string(), xref_format_self);
@@ -2537,7 +2559,8 @@ impl<'a> Ex<'a> {
                             c.children.append(&mut out);
                             csrs.push(c);
                         }
-                        if let Some(n) = s.notes.get(s.notes_before(seg_start + ci)) {
+                        let note_k = advance_counts(seg_start + ci).4;
+                        if let Some(n) = s.notes.get(note_k) {
                             let mut c = self.csr_el(&f);
                             let pos = self.d.footnote_options.ref_position;
                             if pos != designcraft_doc::Position::Normal {

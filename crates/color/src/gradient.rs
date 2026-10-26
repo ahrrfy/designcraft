@@ -69,36 +69,47 @@ impl Gradient {
         if stops.is_empty() {
             return (Color::BLACK, 1.0);
         }
-        if t <= stops[0].offset {
-            return (stops[0].color, stops[0].opacity);
+        let clean_opa = |a: f32| if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
+        if !t.is_finite() || t <= stops[0].offset {
+            return (stops[0].color, clean_opa(stops[0].opacity));
         }
         for w in stops.windows(2) {
             let (a, b) = (&w[0], &w[1]);
+            if !a.offset.is_finite() || !b.offset.is_finite() {
+                continue;
+            }
             if t <= b.offset {
-                let span = (b.offset - a.offset).max(1e-6);
-                let u = (t - a.offset) / span;
+                let span = (f64::from(b.offset) - f64::from(a.offset)).max(1e-6);
+                let u = ((f64::from(t) - f64::from(a.offset)) / span).clamp(0.0, 1.0) as f32;
                 // Map through the midpoint: u=mid → 0.5.
-                let m = a.midpoint.clamp(0.01, 0.99);
+                let m = if a.midpoint.is_finite() { a.midpoint.clamp(0.01, 0.99) } else { 0.5 };
                 let v = if u < m { 0.5 * u / m } else { 0.5 + 0.5 * (u - m) / (1.0 - m) };
-                return (a.color.lerp(&b.color, v), a.opacity + (b.opacity - a.opacity) * v);
+                let (oa, ob) = (clean_opa(a.opacity), clean_opa(b.opacity));
+                return (a.color.lerp(&b.color, v), oa + (ob - oa) * v);
             }
         }
         match stops.last() {
-            Some(l) => (l.color, l.opacity),
+            Some(l) => (l.color, clean_opa(l.opacity)),
             None => (Color::BLACK, 1.0),
         }
     }
     /// Stops expanded so that midpoints are represented as explicit stops (for renderers without midpoints).
     pub fn expanded_stops(&self) -> Vec<(f32, Color, f32)> {
+        let clean_off = |o: f32| if o.is_finite() { o.clamp(0.0, 1.0) } else { 0.0 };
+        let clean_mid = |m: f32| if m.is_finite() { m.clamp(0.0, 1.0) } else { 0.5 };
+        let clean_opa = |a: f32| if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
         let mut out = Vec::new();
         for (i, s) in self.stops.iter().enumerate() {
-            out.push((s.offset, s.color, s.opacity));
+            let s_off = clean_off(s.offset);
+            let s_mid = clean_mid(s.midpoint);
+            out.push((s_off, s.color, clean_opa(s.opacity)));
             if let Some(n) = self.stops.get(i + 1)
-                && (s.midpoint - 0.5).abs() > 1e-3
+                && (s_mid - 0.5).abs() > 1e-3
             {
-                let t = s.offset + (n.offset - s.offset) * s.midpoint;
+                let n_off = clean_off(n.offset);
+                let t = (f64::from(s_off) + (f64::from(n_off) - f64::from(s_off)) * f64::from(s_mid)).clamp(0.0, 1.0) as f32;
                 let (c, o) = self.sample(t);
-                out.push((t, c, o));
+                out.push((t, c, clean_opa(o)));
             }
         }
         out
@@ -279,6 +290,25 @@ mod tests {
             let ((c, o), (want_c, want_o)) = (g.sample(t), original.sample(1.0 - t));
             assert!(c.to_rgb().iter().zip(want_c.to_rgb()).all(|(a, b)| (a - b).abs() < 1e-5), "colour at {t}");
             assert!((o - want_o).abs() < 1e-5, "opacity at {t}");
+        }
+    }
+
+    #[test]
+    fn extreme_or_non_finite_stop_offsets_stay_finite_in_unit_range() {
+        let g = Gradient {
+            kind: GradientKind::Linear,
+            stops: vec![
+                GradientStop { offset: -3e38, color: Color::WHITE, opacity: 1.0, midpoint: 0.0 },
+                GradientStop { offset: 3e38, color: Color::BLACK, opacity: f32::NAN, midpoint: f32::INFINITY },
+                GradientStop { offset: f32::NAN, color: Color::rgb(1.0, 0.0, 0.0), opacity: 0.5, midpoint: -10.0 },
+            ],
+        };
+        let exp = g.expanded_stops();
+        assert!(!exp.is_empty());
+        for (off, col, opa) in exp {
+            assert!(off.is_finite() && (0.0..=1.0).contains(&off), "offset={off}");
+            assert!(opa.is_finite() && (0.0..=1.0).contains(&opa), "opacity={opa}");
+            assert!(col.to_rgb().iter().all(|v| v.is_finite()));
         }
     }
 }

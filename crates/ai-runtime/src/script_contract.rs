@@ -761,7 +761,7 @@ pub(crate) fn compile_native_plan(text: &str, scope: BatchScope) -> Result<Produ
     compile_native_content(text, scope, None)
 }
 
-fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) -> Result<ProductionPlan, String> {
+pub(crate) fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) -> Result<ProductionPlan, String> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Content {
@@ -777,7 +777,9 @@ fn compile_native_content(text: &str, scope: BatchScope, brief: Option<&str>) ->
     if text.len() > MAX_BRIEF_BYTES {
         return Err("Native content plan exceeds 1 MiB".into());
     }
-    let content: Content = serde_json::from_str(text).map_err(|error| format!("Invalid native content plan: {error}"))?;
+    let mut de = serde_json::Deserializer::from_str(text);
+    let content: Content = serde_path_to_error::deserialize(&mut de).map_err(|error| format!("Invalid native content plan: {error}"))?;
+    de.end().map_err(|error| format!("Invalid native content plan: {error}"))?;
     if content.commands.len() > MAX_ACTIONS {
         return Err("Native content plan exceeds 512 commands".into());
     }
@@ -1632,5 +1634,15 @@ mod tests {
 
         // Casual prose mentioning "صفحة 1" without script structure must stay None.
         assert!(parse("صمم لي صفحة 1 جميلة عن الحروف الهجائية للأطفال").unwrap().is_none());
+
+        // Concatenated JSON plans or trailing tokens must be rejected by compile_native_plan.
+        let valid_plan = json!({
+            "title": "Single valid plan",
+            "commands": [{"command": "frame.create", "params": {"spread": 0, "content": "text", "rect": [45, 45, 300, 90], "text": "Hello"}}],
+            "images": []
+        });
+        let concatenated = format!("{valid_plan} {valid_plan}");
+        let err = compile_native_plan(&concatenated, BatchScope { start: 0, count: 1 }).unwrap_err();
+        assert!(err.contains("Invalid native content plan"), "{err}");
     }
 }

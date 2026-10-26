@@ -140,7 +140,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Place…",
             ["File"],
             Some("Cmd+D"),
-            "{path?|base64?, name?, frame?: id (place into), spread?, x?, y?, width?: finite number > 0 (null: absent), height? (video/audio), pdfPage?: n (1-based, Image Import Options), pdfCrop?: crop|art|trim|bleed|media|contentVisible|contentAll (the box the graphic shows; `width` is the whole page's), loadCursor? (with no frame to fill and no x/y, an image loads into the place cursor, as File › Place), layoutPage?: n (IDML / .designcraft: that page's objects as a group), page?, rect?: [x0,y0,x1,y1] (text: a new frame there), autoflow? (threads one frame per page column from the first frame on, adding pages until the text fits), removeStyles?, styleMap?: {imported name: document style}, styleConflicts?: useExisting|redefine|autoRename, link? (keep the file linked in the Links panel; default: the linkTextFiles preference)} — places an image into `frame` when given; otherwise any explicit x/y/spread/width creates a new frame; otherwise uses the selected empty or graphic frame, or creates a new frame; text files (.txt, .docx, .rtf, .md) and Excel workbooks (.xlsx, as a table) go into the insertion point, the selected frame or a new frame on `page`/`rect`",
+            "{path?|base64?|reuseAsset?, name?, frame?: id (place into), spread?, x?, y?, width?: finite number > 0 (null: absent), height? (video/audio), pdfPage?: n (1-based, Image Import Options), pdfCrop?: crop|art|trim|bleed|media|contentVisible|contentAll (the box the graphic shows; `width` is the whole page's), loadCursor? (with no frame to fill and no x/y, an image loads into the place cursor, as File › Place), layoutPage?: n (IDML / .designcraft: that page's objects as a group), page?, rect?: [x0,y0,x1,y1] (text: a new frame there), autoflow? (threads one frame per page column from the first frame on, adding pages until the text fits), removeStyles?, styleMap?: {imported name: document style}, styleConflicts?: useExisting|redefine|autoRename, link? (keep the file linked in the Links panel; default: the linkTextFiles preference)} — places an image into `frame` when given; otherwise any explicit x/y/spread/width creates a new frame; otherwise uses the selected empty or graphic frame, or creates a new frame; text files (.txt, .docx, .rtf, .md) and Excel workbooks (.xlsx, as a table) go into the insertion point, the selected frame or a new frame on `page`/`rect`",
             has_doc,
             file_place
         ),
@@ -658,8 +658,11 @@ fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
 fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
     // The file's size and time before it is read (a linked text file remembers them).
     let mut before = None;
-    let (bytes, name, link) = if let Some(b) = str_param(p, "base64") {
-        (base64_decode(b), str_param(p, "name").unwrap_or("image").to_string(), None)
+    let (data, name, link) = if let Some(aid_num) = p.get("reuseAsset").and_then(Value::as_u64) {
+        let existing = s.doc()?.doc.assets.get(&AssetId(aid_num)).ok_or_else(|| bad("file.place", format!("no such asset {aid_num}")))?;
+        (Arc::clone(&existing.data), str_param(p, "name").map(str::to_owned).unwrap_or_else(|| existing.name.clone()), existing.link.clone())
+    } else if let Some(b) = str_param(p, "base64") {
+        (Arc::new(base64_decode(b)), str_param(p, "name").unwrap_or("image").to_string(), None)
     } else if let Some(path) = str_param(p, "path") {
         before = super::datamerge::fingerprint_from_path(path);
         #[cfg(not(target_arch = "wasm32"))]
@@ -667,7 +670,7 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         #[cfg(target_arch = "wasm32")]
         let b: Vec<u8> = vec![];
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.into());
-        (b, name, Some(path.to_string()))
+        (Arc::new(b), name, Some(path.to_string()))
     } else {
         s.ui_requests.push(crate::UiRequest::Pick { purpose: "place".into(), params: json!({}) });
         return ok();
@@ -675,17 +678,17 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
     // A page of another layout (IDML or DesignCraft): its objects, as one group.
     let lname = name.to_lowercase();
     if lname.ends_with(".idml") || lname.ends_with(".designcraft") {
-        return place_layout_page(s, p, &name, &bytes);
+        return place_layout_page(s, p, &name, &data);
     }
     // Keep the EPS source for link comparison; rendering uses its preview at the bounding box size.
-    let eps_size = eps_size(&bytes, "file.place")?;
+    let eps_size = eps_size(&data, "file.place")?;
     // Video and sound: a media frame (Window › Interactive › Media).
     if let Some(mime) = designcraft_doc::media_mime(&name) {
-        return super::media::place_media(s, p, name, mime, bytes, link);
+        return super::media::place_media(s, p, name, mime, Arc::unwrap_or_clone(data), link);
     }
     // Text files (plain, Word, RTF) flow into frames.
     if designcraft_textimport::is_text_file(&name) {
-        return super::place_text::place_text(s, p, &name, &bytes, link, before);
+        return super::place_text::place_text(s, p, &name, &data, link, before);
     }
     let want_w = p
         .get("width")
@@ -698,12 +701,12 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .transpose()?;
     // Image Import Options: which page of a PDF (1-based).
-    if designcraft_render::is_pdf(&bytes) {
-        designcraft_render::check_pdf_input_size(bytes.len()).map_err(|e| bad("file.place", e.to_string()))?;
+    if designcraft_render::is_pdf(&data) {
+        designcraft_render::check_pdf_input_size(data.len()).map_err(|e| bad("file.place", e.to_string()))?;
     }
     let pdf_page = match p.get("pdfPage").and_then(Value::as_u64) {
-        Some(n) if designcraft_render::is_pdf(&bytes) => {
-            let count = designcraft_render::pdf_page_count(&bytes).unwrap_or(1);
+        Some(n) if designcraft_render::is_pdf(&data) => {
+            let count = designcraft_render::pdf_page_count(&data).unwrap_or(1);
             let invalid_page = || bad("file.place", format!("the PDF has {count} page(s)"));
             let one_based = usize::try_from(n).map_err(|_| invalid_page())?;
             if one_based == 0 || one_based > count {
@@ -715,23 +718,23 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         _ => 0,
     };
     let (pw, ph) = match pdf_page {
-        0 => designcraft_render::image_size(&bytes).ok_or_else(|| bad("file.place", "unsupported or corrupt image"))?,
-        n => designcraft_render::pdf_page_size(&bytes, n as usize)
+        0 => designcraft_render::image_size(&data).ok_or_else(|| bad("file.place", "unsupported or corrupt image"))?,
+        n => designcraft_render::pdf_page_size(&data, n as usize)
             .map(|(w, h)| (w.round().max(1.0) as u32, h.round().max(1.0) as u32))
             .ok_or_else(|| bad("file.place", "can't read that PDF page"))?,
     };
     // 72 ppi by default unless the file says otherwise; scale so it fits the page when huge. PDF pages
     // and SVGs keep their exact size: rounding it to whole points would stretch them unevenly.
-    let (nw, nh) = eps_size.or_else(|| designcraft_render::natural_size(&bytes, pdf_page as usize)).unwrap_or((pw as f64, ph as f64));
+    let (nw, nh) = eps_size.or_else(|| designcraft_render::natural_size(&data, pdf_page as usize)).unwrap_or((pw as f64, ph as f64));
     // Image Import Options › Crop to: the graphic spans that box of the PDF page.
-    let is_pdf = designcraft_render::is_pdf(&bytes);
+    let is_pdf = designcraft_render::is_pdf(&data);
     let pdf_crop = match str_param(p, "pdfCrop") {
         Some(k) if is_pdf => PdfCrop::from_name(k)
             .ok_or_else(|| bad("file.place", format!("unknown pdfCrop `{k}` (crop, art, trim, bleed, media, contentVisible, contentAll)")))?,
         _ => PdfCrop::Crop,
     };
-    let mime = designcraft_render::image_mime(&bytes).to_string();
-    let mut asset = Asset { page: pdf_page, name, mime, link, data: Arc::new(bytes), pixels: Some((pw, ph)), pdf_crop, ..Default::default() };
+    let mime = designcraft_render::image_mime(&data).to_string();
+    let mut asset = Asset { page: pdf_page, name, mime, link, data, pixels: Some((pw, ph)), pdf_crop, ..Default::default() };
     // The graphic's natural size: the box in points (the whole page when the box can't be found,
     // and then the document says so).
     let (bw, bh) = match crop_pdf(&mut asset) {
@@ -1818,7 +1821,9 @@ mod document_fonts_tests {
         for (sid, story) in &st.doc.stories {
             let cs = s.cache.get(&st.doc, *sid, None);
             for g in cs.frames.iter().flat_map(|ft| &ft.lines).flat_map(|l| &l.glyphs).filter(|g| g.visible && g.len > 0) {
-                out.push((story.text[g.byte..].chars().next().unwrap(), g.face));
+                #[allow(clippy::clone_on_copy)]
+                let face = g.face.clone();
+                out.push((story.text[g.byte..].chars().next().unwrap(), face));
             }
         }
         out
@@ -1972,7 +1977,7 @@ mod document_fonts_tests {
 
         let mut s = Session::new();
         open(&mut s, &path);
-        let first = glyph_faces(&s)[0].1;
+        let first = glyph_faces(&s)[0].1.clone();
         assert_eq!(first.family, FAMILY);
         s.execute("file.close", &json!({})).unwrap();
         // A new document can't use the closed document's font.

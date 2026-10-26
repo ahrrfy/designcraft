@@ -131,6 +131,10 @@ pub struct ImagePlacement {
     pub page: usize,
     pub rect: [f64; 4],
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
     /// Additional native frames sharing one generated single-subject source.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repeat_rects: Vec<[f64; 4]>,
@@ -156,6 +160,41 @@ pub struct ProductionPlan {
     pub images: Vec<ImagePlacement>,
 }
 
+/// Ephemeral plaintext credential buffer; zeroized automatically whenever dropped
+/// (including early rejection of [`AiRequest::SetApiKey`] or [`AiRequest::SaveApiKey`]).
+#[derive(Clone, Default)]
+pub struct EphemeralKey(String);
+
+impl EphemeralKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn take(&mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for EphemeralKey {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for EphemeralKey {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl Drop for EphemeralKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 /// Deliberately not serializable or Debug: SetApiKey carries an ephemeral secret.
 #[derive(Clone)]
 pub enum AiRequest {
@@ -178,11 +217,11 @@ pub enum AiRequest {
     UpdateSettings(AiSettings),
     SetApiKey {
         provider: ProviderKind,
-        key: String,
+        key: EphemeralKey,
     },
     SaveApiKey {
         selection: ModelSelection,
-        key: String,
+        key: EphemeralKey,
     },
     RemoveApiKey {
         selection: ModelSelection,
@@ -454,4 +493,26 @@ pub struct AiSnapshot {
     pub resources: Option<crate::ResourceSnapshot>,
     #[serde(default)]
     pub print_proof: Option<PrintProof>,
+}
+
+#[cfg(test)]
+mod ephemeral_key_tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_key_take_moves_and_leaves_empty_buffer_while_drop_completes_cleanly() {
+        let mut k = EphemeralKey::from("sk-synthetic-test-secret");
+        assert_eq!(k.as_str(), "sk-synthetic-test-secret");
+        let moved = k.take();
+        assert_eq!(moved, "sk-synthetic-test-secret");
+        assert!(k.as_str().is_empty());
+
+        let rejected = AiRequest::SetApiKey { provider: ProviderKind::Gemini, key: "sk-dropped-early".into() };
+        drop(rejected);
+        let rejected_save = AiRequest::SaveApiKey {
+            selection: ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-4.1-mini".into(), endpoint: None },
+            key: String::from("sk-dropped-save").into(),
+        };
+        drop(rejected_save);
+    }
 }

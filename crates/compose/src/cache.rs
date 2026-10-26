@@ -228,7 +228,17 @@ impl Cache {
             && cross
             && let Some(old) = replaced
         {
-            self.previous.lock().unwrap_or_else(|e| e.into_inner()).insert(sid, (old.sig, old.out));
+            const MAX_PREVIOUS_STORIES: usize = 256;
+            let mut prev = self.previous.lock().unwrap_or_else(|e| e.into_inner());
+            if prev.len() >= MAX_PREVIOUS_STORIES && !prev.contains_key(&sid) {
+                prev.retain(|k, _| doc.stories.contains_key(k));
+                if prev.len() >= MAX_PREVIOUS_STORIES
+                    && let Some(&evict) = prev.keys().next()
+                {
+                    prev.remove(&evict);
+                }
+            }
+            prev.insert(sid, (old.sig, old.out));
         }
         out
     }
@@ -307,6 +317,7 @@ impl Cache {
 
     pub fn clear(&self) {
         self.map.lock().unwrap_or_else(|e| e.into_inner()).0.clear();
+        self.previous.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.xrefs.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -332,7 +343,7 @@ impl Cache {
         {
             return r.clone();
         }
-        let r = Arc::new(RunningIndex::build(doc, &|sid| self.get(doc, sid, None)));
+        let r = Arc::new(crate::vars::RunningIndex::build(doc, &|sid| self.get(doc, sid, None)));
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some((sig, r.clone()));
         r
     }
@@ -350,6 +361,7 @@ fn signature(doc: &Document, story: &Arc<Story>) -> (Vec<usize>, Vec<Arc<Item>>)
         doc.font_scope as usize,
         g.start.to_bits() as usize,
         g.increment.to_bits() as usize,
+        g.relative_to as usize,
     ];
     let mut keep = Vec::new();
     let mut spreads = Vec::new();
@@ -373,6 +385,19 @@ fn signature(doc: &Document, story: &Arc<Story>) -> (Vec<usize>, Vec<Arc<Item>>)
             sig.push(loc.top());
             if !spreads.contains(&loc.spread) {
                 spreads.push(loc.spread);
+                sig.push(sp.pages.len());
+                for pg in &sp.pages {
+                    sig.extend([
+                        pg.x.to_bits() as usize,
+                        pg.width.to_bits() as usize,
+                        pg.height.to_bits() as usize,
+                        pg.margins.top.to_bits() as usize,
+                        pg.margins.bottom.to_bits() as usize,
+                        pg.margins.inside.to_bits() as usize,
+                        pg.margins.outside.to_bits() as usize,
+                        pg.side as usize,
+                    ]);
+                }
                 for it in &sp.items {
                     let mut wraps = false;
                     it.walk(&mut |i| wraps |= i.has_wrap());
@@ -388,4 +413,32 @@ fn signature(doc: &Document, story: &Arc<Story>) -> (Vec<usize>, Vec<Arc<Item>>)
         }
     }
     (sig, keep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use designcraft_doc::build::NewDocument;
+    use designcraft_doc::{ParaFormat, SpreadRef};
+    use designcraft_geom::Rect;
+
+    #[test]
+    fn previous_compositions_are_bounded_and_cleared() {
+        let mut doc = Document::new(&NewDocument::default());
+        let layer = doc.default_layer();
+        let cache = Cache::new();
+        let mut stories = Vec::new();
+        for _ in 0..280 {
+            let (_, sid) = doc.add_text_frame(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 120.0, 40.0), layer, "One", ParaFormat::default()).unwrap();
+            let _ = cache.get(&doc, sid, None);
+            stories.push(sid);
+        }
+        for sid in stories {
+            Arc::make_mut(doc.stories.get_mut(&sid).unwrap()).rev += 1;
+            let _ = cache.get(&doc, sid, None);
+        }
+        assert!(cache.previous.lock().unwrap().len() <= 256);
+        cache.clear();
+        assert!(cache.previous.lock().unwrap().is_empty());
+    }
 }

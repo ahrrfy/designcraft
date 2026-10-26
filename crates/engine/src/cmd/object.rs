@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create Frame",
             [],
             None,
-            "{spread?: index | {kind: doc|parent, index} (a parent spread: index into `parents` of document.inspect), rect: [x0,y0,x1,y1] (spread coords), shape?: rectangle|ellipse|polygon, content?: graphic|text|unassigned, sides?: 6, starInset?: 0–100 (%), text?: string, caret?: bool, vertical?: bool (text: a new vertical story)}",
+            "{spread?: index | {kind: doc|parent, index} (a parent spread: index into `parents` of document.inspect), rect: [x0,y0,x1,y1] (spread coords), shape?: rectangle|ellipse|oval|polygon, content?: graphic|text|unassigned, sides?: 6, starInset?: 0–100 (%), text?: string, caret?: bool, vertical?: bool (text: a new vertical story)}",
             has_doc,
             frame_create
         ),
@@ -1002,8 +1002,11 @@ fn frame_create(s: &mut Session, p: &Value) -> Result<Value> {
         let mut it = Item::new(id, lid, sh, path);
         if content == "graphic" {
             it.object_style = d.styles.default_graphic_frame.clone();
-            if let Some(e) = d.styles.object_effects(&it.object_style) {
-                it.effects = e.clone();
+            if let Some(e) = super::style::resolved_object_style(&d.styles, &it.object_style)
+                .and_then(|s| s.effects)
+                .or_else(|| d.styles.object_effects(&it.object_style).cloned())
+            {
+                it.effects = e;
             }
         } else {
             // Shapes drawn with Rectangle/Ellipse/Polygon get a 1 pt stroke in the document's

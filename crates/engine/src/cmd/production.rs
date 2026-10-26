@@ -278,7 +278,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                 &[
                     ("rect", rect()),
                     ("spread", index()),
-                    ("shape", choice(&["rectangle", "ellipse", "polygon"])),
+                    ("shape", choice(&["rectangle", "ellipse", "oval", "polygon"])),
                     ("content", choice(&["text", "graphic", "unassigned"])),
                     ("text", string()),
                     ("caret", boolean()),
@@ -509,6 +509,13 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
                     ("gutter", number(0.0, 1000.0)),
                     ("inset", edges()),
                     ("verticalJustification", choice(&["top", "center", "bottom", "justify"])),
+                    ("autoSize", choice(&["off", "heightOnly", "widthOnly", "heightAndWidth", "heightAndWidthProportionally"])),
+                    ("autoSizeReference", choice(&crate::autosize::REFERENCES)),
+                    ("useMinimumHeight", boolean()),
+                    ("minimumHeight", number(0.0, crate::autosize::MAX_SIDE)),
+                    ("useMinimumWidth", boolean()),
+                    ("minimumWidth", number(0.0, crate::autosize::MAX_SIDE)),
+                    ("noLineBreaks", boolean()),
                     ("ignoreWrap", boolean()),
                     ("balanceColumns", boolean()),
                 ],
@@ -685,6 +692,7 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
             object(
                 &[
                     ("name", string()),
+                    ("basedOn", string()),
                     ("fromSelection", boolean()),
                     ("fill", string()),
                     ("paragraphStyle", string()),
@@ -1200,8 +1208,8 @@ fn check(schema: &Value, value: &Value, path: &str) -> Result<()> {
             return Err(bad(ID, format!("{path}: invalid array length")));
         }
         let item = schema.get("items").ok_or_else(|| bad(ID, "missing item schema"))?;
-        for v in values {
-            check(item, v, path)?;
+        for (idx, v) in values.iter().enumerate() {
+            check(item, v, &format!("{path}[{idx}]"))?;
         }
     }
     if let Some(values) = value.as_object() {
@@ -1260,45 +1268,108 @@ fn bounded_limits(value: &Value, id: &str, max_bytes: usize, max_nodes: usize, m
     Ok(())
 }
 
+fn deserialize_present<'de, T, D>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    <T as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActionEnvelope {
+    command: String,
+    params: serde_json::Map<String, Value>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlanEnvelope {
+    commands: Vec<ActionEnvelope>,
+    output_mode: String,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    allowed_commands: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    label: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    expected_document_uid: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    expected_revision: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    require_preflight: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    min_ppi: Option<f64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocumentSetupEnvelope {
+    #[serde(default, deserialize_with = "deserialize_present")]
+    facing_pages: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    binding: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChunkEnvelope {
+    #[allow(dead_code)]
+    commands: Vec<ActionEnvelope>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    #[allow(dead_code)]
+    label: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GroupEnvelope {
+    chunks: Vec<ChunkEnvelope>,
+    #[allow(dead_code)]
+    output_mode: String,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    label: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    expected_document_uid: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    expected_revision: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    #[allow(dead_code)]
+    require_preflight: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    #[allow(dead_code)]
+    min_ppi: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    document_setup: Option<DocumentSetupEnvelope>,
+}
+
 fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<(crate::DocState, Vec<Value>)> {
     bounded(p)?;
-    let params = p.as_object().ok_or_else(|| bad(ID, "parameters must be an object"))?;
-    for key in params.keys() {
-        if !["commands", "outputMode", "allowedCommands", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi"]
-            .contains(&key.as_str())
-        {
-            return Err(bad(ID, format!("unknown parameter `{key}`")));
-        }
+    if !p.is_object() {
+        return Err(bad(ID, "plan must be a JSON object"));
     }
-    let require_preflight = match p.get("requirePreflight") {
-        None => false,
-        Some(v) => v.as_bool().ok_or_else(|| bad(ID, "requirePreflight must be a boolean"))?,
-    };
-    let min_ppi = match p.get("minPpi") {
+    let env: PlanEnvelope = serde_path_to_error::deserialize(p).map_err(|e| bad(ID, e.to_string()))?;
+    let require_preflight = env.require_preflight.unwrap_or(false);
+    let min_ppi = match env.min_ppi {
         None => 150.0,
-        Some(v) => v
-            .as_f64()
-            .filter(|n| n.is_finite() && (1.0..=2400.0).contains(n))
-            .ok_or_else(|| bad(ID, "minPpi must be a finite number from 1 to 2400"))?,
+        Some(n) if n.is_finite() && (1.0..=2400.0).contains(&n) => n,
+        Some(_) => return Err(bad(ID, "minPpi must be a finite number from 1 to 2400")),
     };
-    let mode = p.get("outputMode").and_then(Value::as_str).ok_or_else(|| bad(ID, "outputMode required"))?;
-    let images = match mode {
+    let images = match env.output_mode.as_str() {
         "native_only" | "nativeOnly" => false,
         "native_with_images" | "nativeWithImages" => true,
         _ => return Err(bad(ID, "invalid outputMode")),
     };
-    let actions = p
-        .get("commands")
-        .and_then(Value::as_array)
-        .filter(|a| !a.is_empty() && a.len() <= MAX_ACTIONS)
-        .ok_or_else(|| bad(ID, "commands must contain 1 to 512 actions"))?;
-    let allowed = match p.get("allowedCommands") {
-        None => None,
-        Some(Value::Array(a)) if a.iter().all(Value::is_string) && a.len() <= 128 => Some(a),
-        _ => return Err(bad(ID, "allowedCommands must be a string array")),
-    };
-    if let Some(label) = p.get("label")
-        && !label.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 256)
+    if env.commands.is_empty() || env.commands.len() > MAX_ACTIONS {
+        return Err(bad(ID, "commands must contain 1 to 512 actions"));
+    }
+    if let Some(allowed) = &env.allowed_commands
+        && allowed.len() > 128
+    {
+        return Err(bad(ID, "allowedCommands must be a string array"));
+    }
+    if let Some(label) = &env.label
+        && (label.trim().is_empty() || label.len() > 256)
     {
         return Err(bad(ID, "label must contain 1 to 256 bytes"));
     }
@@ -1306,9 +1377,11 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
     if original.interaction.is_some() || original.preview_stash.is_some() || s.tool.composing() {
         return Err(bad(ID, "finish the current interaction or preview first"));
     }
-    for (key, actual) in [("expectedDocumentUid", original.uid), ("expectedRevision", original.revision)] {
-        if let Some(v) = p.get(key)
-            && v.as_u64() != Some(actual)
+    for (key, given, actual) in
+        [("expectedDocumentUid", env.expected_document_uid, original.uid), ("expectedRevision", env.expected_revision, original.revision)]
+    {
+        if let Some(v) = given
+            && v != actual
         {
             return Err(bad(ID, format!("{key}: document changed while generation was pending")));
         }
@@ -1325,20 +1398,13 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
         .ok_or_else(|| bad(ID, "missing inline image byte limit"))?;
     *encoded_limit = json!(MAX_ENCODED_IMAGE_BYTES);
     // Reject every command and malformed envelope before executing the first draft action.
-    for action in actions {
-        let a = action.as_object().ok_or_else(|| bad(ID, "each action must be an object"))?;
-        if a.keys().any(|k| k != "command" && k != "params") {
-            return Err(bad(ID, "unsupported action property"));
-        }
-        let id = action.get("command").and_then(Value::as_str).ok_or_else(|| bad(ID, "action command required"))?;
+    for (i, action) in env.commands.iter().enumerate() {
+        let id = action.command.as_str();
         if !vetted.iter().any(|(c, _, _)| *c == id)
             || (!images && id == "file.place")
-            || allowed.is_some_and(|a| !a.iter().any(|c| c.as_str() == Some(id)))
+            || env.allowed_commands.as_ref().is_some_and(|a| !a.iter().any(|c| c == id))
         {
-            return Err(bad(ID, format!("command `{id}` is not permitted")));
-        }
-        if !action.get("params").is_some_and(Value::is_object) {
-            return Err(bad(ID, "action params must be an object"));
+            return Err(bad(ID, format!("commands[{i}].command: command `{id}` is not permitted")));
         }
     }
     let mut work = Session::new();
@@ -1348,22 +1414,25 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
     work.active = Some(0);
     // A draft needs no per-action history or journal retention.
     work.in_undo_step = true;
-    let mut results = Vec::with_capacity(actions.len());
+    let mut results = Vec::with_capacity(env.commands.len());
     let mut image_sources = BTreeSet::new();
     let mut placed_raster_frames = BTreeSet::new();
     let mut image_bytes = 0usize;
     let mut image_pixels = 0u64;
     let mut table_cells = 0u64;
-    for (i, action) in actions.iter().enumerate() {
+    for (i, action) in env.commands.into_iter().enumerate() {
         if cancelled() {
             return Err(bad(ID, "production cancelled"));
         }
-        let id = action.get("command").and_then(Value::as_str).ok_or_else(|| bad(ID, "missing command"))?;
-        let raw = action.get("params").ok_or_else(|| bad(ID, "missing params"))?;
-        let mut resolved = crate::script::resolve(raw, &results).map_err(|e| bad(ID, format!("step {i}: {e}")))?;
+        let id = action.command.as_str();
+        let raw = Value::Object(action.params);
+        let mut resolved = crate::script::resolve(&raw, &results).map_err(|e| bad(ID, format!("commands[{i}].params (step {i}): {e}")))?;
         bounded(&resolved)?;
         let schema = vetted.iter().find(|(c, _, _)| *c == id).ok_or_else(|| bad(ID, "command not vetted"))?;
-        check(&schema.1, &resolved, id)?;
+        check(&schema.1, &resolved, &format!("commands[{i}].params")).map_err(|e| match e {
+            crate::EngineError::BadParams { cmd, msg } => crate::EngineError::BadParams { cmd, msg: format!("{msg} ({id})") },
+            other => other,
+        })?;
         check_command_swatches(&work.doc()?.doc, id, &resolved)?;
         if id == "object.gradient"
             && let Some(stops) = resolved.get_mut("stops").and_then(Value::as_array_mut)
@@ -2074,51 +2143,51 @@ fn publish_draft(s: &mut Session, mut finished: crate::DocState, label: &str) ->
 /// capabilities, including chunk-local `$N` references; no intermediate draft reaches `s`.
 /// Cancellation or a later chunk's error leaves the live document and its history untouched.
 pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<Value> {
-    let params = p.as_object().ok_or_else(|| bad(GROUP_ID, "parameters must be an object"))?;
-    for key in params.keys() {
-        if !["chunks", "outputMode", "label", "expectedDocumentUid", "expectedRevision", "requirePreflight", "minPpi", "documentSetup"]
-            .contains(&key.as_str())
-        {
-            return Err(bad(GROUP_ID, format!("unknown parameter `{key}`")));
-        }
-    }
-    let chunks = p
-        .get("chunks")
-        .and_then(Value::as_array)
-        .filter(|chunks| !chunks.is_empty() && chunks.len() <= MAX_GROUPS)
-        .ok_or_else(|| bad(GROUP_ID, "chunks must contain 1 to 1000 plans"))?;
     // Two outer levels enclose the same per-plan shape: `chunks` and each chunk object.
     bounded_limits(p, GROUP_ID, MAX_GROUP_BYTES, MAX_GROUPS * 65536, 26)?;
-    if let Some(label) = p.get("label")
-        && !label.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 256)
+    let root = p.as_object().ok_or_else(|| bad(GROUP_ID, "group plan must be a JSON object"))?;
+    if let Some(raw_setup) = root.get("documentSetup")
+        && !raw_setup.is_object()
+    {
+        return Err(bad(GROUP_ID, "documentSetup: expected an object"));
+    }
+    let env: GroupEnvelope = serde_path_to_error::deserialize(p).map_err(|e| bad(GROUP_ID, e.to_string()))?;
+    if env.chunks.is_empty() || env.chunks.len() > MAX_GROUPS {
+        return Err(bad(GROUP_ID, "chunks must contain 1 to 1000 plans"));
+    }
+    if let Some(label) = &env.label
+        && (label.trim().is_empty() || label.len() > 256)
     {
         return Err(bad(GROUP_ID, "label must contain 1 to 256 bytes"));
     }
     // This host envelope is deliberately absent from the provider command schemas. A review
     // group may change pagination/binding atomically, but cannot smuggle size/page-count or
     // unrelated Document Setup changes through the host.
-    let document_setup = if let Some(value) = p.get("documentSetup") {
-        let setup = value.as_object().ok_or_else(|| bad(GROUP_ID, "documentSetup must be an object"))?;
-        for (key, value) in setup {
-            match key.as_str() {
-                "facingPages" if value.as_bool().is_some() => {}
-                "binding" if matches!(value.as_str(), Some("leftToRight" | "rightToLeft")) => {}
-                "facingPages" => return Err(bad(GROUP_ID, "documentSetup.facingPages must be a boolean")),
-                "binding" => return Err(bad(GROUP_ID, "documentSetup.binding must be leftToRight or rightToLeft")),
-                _ => return Err(bad(GROUP_ID, format!("documentSetup: unknown parameter `{key}`"))),
+    let document_setup = match &env.document_setup {
+        None => None,
+        Some(setup) => {
+            let mut map = serde_json::Map::new();
+            if let Some(fp) = setup.facing_pages {
+                map.insert("facingPages".into(), Value::Bool(fp));
             }
+            if let Some(binding) = &setup.binding {
+                if !matches!(binding.as_str(), "leftToRight" | "rightToLeft") {
+                    return Err(bad(GROUP_ID, "documentSetup.binding must be leftToRight or rightToLeft"));
+                }
+                map.insert("binding".into(), Value::String(binding.clone()));
+            }
+            Some(Value::Object(map))
         }
-        Some(value)
-    } else {
-        None
     };
     let original = s.doc()?;
     if original.interaction.is_some() || original.preview_stash.is_some() || s.tool.composing() {
         return Err(bad(GROUP_ID, "finish the current interaction or preview first"));
     }
-    for (key, actual) in [("expectedDocumentUid", original.uid), ("expectedRevision", original.revision)] {
-        if let Some(v) = p.get(key)
-            && v.as_u64() != Some(actual)
+    for (key, given, actual) in
+        [("expectedDocumentUid", env.expected_document_uid, original.uid), ("expectedRevision", env.expected_revision, original.revision)]
+    {
+        if let Some(v) = given
+            && v != actual
         {
             return Err(bad(GROUP_ID, format!("{key}: document changed while generation was pending")));
         }
@@ -2130,7 +2199,7 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
     work.docs.push(original.clone());
     work.active = Some(0);
     work.in_undo_step = true;
-    if let Some(setup) = document_setup {
+    if let Some(setup) = &document_setup {
         if cancelled() {
             return Err(bad(GROUP_ID, "production cancelled"));
         }
@@ -2139,6 +2208,7 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
             return Err(bad(GROUP_ID, "documentSetup cannot add or remove existing document pages"));
         }
     }
+    let chunks = p.get("chunks").and_then(Value::as_array).ok_or_else(|| bad(GROUP_ID, "chunks must contain 1 to 1000 plans"))?;
     let mut results = Vec::with_capacity(chunks.len());
     let mut steps = 0usize;
     for (index, chunk) in chunks.iter().enumerate() {
@@ -2146,10 +2216,7 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
             return Err(bad(GROUP_ID, "production cancelled"));
         }
         bounded(chunk)?;
-        let chunk = chunk.as_object().ok_or_else(|| bad(GROUP_ID, format!("chunk {index}: expected an object")))?;
-        if let Some(key) = chunk.keys().find(|key| key.as_str() != "commands" && key.as_str() != "label") {
-            return Err(bad(GROUP_ID, format!("chunk {index}: unknown parameter `{key}`")));
-        }
+        let chunk = chunk.as_object().ok_or_else(|| bad(GROUP_ID, format!("chunks[{index}]: expected an object")))?;
         let mut chunk_params = serde_json::Map::new();
         for key in ["outputMode", "requirePreflight", "minPpi"] {
             if let Some(value) = p.get(key) {
@@ -2157,7 +2224,12 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
             }
         }
         chunk_params.extend(chunk.clone());
-        let (finished, chunk_results) = draft(&work, &Value::Object(chunk_params), &mut cancelled)?;
+        let (finished, chunk_results) = draft(&work, &Value::Object(chunk_params), &mut cancelled).map_err(|e| match e {
+            crate::EngineError::BadParams { msg, .. } if msg.starts_with("commands[") => {
+                crate::EngineError::BadParams { cmd: GROUP_ID.into(), msg: format!("chunks[{index}].{msg}") }
+            }
+            other => other,
+        })?;
         *work.doc_mut()? = finished;
         steps = steps.saturating_add(chunk_results.len());
         results.push(chunk_results);
@@ -2165,7 +2237,7 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
     if cancelled() {
         return Err(bad(GROUP_ID, "production cancelled"));
     }
-    let label = p.get("label").and_then(Value::as_str).unwrap_or("AI Production Group");
+    let label = env.label.as_deref().unwrap_or("AI Production Group");
     publish_draft(s, work.doc()?.clone(), label)?;
     Ok(
         json!({"applied":true,"groups":results.len(),"steps":steps,"results":results,"label":label,"documentUid":s.doc()?.uid,"revision":s.doc()?.revision}),
@@ -3099,5 +3171,69 @@ mod tests {
         let err_opaque_png = s.execute("production.apply", &opaque_overlay).unwrap_err();
         assert!(err_opaque_png.to_string().contains("textOccludedByObject"), "expected textOccludedByObject on opaque PNG, got: {err_opaque_png}");
         assert!(Arc::ptr_eq(&after_sparse, &s.doc().unwrap().doc));
+    }
+
+    #[test]
+    fn serde_path_to_error_and_indexed_schema_paths_pinpoint_malformed_fields_and_support_oval_and_autosize() {
+        let mut s = session();
+        let before = s.doc().unwrap().doc.clone();
+
+        // Envelope type mismatch pinpoints exact indexed action path via serde_path_to_error.
+        let bad_envelope = json!({
+            "outputMode": "native_only",
+            "commands": [
+                {"command": "frame.create", "params": {"rect": [36, 36, 100, 100]}},
+                {"command": "frame.create", "params": [1, 2, 3]}
+            ]
+        });
+        let err_env = s.execute("production.validate", &bad_envelope).unwrap_err().to_string();
+        assert!(err_env.contains("commands[1].params"), "expected commands[1].params in error: {err_env}");
+
+        // Schema check pinpoints exact array element index inside nested parameters.
+        let bad_rect = json!({
+            "outputMode": "native_only",
+            "commands": [
+                {"command": "frame.create", "params": {"rect": [36, 36, 100, 100]}},
+                {"command": "frame.create", "params": {"rect": [36, 36, "bad", 100]}}
+            ]
+        });
+        let err_rect = s.execute("production.validate", &bad_rect).unwrap_err().to_string();
+        assert!(err_rect.contains("commands[1].params.rect[2]"), "expected commands[1].params.rect[2] in error: {err_rect}");
+
+        // Grouped plan pinpoints chunk + command + parameter array index.
+        let bad_group = json!({
+            "outputMode": "native_only",
+            "chunks": [
+                {"commands": [{"command": "frame.create", "params": {"rect": [36, 36, 100, 100]}}]},
+                {"commands": [{"command": "frame.create", "params": {"rect": [36, "bad", 100, 100]}}]}
+            ]
+        });
+        let err_grp = s.execute("production.applyGroup", &bad_group).unwrap_err().to_string();
+        assert!(err_grp.contains("chunks[1].commands[0].params.rect[1]"), "expected chunks[1].commands[0].params.rect[1], got: {err_grp}");
+        assert!(Arc::ptr_eq(&before, &s.doc().unwrap().doc));
+
+        // `oval` shape in `frame.create` and `autoSize` options in `object.textFrameOptions` succeed in production.
+        let valid = json!({
+            "outputMode": "native_only",
+            "requirePreflight": true,
+            "commands": [
+                {"command": "frame.create", "params": {"rect": [36, 36, 120, 120], "shape": "oval", "content": "unassigned"}},
+                {"command": "frame.create", "params": {"rect": [150, 36, 360, 52], "content": "text", "text": "Auto-sized text grows to avoid overset.\n".repeat(6), "caret": false}},
+                {"command": "object.textFrameOptions", "params": {
+                    "ids": ["$1.id"],
+                    "autoSize": "heightOnly",
+                    "autoSizeReference": "topLeft",
+                    "useMinimumHeight": true,
+                    "minimumHeight": 40,
+                    "noLineBreaks": false
+                }}
+            ]
+        });
+        let r = s.execute("production.apply", &valid).unwrap();
+        let doc = &s.doc().unwrap().doc;
+        let oval_id = designcraft_doc::ItemId(r["results"][0]["id"].as_u64().unwrap());
+        let tf_id = designcraft_doc::ItemId(r["results"][1]["id"].as_u64().unwrap());
+        assert_eq!(doc.item(oval_id).unwrap().shape, designcraft_doc::Shape::Oval);
+        assert!(doc.item(tf_id).unwrap().bounds().height() > 52.0 - 36.0 + 20.0, "autoSize heightOnly grew the frame");
     }
 }

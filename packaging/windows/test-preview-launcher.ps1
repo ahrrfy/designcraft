@@ -20,7 +20,14 @@ try {
         $taskHashBefore = (Get-FileHash -LiteralPath $taskManifest).Hash
         $taskResult = & (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $taskManifest -ValidateOnly
         if ($taskResult.profile -ne $taskProfile -or $taskResult.document -ne $taskBook) { throw 'Unicode paths changed during validation.' }
+        if ($taskResult.control_enabled) { throw 'Control channel must be disabled by default on normal user launches.' }
+        $taskEnabled = & (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $taskManifest -EnableControl -ValidateOnly
+        if (-not $taskEnabled.control_enabled) { throw 'Explicit -EnableControl flag did not enable control mode.' }
         if ((Get-FileHash -LiteralPath $taskManifest).Hash -ne $taskHashBefore) { throw 'Validation modified the manifest.' }
+    }
+    $launcherSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'start-native-preview.ps1'))
+    if ($launcherSource -notmatch 'control\.token') {
+        throw 'Launcher must purge stale control.token when starting without -EnableControl.'
     }
     foreach ($taskField in @('profile', 'document_path', 'executable')) {
         $taskBad = $taskRecord.Clone()

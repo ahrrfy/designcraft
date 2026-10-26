@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 framing and the MCP lifecycle / tools / resources methods.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 
 use serde_json::{Value, json};
 
@@ -25,6 +25,42 @@ flow: new_document → execute frame.create {rect:[x0,y0,x1,y1], content:\"text\
 execute type.char / style.paragraph.apply → render_page to look at the result. inspect_document lists pages, items \
 (ids, bounds), stories (overset) and styles. place_image puts a picture on the page.";
 
+/// Maximum accepted JSON-RPC line size (16 MiB) so an unbounded line without `\n` cannot OOM.
+pub const MAX_MCP_LINE: usize = 16 * 1024 * 1024;
+
+pub(crate) fn read_bounded_line(input: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(2);
+    let n = input.take(limit).read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let ended_with_newline = buf.last() == Some(&b'\n');
+    if ended_with_newline {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+        return Ok(Some(buf.len() <= max));
+    }
+    if buf.len() > max {
+        // Drain until newline or EOF via `BufRead::fill_buf` + `consume` so subsequent lines stay framed.
+        loop {
+            let available = input.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                input.consume(pos + 1);
+                break;
+            }
+            let len = available.len();
+            input.consume(len);
+        }
+        return Ok(Some(false));
+    }
+    Ok(Some(true))
+}
 /// Resource URIs.
 pub const DOC_URI: &str = "designcraft://document";
 pub const COMMANDS_URI: &str = "designcraft://commands";
@@ -59,10 +95,17 @@ impl Server {
 
     /// Serve newline-delimited JSON-RPC until `input` closes. Logs go to stderr only (stdout is
     /// the protocol stream).
-    pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            if let Some(reply) = self.handle_line(&line) {
+    pub fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        while let Some(within_limit) = read_bounded_line(&mut input, &mut buf, MAX_MCP_LINE)? {
+            let reply = if !within_limit {
+                Some(error(Value::Null, PARSE_ERROR, format!("request line exceeds {MAX_MCP_LINE} bytes")).to_string())
+            } else if let Ok(line) = std::str::from_utf8(&buf) {
+                self.handle_line(line)
+            } else {
+                Some(error(Value::Null, PARSE_ERROR, "invalid UTF-8 in JSON-RPC request").to_string())
+            };
+            if let Some(reply) = reply {
                 output.write_all(reply.as_bytes())?;
                 output.write_all(b"\n")?;
                 output.flush()?;

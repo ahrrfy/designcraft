@@ -497,6 +497,12 @@ impl Story {
                 return Err(format!("run boundary {pos} splits a character"));
             }
         }
+        let mut seen_frames = std::collections::HashSet::new();
+        for f in &self.frames {
+            if !seen_frames.insert(*f) {
+                return Err(format!("story {}: duplicate frame {f}", self.id.0));
+            }
+        }
         self.check_tables()?;
         self.check_notes()?;
         self.check_endnotes()?;

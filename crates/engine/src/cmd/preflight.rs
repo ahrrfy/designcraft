@@ -62,7 +62,11 @@ fn missing_glyphs(
             match out.iter_mut().find(|(face, _, item)| *face == g.face && *item == owner) {
                 Some((_, chars, _)) if !chars.contains(&c) => chars.push(c),
                 Some(_) => {}
-                None => out.push((g.face, vec![c], owner)),
+                None => {
+                    #[allow(clippy::clone_on_copy)]
+                    let face = g.face.clone();
+                    out.push((face, vec![c], owner));
+                }
             }
         }
         for c in f.tables.iter().flat_map(|t| &t.cells) {

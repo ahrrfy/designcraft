@@ -332,12 +332,22 @@ pub fn specs() -> Vec<CommandSpec> {
             sync_styles(s)
         }),
         cmd!(noundo "book.exportPdf", "Export Book to PDF…", [], None, "{path?} — every document in order as one PDF → {path, bytes, pages} (no path: {base64, …})", has_book, |s, p| {
+            struct ChapterFontGuard(u32);
+            impl Drop for ChapterFontGuard {
+                fn drop(&mut self) {
+                    if self.0 != 0 {
+                        designcraft_fonts::FontDb::global().close_scope(self.0);
+                    }
+                }
+            }
             let b = s.book.clone().ok_or_else(no_book)?;
             let mut parts = Vec::new();
             for path in &chapters(&b)? {
                 let mut d = load(path)?;
-                // The chapter's own fonts, for this export (skipped font files are logged).
+                // The chapter's own fonts, for this export (skipped font files are logged); always
+                // close the scope when leaving this chapter, including on early error.
                 let _fonts = super::file::load_document_fonts(&mut d, path).0;
+                let _scope_guard = ChapterFontGuard(d.font_scope);
                 let cache = designcraft_compose::Cache::new();
                 let r = designcraft_pdf::export_pdf_with_report(&super::interchange::with_pdf_boxes(&d), &cache, &designcraft_pdf::PdfOptions::default()).map_err(|e| EngineError::Other(e.to_string()))?;
                 let n = designcraft_render::pdf_page_count(&r.bytes).unwrap_or(0);
@@ -428,5 +438,68 @@ mod tests {
         let mut t = Session::new();
         assert_eq!(t.execute("book.open", &json!({"path": p("book.dcbook")})).unwrap()["documents"], 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn book_export_pdf_closes_chapter_font_scopes_on_success_and_early_error() {
+        const FAMILY: &str = "DC Book Chapter Scoped Font";
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("dc-book-font-scope-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ch1_dir = dir.join("ch1");
+        let ch1_fonts = ch1_dir.join(designcraft_fonts::DOCUMENT_FONTS_FOLDER);
+        std::fs::create_dir_all(&ch1_fonts).unwrap();
+        std::fs::write(ch1_fonts.join("ch1.ttf"), designcraft_fonts::testing::font_with(FAMILY, &['A', 'B']).unwrap()).unwrap();
+
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("frame.create", &json!({"rect": [36, 36, 200, 120], "content": "text", "text": "AB", "caret": false})).unwrap();
+        s.execute("type.char", &json!({"attrs": {"fontFamily": FAMILY, "size": 14}})).unwrap();
+        let ch1_path = ch1_dir.join("ch1.designcraft");
+        s.execute("file.saveAs", &json!({"path": ch1_path.to_string_lossy()})).unwrap();
+        s.execute("file.close", &json!({})).unwrap();
+
+        let ch2_path = dir.join("ch2.designcraft");
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("file.saveAs", &json!({"path": ch2_path.to_string_lossy()})).unwrap();
+        s.execute("file.close", &json!({})).unwrap();
+
+        let book_path = dir.join("scoped.dcbook");
+        s.execute("book.new", &json!({"path": book_path.to_string_lossy()})).unwrap();
+        s.execute("book.add", &json!({"path": ch1_path.to_string_lossy()})).unwrap();
+        s.execute("book.add", &json!({"path": ch2_path.to_string_lossy()})).unwrap();
+
+        // Probe the current scope counter before and after `book.exportPdf`: every scope allocated
+        // during `book.exportPdf` must be closed once it finishes (and also when ch2 fails).
+        let probe = designcraft_fonts::FontDb::global().load_document_fonts(&ch1_fonts, &|_| Ok(()));
+        assert!(probe.scope > 0);
+        assert!(designcraft_fonts::FontDb::global().scoped(probe.scope).families().iter().any(|f| f == FAMILY));
+        designcraft_fonts::FontDb::global().close_scope(probe.scope);
+        assert!(!designcraft_fonts::FontDb::global().scoped(probe.scope).families().iter().any(|f| f == FAMILY));
+
+        let res = s.execute("book.exportPdf", &json!({})).unwrap();
+        assert_eq!(res["pages"], 2);
+        let after_ok = designcraft_fonts::FontDb::global().load_document_fonts(&ch1_fonts, &|_| Ok(()));
+        designcraft_fonts::FontDb::global().close_scope(after_ok.scope);
+        for sc in (probe.scope + 1)..after_ok.scope {
+            assert!(
+                !designcraft_fonts::FontDb::global().scoped(sc).families().iter().any(|f| f == FAMILY),
+                "chapter font scope {sc} leaked on successful book.exportPdf"
+            );
+        }
+
+        // Remove chapter 2 after adding so chapter 1 loads its fonts and chapter 2 fails cleanly.
+        std::fs::remove_file(&ch2_path).unwrap();
+        assert!(s.execute("book.exportPdf", &json!({})).is_err());
+        let after_err = designcraft_fonts::FontDb::global().load_document_fonts(&ch1_fonts, &|_| Ok(()));
+        designcraft_fonts::FontDb::global().close_scope(after_err.scope);
+        for sc in (after_ok.scope + 1)..after_err.scope {
+            assert!(
+                !designcraft_fonts::FontDb::global().scoped(sc).families().iter().any(|f| f == FAMILY),
+                "chapter font scope {sc} leaked on early error in book.exportPdf"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -359,7 +359,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Object Style…",
             [],
             None,
-            "{name, fromSelection?: true (fill, stroke, effects and text frame options of the first selected item), fill?, paragraphStyle?, effects?: {dropShadow?, feather?, innerShadow?, outerGlow?, innerGlow?, bevel?, satin?, gradientFeather?, directionalFeather?}, dropShadow?: {on?, color?, opacity? (0–1), angle?, globalLight?, distance?, size?, spread?}, feather?: width, innerShadow?, outerGlow?, innerGlow?, bevel?, satin?, gradientFeather?, directionalFeather?} → {name} (made unique)",
+            "{name, basedOn?, fromSelection?: true (fill, stroke, effects and text frame options of the first selected item), fill?, paragraphStyle?, effects?: {dropShadow?, feather?, innerShadow?, outerGlow?, innerGlow?, bevel?, satin?, gradientFeather?, directionalFeather?}, dropShadow?: {on?, color?, opacity? (0–1), angle?, globalLight?, distance?, size?, spread?}, feather?: width, innerShadow?, outerGlow?, innerGlow?, bevel?, satin?, gradientFeather?, directionalFeather?} → {name} (made unique)",
             has_doc,
             create_object
         ),
@@ -368,7 +368,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Object Style Options…",
             [],
             None,
-            "{name, effects?: {…} | null (the style no longer sets effects), dropShadow?, feather?, innerShadow?, outerGlow?, innerGlow?, bevel?, satin?, gradientFeather?, directionalFeather?} — effect objects merge field by field into the style's effects (fields as in `document.inspect` item effects); values that aren't finite numbers are refused, the others clamped (opacities 0–1, sizes and distances ≥ 0); items using the style whose effects match the style's (no effects, when the style set none) take the new effects, items with their own effects keep them → {name, updated}",
+            "{name, basedOn?: string | null, effects?: {…} | null (the style no longer sets effects), dropShadow?, feather?, innerShadow?, outerGlow?, innerGlow?, bevel?, satin?, gradientFeather?, directionalFeather?} — effect objects merge field by field into the style's effects (fields as in `document.inspect` item effects); values that aren't finite numbers are refused, the others clamped (opacities 0–1, sizes and distances ≥ 0); items using the style whose effects match the style's (no effects, when the style set none) take the new effects, items with their own effects keep them → {name, updated}",
             has_doc,
             edit_object
         ),
@@ -1402,9 +1402,34 @@ fn model_color(v: &Value) -> Option<designcraft_color::Color> {
     }
 }
 
+/// Does setting `name`'s `based_on` to `parent` create a cycle (including self-reference or an
+/// existing cycle reachable from `parent`)?
+pub(crate) fn object_based_on_cycles(styles: &Styles, name: &str, parent: &str) -> bool {
+    if name == parent {
+        return true;
+    }
+    let mut seen: Vec<&str> = vec![name];
+    let mut cur = Some(parent);
+    for _ in 0..=styles.object.len() {
+        let Some(p) = cur else { return false };
+        if seen.contains(&p) {
+            return true;
+        }
+        seen.push(p);
+        cur = styles.object_style(p).and_then(|s| s.based_on.as_deref());
+    }
+    true
+}
+
+/// Resolve an object style along its `based_on` chain (root to leaf, bounded against cycles in
+/// imported documents).
+pub(crate) fn resolved_object_style(styles: &Styles, name: &str) -> Option<ObjectStyle> {
+    styles.resolve_object_style(name)
+}
+
 fn apply_object(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_param(p, "name").ok_or_else(|| bad("style.object.apply", "missing name"))?.to_string();
-    let os = s.doc()?.doc.styles.object_style(&name).cloned().ok_or_else(|| bad("style.object.apply", format!("no object style `{name}`")))?;
+    let os = resolved_object_style(&s.doc()?.doc.styles, &name).ok_or_else(|| bad("style.object.apply", format!("no object style `{name}`")))?;
     let ids = super::targets(s, p)?;
     s.edit(|d, _| {
         let mut stories = Vec::new();
@@ -1437,7 +1462,7 @@ fn clear_object_overrides(s: &mut Session, p: &Value) -> Result<Value> {
         .filter_map(|id| {
             let it = d.item(*id)?;
             let mut next = it.clone();
-            d.styles.object_style(&it.object_style)?.apply_to(&mut next);
+            resolved_object_style(&d.styles, &it.object_style)?.apply_to(&mut next);
             (next != *it).then_some(next)
         })
         .collect();
@@ -1507,8 +1532,15 @@ fn merge_json(base: &mut Value, top: Value, depth: usize) {
 }
 
 fn create_object(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "style.object.create";
     let base = str_param(p, "name").unwrap_or("Object Style 1").to_string();
-    let from_sel = p.get("fromSelection").and_then(Value::as_bool).unwrap_or(true);
+    let based_on = match p.get("basedOn") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(b)) if b == designcraft_doc::NO_OBJECT_STYLE => None,
+        Some(Value::String(b)) => Some(b.clone()),
+        Some(_) => return Err(bad(CMD, "`basedOn` must be a string or null")),
+    };
+    let from_sel = p.get("fromSelection").and_then(Value::as_bool).unwrap_or(based_on.is_none());
     let src = if from_sel { s.doc()?.selection.items.first().and_then(|i| s.doc().ok()?.doc.item(*i).cloned()) } else { None };
     let mut os = ObjectStyle::default();
     if let Some(it) = &src {
@@ -1532,12 +1564,21 @@ fn create_object(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(ps) = str_param(p, "paragraphStyle") {
         os.paragraph_style = Some(ps.to_string());
     }
-    if let Some(e) = effects_param("style.object.create", p, os.effects.as_ref().unwrap_or(&Effects::default()))? {
+    if let Some(e) = effects_param(CMD, p, os.effects.as_ref().unwrap_or(&Effects::default()))? {
         os.effects = Some(e);
     }
     s.edit(|d, _| {
         let name = Styles::unique_name(|n| d.styles.object_style(n).is_some(), &base);
+        if let Some(b) = &based_on {
+            if d.styles.object_style(b).is_none() {
+                return Err(bad(CMD, format!("no object style `{b}`")));
+            }
+            if object_based_on_cycles(&d.styles, &name, b) {
+                return Err(bad(CMD, "based-on would create a cycle"));
+            }
+        }
         os.name = name.clone();
+        os.based_on = based_on.clone();
         d.styles_mut().object.push(os.clone());
         Ok(json!({"name": name}))
     })
@@ -1550,33 +1591,59 @@ fn edit_object(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(CMD, format!("`{name}` can't be edited")));
     }
     let old = s.doc()?.doc.styles.object_style(&name).cloned().ok_or_else(|| bad(CMD, format!("no object style `{name}`")))?;
-    let effects = if p.get("effects").is_some_and(Value::is_null) {
+    let based_on_change = match p.get("basedOn") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(b)) if b == designcraft_doc::NO_OBJECT_STYLE => Some(None),
+        Some(Value::String(b)) => {
+            let doc = &s.doc()?.doc;
+            if doc.styles.object_style(b).is_none() {
+                return Err(bad(CMD, format!("no object style `{b}`")));
+            }
+            if object_based_on_cycles(&doc.styles, &name, b) {
+                return Err(bad(CMD, "based-on would create a cycle"));
+            }
+            Some(Some(b.clone()))
+        }
+        Some(_) => return Err(bad(CMD, "`basedOn` must be a string or null")),
+    };
+    let (effects_changed, effects) = if p.get("effects").is_some_and(Value::is_null) {
         if EFFECT_KEYS.iter().any(|k| p.get(k).is_some()) {
             return Err(bad(CMD, "`effects: null` can't be combined with effect settings"));
         }
-        None
+        (old.effects.is_some(), None)
     } else {
         match effects_param(CMD, p, old.effects.as_ref().unwrap_or(&Effects::default()))? {
-            Some(e) => Some(e),
-            None => return Ok(json!({"name": name, "updated": 0})),
+            Some(e) => (Some(&e) != old.effects.as_ref(), Some(e)),
+            None => (false, old.effects.clone()),
         }
     };
-    if effects == old.effects {
+    let based_changed = based_on_change.as_ref().is_some_and(|next| *next != old.based_on);
+    if !effects_changed && !based_changed {
         return Ok(json!({"name": name, "updated": 0}));
     }
     s.edit(|d, _| {
+        let before_fx: Vec<(String, Option<Effects>)> =
+            d.styles.object.iter().map(|o| (o.name.clone(), resolved_object_style(&d.styles, &o.name).and_then(|s| s.effects))).collect();
         let Some(os) = d.styles_mut().object.iter_mut().find(|o| o.name == name) else {
             return Err(bad(CMD, format!("no object style `{name}`")));
         };
+        if let Some(next_based) = &based_on_change {
+            os.based_on = next_based.clone();
+        }
         os.effects = effects.clone();
-        // An item follows the style while its effects are the style's. When the style didn't set
-        // effects before, only items without effects of their own follow (the default styles are
-        // on most frames).
-        let follows = old.effects.clone().unwrap_or_default();
-        let updated = match &effects {
-            Some(new) => d.update_items(|it| it.object_style == name && it.effects == follows, |it| it.effects = new.clone()),
-            None => 0,
-        };
+        // An item follows its style while its effects match the style's resolved effects (or no
+        // effects, when the style previously resolved to none). Propagates through `based_on`.
+        let mut updated = 0;
+        for (st_name, old_resolved) in before_fx {
+            let new_resolved = resolved_object_style(&d.styles, &st_name).and_then(|s| s.effects);
+            if let Some(next_fx) = &new_resolved
+                && new_resolved != old_resolved
+            {
+                let follows = old_resolved.unwrap_or_default();
+                updated += d.update_items(|it| it.object_style == st_name && it.effects == follows, |it| it.effects = next_fx.clone());
+            }
+        }
         Ok(json!({"name": name, "updated": updated}))
     })
 }
@@ -3584,3 +3651,66 @@ mod gradient_stroke_tests {
 #[cfg(test)]
 #[path = "text_color_tests.rs"]
 mod text_color_tests;
+
+#[cfg(test)]
+mod object_style_based_on_tests {
+    use designcraft_doc::ItemId;
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn object_style_based_on_inherits_propagates_and_rejects_cycles() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Card Heading"})).unwrap();
+        s.execute("style.object.create", &json!({"name": "Card Base", "fill": "[Black]", "feather": 8})).unwrap();
+        s.execute("style.object.create", &json!({"name": "Card Child", "basedOn": "Card Base", "paragraphStyle": "Card Heading"})).unwrap();
+
+        let d = &s.doc().unwrap().doc;
+        assert_eq!(d.styles.object_style("Card Child").unwrap().based_on.as_deref(), Some("Card Base"));
+        assert!(d.styles.object_style("Card Child").unwrap().fill.is_none(), "child keeps fill unset so it inherits");
+
+        let f = s.execute("frame.create", &json!({"rect": [72, 72, 240, 160], "content": "text", "text": "Hello", "caret": false})).unwrap();
+        let id = ItemId(f["id"].as_u64().unwrap());
+        let sid = designcraft_doc::StoryId(f["story"].as_u64().unwrap());
+        s.execute("style.object.apply", &json!({"name": "Card Child", "ids": [id.0]})).unwrap();
+
+        let it = s.doc().unwrap().doc.item(id).unwrap().clone();
+        assert_eq!(it.fill.swatch, "[Black]");
+        assert!((it.effects.feather - 8.0).abs() < 1e-6);
+        assert_eq!(s.doc().unwrap().doc.story(sid).unwrap().paras[0].style, "Card Heading");
+
+        // Local override cleared through the based_on chain.
+        s.execute("object.fill", &json!({"ids": [id.0], "swatch": "[Paper]"})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.item(id).unwrap().fill.swatch, "[Paper]");
+        let cleared = s.execute("style.object.clearOverrides", &json!({"ids": [id.0]})).unwrap();
+        assert_eq!(cleared["changed"], 1);
+        assert_eq!(s.doc().unwrap().doc.item(id).unwrap().fill.swatch, "[Black]");
+
+        // Editing parent effects propagates to items using descendant styles without local overrides.
+        let upd = s.execute("style.object.edit", &json!({"name": "Card Base", "feather": 14})).unwrap();
+        assert_eq!(upd["updated"], 1);
+        assert!((s.doc().unwrap().doc.item(id).unwrap().effects.feather - 14.0).abs() < 1e-6);
+
+        // Unknown parent, self-reference, and multi-step cycles are rejected.
+        assert!(s.execute("style.object.create", &json!({"name": "Orphan", "basedOn": "Missing"})).is_err());
+        assert!(s.execute("style.object.edit", &json!({"name": "Card Base", "basedOn": "Card Base"})).is_err());
+        s.execute("style.object.create", &json!({"name": "Card Leaf", "basedOn": "Card Child"})).unwrap();
+        assert!(s.execute("style.object.edit", &json!({"name": "Card Base", "basedOn": "Card Leaf"})).is_err());
+
+        // Clearing basedOn with [None] or null stops inheriting effects without clobbering existing
+        // item effects (matching `effects: null`), while editing parent `feather: 0` resets followers.
+        let reset = s.execute("style.object.edit", &json!({"name": "Card Base", "feather": 0})).unwrap();
+        assert_eq!(reset["updated"], 1);
+        assert!(s.doc().unwrap().doc.item(id).unwrap().effects.feather.abs() < 1e-6);
+        s.execute("style.object.edit", &json!({"name": "Card Base", "feather": 14})).unwrap();
+        assert!((s.doc().unwrap().doc.item(id).unwrap().effects.feather - 14.0).abs() < 1e-6);
+        s.execute("style.object.edit", &json!({"name": "Card Leaf", "basedOn": "[None]"})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.styles.object_style("Card Leaf").unwrap().based_on, None);
+        let detached = s.execute("style.object.edit", &json!({"name": "Card Child", "basedOn": null})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.styles.object_style("Card Child").unwrap().based_on, None);
+        assert_eq!(detached["updated"], 0);
+        assert!((s.doc().unwrap().doc.item(id).unwrap().effects.feather - 14.0).abs() < 1e-6);
+    }
+}

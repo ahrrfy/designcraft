@@ -208,9 +208,94 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) { Err("AI request cancelled".into()) } else { Ok(()) }
 }
 
+static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct LocalSlotRelease;
+
+impl Drop for LocalSlotRelease {
+    fn drop(&mut self) {
+        LOCAL_INFERENCE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+thread_local! {
+    static CURRENT_LOCAL_LEASE: std::cell::RefCell<std::sync::Weak<LocalSlotRelease>> =
+        const { std::cell::RefCell::new(std::sync::Weak::new()) };
+}
+
+/// Process-wide single-local-request admission lease shared with any spawned HTTP worker so a
+/// cancelled blocking request keeps the admission slot occupied until the background call stops.
+pub struct LocalInferenceLease {
+    token: Option<std::sync::Arc<LocalSlotRelease>>,
+}
+
+impl LocalInferenceLease {
+    pub fn inactive() -> Self {
+        Self { token: None }
+    }
+
+    pub fn acquire() -> Result<Self, String> {
+        LOCAL_INFERENCE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "Another local inference is running; wait before sending another request".to_string())?;
+        let token = std::sync::Arc::new(LocalSlotRelease);
+        let weak = std::sync::Arc::downgrade(&token);
+        CURRENT_LOCAL_LEASE.with(|slot| {
+            let _ = slot.replace(weak);
+        });
+        Ok(Self { token: Some(token) })
+    }
+}
+
+impl Drop for LocalInferenceLease {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let weak = std::sync::Arc::downgrade(&token);
+            CURRENT_LOCAL_LEASE.with(|slot| {
+                let clear = std::sync::Weak::ptr_eq(&slot.borrow(), &weak);
+                if clear {
+                    let _ = slot.replace(std::sync::Weak::new());
+                }
+            });
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn current_local_lease() -> Option<std::sync::Arc<LocalSlotRelease>> {
+    CURRENT_LOCAL_LEASE.with(|slot| slot.borrow().upgrade())
+}
+
+fn is_forbidden_cloud_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        || octets[0] == 0
+}
+
+fn is_forbidden_cloud_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped().or_else(|| ip.to_ipv4())
+        && is_forbidden_cloud_ipv4(v4)
+    {
+        return true;
+    }
+    let segments = ip.segments();
+    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80
+}
+
+fn is_forbidden_cloud_domain(host: &str) -> bool {
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    lower.is_empty() || lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") || lower.ends_with(".internal")
+}
+
 /// Validate before persisting configuration. Endpoint credentials, query and
-/// fragment are prohibited. Cloud providers require HTTPS; local providers
-/// allow HTTP only to literal loopback IPs or localhost. Redirects are disabled.
+/// fragment are prohibited. Cloud providers require HTTPS to public hosts;
+/// local providers allow HTTP/HTTPS only to localhost, 127.0.0.1, or [::1]. Redirects are disabled.
 pub fn validate_endpoint(selection: &ModelSelection) -> Result<Url, String> {
     let default = match selection.provider {
         ProviderKind::OpenAi => "https://api.openai.com/v1/",
@@ -226,15 +311,37 @@ pub fn validate_endpoint(selection: &ModelSelection) -> Result<Url, String> {
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("AI endpoint must not contain credentials, query, or fragment".into());
     }
-    let loopback = match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => return Err("AI endpoint needs a host".into()),
-    };
     let local = matches!(selection.provider, ProviderKind::Ollama | ProviderKind::ComfyUi);
-    if url.scheme() != "https" && !(local && loopback && url.scheme() == "http") {
-        return Err("AI endpoint requires HTTPS (local HTTP is restricted to loopback)".into());
+    if local {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("Local AI endpoint requires HTTP or HTTPS".into());
+        }
+        let allowed_local_host = match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+            Some(url::Host::Domain(host)) => host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+            None => return Err("AI endpoint needs a host".into()),
+        };
+        if !allowed_local_host {
+            return Err("Local AI endpoint must target localhost, 127.0.0.1, or [::1]".into());
+        }
+    } else {
+        if url.scheme() != "https" {
+            return Err("AI endpoint requires HTTPS (local HTTP is restricted to loopback)".into());
+        }
+        match url.host() {
+            Some(url::Host::Ipv4(ip)) if is_forbidden_cloud_ipv4(ip) => {
+                return Err("Cloud AI endpoint must not target loopback, private, link-local, metadata, or CGNAT IP addresses".into());
+            }
+            Some(url::Host::Ipv6(ip)) if is_forbidden_cloud_ipv6(ip) => {
+                return Err("Cloud AI endpoint must not target loopback, unique-local, link-local, or private IPv6 addresses".into());
+            }
+            Some(url::Host::Domain(host)) if is_forbidden_cloud_domain(host) => {
+                return Err("Cloud AI endpoint must not target localhost, .local, or .internal hostnames".into());
+            }
+            Some(_) => {}
+            None => return Err("AI endpoint needs a host".into()),
+        }
     }
     let path = url.path().to_string();
     if !path.ends_with('/') {

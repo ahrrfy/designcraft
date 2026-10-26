@@ -3,11 +3,29 @@
 use designcraft_ai_types::{GpuSnapshot, LocalResourcePolicy, ModelSelection, ProviderKind, ResourceSnapshot};
 use serde_json::Value;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_GPU_ADAPTER: Mutex<Option<GpuSnapshot>> = Mutex::new(None);
+
+/// Record an active graphics adapter hint (for example from `wgpu::AdapterInfo` at UI startup)
+/// without introducing any L5 -> L6 crate dependency.
+pub fn set_active_gpu_adapter(name: impl Into<String>, vram_mb: u64) {
+    let trimmed = name.into().trim().to_string();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return;
+    }
+    let mut guard = ACTIVE_GPU_ADAPTER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(GpuSnapshot { name: trimmed, total_vram_mb: vram_mb, free_vram_mb: 0 });
+}
+
+/// Clear any previously recorded active graphics adapter hint.
+pub fn clear_active_gpu_adapter() {
+    let mut guard = ACTIVE_GPU_ADAPTER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
 
 // A scoped unit-test input, never compiled into the application. Worker tests capture
 // this explicit input when spawning; independent test threads cannot affect one another.
@@ -48,34 +66,24 @@ pub(crate) fn test_admission_snapshot() -> Option<ResourceSnapshot> {
     TEST_ADMISSION_SNAPSHOT.with(|current| current.borrow().clone())
 }
 
-/// Held throughout one local inference request (including Comfy polling).
-/// One process-wide slot prevents concurrent local generation from profiles.
+/// Held throughout one local inference request (including Comfy polling and any detached HTTP
+/// worker unwinding after cancellation). One process-wide slot prevents concurrent local generation.
 pub struct LocalRequestGuard {
-    held: bool,
-}
-impl Drop for LocalRequestGuard {
-    fn drop(&mut self) {
-        if self.held {
-            LOCAL_INFERENCE_ACTIVE.store(false, Ordering::Release);
-        }
-    }
+    _lease: designcraft_ai_providers::LocalInferenceLease,
 }
 
 impl LocalRequestGuard {
     pub fn acquire(selection: &ModelSelection, policy: &LocalResourcePolicy) -> Result<Self, String> {
         policy.validate()?;
         if !matches!(selection.provider, ProviderKind::Ollama | ProviderKind::ComfyUi) {
-            return Ok(Self { held: false });
+            return Ok(Self { _lease: designcraft_ai_providers::LocalInferenceLease::inactive() });
         }
         if selection.provider == ProviderKind::Ollama && is_cloud_model(&selection.model) {
             return Err("Cloud-tagged Ollama models are disabled in local generation; choose a downloaded local model".into());
         }
         let snapshot = admission_memory_snapshot();
         admit_memory(policy, &snapshot)?;
-        LOCAL_INFERENCE_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "Another local inference is running; wait before sending another request".to_string())?;
-        Ok(Self { held: true })
+        Ok(Self { _lease: designcraft_ai_providers::LocalInferenceLease::acquire()? })
     }
 }
 
@@ -124,9 +132,19 @@ fn memory_snapshot() -> ResourceSnapshot {
 /// Run on the background worker. No models/services are installed or stopped.
 pub fn probe_host() -> ResourceSnapshot {
     let mut snapshot = memory_snapshot();
-    match probe_nvidia() {
-        Ok(gpus) => snapshot.gpus = gpus,
-        Err(message) => snapshot.message = message,
+    let mut fallback_note = String::new();
+    let nvidia_gpus = match probe_nvidia() {
+        Ok(gpus) => gpus,
+        Err(message) => {
+            fallback_note = message;
+            Vec::new()
+        }
+    };
+    let platform_gpus = probe_platform_gpus(&nvidia_gpus, snapshot.total_ram_mb, snapshot.available_ram_mb);
+    let merged = merge_gpu_snapshots(nvidia_gpus, platform_gpus);
+    snapshot.gpus = merge_gpu_snapshots(merged, active_or_env_gpu_hints());
+    if snapshot.gpus.is_empty() && !fallback_note.is_empty() {
+        snapshot.message = fallback_note;
     }
     let scope = "One local request at a time; CPU/context/image limits and RAM admission apply to this client. Shared services manage their own VRAM and other clients.";
     if snapshot.message.is_empty() {
@@ -136,6 +154,83 @@ pub fn probe_host() -> ResourceSnapshot {
         snapshot.message.push_str(scope);
     }
     snapshot
+}
+
+fn active_or_env_gpu_hints() -> Vec<GpuSnapshot> {
+    let mut hints = Vec::new();
+    if let Some(active) = ACTIVE_GPU_ADAPTER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+        hints.push(active);
+    }
+    if let Ok(raw_name) = std::env::var("DESIGNCRAFT_GPU_ADAPTER") {
+        let trimmed = raw_name.trim();
+        if !trimmed.is_empty() && trimmed.len() <= 256 {
+            let vram_mb = std::env::var("DESIGNCRAFT_GPU_VRAM_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+            hints.push(GpuSnapshot { name: trimmed.to_string(), total_vram_mb: vram_mb, free_vram_mb: 0 });
+        }
+    }
+    hints
+}
+
+fn merge_gpu_snapshots(primary: Vec<GpuSnapshot>, secondary: Vec<GpuSnapshot>) -> Vec<GpuSnapshot> {
+    let mut merged = Vec::new();
+    for candidate in primary.into_iter().chain(secondary) {
+        let trimmed = candidate.name.trim();
+        if trimmed.is_empty() || trimmed.len() > 256 {
+            continue;
+        }
+        if let Some(existing) = merged.iter_mut().find(|existing: &&mut GpuSnapshot| existing.name.trim().eq_ignore_ascii_case(trimmed)) {
+            if existing.total_vram_mb == 0 && candidate.total_vram_mb > 0 {
+                existing.total_vram_mb = candidate.total_vram_mb;
+                existing.free_vram_mb = candidate.free_vram_mb.min(candidate.total_vram_mb);
+            } else if existing.free_vram_mb == 0 && candidate.free_vram_mb > 0 && candidate.free_vram_mb <= existing.total_vram_mb {
+                existing.free_vram_mb = candidate.free_vram_mb;
+            }
+            continue;
+        }
+        if merged.len() >= 8 {
+            break;
+        }
+        merged.push(GpuSnapshot {
+            name: trimmed.to_string(),
+            total_vram_mb: candidate.total_vram_mb,
+            free_vram_mb: candidate.free_vram_mb.min(candidate.total_vram_mb),
+        });
+    }
+    merged
+}
+
+fn run_bounded_command(mut command: Command, timeout: Duration, max_bytes: usize, spawn_err: &str) -> Result<String, String> {
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().map_err(|_| spawn_err.to_string())?;
+    let stdout = child.stdout.take().ok_or("Missing GPU telemetry")?;
+    let cap = u64::try_from(max_bytes).unwrap_or(65_536).saturating_add(1);
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(cap).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return Err("GPU telemetry command failed".into()),
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("GPU telemetry timed out".into());
+            }
+        }
+    }
+    let bytes = reader.join().map_err(|_| "GPU telemetry reader failed")?.map_err(|_| "Cannot read GPU telemetry")?;
+    if bytes.len() > max_bytes {
+        return Err("GPU telemetry exceeds the supported size".into());
+    }
+    std::str::from_utf8(&bytes).map(str::to_owned).map_err(|_| "Invalid GPU telemetry encoding".into())
 }
 
 fn probe_nvidia() -> Result<Vec<GpuSnapshot>, String> {
@@ -148,38 +243,208 @@ fn probe_nvidia() -> Result<Vec<GpuSnapshot>, String> {
     #[cfg(not(windows))]
     let executable = std::path::PathBuf::from("/usr/bin/nvidia-smi");
     let mut command = Command::new(executable);
-    command
-        .args(["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+    command.args(["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"]);
+    let text = run_bounded_command(
+        command,
+        Duration::from_secs(2),
+        8192,
+        "NVIDIA telemetry unavailable; GPU support may still be available through your local service",
+    )?;
+    parse_gpu_csv(&text)
+}
+
+#[cfg(target_os = "windows")]
+fn probe_platform_gpus(_nvidia_gpus: &[GpuSnapshot], _total_ram_mb: u64, _available_ram_mb: u64) -> Vec<GpuSnapshot> {
+    let Ok(system_root) = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).ok_or(()) else {
+        return Vec::new();
+    };
+    let powershell = system_root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+    let mut command = Command::new(powershell);
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json -Compress",
+    ]);
+    run_bounded_command(command, Duration::from_secs(3), 32_768, "Windows GPU telemetry unavailable")
+        .and_then(|json_text| parse_windows_cim_gpus(&json_text))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn probe_platform_gpus(nvidia_gpus: &[GpuSnapshot], total_ram_mb: u64, available_ram_mb: u64) -> Vec<GpuSnapshot> {
+    if !nvidia_gpus.is_empty() {
+        return Vec::new();
     }
-    let mut child =
-        command.spawn().map_err(|_| "NVIDIA telemetry unavailable; GPU support may still be available through your local service".to_string())?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return Err("NVIDIA telemetry command failed".into()),
-            Ok(None) if start.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(25)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("NVIDIA telemetry timed out".into());
+    let mut command = Command::new("/usr/sbin/system_profiler");
+    command.args(["SPDisplaysDataType", "-json"]);
+    run_bounded_command(command, Duration::from_secs(3), 65_536, "macOS GPU telemetry unavailable")
+        .and_then(|json_text| parse_macos_system_profiler_gpus(&json_text, total_ram_mb, available_ram_mb))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn probe_platform_gpus(nvidia_gpus: &[GpuSnapshot], _total_ram_mb: u64, _available_ram_mb: u64) -> Vec<GpuSnapshot> {
+    if !nvidia_gpus.is_empty() {
+        return Vec::new();
+    }
+    parse_linux_drm_gpus_from_dir(Path::new("/sys/class/drm"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn probe_platform_gpus(_nvidia_gpus: &[GpuSnapshot], _total_ram_mb: u64, _available_ram_mb: u64) -> Vec<GpuSnapshot> {
+    Vec::new()
+}
+
+fn is_software_or_virtual_adapter(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("microsoft basic render")
+        || lower.contains("microsoft basic display")
+        || lower.contains("microsoft hyper-v video")
+        || lower.contains("microsoft remote display")
+        || lower.contains("remote desktop")
+        || lower.contains("citrix indirect")
+}
+
+pub(crate) fn parse_windows_cim_gpus(json_text: &str) -> Result<Vec<GpuSnapshot>, String> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: Value = serde_json::from_str(trimmed).map_err(|_| "Invalid Windows GPU telemetry JSON")?;
+    let items: Vec<&Value> = match &parsed {
+        Value::Array(arr) => arr.iter().collect(),
+        Value::Object(_) => vec![&parsed],
+        _ => return Ok(Vec::new()),
+    };
+    let mut candidates = Vec::new();
+    for item in items {
+        let Some(name) = item.get("Name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 256) else {
+            continue;
+        };
+        let total_vram_mb = item
+            .get("AdapterRAM")
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok())))
+            .map(|bytes| bytes / 1_048_576)
+            .unwrap_or(0);
+        candidates.push((is_software_or_virtual_adapter(name), GpuSnapshot { name: name.to_string(), total_vram_mb, free_vram_mb: 0 }));
+    }
+    let has_real_gpu = candidates.iter().any(|(is_virtual, _)| !*is_virtual);
+    let filtered = candidates.into_iter().filter(|(is_virtual, _)| !has_real_gpu || !*is_virtual).map(|(_, gpu)| gpu).collect();
+    Ok(merge_gpu_snapshots(filtered, Vec::new()))
+}
+
+fn parse_memory_string_mb(raw: &str) -> Option<u64> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let digits_end = lower.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(lower.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let number: f64 = lower.get(..digits_end)?.trim().parse().ok()?;
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    let unit = lower.get(digits_end..)?.trim();
+    let mb = if unit.starts_with("gb") || unit.starts_with("gib") {
+        number * 1024.0
+    } else if unit.starts_with("mb") || unit.starts_with("mib") || unit.is_empty() {
+        number
+    } else {
+        return None;
+    };
+    if mb > 0.0 && mb <= 1_048_576.0 { Some(mb.round() as u64) } else { None }
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn parse_macos_system_profiler_gpus(
+    json_text: &str,
+    host_total_ram_mb: u64,
+    host_available_ram_mb: u64,
+) -> Result<Vec<GpuSnapshot>, String> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parsed: Value = serde_json::from_str(trimmed).map_err(|_| "Invalid macOS GPU telemetry JSON")?;
+    let Some(items) = parsed.get("SPDisplaysDataType").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut gpus = Vec::new();
+    for item in items {
+        let Some(name) =
+            item.get("sppci_model").or_else(|| item.get("_name")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 256)
+        else {
+            continue;
+        };
+        let explicit_vram =
+            item.get("spdisplays_vram").or_else(|| item.get("spdisplays_vram_shared")).and_then(Value::as_str).and_then(parse_memory_string_mb);
+        let is_apple_unified =
+            name.to_ascii_lowercase().starts_with("apple ") || item.get("sppci_bus").and_then(Value::as_str) == Some("spdisplays_builtin");
+        let (total_vram_mb, free_vram_mb) = match explicit_vram {
+            Some(vram_mb) => (vram_mb, 0),
+            None if is_apple_unified && host_total_ram_mb > 0 => (host_total_ram_mb, host_available_ram_mb.min(host_total_ram_mb)),
+            None => (0, 0),
+        };
+        gpus.push(GpuSnapshot { name: name.to_string(), total_vram_mb, free_vram_mb });
+    }
+    Ok(merge_gpu_snapshots(gpus, Vec::new()))
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn parse_linux_drm_gpus_from_dir(drm_root: &Path) -> Vec<GpuSnapshot> {
+    let Ok(entries) = std::fs::read_dir(drm_root) else {
+        return Vec::new();
+    };
+    let mut card_dirs: Vec<(String, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let digits = name.strip_prefix("card")?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
             }
+            Some((name, entry.path().join("device")))
+        })
+        .collect();
+    card_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let read_trimmed = |path: &Path| -> Option<String> {
+        let file = std::fs::File::open(path).ok()?;
+        let mut buf = String::new();
+        file.take(256).read_to_string(&mut buf).ok()?;
+        let trimmed = buf.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+
+    let mut gpus = Vec::new();
+    for (_card_name, dev_dir) in card_dirs {
+        let total_bytes = read_trimmed(&dev_dir.join("mem_info_vram_total")).and_then(|s| s.parse::<u64>().ok());
+        let used_bytes = read_trimmed(&dev_dir.join("mem_info_vram_used")).and_then(|s| s.parse::<u64>().ok());
+        let vendor = read_trimmed(&dev_dir.join("vendor")).map(|v| v.to_ascii_lowercase());
+        let device_id = read_trimmed(&dev_dir.join("device")).map(|d| d.to_ascii_lowercase());
+        let explicit_name = read_trimmed(&dev_dir.join("product_name")).or_else(|| read_trimmed(&dev_dir.join("label")));
+        let vendor_label = match vendor.as_deref() {
+            Some("0x1002") => Some("AMD Radeon GPU"),
+            Some("0x8086") => Some("Intel Graphics GPU"),
+            Some("0x10de") => Some("NVIDIA GPU"),
+            _ => None,
+        };
+        if total_bytes.is_none() && explicit_name.is_none() && vendor_label.is_none() {
+            continue;
         }
+        let name = explicit_name.unwrap_or_else(|| match (vendor_label, device_id.as_deref()) {
+            (Some(v), Some(d)) => format!("{v} ({d})"),
+            (Some(v), None) => v.to_string(),
+            _ => "DRM Graphics Adapter".to_string(),
+        });
+        let total_vram_mb = total_bytes.map(|b| b / 1_048_576).unwrap_or(0);
+        let free_vram_mb = match (total_bytes, used_bytes) {
+            (Some(t), Some(u)) if t >= u => (t - u) / 1_048_576,
+            _ => 0,
+        };
+        gpus.push(GpuSnapshot { name, total_vram_mb, free_vram_mb: free_vram_mb.min(total_vram_mb) });
     }
-    let mut bytes = Vec::new();
-    child.stdout.take().ok_or("Missing GPU telemetry")?.take(8193).read_to_end(&mut bytes).map_err(|_| "Cannot read GPU telemetry")?;
-    if bytes.len() > 8192 {
-        return Err("GPU telemetry exceeds the supported size".into());
-    }
-    let text = std::str::from_utf8(&bytes).map_err(|_| "Invalid GPU telemetry encoding")?;
-    parse_gpu_csv(text)
+    merge_gpu_snapshots(gpus, Vec::new())
 }
 
 fn parse_gpu_csv(text: &str) -> Result<Vec<GpuSnapshot>, String> {
@@ -292,5 +557,209 @@ mod tests {
         assert!(is_cloud_model("qwen:cloud"));
         assert!(is_cloud_model("qwen-cloud"));
         assert!(!is_cloud_model("qwen:8b"));
+    }
+
+    #[test]
+    fn multi_vendor_gpu_parsers_and_deduplication_handle_amd_intel_apple_and_adapter_hints() {
+        // 1. Windows CIM single object and array JSON, filtering Microsoft Basic Render Driver when real GPUs exist.
+        let win_array = r#"[
+            {"Name": "AMD Radeon RX 7900 XTX", "AdapterRAM": 4293918720},
+            {"Name": "Intel(R) Arc(TM) A770 Graphics", "AdapterRAM": 17179869184},
+            {"Name": "Microsoft Basic Render Driver", "AdapterRAM": 0}
+        ]"#;
+        let win_gpus = parse_windows_cim_gpus(win_array).unwrap();
+        assert_eq!(win_gpus.len(), 2);
+        assert_eq!(win_gpus[0].name, "AMD Radeon RX 7900 XTX");
+        assert_eq!(win_gpus[0].total_vram_mb, 4095);
+        assert_eq!(win_gpus[1].name, "Intel(R) Arc(TM) A770 Graphics");
+        assert_eq!(win_gpus[1].total_vram_mb, 16_384);
+
+        let win_single = r#"{"Name": "Intel(R) Iris(R) Xe Graphics", "AdapterRAM": null}"#;
+        let single_gpus = parse_windows_cim_gpus(win_single).unwrap();
+        assert_eq!(single_gpus.len(), 1);
+        assert_eq!(single_gpus[0].name, "Intel(R) Iris(R) Xe Graphics");
+        assert_eq!(single_gpus[0].total_vram_mb, 0);
+
+        // 2. macOS system_profiler SPDisplaysDataType (Apple Silicon unified memory + discrete Radeon).
+        let mac_json = r#"{
+            "SPDisplaysDataType": [
+                {"sppci_model": "Apple M3 Max", "sppci_bus": "spdisplays_builtin"},
+                {"sppci_model": "AMD Radeon Pro W6800X", "spdisplays_vram": "32 GB"}
+            ]
+        }"#;
+        let mac_gpus = parse_macos_system_profiler_gpus(mac_json, 65_536, 48_000).unwrap();
+        assert_eq!(mac_gpus.len(), 2);
+        assert_eq!(mac_gpus[0].name, "Apple M3 Max");
+        assert_eq!(mac_gpus[0].total_vram_mb, 65_536);
+        assert_eq!(mac_gpus[0].free_vram_mb, 48_000);
+        assert_eq!(mac_gpus[1].name, "AMD Radeon Pro W6800X");
+        assert_eq!(mac_gpus[1].total_vram_mb, 32_768);
+
+        // 3. Linux /sys/class/drm sysfs layout (card0 AMD with mem_info_vram_total/used, ignoring card0-DP-1 connector).
+        let drm_dir = tempfile::tempdir().unwrap();
+        let card0_dev = drm_dir.path().join("card0").join("device");
+        std::fs::create_dir_all(&card0_dev).unwrap();
+        std::fs::write(
+            card0_dev.join("vendor"),
+            "0x1002
+",
+        )
+        .unwrap();
+        std::fs::write(
+            card0_dev.join("product_name"),
+            "AMD Radeon RX 7800 XT
+",
+        )
+        .unwrap();
+        std::fs::write(
+            card0_dev.join("mem_info_vram_total"),
+            format!(
+                "{}
+",
+                16_384_u64 * 1_048_576
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            card0_dev.join("mem_info_vram_used"),
+            format!(
+                "{}
+",
+                4_096_u64 * 1_048_576
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(drm_dir.path().join("card0-DP-1")).unwrap();
+        let linux_gpus = parse_linux_drm_gpus_from_dir(drm_dir.path());
+        assert_eq!(linux_gpus.len(), 1);
+        assert_eq!(linux_gpus[0].name, "AMD Radeon RX 7800 XT");
+        assert_eq!(linux_gpus[0].total_vram_mb, 16_384);
+        assert_eq!(linux_gpus[0].free_vram_mb, 12_288);
+
+        // 4. Deduplication keeps richer nvidia-smi telemetry over zero-free fallback + honors active adapter hint.
+        let nvidia = vec![GpuSnapshot { name: "NVIDIA GeForce RTX 4080".into(), total_vram_mb: 16_384, free_vram_mb: 14_000 }];
+        let cim = vec![
+            GpuSnapshot { name: "nvidia geforce rtx 4080".into(), total_vram_mb: 4095, free_vram_mb: 0 },
+            GpuSnapshot { name: "AMD Radeon(TM) Graphics".into(), total_vram_mb: 512, free_vram_mb: 0 },
+        ];
+        let deduped = merge_gpu_snapshots(nvidia, cim);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].total_vram_mb, 16_384);
+        assert_eq!(deduped[0].free_vram_mb, 14_000);
+        assert_eq!(deduped[1].name, "AMD Radeon(TM) Graphics");
+
+        set_active_gpu_adapter("Intel(R) Arc(TM) B580 Graphics", 12_288);
+        let hints = active_or_env_gpu_hints();
+        clear_active_gpu_adapter();
+        assert!(hints.iter().any(|g| g.name == "Intel(R) Arc(TM) B580 Graphics" && g.total_vram_mb == 12_288));
+    }
+
+    #[test]
+    fn cancelled_local_http_retains_request_guard_admission_until_worker_exits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _healthy = TestAdmissionGuard::healthy();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let release_stall = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let server_release = std::sync::Arc::clone(&release_stall);
+        let server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf);
+                let (lock, cvar) = &*server_release;
+                let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = cvar.wait_timeout_while(guard, Duration::from_secs(10), |released| !*released);
+            }
+        });
+
+        let policy = LocalResourcePolicy::default();
+        let ollama = ModelSelection { provider: ProviderKind::Ollama, model: "llama3.2:latest".into(), endpoint: Some(endpoint) };
+        let comfy = ModelSelection { provider: ProviderKind::ComfyUi, model: "sdxl.safetensors".into(), endpoint: None };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel_trigger = std::sync::Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            cancel_trigger.store(true, Ordering::Relaxed);
+        });
+
+        let req = designcraft_ai_providers::GenerationRequest {
+            system: "sys".into(),
+            prompt: "hello".into(),
+            json_schema: serde_json::json!({"type": "object"}),
+            max_output_tokens: 64,
+            images: Vec::new(),
+            resources: policy.clone(),
+        };
+        {
+            let _guard = LocalRequestGuard::acquire(&ollama, &policy).unwrap();
+            let err = designcraft_ai_providers::generate(&ollama, None, &req, &cancel).unwrap_err();
+            assert_eq!(err, "AI request cancelled");
+        }
+        canceller.join().unwrap();
+
+        // Even after LocalRequestGuard dropped on the cancelled caller, the process-wide local
+        // admission slot must stay held while the detached HTTP worker is still blocked.
+        let blocked = LocalRequestGuard::acquire(&comfy, &policy).err().expect("expected local admission to stay busy");
+        assert!(blocked.contains("Another local inference is running"), "{blocked}");
+
+        let (lock, cvar) = &*release_stall;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+        server.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reacquired = loop {
+            match LocalRequestGuard::acquire(&comfy, &policy) {
+                Ok(guard) => break guard,
+                Err(err) => {
+                    assert!(Instant::now() < deadline, "local admission slot did not release after HTTP worker exited: {err}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        drop(reacquired);
+
+        // Defense-in-depth: a cancelled non-inference HTTP worker (`origin_lease.is_none()`, same
+        // branch taken by cloud Gemini/OpenAI calls) spawned while an outer LocalRequestGuard is
+        // held on the same thread must NEVER inherit the local admission token.
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe_endpoint = format!("http://{}/", probe_listener.local_addr().unwrap());
+        let probe_release = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let probe_server_release = std::sync::Arc::clone(&probe_release);
+        let probe_server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = probe_listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut hello = [0u8; 1024];
+                let _ = socket.read(&mut hello);
+                let (lock, cvar) = &*probe_server_release;
+                let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = cvar.wait_timeout_while(guard, Duration::from_secs(10), |released| !*released);
+            }
+        });
+        let probe_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let probe_cancel_trigger = std::sync::Arc::clone(&probe_cancel);
+        let probe_canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            probe_cancel_trigger.store(true, Ordering::Relaxed);
+        });
+        let discovery = ModelSelection { provider: ProviderKind::Ollama, model: "llama3.2:latest".into(), endpoint: Some(probe_endpoint) };
+        {
+            let _outer_local = LocalRequestGuard::acquire(&comfy, &policy).unwrap();
+            let err = designcraft_ai_providers::list_models(&discovery, None, &probe_cancel).unwrap_err();
+            assert_eq!(err, "AI request cancelled");
+        }
+        probe_canceller.join().unwrap();
+
+        // While the non-inference HTTP socket is still stalled, local admission must already be free!
+        let immediate_local = LocalRequestGuard::acquire(&comfy, &policy).expect("non-inference HTTP worker must not retain local admission");
+        drop(immediate_local);
+
+        let (lock, cvar) = &*probe_release;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+        probe_server.join().unwrap();
     }
 }

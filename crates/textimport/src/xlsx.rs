@@ -3,11 +3,19 @@
 //! [`records`], which keeps empty cells and can name a sheet.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use designcraft_doc::{CharFormat, ParaFormat, Story, StoryId, Table};
 
 use crate::docx::{El, parse, part};
 use crate::{ImportError, Imported};
+
+/// Maximum cumulative materialised cell text across one worksheet import (guards shared-string amplification).
+const MAX_XLSX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum cells placed into a table by [`import`].
+const MAX_CELLS: usize = 100_000;
+/// Maximum `<c>` elements read by [`records`] before row/column validation.
+const MAX_RECORDS_CELLS: usize = (crate::DATA_MERGE_MAX_ROWS + 1) * crate::DATA_MERGE_MAX_COLS;
 
 /// "B12" → (row 11, column 1).
 fn cell_ref(r: &str) -> Option<(usize, usize)> {
@@ -47,26 +55,27 @@ fn string_item(si: &El) -> String {
         .collect()
 }
 
-fn value(c: &El, shared: &[String]) -> String {
+fn value(c: &El, shared: &[Arc<str>]) -> Arc<str> {
     let v = || c.child("v").map(El::text).unwrap_or_default();
     match c.attr("t") {
-        Some("s") => v().trim().parse::<usize>().ok().and_then(|i| shared.get(i).cloned()).unwrap_or_default(),
-        Some("inlineStr") => c.child("is").map(string_item).unwrap_or_default(),
+        Some("s") => v().trim().parse::<usize>().ok().and_then(|i| shared.get(i).cloned()).unwrap_or_else(|| Arc::from("")),
+        Some("inlineStr") => Arc::from(c.child("is").map(string_item).unwrap_or_default()),
         // A cached formula string is text even when it looks like a number.
-        Some("str") => v(),
+        Some("str") => Arc::from(v()),
         Some("b") => {
             if v().trim() == "1" {
-                "TRUE".into()
+                Arc::from("TRUE")
             } else {
-                "FALSE".into()
+                Arc::from("FALSE")
             }
         }
         _ => {
             let raw = v();
-            match raw.trim().parse::<f64>() {
+            let s = match raw.trim().parse::<f64>() {
                 Ok(f) if f.is_finite() => general(f),
                 _ => raw,
-            }
+            };
+            Arc::from(s)
         }
     }
 }
@@ -99,17 +108,26 @@ pub fn records(bytes: &[u8], sheet: Option<&str>) -> Result<Vec<Vec<String>>, Im
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Corrupt(e.to_string()))?;
     let sheet_part = sheet_target(&mut zip, sheet)?;
     let sheet_xml = parse(&part(&mut zip, &sheet_part)?.ok_or_else(|| ImportError::Corrupt(format!("no {sheet_part} (not an Excel workbook)")))?)?;
-    let shared: Vec<String> = part(&mut zip, "xl/sharedStrings.xml")?
+    let shared: Vec<Arc<str>> = part(&mut zip, "xl/sharedStrings.xml")?
         .map(|x| parse(&x))
         .transpose()?
-        .map(|sst| sst.els().filter(|e| e.name == "si").map(string_item).collect())
+        .map(|sst| sst.els().filter(|e| e.name == "si").map(|si| Arc::from(string_item(si))).collect())
         .unwrap_or_default();
-    let mut cells: Vec<(usize, usize, String)> = Vec::new();
+    let mut cells: Vec<(usize, usize, Arc<str>)> = Vec::new();
+    let mut text_bytes = 0usize;
     if let Some(data) = sheet_xml.child("sheetData") {
         for (ri, row) in data.els().filter(|e| e.name == "row").enumerate() {
             for (ci, c) in row.els().filter(|e| e.name == "c").enumerate() {
+                if cells.len() >= MAX_RECORDS_CELLS {
+                    return Err(ImportError::Corrupt(format!("the sheet exceeds the {MAX_RECORDS_CELLS} cell limit")));
+                }
                 let (r, col) = c.attr("r").and_then(cell_ref).unwrap_or((ri, ci));
-                cells.push((r, col, value(c, &shared)));
+                let v = value(c, &shared);
+                text_bytes = text_bytes.saturating_add(v.len());
+                if text_bytes > MAX_XLSX_TEXT_BYTES {
+                    return Err(ImportError::Corrupt("the worksheet text exceeds the 64 MiB limit".into()));
+                }
+                cells.push((r, col, v));
             }
         }
     }
@@ -135,7 +153,7 @@ pub fn records(bytes: &[u8], sheet: Option<&str>) -> Result<Vec<Vec<String>>, Im
         return Err(ImportError::Corrupt(format!("the sheet has {width} columns; the limit is {}", crate::DATA_MERGE_MAX_COLS)));
     }
     // Group by row. Gaps (empty rows) are not materialised.
-    let mut by_row: BTreeMap<usize, Vec<(usize, String)>> = BTreeMap::new();
+    let mut by_row: BTreeMap<usize, Vec<(usize, Arc<str>)>> = BTreeMap::new();
     for (r, c, v) in cells {
         by_row.entry(r).or_default().push((c, v));
     }
@@ -160,17 +178,17 @@ pub fn records(bytes: &[u8], sheet: Option<&str>) -> Result<Vec<Vec<String>>, Im
             if *c < min_c {
                 // Outside the header span. Keep one non-empty value so the caller can warn.
                 if !v.is_empty() {
-                    extra.push(v.clone());
+                    extra.push(v.as_ref().to_owned());
                 }
                 continue;
             }
             let at = c - min_c;
             if at < width {
                 if let Some(cell) = row.get_mut(at) {
-                    *cell = v.clone();
+                    *cell = v.as_ref().to_owned();
                 }
             } else if !v.is_empty() {
-                extra.push(v.clone());
+                extra.push(v.as_ref().to_owned());
             }
         }
         if *r != header_row && row.iter().all(|c| c.is_empty()) && extra.is_empty() {
@@ -207,18 +225,26 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Corrupt(e.to_string()))?;
     let sheet_part = first_sheet(&mut zip)?.unwrap_or_else(|| "xl/worksheets/sheet1.xml".into());
     let sheet = parse(&part(&mut zip, &sheet_part)?.ok_or_else(|| ImportError::Corrupt(format!("no {sheet_part} (not an Excel workbook)")))?)?;
-    let shared: Vec<String> = part(&mut zip, "xl/sharedStrings.xml")?
+    let shared: Vec<Arc<str>> = part(&mut zip, "xl/sharedStrings.xml")?
         .map(|x| parse(&x))
         .transpose()?
-        .map(|sst| sst.els().filter(|e| e.name == "si").map(string_item).collect())
+        .map(|sst| sst.els().filter(|e| e.name == "si").map(|si| Arc::from(string_item(si))).collect())
         .unwrap_or_default();
-    let mut cells: Vec<((usize, usize), String)> = Vec::new();
+    let mut cells: Vec<((usize, usize), Arc<str>)> = Vec::new();
+    let mut text_bytes = 0usize;
     if let Some(data) = sheet.child("sheetData") {
         for (ri, row) in data.els().filter(|e| e.name == "row").enumerate() {
             for (ci, c) in row.els().filter(|e| e.name == "c").enumerate() {
                 let at = c.attr("r").and_then(cell_ref).unwrap_or((ri, ci));
                 let v = value(c, &shared);
                 if !v.is_empty() {
+                    if cells.len() >= MAX_CELLS {
+                        return Err(ImportError::Corrupt(format!("the worksheet exceeds the {MAX_CELLS} cell limit")));
+                    }
+                    text_bytes = text_bytes.saturating_add(v.len());
+                    if text_bytes > MAX_XLSX_TEXT_BYTES {
+                        return Err(ImportError::Corrupt("the worksheet text exceeds the 64 MiB limit".into()));
+                    }
                     cells.push((at, v));
                 }
             }
@@ -230,7 +256,6 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
     }
     // The used range, from the first used row/column. Cell references come from the file: the
     // table is capped before anything is allocated for it.
-    const MAX_CELLS: usize = 100_000;
     const MAX_COLS: usize = 1_000;
     let (r0, c0) = cells.iter().fold((usize::MAX, usize::MAX), |(r, c), ((a, b), _)| (r.min(*a), c.min(*b)));
     let (r1, c1) = cells.iter().fold((0, 0), |(r, c), ((a, b), _)| (r.max(*a), c.max(*b)));
@@ -246,7 +271,7 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
     let mut rows: Vec<Vec<String>> = vec![vec![String::new(); ncols_kept]; nrows_kept];
     for ((r, c), v) in cells {
         if let Some(cell) = rows.get_mut(r - r0).and_then(|row| row.get_mut(c - c0)) {
-            *cell = v;
+            *cell = v.as_ref().to_owned();
         }
     }
     let mut story = Story::new(StoryId(0));
@@ -442,5 +467,28 @@ mod tests {
             assert_eq!(table.cell(1, 0).unwrap().text.text, text);
             assert_eq!(rows[1][0], text);
         }
+    }
+
+    #[test]
+    fn shared_string_amplification_is_refused_before_materialising_grid() {
+        // One 1 MiB shared string referenced 70 times (> 64 MiB cumulative text) in a tiny workbook.
+        let payload = "x".repeat(1024 * 1024);
+        let sst = format!("<sst><si><t>{payload}</t></si></sst>");
+        let mut sheet = String::from("<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Col</t></is></c></row>");
+        for r in 2..=72 {
+            sheet.push_str(&format!("<row r=\"{r}\"><c r=\"A{r}\" t=\"s\"><v>0</v></c></row>"));
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        let book = sheets(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships><Relationship Id="rId1" Type="x" Target="worksheets/sheet1.xml"/></Relationships>"#),
+            ("xl/sharedStrings.xml", &sst),
+            ("xl/worksheets/sheet1.xml", &sheet),
+        ]);
+        assert!(matches!(records(&book, None), Err(ImportError::Corrupt(_))));
+        assert!(matches!(import(&book), Err(ImportError::Corrupt(_))));
     }
 }

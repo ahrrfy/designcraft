@@ -104,15 +104,40 @@ fn story_param(p: &Value) -> Option<StoryId> {
     p.get("story").and_then(Value::as_u64).map(StoryId)
 }
 
-/// FNV-1a (64-bit) of `bytes`, in hex: a linked text file's fingerprint.
-pub(crate) fn fnv_hex(bytes: &[u8]) -> String {
-    let h = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3));
-    format!("{h:016x}")
+struct FnvWriter(u64);
+
+impl Default for FnvWriter {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
 }
 
-/// Fingerprint of a story's text and formatting (edits made in the layout change it).
+impl std::io::Write for FnvWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = buf.iter().fold(self.0, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// FNV-1a (64-bit) of `bytes`, in hex: a linked text file's fingerprint.
+pub(crate) fn fnv_hex(bytes: &[u8]) -> String {
+    let mut w = FnvWriter::default();
+    let _ = std::io::Write::write_all(&mut w, bytes);
+    format!("{:016x}", w.0)
+}
+
+/// Fingerprint of a story's text and formatting (edits made in the layout change it), streamed
+/// without allocating an intermediate JSON string.
 pub(crate) fn story_hash(st: &Story) -> String {
-    fnv_hex(serde_json::to_string(&(&st.text, &st.paras, &st.chars)).unwrap_or_default().as_bytes())
+    let mut w = FnvWriter::default();
+    if serde_json::to_writer(&mut w, &(&st.text, &st.paras, &st.chars)).is_err() {
+        w = FnvWriter::default();
+    }
+    format!("{:016x}", w.0)
 }
 
 /// Frames (graphic content) showing an asset, top-level or in groups.
@@ -394,12 +419,47 @@ fn reimport(d: &mut Document, sid: StoryId, path: &str, bytes: &[u8], before: Fi
     Ok(warnings)
 }
 
+/// Maximum PDF input size accepted when placing or relinking (matches `craft_pdf::MAX_PDF_BYTES`).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PDF_LINK_BYTES: u64 = 256 * 1024 * 1024;
+
 #[cfg(not(target_arch = "wasm32"))]
 fn reload(path: impl AsRef<Path>) -> Result<(Vec<u8>, (u32, u32))> {
+    use std::io::Read;
     let path = path.as_ref();
-    let b = crate::io::read_file(path).map_err(EngineError::Other)?;
-    if designcraft_render::is_pdf(&b) {
+    let (mut file, len) = crate::io::open_with_len(path).map_err(EngineError::Other)?;
+    if len > crate::io::MAX_READ_BYTES {
+        return Err(EngineError::Other(format!(
+            "{}: file exceeds maximum read size of {} MiB",
+            path.display(),
+            crate::io::MAX_READ_BYTES / (1024 * 1024)
+        )));
+    }
+    let mut b = Vec::new();
+    file.by_ref().take(4).read_to_end(&mut b).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    let is_pdf = designcraft_render::is_pdf(&b);
+    if is_pdf {
+        if len > MAX_PDF_LINK_BYTES {
+            return Err(bad("links", format!("{}: PDF exceeds maximum link size of {} MiB", path.display(), MAX_PDF_LINK_BYTES / (1024 * 1024))));
+        }
+        designcraft_render::check_pdf_input_size(usize::try_from(len).unwrap_or(usize::MAX))
+            .map_err(|e| bad("links", format!("{}: {e}", path.display())))?;
+    }
+    let cap = if is_pdf { MAX_PDF_LINK_BYTES } else { crate::io::MAX_READ_BYTES };
+    let remaining = cap.saturating_add(1).saturating_sub(b.len() as u64);
+    file.take(remaining).read_to_end(&mut b).map_err(|e| EngineError::Other(format!("{}: {e}", path.display())))?;
+    if is_pdf || designcraft_render::is_pdf(&b) {
+        if b.len() as u64 > MAX_PDF_LINK_BYTES {
+            return Err(bad("links", format!("{}: PDF exceeds maximum link size of {} MiB", path.display(), MAX_PDF_LINK_BYTES / (1024 * 1024))));
+        }
         designcraft_render::check_pdf_input_size(b.len()).map_err(|e| bad("links", format!("{}: {e}", path.display())))?;
+    }
+    if b.len() as u64 > crate::io::MAX_READ_BYTES {
+        return Err(EngineError::Other(format!(
+            "{}: file exceeds maximum read size of {} MiB",
+            path.display(),
+            crate::io::MAX_READ_BYTES / (1024 * 1024)
+        )));
     }
     let px = designcraft_render::image_size(&b).ok_or_else(|| bad("links", format!("{}: unsupported or corrupt image", path.display())))?;
     Ok((b, px))
@@ -1447,6 +1507,42 @@ mod text_link_tests {
         let r = s.execute("file.place", &json!({"path": path.to_string_lossy()})).unwrap();
         assert!(r["warnings"][0].as_str().unwrap().contains("not linked"), "{r}");
         assert!(s.doc().unwrap().doc.story(StoryId(sid)).unwrap().file_link.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streaming_story_hash_matches_serialized_fnv_and_oversized_pdf_relink_fails_early() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let fr = s.execute("frame.create", &json!({"rect": [36, 36, 300, 200], "content": "text", "text": "Hello\nWorld", "caret": false})).unwrap();
+        let sid = StoryId(fr["story"].as_u64().unwrap());
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 5})).unwrap();
+        s.execute("type.char", &json!({"attrs": {"size": 18, "fontStyle": "Bold"}})).unwrap();
+        let st = story(&s, sid);
+        let expected = super::fnv_hex(serde_json::to_string(&(&st.text, &st.paras, &st.chars)).unwrap().as_bytes());
+        assert_eq!(super::story_hash(&st), expected);
+
+        // Oversized PDF (>256 MiB, <=512 MiB) is rejected on the `%PDF` header + length check
+        // without reading hundreds of megabytes into memory.
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("dc-pdf-relink-cap-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big_pdf = dir.join("oversized.pdf");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&big_pdf).unwrap();
+            f.write_all(b"%PDF-1.7\n").unwrap();
+            f.set_len(super::MAX_PDF_LINK_BYTES + 1024).unwrap();
+        }
+        let err = super::reload(&big_pdf).unwrap_err().to_string();
+        assert!(
+            err.contains("256")
+                || err.to_lowercase().contains("large")
+                || err.to_lowercase().contains("limit")
+                || err.to_lowercase().contains("exceed"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

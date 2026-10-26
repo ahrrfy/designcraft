@@ -141,6 +141,8 @@ pub(crate) fn parse(xml: &str) -> Result<El, ImportError> {
 
 /// Largest decompressed zip part read (a small file can inflate to gigabytes).
 pub(crate) const PART_LIMIT: u64 = 64 * 1024 * 1024;
+/// Maximum cumulative imported story text across body, footnotes and tables.
+const MAX_DOCX_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A zip part as text. `Ok(None)` when the part is missing or isn't text; an error when it
 /// decompresses to more than [`PART_LIMIT`].
@@ -228,6 +230,9 @@ struct Ctx {
     para_names: HashMap<String, String>,
     char_names: HashMap<String, String>,
     footnotes: HashMap<String, El>,
+    used_footnotes: std::collections::HashSet<String>,
+    used_endnotes: std::collections::HashSet<String>,
+    text_bytes: usize,
     warnings: Vec<String>,
     next_table: u64,
     numbering: Numbering,
@@ -242,17 +247,26 @@ struct Ctx {
 }
 
 impl Ctx {
+    fn charge_bytes(&mut self, n: usize) -> Result<(), ImportError> {
+        self.text_bytes = self.text_bytes.saturating_add(n);
+        if self.text_bytes > MAX_DOCX_TEXT_BYTES {
+            return Err(ImportError::Corrupt("the Word document text exceeds the 64 MiB limit".into()));
+        }
+        Ok(())
+    }
+
     fn para_style(&self, ppr: Option<&El>) -> String {
         ppr.and_then(|p| p.val("pStyle")).and_then(|id| self.para_names.get(&id).cloned()).unwrap_or_else(|| self.default_para.clone())
     }
 
     /// Append the paragraphs and tables of `body` to `st`.
-    fn blocks(&mut self, body: &El, st: &mut Story, allow_notes: bool) {
+    fn blocks(&mut self, body: &El, st: &mut Story, allow_notes: bool) -> Result<(), ImportError> {
         let mut first = st.is_empty();
         for e in body.els() {
             match e.name.as_str() {
                 "p" => {
                     if !first {
+                        self.charge_bytes(1)?;
                         let len = st.len();
                         st.insert(len, "\n");
                     }
@@ -269,7 +283,7 @@ impl Ctx {
                     }
                     let at = st.len();
                     st.format_paras(at..at, |f| *f = ParaFormat { style: style.clone(), para: attrs.clone(), ..Default::default() });
-                    self.inline(e, st, allow_notes);
+                    self.inline(e, st, allow_notes)?;
                     let (start_at, expression) = self.start_at(list.as_ref(), st.len() == at);
                     if let Some(n) = start_at {
                         st.format_paras(at..at, |f| f.para.start_at = Some(Some(n)));
@@ -284,7 +298,8 @@ impl Ctx {
                         let mut row = Vec::new();
                         for c in r.els().filter(|c| c.name == "tc") {
                             let mut paras = Vec::new();
-                            self.cell_paras(c, &mut paras);
+                            self.cell_paras(c, &mut paras)?;
+                            self.charge_bytes(paras.len().saturating_sub(1))?;
                             row.push(paras.join("\n"));
                         }
                         rows.push(row);
@@ -300,33 +315,35 @@ impl Ctx {
                 }
                 "sdt" => {
                     if let Some(c) = e.child("sdtContent") {
-                        self.blocks(c, st, allow_notes);
+                        self.blocks(c, st, allow_notes)?;
                     }
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// The text of each paragraph in a table cell, read by the same run rules as body text.
     /// Cells are plain text, so a page or column break in a cell ends its paragraph.
-    fn cell_paras(&mut self, el: &El, out: &mut Vec<String>) {
+    fn cell_paras(&mut self, el: &El, out: &mut Vec<String>) -> Result<(), ImportError> {
         for e in el.els() {
             match e.name.as_str() {
                 "p" => {
                     let mut st = Story::new(StoryId(0));
-                    self.inline(e, &mut st, false);
+                    self.inline(e, &mut st, false)?;
                     let is_break = |c: char| matches!(c, designcraft_doc::PAGE_BREAK | designcraft_doc::COLUMN_BREAK);
                     out.push(st.text.chars().map(|c| if is_break(c) { '\n' } else { c }).collect());
                 }
                 "sdt" => {
                     if let Some(c) = e.child("sdtContent") {
-                        self.cell_paras(c, out);
+                        self.cell_paras(c, out)?;
                     }
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// The list a paragraph is in (its own `w:numPr`, else its style's), counting it.
@@ -370,25 +387,26 @@ impl Ctx {
     }
 
     /// Runs (and hyperlinks, fields' results) of a paragraph.
-    fn inline(&mut self, p: &El, st: &mut Story, allow_notes: bool) {
+    fn inline(&mut self, p: &El, st: &mut Story, allow_notes: bool) -> Result<(), ImportError> {
         for e in p.els() {
             match e.name.as_str() {
-                "r" => self.run(e, st, allow_notes),
+                "r" => self.run(e, st, allow_notes)?,
                 // Tracked changes import as accepted: insertions and move destinations are kept,
                 // deletions (`del`) and move sources (`moveFrom`) are dropped.
-                "hyperlink" | "smartTag" | "ins" | "moveTo" | "fldSimple" | "customXml" => self.inline(e, st, allow_notes),
+                "hyperlink" | "smartTag" | "ins" | "moveTo" | "fldSimple" | "customXml" => self.inline(e, st, allow_notes)?,
                 // A content control (date picker, drop-down, plain text) keeps its runs in `sdtContent`.
                 "sdt" => {
                     if let Some(c) = e.child("sdtContent") {
-                        self.inline(c, st, allow_notes);
+                        self.inline(c, st, allow_notes)?;
                     }
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
-    fn run(&mut self, r: &El, st: &mut Story, allow_notes: bool) {
+    fn run(&mut self, r: &El, st: &mut Story, allow_notes: bool) -> Result<(), ImportError> {
         let rpr = r.child("rPr");
         let style = rpr.and_then(|p| p.val("rStyle")).and_then(|id| self.char_names.get(&id).cloned()).unwrap_or_else(|| NO_CHAR_STYLE.into());
         let fmt = CharFormat { style, over: run_attrs(rpr) };
@@ -404,21 +422,30 @@ impl Ctx {
                 "noBreakHyphen" => "\u{2011}".into(),
                 "softHyphen" => "\u{AD}".into(),
                 "footnoteReference" if allow_notes => {
-                    if let Some(note) = e.attr("id").and_then(|id| self.footnotes.get(id).cloned()) {
+                    if let Some(id) = e.attr("id")
+                        && self.used_footnotes.insert(id.to_string())
+                        && let Some(note) = self.footnotes.get(id).cloned()
+                    {
                         let mut ns = Story::new(StoryId(0));
                         let counter = std::mem::take(&mut self.model_counter);
-                        self.blocks(&note, &mut ns, false);
+                        self.blocks(&note, &mut ns, false)?;
                         self.model_counter = counter;
                         // Word puts the reference mark in the note text: we generate the number.
                         let len = st.len();
                         match st.insert_note(len, "", ParaFormat::default()) {
-                            Some(id) => {
-                                if let Some(n) = st.note_mut(id) {
+                            Some(nid) => {
+                                if let Some(n) = st.note_mut(nid) {
                                     n.text = ns;
                                 }
                             }
                             None => self.warnings.push("A footnote in the Word file could not be imported.".into()),
                         }
+                    }
+                    continue;
+                }
+                "endnoteReference" if allow_notes => {
+                    if let Some(id) = e.attr("id") {
+                        self.used_endnotes.insert(id.to_string());
                     }
                     continue;
                 }
@@ -431,10 +458,12 @@ impl Ctx {
                 _ => continue,
             };
             if !text.is_empty() {
+                self.charge_bytes(text.len())?;
                 let len = st.len();
                 st.insert_with(len, &text, fmt.clone());
             }
         }
+        Ok(())
     }
 }
 
@@ -477,6 +506,9 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
         para_names: HashMap::new(),
         char_names: HashMap::new(),
         footnotes: HashMap::new(),
+        used_footnotes: std::collections::HashSet::new(),
+        used_endnotes: std::collections::HashSet::new(),
+        text_bytes: 0,
         warnings: vec![],
         next_table: 0,
         numbering: Numbering::default(),
@@ -551,7 +583,7 @@ pub fn import(bytes: &[u8]) -> Result<Imported, ImportError> {
     }
     let body = doc.child("body").ok_or_else(|| ImportError::Corrupt("no document body".into()))?;
     let mut st = Story::new(StoryId(0));
-    ctx.blocks(body, &mut st, true);
+    ctx.blocks(body, &mut st, true)?;
     // A page or column break ends its paragraph.
     st.end_paragraphs_at_breaks();
     // Only styles that are used, plus what they are based on.
@@ -1037,5 +1069,29 @@ mod tests {
         assert_eq!(plain.capitalization, None, "no all-caps");
         let on = st.format_after(st.text.find("bold").unwrap()).clone().over;
         assert_eq!(on.font_style.as_deref(), Some("Bold"), "`on` is still on");
+    }
+
+    #[test]
+    fn repeated_footnote_references_do_not_amplify_subtree_and_story_budget_is_enforced() {
+        let refs = r#"<w:r><w:footnoteReference w:id="1"/></w:r>"#.repeat(500);
+        let document = format!(r#"<w:document {W}><w:body><w:p><w:r><w:t>Body</w:t></w:r>{refs}</w:p></w:body></w:document>"#);
+        let note_body = "N".repeat(64 * 1024);
+        let notes = format!(r#"<w:footnotes {W}><w:footnote w:id="1"><w:p><w:r><w:t>{note_body}</w:t></w:r></w:p></w:footnote></w:footnotes>"#);
+        let imported = import(&docx(&document, "", &notes)).unwrap();
+        assert_eq!(imported.story.notes.len(), 1, "each footnote id is consumed at most once");
+        assert_eq!(imported.story.notes[0].text.len(), 64 * 1024);
+
+        // Even distinct parts (e.g. ~40 MiB body + ~30 MiB footnotes, each under the 64 MiB part cap)
+        // are stopped when total imported story text exceeds 64 MiB.
+        let chunk = "a".repeat(1024 * 1024);
+        let big_body = format!(
+            r#"<w:document {W}><w:body><w:p>{}<w:r><w:footnoteReference w:id="1"/></w:r></w:p></w:body></w:document>"#,
+            format!("<w:r><w:t>{chunk}</w:t></w:r>").repeat(40)
+        );
+        let big_notes = format!(
+            r#"<w:footnotes {W}><w:footnote w:id="1"><w:p>{}</w:p></w:footnote></w:footnotes>"#,
+            format!("<w:r><w:t>{chunk}</w:t></w:r>").repeat(30)
+        );
+        assert!(matches!(import(&docx(&big_body, "", &big_notes)), Err(ImportError::Corrupt(_))));
     }
 }

@@ -74,6 +74,7 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
     }
     let mut compact = doc.clone();
     compact.compact_assets();
+    sanitize_for_save(&mut compact);
     let doc = &compact;
     let io = |e: zip::result::ZipError| FormatError::Io(e.to_string());
     let mut buf = Cursor::new(Vec::new());
@@ -95,7 +96,7 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
             z.write_all(png).map_err(|e| FormatError::Io(e.to_string()))?;
         }
         z.start_file("document.json", deflate).map_err(io)?;
-        let json = serde_json::to_vec_pretty(doc).map_err(|e| FormatError::Io(e.to_string()))?;
+        let json = to_finite_json_vec_pretty(doc).map_err(|e| FormatError::Io(e.to_string()))?;
         z.write_all(&json).map_err(|e| FormatError::Io(e.to_string()))?;
         for (id, a) in &doc.assets {
             if a.data.is_empty() {
@@ -110,6 +111,317 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
         z.finish().map_err(io)?;
     }
     Ok(buf.into_inner())
+}
+
+/// Repair fields that have positive-finite invariants in [`Document::check`] or custom NaN-dropping
+/// semantics (`TabStop`) before serialising, so a stray `NaN`/`Infinity` never writes an unopenable
+/// `.designcraft` archive.
+fn sanitize_for_save(doc: &mut Document) {
+    let fix_chars = |c: &mut designcraft_doc::CharAttrs| {
+        if let Some(sz) = c.size
+            && (!sz.is_finite() || sz <= 0.0)
+        {
+            c.size = Some(12.0);
+        }
+    };
+    let fix_para = |p: &mut ParaAttrs| {
+        if let Some(tabs) = p.tabs.take() {
+            p.tabs = Some(designcraft_doc::TabStop::sanitized_list(tabs));
+        }
+    };
+    let styles = doc.styles_mut();
+    for ps in &mut styles.paragraph {
+        fix_chars(&mut ps.chars);
+        fix_para(&mut ps.para);
+    }
+    for cs in &mut styles.character {
+        fix_chars(&mut cs.chars);
+    }
+    for cf in &mut styles.composite_fonts {
+        for e in &mut cf.entries {
+            if !e.relative_size.is_finite() || e.relative_size <= 0.0 {
+                e.relative_size = 1.0;
+            }
+            if !e.horizontal_scale.is_finite() || e.horizontal_scale <= 0.0 {
+                e.horizontal_scale = 1.0;
+            }
+            if !e.vertical_scale.is_finite() || e.vertical_scale <= 0.0 {
+                e.vertical_scale = 1.0;
+            }
+            if !e.baseline_shift.is_finite() {
+                e.baseline_shift = 0.0;
+            }
+        }
+    }
+    for mt in &mut styles.mojikumi_tables {
+        for r in &mut mt.overrides {
+            if !r.minimum.is_finite() {
+                r.minimum = 0.0;
+            }
+            if !r.desired.is_finite() {
+                r.desired = 0.0;
+            }
+            if !r.maximum.is_finite() {
+                r.maximum = 0.0;
+            }
+        }
+    }
+    let mut fix_story = |st: &mut Story| {
+        for p in &mut st.paras {
+            fix_chars(&mut p.chars);
+            fix_para(&mut p.para);
+        }
+        for r in &mut st.chars {
+            fix_chars(&mut r.format.over);
+        }
+    };
+    for st in doc.stories.values_mut() {
+        fn story_has_bad(
+            st: &Story,
+            depth: usize,
+            check_c: &impl Fn(&designcraft_doc::CharAttrs) -> bool,
+            check_p: &impl Fn(&ParaAttrs) -> bool,
+        ) -> bool {
+            if depth > 32 {
+                return false;
+            }
+            st.paras.iter().any(|p| check_c(&p.chars) || check_p(&p.para))
+                || st.chars.iter().any(|r| check_c(&r.format.over))
+                || st.tables.values().any(|t| t.cells.iter().any(|cell| story_has_bad(&cell.text, depth + 1, check_c, check_p)))
+                || st.notes.iter().any(|n| story_has_bad(&n.text, depth + 1, check_c, check_p))
+                || st.endnotes.iter().any(|n| story_has_bad(&n.text, depth + 1, check_c, check_p))
+        }
+        let check_c = |c: &designcraft_doc::CharAttrs| c.size.is_some_and(|s| !s.is_finite() || s <= 0.0);
+        let check_p = |p: &ParaAttrs| p.tabs.as_ref().is_some_and(|t| t.iter().any(|s| !s.position.is_finite()));
+        let has_bad = story_has_bad(st, 0, &check_c, &check_p);
+        if has_bad {
+            let st = Arc::make_mut(st);
+            st.for_each_text_mut(&mut fix_story);
+            for n in &mut st.endnotes {
+                Arc::make_mut(n).text.for_each_text_mut(&mut fix_story);
+            }
+        }
+    }
+}
+
+/// Pretty-print `value` to JSON while replacing any stray `NaN` or `±Infinity` `f32`/`f64` with
+/// `0.0` instead of `null` (which `serde_json` emits for non-finite floats and later refuses to
+/// deserialize into float fields).
+fn to_finite_json_vec_pretty<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    use serde::ser::{
+        Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant,
+        Serializer,
+    };
+
+    struct Finite<'a, V: ?Sized>(&'a V);
+    impl<V: ?Sized + Serialize> Serialize for Finite<'_, V> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.serialize(FiniteSer(serializer))
+        }
+    }
+
+    struct FiniteSer<S>(S);
+    struct Wrap<C>(C);
+
+    impl<S: Serializer> Serializer for FiniteSer<S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        type SerializeSeq = Wrap<S::SerializeSeq>;
+        type SerializeTuple = Wrap<S::SerializeTuple>;
+        type SerializeTupleStruct = Wrap<S::SerializeTupleStruct>;
+        type SerializeTupleVariant = Wrap<S::SerializeTupleVariant>;
+        type SerializeMap = Wrap<S::SerializeMap>;
+        type SerializeStruct = Wrap<S::SerializeStruct>;
+        type SerializeStructVariant = Wrap<S::SerializeStructVariant>;
+
+        fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_bool(v)
+        }
+        fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_i8(v)
+        }
+        fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_i16(v)
+        }
+        fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_i32(v)
+        }
+        fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_i64(v)
+        }
+        fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_i128(v)
+        }
+        fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_u8(v)
+        }
+        fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_u16(v)
+        }
+        fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_u32(v)
+        }
+        fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_u64(v)
+        }
+        fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_u128(v)
+        }
+        fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_f32(if v.is_finite() { v } else { 0.0 })
+        }
+        fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_f64(if v.is_finite() { v } else { 0.0 })
+        }
+        fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_char(v)
+        }
+        fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_str(v)
+        }
+        fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_bytes(v)
+        }
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_none()
+        }
+        fn serialize_some<U: ?Sized + Serialize>(self, value: &U) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_some(&Finite(value))
+        }
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_unit()
+        }
+        fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_unit_struct(name)
+        }
+        fn serialize_unit_variant(self, name: &'static str, idx: u32, variant: &'static str) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_unit_variant(name, idx, variant)
+        }
+        fn serialize_newtype_struct<U: ?Sized + Serialize>(self, name: &'static str, value: &U) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_newtype_struct(name, &Finite(value))
+        }
+        fn serialize_newtype_variant<U: ?Sized + Serialize>(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+            value: &U,
+        ) -> Result<Self::Ok, Self::Error> {
+            self.0.serialize_newtype_variant(name, idx, variant, &Finite(value))
+        }
+        fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            self.0.serialize_seq(len).map(Wrap)
+        }
+        fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            self.0.serialize_tuple(len).map(Wrap)
+        }
+        fn serialize_tuple_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            self.0.serialize_tuple_struct(name, len).map(Wrap)
+        }
+        fn serialize_tuple_variant(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            self.0.serialize_tuple_variant(name, idx, variant, len).map(Wrap)
+        }
+        fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            self.0.serialize_map(len).map(Wrap)
+        }
+        fn serialize_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeStruct, Self::Error> {
+            self.0.serialize_struct(name, len).map(Wrap)
+        }
+        fn serialize_struct_variant(
+            self,
+            name: &'static str,
+            idx: u32,
+            variant: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            self.0.serialize_struct_variant(name, idx, variant, len).map(Wrap)
+        }
+    }
+
+    impl<C: SerializeSeq> SerializeSeq for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_element<U: ?Sized + Serialize>(&mut self, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_element(&Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+    impl<C: SerializeTuple> SerializeTuple for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_element<U: ?Sized + Serialize>(&mut self, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_element(&Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+    impl<C: SerializeTupleStruct> SerializeTupleStruct for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_field<U: ?Sized + Serialize>(&mut self, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_field(&Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+    impl<C: SerializeTupleVariant> SerializeTupleVariant for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_field<U: ?Sized + Serialize>(&mut self, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_field(&Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+    impl<C: SerializeMap> SerializeMap for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_key<U: ?Sized + Serialize>(&mut self, key: &U) -> Result<(), Self::Error> {
+            self.0.serialize_key(&Finite(key))
+        }
+        fn serialize_value<U: ?Sized + Serialize>(&mut self, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_value(&Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+    impl<C: SerializeStruct> SerializeStruct for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_field<U: ?Sized + Serialize>(&mut self, key: &'static str, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_field(key, &Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+    impl<C: SerializeStructVariant> SerializeStructVariant for Wrap<C> {
+        type Ok = C::Ok;
+        type Error = C::Error;
+        fn serialize_field<U: ?Sized + Serialize>(&mut self, key: &'static str, value: &U) -> Result<(), Self::Error> {
+            self.0.serialize_field(key, &Finite(value))
+        }
+        fn end(self) -> Result<Self::Ok, Self::Error> {
+            self.0.end()
+        }
+    }
+
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::pretty(&mut buf);
+    Finite(value).serialize(&mut ser)?;
+    Ok(buf)
 }
 
 /// The file name extension of a DesignCraft document.
@@ -1014,5 +1326,26 @@ mod tests {
         }
         let Err(err) = load(&z.finish().unwrap().into_inner()) else { panic!("an archive with 100 001 entries loaded") };
         assert!(err.to_string().contains("entries"), "{err}");
+    }
+
+    #[test]
+    fn stray_non_finite_floats_never_write_an_unopenable_archive() {
+        let mut d = Document::new(&NewDocument::default());
+        let lid = d.default_layer();
+        let (fid, sid) = d.add_text_frame(SpreadRef::Doc(0), Rect::new(36.0, 36.0, 200.0, 200.0), lid, "hello", ParaFormat::default()).unwrap();
+        d.settings.bleed = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 9.0];
+        let it = d.item_mut(fid).unwrap();
+        it.opacity = f32::NAN;
+        it.stroke.weight = f64::INFINITY;
+        it.effects.feather = f64::NAN;
+        d.story_mut(sid).unwrap().format_chars(0..5, |f| {
+            f.over.tracking = Some(f64::INFINITY);
+            f.over.size = Some(f64::NAN);
+        });
+        let saved = save(&d).expect("save sanitizes stray non-finite numbers");
+        let reopened = load(&saved).expect("saved archive reopens cleanly");
+        assert_eq!(reopened.settings.bleed, [0.0, 0.0, 0.0, 9.0]);
+        assert_eq!(reopened.item(fid).unwrap().opacity, 0.0);
+        assert_eq!(reopened.item(fid).unwrap().stroke.weight, 0.0);
     }
 }

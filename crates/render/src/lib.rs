@@ -38,6 +38,7 @@ mod pdf_bounds;
 mod pdf_layers;
 pub use pdf_layers::{pdf_hide_layers, pdf_layers};
 pub mod images;
+pub use images::trim_unused_images;
 mod text;
 
 /// Largest side of a raster the renderer draws. vello_cpu keeps sizes in `u16` and rounds them
@@ -57,6 +58,15 @@ pub struct Rendered {
 }
 
 impl Rendered {
+    /// Allocate a zeroed `width`×`height` premultiplied RGBA8 buffer, returning `None` on overflow
+    /// or allocation failure.
+    pub fn new(width: u32, height: u32) -> Option<Self> {
+        let len = usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)?.checked_mul(4)?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(len).ok()?;
+        pixels.resize(len, 0);
+        Some(Self { width, height, pixels })
+    }
     pub fn to_straight(&self) -> Vec<u8> {
         let mut out = self.pixels.clone();
         for px in out.as_chunks_mut::<4>().0 {
@@ -72,9 +82,21 @@ impl Rendered {
     /// PNG bytes (empty, with the error logged, if the image can't be encoded).
     pub fn to_png(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+        let Some(len) = usize::try_from(self.width)
+            .ok()
+            .and_then(|w| usize::try_from(self.height).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|px| px.checked_mul(4))
+        else {
+            log::error!("PNG encode: {}×{} image is too large", self.width, self.height);
+            return Vec::new();
+        };
         let mut px = self.to_straight();
         // `pixels` is public: a mismatched buffer is padded or cut to the stated size.
-        px.resize(self.width as usize * self.height as usize * 4, 0);
+        if len > px.len() && px.try_reserve_exact(len - px.len()).is_err() {
+            log::error!("PNG encode: {}×{} image is too large", self.width, self.height);
+            return Vec::new();
+        }
+        px.resize(len, 0);
         let Some(img) = image::RgbaImage::from_raw(self.width, self.height, px) else {
             log::error!("PNG encode: {}×{} image is too large", self.width, self.height);
             return Vec::new();
@@ -104,8 +126,20 @@ impl Rendered {
     }
     /// Straight-alpha RGBA at (x, y).
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
-        let i = ((y * self.width + x) * 4) as usize;
-        let p = &self.pixels[i..i + 4];
+        if x >= self.width || y >= self.height {
+            return [0, 0, 0, 0];
+        }
+        let Some(i) = usize::try_from(y)
+            .ok()
+            .and_then(|y| usize::try_from(self.width).ok().and_then(|w| y.checked_mul(w)))
+            .and_then(|row| usize::try_from(x).ok().and_then(|x| row.checked_add(x)))
+            .and_then(|px| px.checked_mul(4))
+        else {
+            return [0, 0, 0, 0];
+        };
+        let Some(p) = self.pixels.get(i..i + 4) else {
+            return [0, 0, 0, 0];
+        };
         let a = p[3] as u32;
         if a == 0 {
             return [0, 0, 0, 0];
@@ -228,6 +262,11 @@ pub struct Renderer {
     /// Composed stories looked up during the current render.
     stories: HashMap<(StoryId, ShownOn), Arc<ComposedStory>>,
     drawing_items: Vec<designcraft_doc::ItemId>,
+    cmyk_ctx: Option<RenderContext>,
+    cmyk_cmy: Option<Arc<Pixmap>>,
+    cmyk_black: Option<Pixmap>,
+    fx_ctx: Option<RenderContext>,
+    fx_pm: Option<Arc<Pixmap>>,
     cmyk_view: Option<blendspace::CachedView>,
     /// Whether the last render ran the CMYK ink passes (only then is its view worth keeping).
     cmyk_ran: bool,
@@ -285,6 +324,11 @@ impl Renderer {
             glyphs: text::GlyphCache::default(),
             stories: HashMap::new(),
             drawing_items: Vec::new(),
+            cmyk_ctx: None,
+            cmyk_cmy: None,
+            cmyk_black: None,
+            fx_ctx: None,
+            fx_pm: None,
             cmyk_view: None,
             cmyk_ran: false,
             #[cfg(test)]
@@ -300,6 +344,11 @@ impl Renderer {
 
     /// Drop cached glyph paths and the CMYK viewport (rebuilt on demand).
     pub fn clear_caches(&mut self) {
+        self.cmyk_ctx = None;
+        self.cmyk_cmy = None;
+        self.cmyk_black = None;
+        self.fx_ctx = None;
+        self.fx_pm = None;
         self.cmyk_view = None;
         self.glyphs.clear();
         self.stories.clear();
@@ -1170,30 +1219,6 @@ pub fn decode_pixmap_page(bytes: &[u8], page: u32) -> Option<Pixmap> {
         })
         .collect();
     Some(Pixmap::from_parts(data, w as u16, h as u16))
-}
-
-/// Box-filter downsample by 2.
-fn halve(pm: &Pixmap) -> Pixmap {
-    let (w, h) = (pm.width() as usize, pm.height() as usize);
-    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-    let src = pm.data();
-    let mut out = Vec::with_capacity(nw * nh);
-    for y in 0..nh {
-        for x in 0..nw {
-            let mut acc = [0u32; 4];
-            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let sx = (2 * x + dx).min(w - 1);
-                let sy = (2 * y + dy).min(h - 1);
-                let p = src[sy * w + sx];
-                acc[0] += p.r as u32;
-                acc[1] += p.g as u32;
-                acc[2] += p.b as u32;
-                acc[3] += p.a as u32;
-            }
-            out.push(vello_cpu::color::PremulRgba8 { r: (acc[0] / 4) as u8, g: (acc[1] / 4) as u8, b: (acc[2] / 4) as u8, a: (acc[3] / 4) as u8 });
-        }
-    }
-    Pixmap::from_parts(out, nw as u16, nh as u16)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2222,5 +2247,24 @@ mod tests {
         let want = [100.0 / 612.0, 200.0 / 792.0, 500.0 / 612.0, 697.0 / 792.0];
         assert!(frac.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6), "{frac:?} vs {want:?}");
         assert!((size.0 - 400.0).abs() < 1e-3 && (size.1 - 497.0).abs() < 1e-3, "{size:?}");
+    }
+
+    #[test]
+    fn rendered_pixel_and_new_guard_out_of_bounds_and_overflow() {
+        let img = Rendered { width: 2, height: 2, pixels: vec![10, 20, 30, 255, 0, 0, 0, 0] };
+        assert_eq!(img.pixel(0, 0), [10, 20, 30, 255]);
+        assert_eq!(img.pixel(1, 0), [0, 0, 0, 0]);
+        // Truncated pixel buffer and out-of-bounds / u32-overflowing coordinates return transparent.
+        assert_eq!(img.pixel(0, 1), [0, 0, 0, 0]);
+        assert_eq!(img.pixel(2, 0), [0, 0, 0, 0]);
+        assert_eq!(img.pixel(0, 2), [0, 0, 0, 0]);
+        assert_eq!(img.pixel(u32::MAX, u32::MAX), [0, 0, 0, 0]);
+
+        let huge = Rendered { width: u32::MAX, height: u32::MAX, pixels: vec![255; 16] };
+        assert_eq!(huge.pixel(u32::MAX - 1, u32::MAX - 1), [0, 0, 0, 0]);
+        assert_eq!(huge.pixel(1, 65_536), [0, 0, 0, 0]);
+        assert!(huge.to_png().is_empty());
+        assert!(Rendered::new(u32::MAX, u32::MAX).is_none());
+        assert_eq!(Rendered::new(3, 2).unwrap().pixels.len(), 24);
     }
 }

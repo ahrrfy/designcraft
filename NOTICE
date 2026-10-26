@@ -92,8 +92,9 @@ list (author, source, license) is in ASSETS.md.
   packages; copied from the pinned pdfcraft vendor/hayro-interpret/assets/LICENSE_FOXIT)
   and a CMYK profile under CC0-1.0.
 
-Rust dependencies (vello_cpu, kurbo, skrifa, harfrust, image, egui, eframe, …) are permissively
-licensed (MIT/Apache-2.0/BSD/ISC/Zlib), fetched through crates.io or the pinned source below.
+Rust dependencies (vello_cpu, kurbo, skrifa, harfrust, image, fast_image_resize, zune-png, quick_cache,
+ecow, serde_path_to_error, zeroize, egui, eframe, …) are permissively licensed (MIT/Apache-2.0/BSD/ISC/Zlib),
+fetched through crates.io or the pinned source below.
 
 No Adobe icons, images or artwork are included.
 

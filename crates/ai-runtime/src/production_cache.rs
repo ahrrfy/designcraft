@@ -15,6 +15,10 @@ const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: usize = 512;
+const TARGET_ENTRIES: usize = (MAX_ENTRIES * 85) / 100;
+const TARGET_CACHE_BYTES: u64 = (MAX_CACHE_BYTES * 85) / 100;
+const REJECTED_RESPONSE_FILE: &str = "last-rejected-response.txt";
+const MAX_SCAN_FILES: usize = 8192;
 const MAX_NODES: usize = 65_536;
 static WRITES: Mutex<()> = Mutex::new(());
 
@@ -70,7 +74,7 @@ pub(crate) fn store_rejected_response(root: &Path, response: &str) -> Result<Opt
     if response.len() > 4 * 1024 * 1024 {
         return Err("Rejected response exceeds its 4-MiB diagnostic limit".into());
     }
-    let path = root.join("last-rejected-response.txt");
+    let path = root.join(REJECTED_RESPONSE_FILE);
     Ok(write_cache_file(root, &path, response.as_bytes())?.then_some(path))
 }
 
@@ -114,16 +118,24 @@ pub(crate) fn load_image(root: &Path, key: &str) -> Result<Option<GeneratedImage
 }
 
 pub(crate) fn store_image(root: &Path, key: &str, image: &GeneratedImage) -> Result<(), String> {
-    normalized_key(key)?;
+    let key = normalized_key(key)?;
     validate_image(image)?;
     let sha256 = hash(&image.bytes);
-    let path = root.join(format!("raster-{sha256}.bin"));
-    if !write_cache_file(root, &path, &image.bytes)? {
+    let blob_path = root.join(format!("raster-{sha256}.bin"));
+    if !write_cache_file(root, &blob_path, &image.bytes)? {
         return Ok(());
     }
-    let payload =
-        BinaryImagePayload { filename: image.filename.clone(), mime_type: image.mime_type.clone(), blob_sha256: sha256, bytes: image.bytes.len() };
-    store(root, key, "image", serde_json::to_value(payload).map_err(|e| format!("Cannot encode production cache image: {e}"))?)
+    let payload = serde_json::to_value(BinaryImagePayload {
+        filename: image.filename.clone(),
+        mime_type: image.mime_type.clone(),
+        blob_sha256: sha256,
+        bytes: image.bytes.len(),
+    })
+    .map_err(|e| format!("Cannot encode production cache image: {e}"))?;
+    let entry = Entry { version: VERSION, kind: "image".into(), key: key.clone(), payload_sha256: digest(&payload)?, payload };
+    let bytes = encode(&entry)?;
+    let meta_path = entry_path(root, &key, "image");
+    write_cache_file_protecting(root, &meta_path, &bytes, Some(&blob_path)).map(|_| ())
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -196,7 +208,7 @@ fn load(root: &Path, key: &str, kind: &str) -> Result<Option<Value>, String> {
     Ok(Some(entry.payload))
 }
 
-/// A full cache declines additional writes; existing results are never deleted.
+/// Oldest cache entries are evicted down to 85% of entry/byte caps when full.
 fn store(root: &Path, key: &str, kind: &str, payload: Value) -> Result<(), String> {
     let key = normalized_key(key)?;
     let entry = Entry { version: VERSION, kind: kind.into(), key: key.clone(), payload_sha256: digest(&payload)?, payload };
@@ -205,22 +217,49 @@ fn store(root: &Path, key: &str, kind: &str, payload: Value) -> Result<(), Strin
     write_cache_file(root, &path, &bytes).map(|_| ())
 }
 
-// Binary blobs and metadata share the same entry and byte quotas, including atomic-write
-// staging space. A declined write never deletes a previous cached result.
+struct DiskCacheItem {
+    path: PathBuf,
+    file_name: String,
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+fn read_image_blob_ref(path: &Path) -> Option<String> {
+    let bytes = io::read_capped(path, 65_536).ok()?;
+    let entry: Entry = serde_json::from_slice(&bytes).ok()?;
+    entry.payload.get("blob_sha256").and_then(Value::as_str).map(str::to_ascii_lowercase)
+}
+
 fn write_cache_file(root: &Path, path: &Path, bytes: &[u8]) -> Result<bool, String> {
+    write_cache_file_protecting(root, path, bytes, None)
+}
+
+// Binary blobs and metadata share the same entry and byte quotas, including atomic-write
+// staging space. When full, oldest `.json`/`.bin` entries are evicted down to 85% of cap;
+// `last-rejected-response.txt` is never evicted and can always overwrite itself.
+fn write_cache_file_protecting(root: &Path, path: &Path, bytes: &[u8], protected: Option<&Path>) -> Result<bool, String> {
     let _lock = WRITES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     checked_root(root)?;
     file_access::check_write(root)?;
     std::fs::create_dir_all(root).map_err(|e| format!("Cannot create production cache directory: {e}"))?;
     checked_root(root)?;
     file_access::check_write(path)?;
-    let mut count = 0usize;
+    let incoming_len = bytes.len() as u64;
+    if incoming_len > MAX_CACHE_BYTES {
+        return Ok(false);
+    }
+
+    let is_diagnostic = path.file_name().and_then(|n| n.to_str()) == Some(REJECTED_RESPONSE_FILE);
+    let mut scanned = 0usize;
+    let mut cache_entries = 0usize;
     let mut total = 0u64;
     let mut replaced = None;
+    let mut items = Vec::new();
+
     for item in std::fs::read_dir(root).map_err(|e| format!("Cannot inspect production cache quota: {e}"))? {
-        count = count.checked_add(1).ok_or("Production cache entry count overflow")?;
-        if count > MAX_ENTRIES {
-            return Ok(false);
+        scanned = scanned.checked_add(1).ok_or("Production cache entry count overflow")?;
+        if scanned > MAX_SCAN_FILES {
+            return Err("Production cache directory exceeds maximum scan safety limit".into());
         }
         let item = item.map_err(|e| format!("Cannot inspect production cache entry: {e}"))?;
         let candidate = item.path();
@@ -229,18 +268,105 @@ fn write_cache_file(root: &Path, path: &Path, bytes: &[u8]) -> Result<bool, Stri
         if is_link(&metadata) || !metadata.is_file() {
             return Err("Production cache directory must contain only ordinary files".into());
         }
-        total = total.checked_add(metadata.len()).ok_or("Production cache byte count overflow")?;
+        let len = metadata.len();
+        total = total.checked_add(len).ok_or("Production cache byte count overflow")?;
         if candidate == path {
-            replaced = Some(metadata.len());
+            replaced = Some(len);
+        }
+        let file_name = candidate.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if file_name != REJECTED_RESPONSE_FILE {
+            cache_entries = cache_entries.checked_add(1).ok_or("Production cache entry count overflow")?;
+            let is_evictable_ext = matches!(candidate.extension().and_then(|e| e.to_str()), Some("json" | "bin"));
+            if is_evictable_ext && candidate != path && protected.is_none_or(|p| p != candidate) {
+                let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                items.push(DiskCacheItem { path: candidate, file_name, len, modified });
+            }
         }
     }
-    let projected =
-        total.checked_sub(replaced.unwrap_or(0)).and_then(|n| n.checked_add(bytes.len() as u64)).ok_or("Production cache byte count overflow")?;
-    let staged = total.checked_add(bytes.len() as u64).ok_or("Production cache staging byte count overflow")?;
-    if projected > MAX_CACHE_BYTES || staged > MAX_CACHE_BYTES || (replaced.is_none() && count >= MAX_ENTRIES) {
-        return Ok(false);
+
+    let projected_entries = |entries: usize| -> usize { if is_diagnostic || replaced.is_some() { entries } else { entries.saturating_add(1) } };
+    let exceeds_max = |entries: usize, bytes_total: u64| -> Result<bool, String> {
+        let proj =
+            bytes_total.checked_sub(replaced.unwrap_or(0)).and_then(|n| n.checked_add(incoming_len)).ok_or("Production cache byte count overflow")?;
+        let staged = bytes_total.checked_add(incoming_len).ok_or("Production cache staging byte count overflow")?;
+        Ok((!is_diagnostic && projected_entries(entries) > MAX_ENTRIES) || proj > MAX_CACHE_BYTES || staged > MAX_CACHE_BYTES)
+    };
+
+    if exceeds_max(cache_entries, total)? {
+        items.sort_by(|a, b| a.modified.cmp(&b.modified).then_with(|| a.file_name.cmp(&b.file_name)));
+        let mut image_refs: std::collections::BTreeMap<PathBuf, String> = std::collections::BTreeMap::new();
+        for item in &items {
+            if item.file_name.ends_with(".image.json")
+                && let Some(sha) = read_image_blob_ref(&item.path)
+            {
+                image_refs.insert(item.path.clone(), sha);
+            }
+        }
+        let by_path: std::collections::BTreeMap<PathBuf, u64> = items.iter().map(|i| (i.path.clone(), i.len)).collect();
+        let mut removed: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+
+        let target_bytes_cap = TARGET_CACHE_BYTES.max(incoming_len);
+        let needs_more_eviction = |entries: usize, bytes_total: u64| -> bool {
+            let proj = bytes_total.saturating_sub(replaced.unwrap_or(0)).saturating_add(incoming_len);
+            let staged = bytes_total.saturating_add(incoming_len);
+            (!is_diagnostic && projected_entries(entries) > TARGET_ENTRIES) || proj > target_bytes_cap || staged > target_bytes_cap
+        };
+
+        for item in &items {
+            if !needs_more_eviction(cache_entries, total) {
+                break;
+            }
+            if removed.contains(&item.path) {
+                continue;
+            }
+            let mut batch_to_remove = Vec::new();
+            if let Some(sha) = item.file_name.strip_prefix("raster-").and_then(|s| s.strip_suffix(".bin")) {
+                let sha_lower = sha.to_ascii_lowercase();
+                for (img_path, ref_sha) in &image_refs {
+                    if *ref_sha == sha_lower && !removed.contains(img_path) {
+                        batch_to_remove.push(img_path.clone());
+                    }
+                }
+                batch_to_remove.push(item.path.clone());
+            } else if let Some(ref_sha) = image_refs.get(&item.path).cloned() {
+                batch_to_remove.push(item.path.clone());
+                let still_referenced = image_refs
+                    .iter()
+                    .any(|(other_path, other_sha)| other_path != &item.path && !removed.contains(other_path) && *other_sha == ref_sha);
+                let blob_candidate = root.join(format!("raster-{ref_sha}.bin"));
+                if !still_referenced
+                    && by_path.contains_key(&blob_candidate)
+                    && !removed.contains(&blob_candidate)
+                    && protected.is_none_or(|p| p != blob_candidate)
+                    && blob_candidate != path
+                {
+                    batch_to_remove.push(blob_candidate);
+                }
+            } else {
+                batch_to_remove.push(item.path.clone());
+            }
+
+            for victim in batch_to_remove {
+                if removed.contains(&victim) {
+                    continue;
+                }
+                file_access::check_write(&victim)?;
+                if std::fs::remove_file(&victim).is_ok() {
+                    if let Some(victim_len) = by_path.get(&victim).copied() {
+                        total = total.saturating_sub(victim_len);
+                        cache_entries = cache_entries.saturating_sub(1);
+                    }
+                    removed.insert(victim);
+                }
+            }
+        }
+
+        if exceeds_max(cache_entries, total)? {
+            return Ok(false);
+        }
     }
-    // Recheck the target after scanning, before the engine's atomic replacement.
+
+    // Recheck the target after scanning/eviction, before the engine's atomic replacement.
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && (is_link(&metadata) || !metadata.is_file())
     {
@@ -265,6 +391,8 @@ fn validate_plan(plan: &ProductionPlan) -> Result<(), String> {
             || image.prompt.len() > 8192
             || image.label.trim().is_empty()
             || image.label.len() > 256
+            || image.family_id.as_deref().is_some_and(|s| s.trim().is_empty() || s.len() > 64)
+            || image.slot_id.as_deref().is_some_and(|s| s.trim().is_empty() || s.len() > 64)
             || image.page > 999
             || image.rect.iter().any(|n| !n.is_finite() || n.abs() > 15552.0)
             || image.rect[2] <= image.rect[0]
@@ -489,14 +617,49 @@ mod tests {
     }
 
     #[test]
-    fn quota_declines_new_writes_without_deleting_existing_entries() {
+    fn quota_evicts_oldest_entries_to_85_percent_and_declines_oversized_single_write() {
         let root = temporary_root();
         let filler = root.path().join("existing.plan.json");
         std::fs::File::create(&filler).unwrap().set_len(MAX_CACHE_BYTES).unwrap();
         store_plan(root.path(), &key(), &plan()).unwrap();
-        assert_eq!(std::fs::metadata(&filler).unwrap().len(), MAX_CACHE_BYTES);
-        assert!(load_plan(root.path(), &key()).unwrap().is_none());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert!(!filler.exists(), "Old full-quota cache entry must be evicted to admit fresh plan");
+        assert!(load_plan(root.path(), &key()).unwrap().is_some());
+
+        // An impossible single write larger than MAX_CACHE_BYTES declines without deleting valid cached entries.
+        let oversized = vec![b'x'; (MAX_CACHE_BYTES as usize) + 1];
+        assert!(!write_cache_file(root.path(), &root.path().join("oversized.bin"), &oversized).unwrap());
+        assert!(load_plan(root.path(), &key()).unwrap().is_some());
+    }
+
+    #[test]
+    fn wave2_lru_eviction_handles_more_than_max_entries_and_preserves_rejected_diagnostic() {
+        let root = temporary_root();
+        store_rejected_response(root.path(), "initial diagnostic").unwrap();
+        let sample = plan();
+        let total_writes = MAX_ENTRIES + 24;
+        let base_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut keys = Vec::with_capacity(total_writes);
+        for index in 0..total_writes {
+            let k = format!("{index:064x}");
+            store_plan(root.path(), &k, &sample).unwrap();
+            let p = entry_path(root.path(), &k, "plan");
+            let mtime = base_time + std::time::Duration::from_secs(index as u64);
+            std::fs::File::options().write(true).open(&p).unwrap().set_times(std::fs::FileTimes::new().set_modified(mtime)).unwrap();
+            keys.push(k);
+        }
+        // Diagnostic file can still overwrite cleanly and is never evicted.
+        let diag_path = store_rejected_response(root.path(), "updated diagnostic after eviction").unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(diag_path).unwrap(), "updated diagnostic after eviction");
+
+        // Oldest entries were evicted; newest entries remain loadable and total cache entries stay <= MAX_ENTRIES.
+        assert!(load_plan(root.path(), &keys[0]).unwrap().is_none(), "Oldest entry must be evicted");
+        assert!(load_plan(root.path(), keys.last().unwrap()).unwrap().is_some(), "Newest entry must remain cached");
+        let plan_files = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".plan.json"))
+            .count();
+        assert!(plan_files <= MAX_ENTRIES, "plan_files={plan_files}");
     }
 
     #[test]

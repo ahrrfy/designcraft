@@ -4411,3 +4411,46 @@ fn exports_arabic_language_declaration_and_maps_ar_bcp47_to_idml_arabic() {
         assert_eq!(designcraft_doc::language_tag(lang), Some("ar"), "{input_lang}");
     }
 }
+
+#[test]
+fn sniff_image_skips_jpeg_fill_bytes_and_standalone_markers() {
+    // SOI, standalone TEM (0xFF 0x01), RST0 (0xFF 0xD0), repeated 0xFF fill bytes before SOF0 (320x240).
+    let jpeg = [
+        0xFF, 0xD8, // SOI
+        0xFF, 0x01, // TEM (no length payload)
+        0xFF, 0xD0, // RST0 (no length payload)
+        0xFF, 0xFF, 0xFF, 0xC0, // fill bytes + SOF0
+        0x00, 0x11, // length = 17
+        0x08, // precision
+        0x00, 0xF0, // height = 240
+        0x01, 0x40, // width = 320
+        0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00, 0xFF, 0xD9,
+    ];
+    assert_eq!(crate::sniff_image(&jpeg), (Some("image/jpeg"), Some((320, 240))));
+    // Truncated SOF segment does not panic and still reports image/jpeg.
+    assert_eq!(crate::sniff_image(&[0xFF, 0xD8, 0xFF, 0xFF, 0xC0, 0x00, 0x04]), (Some("image/jpeg"), None));
+}
+
+#[test]
+fn export_story_paras_indexes_many_markers_in_linear_time() {
+    let mut doc = Document::new(&designcraft_doc::build::NewDocument::default());
+    let (_, sid) = doc
+        .add_text_frame(designcraft_doc::SpreadRef::Doc(0), Rect::new(36.0, 36.0, 300.0, 300.0), doc.default_layer(), "", Default::default())
+        .unwrap();
+    {
+        let st = doc.story_mut(sid).unwrap();
+        for i in 0..200 {
+            let pos = st.len();
+            st.insert(pos, &format!("word{i} "));
+            let pos = st.len();
+            st.insert_note(pos, &format!("note-{i}"), ParaFormat::default());
+            let pos = st.len();
+            st.insert(pos, "\n");
+        }
+    }
+    let round = import_idml(&export_idml(&doc)).unwrap();
+    let notes: Vec<String> = round.stories.values().next().unwrap().notes.iter().map(|n| n.text.text.clone()).collect();
+    assert_eq!(notes.len(), 200);
+    assert_eq!(notes.first().map(String::as_str), Some("note-0"));
+    assert_eq!(notes.last().map(String::as_str), Some("note-199"));
+}

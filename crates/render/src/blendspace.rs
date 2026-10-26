@@ -374,10 +374,33 @@ impl Renderer {
         let visible = f.view.inverse().transform_rect_bbox(area);
         let stats = self.stats;
         let threads = self.threads;
-        let mut pass = |plate| {
+        let mut cmy = match self.cmyk_cmy.take() {
+            Some(arc) if arc.width() == aw && arc.height() == ah => match std::sync::Arc::try_unwrap(arc) {
+                Ok(mut pm) => {
+                    pm.data_as_u8_slice_mut().fill(0);
+                    pm
+                }
+                Err(_) => vello_cpu::Pixmap::new(aw, ah),
+            },
+            _ => vello_cpu::Pixmap::new(aw, ah),
+        };
+        let mut black = match self.cmyk_black.take() {
+            Some(mut pm) if pm.width() == aw && pm.height() == ah => {
+                pm.data_as_u8_slice_mut().fill(0);
+                pm
+            }
+            _ => vello_cpu::Pixmap::new(aw, ah),
+        };
+        for (plate, pm) in [(4u8, &mut cmy), (3u8, &mut black)] {
             let opts = RenderOptions { plate: Some(plate), ..rgb.clone() };
             crate::PLATE.with(|p| p.set(opts.plate));
-            let mut off = RenderContext::new_with(aw, ah, vello_cpu::RenderSettings { num_threads: threads, ..Default::default() });
+            let mut off = match self.cmyk_ctx.take() {
+                Some(mut c) if c.width() == aw && c.height() == ah && c.render_settings().num_threads == threads => {
+                    c.reset();
+                    c
+                }
+                _ => RenderContext::new_with(aw, ah, vello_cpu::RenderSettings { num_threads: threads, ..Default::default() }),
+            };
             #[cfg(test)]
             let items = self.stats.items;
             self.draw_spread(&mut off, &Frame { opts: &opts, view: shifted, visible, mt: threads > 0, ..*f }, sr);
@@ -386,17 +409,14 @@ impl Renderer {
                 self.cmyk_pass_items = self.stats.items - items;
             }
             off.flush();
-            let mut pm = vello_cpu::Pixmap::new(aw, ah);
-            off.render(&mut pm, &mut self.resources);
+            off.render(pm, &mut self.resources);
+            self.cmyk_ctx = Some(off);
             #[cfg(test)]
             {
                 self.cmyk_passes += 1;
                 self.cmyk_pass_pixels = aw as usize * ah as usize;
             }
-            pm
-        };
-        let mut cmy = pass(4);
-        let black = pass(3);
+        }
         self.cmyk_ran = true;
         crate::PLATE.with(|p| p.set(f.opts.plate));
         self.stats.items = (self.stats.items - stats.items) / 2 + stats.items;
@@ -412,8 +432,11 @@ impl Renderer {
             let [r, g, b] = rgb.map(|v| (v.clamp(0.0, 1.0) * a).round() as u8);
             (c.r, c.g, c.b) = (r, g, b);
         }
+        self.cmyk_black = Some(black);
+        let cmy_arc = std::sync::Arc::new(cmy);
+        self.cmyk_cmy = Some(cmy_arc.clone());
         ctx.set_transform(Affine::translate((area.x0, area.y0)));
-        ctx.set_paint(vello_cpu::Image { image: vello_cpu::ImageSource::Pixmap(std::sync::Arc::new(cmy)), sampler: peniko::ImageSampler::default() });
+        ctx.set_paint(vello_cpu::Image { image: vello_cpu::ImageSource::Pixmap(cmy_arc), sampler: peniko::ImageSampler::default() });
         ctx.fill_rect(&Rect::new(0.0, 0.0, aw as f64, ah as f64));
         ctx.set_transform(Affine::IDENTITY);
     }

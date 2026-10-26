@@ -21,6 +21,12 @@ pub(crate) fn is_non_text_model(model: &str) -> bool {
 #[derive(Clone, Default)]
 struct Secret(String);
 
+impl Drop for Secret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
 fn collect_page_ranges(pages: usize, mut predicate: impl FnMut(usize) -> bool) -> Vec<[usize; 2]> {
     let mut ranges: Vec<[usize; 2]> = Vec::new();
     for page in 0..pages {
@@ -439,11 +445,6 @@ fn natural_prompt_pages(prompt: &str) -> Option<u32> {
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[redacted]")
-    }
-}
-impl Drop for Secret {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 
@@ -1630,15 +1631,58 @@ fn human_review_input(app: &DesignApp) -> bool {
 /// model discovery accepts `selection: ModelSelection`. All other fields match the typed variant.
 /// Credentials, human approvals, physical print submission and owned-process launch use only
 /// typed panel controls. Secret input never enters control transcripts.
+/// Control/MCP automation may tighten spending budgets, never raise them above the user's ceiling.
+fn clamp_control_settings(ceiling: &AiSettings, settings: &mut AiSettings) {
+    settings.budget.max_requests = settings.budget.max_requests.min(ceiling.budget.max_requests);
+    settings.budget.token_limit = settings.budget.token_limit.min(ceiling.budget.token_limit);
+    settings.budget.max_output_tokens = settings.budget.max_output_tokens.min(ceiling.budget.max_output_tokens);
+    settings.budget.repair_attempts = settings.budget.repair_attempts.min(ceiling.budget.repair_attempts);
+    if let Some(cap) = ceiling.budget.max_cost_usd {
+        settings.budget.max_cost_usd = Some(settings.budget.max_cost_usd.map_or(cap, |v| v.min(cap)));
+    }
+    // Control cannot spoof rate tables or escalate into paid repairs, image generation, or vision review.
+    settings.budget.rates = ceiling.budget.rates.clone();
+    settings.image_rates = ceiling.image_rates.clone();
+    if !ceiling.allow_paid_repairs {
+        settings.allow_paid_repairs = false;
+    }
+    if ceiling.output_mode == OutputMode::NativeOnly {
+        settings.output_mode = OutputMode::NativeOnly;
+    }
+    if !ceiling.verify_generated_images {
+        settings.verify_generated_images = false;
+    }
+}
+
+fn clamped_settings(ceiling: &AiSettings, raw: Value) -> Result<AiSettings, String> {
+    let mut settings: AiSettings = serde_json::from_value(raw).map_err(|e| e.to_string())?;
+    clamp_control_settings(ceiling, &mut settings);
+    Ok(settings)
+}
+
+fn ensure_ceiling_initialized(app: &mut DesignApp) {
+    if !app.ui.ai.initialized && app.services.ai.is_some() {
+        let _ = dispatch(app, AiRequest::Poll);
+    }
+}
+
 pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
     let field = |name: &str| p.get(name).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| format!("missing string: {name}"));
     let decode = |name: &str| p.get(name).cloned().ok_or_else(|| format!("missing {name}"));
     let request = match field("method")?.as_str() {
         "poll" => AiRequest::Poll,
         "cancel" => AiRequest::Cancel,
-        "start" => AiRequest::Start(serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?),
+        "start" => {
+            ensure_ceiling_initialized(app);
+            let mut req: TaskRequest = serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?;
+            clamp_control_settings(&app.ui.ai.settings, &mut req.settings);
+            AiRequest::Start(req)
+        }
         "preview_production" => AiRequest::PreviewProduction(serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?),
-        "update_settings" => AiRequest::UpdateSettings(serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?),
+        "update_settings" => {
+            ensure_ceiling_initialized(app);
+            AiRequest::UpdateSettings(clamped_settings(&app.ui.ai.settings, decode("settings")?)?)
+        }
         "list_models" => AiRequest::ListModels { selection: serde_json::from_value(decode("selection")?).map_err(|e| e.to_string())? },
         "import_skill" => AiRequest::ImportSkill { path: field("path")? },
         "inspect_skill" => AiRequest::InspectSkill { id: field("id")?, revision: field("revision")? },
@@ -1649,17 +1693,23 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
             revision: field("revision")?,
             correction: serde_json::from_value(decode("correction")?).map_err(|e| e.to_string())?,
         },
-        "generate_skill" => AiRequest::GenerateSkill {
-            design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
-            prompt: field("prompt")?,
-            reference_paths: serde_json::from_value(decode("reference_paths")?).map_err(|e| e.to_string())?,
-            settings: serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?,
-        },
-        "generate_skill_from_document" => AiRequest::GenerateSkillFromDocument {
-            design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
-            prompt: field("prompt")?,
-            settings: serde_json::from_value(decode("settings")?).map_err(|e| e.to_string())?,
-        },
+        "generate_skill" => {
+            ensure_ceiling_initialized(app);
+            AiRequest::GenerateSkill {
+                design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
+                prompt: field("prompt")?,
+                reference_paths: serde_json::from_value(decode("reference_paths")?).map_err(|e| e.to_string())?,
+                settings: clamped_settings(&app.ui.ai.settings, decode("settings")?)?,
+            }
+        }
+        "generate_skill_from_document" => {
+            ensure_ceiling_initialized(app);
+            AiRequest::GenerateSkillFromDocument {
+                design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
+                prompt: field("prompt")?,
+                settings: clamped_settings(&app.ui.ai.settings, decode("settings")?)?,
+            }
+        }
         "run_skill_sample" => AiRequest::RunSkillSample { id: field("id")?, revision: field("revision")? },
         "run_design_template" => AiRequest::RunDesignTemplate { id: field("id")?, revision: field("revision")?, template: field("template")? },
         "refresh_batch_proofs" => AiRequest::RefreshBatchProofs { job_id: field("job_id")? },
@@ -2119,12 +2169,20 @@ pub(crate) fn open_target_document_bytes(app: &mut DesignApp, name: &str, bytes:
         let (w, h) = sanitize_pdf_page_size(designcraft_render::pdf_page_size(bytes, 0));
         let created = app.run("file.new", serde_json::json!({"width": w, "height": h, "pages": pages, "facingPages": false, "title": stem}))?;
         let mut last = serde_json::Value::Null;
+        let mut shared_asset: Option<u64> = None;
         for page in 1..=pages {
-            match app.open_file(
-                "file.place",
-                serde_json::json!({"name": name, "base64": b64, "pdfPage": page, "spread": page - 1, "x": 0.0, "y": 0.0, "width": w}),
-            ) {
-                Ok(v) => last = v,
+            let params = if let Some(aid) = shared_asset {
+                serde_json::json!({"name": name, "reuseAsset": aid, "pdfPage": page, "spread": page - 1, "x": 0.0, "y": 0.0, "width": w})
+            } else {
+                serde_json::json!({"name": name, "base64": b64, "pdfPage": page, "spread": page - 1, "x": 0.0, "y": 0.0, "width": w})
+            };
+            match app.open_file("file.place", params) {
+                Ok(v) => {
+                    if shared_asset.is_none() {
+                        shared_asset = v.get("asset").and_then(serde_json::Value::as_u64);
+                    }
+                    last = v;
+                }
                 Err(error) => {
                     if let Some(index) = created.get("index").and_then(serde_json::Value::as_u64) {
                         let _ = app.run("file.close", serde_json::json!({"index": index}));
@@ -2207,7 +2265,7 @@ fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, req
                     if s.workflow_ready() {
                         requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                     }
-                    requests.push(AiRequest::SaveApiKey { selection: selection.clone(), key: std::mem::take(&mut s.api_key.0) });
+                    requests.push(AiRequest::SaveApiKey { selection: selection.clone(), key: std::mem::take(&mut s.api_key.0).into() });
                 }
                 if button(ui, a, "Refresh presence", "تحديث حالة المفاتيح") {
                     requests.push(AiRequest::RefreshCredentials);
@@ -7565,5 +7623,84 @@ mod tests {
         single_review.get_by_label("100% image preview").click();
         single_review.run_steps(3);
         assert!(single_review.state().ui.ai.proof_full_resolution, "single-page review must allow 100% image inspection");
+    }
+
+    #[test]
+    fn control_channel_ai_request_cannot_escalate_spending_budget_above_user_ceiling() {
+        let persisted_rates = TokenRates {
+            input_per_million: 2.50,
+            cached_input_per_million: 0.25,
+            output_per_million: 10.0,
+            cache_write_per_million: None,
+            image_per_request: Some(0.08),
+            image_reserve_usd: None,
+        };
+        let mut persisted_ceiling = AiSettings::default();
+        persisted_ceiling.budget.max_requests = 6;
+        persisted_ceiling.budget.token_limit = 120_000;
+        persisted_ceiling.budget.max_cost_usd = Some(1.50);
+        persisted_ceiling.budget.rates = Some(persisted_rates.clone());
+        persisted_ceiling.allow_paid_repairs = false;
+        persisted_ceiling.output_mode = OutputMode::NativeOnly;
+        persisted_ceiling.verify_generated_images = false;
+
+        let host_settings = std::rc::Rc::new(std::cell::RefCell::new(persisted_ceiling));
+        let host_settings_ref = host_settings.clone();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen_host = seen.clone();
+        let mut app = DesignApp::new(
+            Session::new(),
+            Services {
+                ai: Some(Box::new(move |_, req| {
+                    if let AiRequest::UpdateSettings(s) = &req {
+                        seen_host.borrow_mut().push(s.clone());
+                        *host_settings_ref.borrow_mut() = s.clone();
+                    }
+                    AiSnapshot { available: true, settings: host_settings_ref.borrow().clone(), ..Default::default() }
+                })),
+                ..Default::default()
+            },
+        );
+        // Verify uninitialized `app.ui.ai` hydrates persisted runtime ceiling BEFORE clamping!
+        assert!(!app.ui.ai.initialized);
+
+        let mut escalated = AiSettings::default();
+        escalated.budget.max_requests = 9_999;
+        escalated.budget.token_limit = 15_000_000;
+        escalated.budget.max_cost_usd = None;
+        escalated.budget.rates = Some(TokenRates {
+            input_per_million: 1e-9,
+            cached_input_per_million: 1e-9,
+            output_per_million: 1e-9,
+            cache_write_per_million: None,
+            image_per_request: Some(1e-9),
+            image_reserve_usd: None,
+        });
+        escalated.allow_paid_repairs = true;
+        escalated.output_mode = OutputMode::NativeWithImages;
+        escalated.verify_generated_images = true;
+
+        app.run("ai.request", json!({"method": "update_settings", "settings": escalated})).unwrap();
+        assert!(app.ui.ai.initialized, "request_command must hydrate uninitialized settings first");
+        let applied = seen.borrow().last().cloned().expect("settings forwarded");
+        assert_eq!(applied.budget.max_requests, 6);
+        assert_eq!(applied.budget.token_limit, 120_000);
+        assert_eq!(applied.budget.max_cost_usd, Some(1.50));
+        assert!(!applied.allow_paid_repairs);
+        assert_eq!(applied.output_mode, OutputMode::NativeOnly);
+        assert!(!applied.verify_generated_images);
+        assert_eq!(applied.budget.rates.as_ref().map(|r| r.input_per_million), Some(2.50));
+
+        // Tightening below the ceiling remains allowed while preserving user rate tables.
+        let mut tighter = app.ui.ai.settings.clone();
+        tighter.budget.max_requests = 2;
+        tighter.budget.token_limit = 50_000;
+        tighter.budget.max_cost_usd = Some(0.50);
+        app.run("ai.request", json!({"method": "update_settings", "settings": tighter})).unwrap();
+        let applied = seen.borrow().last().cloned().expect("tighter settings forwarded");
+        assert_eq!(applied.budget.max_requests, 2);
+        assert_eq!(applied.budget.token_limit, 50_000);
+        assert_eq!(applied.budget.max_cost_usd, Some(0.50));
+        assert_eq!(applied.budget.rates.as_ref().map(|r| r.output_per_million), Some(10.0));
     }
 }

@@ -20,6 +20,64 @@ fn endpoint_security() {
         assert!(validate_endpoint(&selection(ProviderKind::Ollama, Some(endpoint))).is_err());
     }
     assert_eq!(validate_endpoint(&selection(ProviderKind::OpenAi, None)).unwrap().as_str(), "https://api.openai.com/v1/");
+
+    // SEC-07: Cloud providers must reject private, loopback, link-local, metadata, CGNAT, unique-local, and internal hosts even over HTTPS.
+    for cloud_provider in [ProviderKind::OpenAi, ProviderKind::Gemini] {
+        for ssrf_endpoint in [
+            "https://127.0.0.1:8443/v1",
+            "https://127.99.1.2/v1",
+            "https://[::1]/v1",
+            "https://0.0.0.0/v1",
+            "https://[::]/v1",
+            "https://10.0.0.1/v1",
+            "https://172.16.0.1/v1",
+            "https://172.31.255.254/v1",
+            "https://192.168.1.1/v1",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[fe80::1]/v1",
+            "https://100.64.0.1/v1",
+            "https://100.127.255.254/v1",
+            "https://[fc00::1]/v1",
+            "https://[fd12:3456:789a::1]/v1",
+            "https://[::ffff:127.0.0.1]/v1",
+            "https://[::ffff:169.254.169.254]/v1",
+            "https://2130706433/v1",
+            "https://localhost/v1",
+            "https://sub.localhost/v1",
+            "https://printer.local/v1",
+            "https://metadata.google.internal/v1",
+            "https://user:pass@api.openai.com/v1",
+        ] {
+            assert!(
+                validate_endpoint(&selection(cloud_provider, Some(ssrf_endpoint))).is_err(),
+                "expected {cloud_provider:?} to reject SSRF endpoint {ssrf_endpoint}"
+            );
+        }
+        for public_endpoint in ["https://proxy.example.com/v1", "https://172.15.0.1/v1", "https://172.32.0.1/v1", "https://100.63.255.254/v1"] {
+            assert!(
+                validate_endpoint(&selection(cloud_provider, Some(public_endpoint))).is_ok(),
+                "expected {cloud_provider:?} to accept public HTTPS endpoint {public_endpoint}"
+            );
+        }
+    }
+
+    // Local providers allow only localhost, 127.0.0.1, or [::1], and reject metadata IPs and URL credentials.
+    for local_provider in [ProviderKind::Ollama, ProviderKind::ComfyUi] {
+        for allowed in ["http://localhost:11434", "https://localhost:11434", "http://127.0.0.1:8188", "http://[::1]:8188"] {
+            assert!(validate_endpoint(&selection(local_provider, Some(allowed))).is_ok(), "{allowed}");
+        }
+        for rejected in [
+            "http://169.254.169.254/",
+            "https://169.254.169.254/",
+            "http://user:pass@127.0.0.1:11434/",
+            "https://user:pass@localhost:11434/",
+            "http://127.0.0.2:11434/",
+            "https://10.0.0.5:11434/",
+            "https://metadata.google.internal/",
+        ] {
+            assert!(validate_endpoint(&selection(local_provider, Some(rejected))).is_err(), "{rejected}");
+        }
+    }
 }
 
 #[test]
@@ -869,5 +927,61 @@ mod native_tests {
         .unwrap_err();
         assert_eq!(still_bad, "AI provider HTTP 400: invalid request or unsupported model parameter");
         assert_eq!(fail_calls, 2);
+    }
+
+    #[test]
+    fn bug02_stalled_blocking_http_call_cancels_under_400ms() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let release_stall = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let server_release = std::sync::Arc::clone(&release_stall);
+        let server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf);
+                // Stall without replying for up to 10 seconds until the test releases cleanup.
+                let (lock, cvar) = &*server_release;
+                let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = cvar.wait_timeout_while(guard, std::time::Duration::from_secs(10), |released| !*released);
+            }
+        });
+
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel_trigger = std::sync::Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            cancel_trigger.store(true, Ordering::Relaxed);
+        });
+
+        let sel = selection(ProviderKind::Ollama, Some(&endpoint));
+        let started = std::time::Instant::now();
+        let err = generate(&sel, None, &request(), &cancel).unwrap_err();
+        let elapsed = started.elapsed();
+
+        canceller.join().unwrap();
+        assert_eq!(err, "AI request cancelled");
+        assert!(elapsed < std::time::Duration::from_millis(400), "expected cancellation in < 400ms, took {elapsed:?}");
+
+        // While the cancelled blocking request is still stalled on the local server, a second
+        // local generation to that origin must be rejected rather than bypassing single-request admission.
+        let concurrent_err = generate(&sel, None, &request(), &AtomicBool::new(false)).unwrap_err();
+        assert!(concurrent_err.contains("Another local inference is running"), "{concurrent_err}");
+
+        let (lock, cvar) = &*release_stall;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+        server.join().unwrap();
+
+        // Once the detached HTTP worker finishes unwinding, the local origin slot is released.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let probe = generate(&sel, None, &request(), &AtomicBool::new(false));
+            if probe.as_ref().is_err_and(|msg| !msg.contains("Another local inference is running")) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "local origin slot remained stuck after worker exit: {probe:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

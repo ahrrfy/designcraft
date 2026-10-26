@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 
-use designcraft_doc::{Document, Item, ItemId, Orientation, Selection, SpreadRef, StrokeAlign};
+use designcraft_doc::{Document, GridRelative, Item, ItemId, Orientation, Selection, SpreadRef, StrokeAlign};
 use designcraft_geom::snap::snap_to_grid;
 use designcraft_geom::{Affine, Point, Rect, Vec2, format_measure};
 
@@ -393,9 +393,11 @@ fn grid_origin(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis) -> Option<f6
 
 /// Baseline grid. No overlay.
 ///
-/// Lines are `page.y0 + start + n * increment` for n >= 0 while the line is inside the page
-/// (the bottom edge is not a line, matching the canvas). An increment of 0 or less skips the
-/// pass. `relative_to` and `view_threshold` are not read, and hiding the baseline grid does not
+/// Lines are `origin + n * increment` for n >= 0 while the line is inside the page
+/// (the bottom edge is not a line, matching the canvas), where `origin` starts from
+/// `page.y0` ([`GridRelative::TopOfPage`]) or `page.y0 + page.margins.top`
+/// ([`GridRelative::TopMargin`]) plus `start`. An increment of 0 or less skips the
+/// pass. `view_threshold` is not read, and hiding the baseline grid does not
 /// turn this off. Only a page the rect crosses on x contributes. A dragged ruler guide
 /// ([`Gesture::Guide`]) doesn't snap to it.
 fn pass_baseline(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> Option<AxisHit> {
@@ -417,7 +419,14 @@ fn pass_baseline(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) 
         if !ranges_overlap(moving_lo, moving_hi, lo, hi) {
             continue;
         }
-        let origin = bounds.y0 + baseline.start;
+        let top_off = match baseline.relative_to {
+            GridRelative::TopOfPage => 0.0,
+            GridRelative::TopMargin => page.margins.top,
+        };
+        if !top_off.is_finite() {
+            continue;
+        }
+        let origin = bounds.y0 + top_off + baseline.start;
         offer_enabled(&mut best, req.rect, flags, axis, tol, |v| nearest_baseline(v, origin, increment, bounds.y0, bounds.y1));
     }
     best.map(|b| b.hit)
@@ -2216,5 +2225,30 @@ mod tests {
         let near_group = ask(28.0);
         let angle = near_group.angle.expect("absolute 30");
         assert!((angle - 30.0).abs() < 1e-6, "angle {angle}");
+    }
+
+    #[test]
+    fn baseline_grid_snaps_relative_to_top_of_page_or_top_margin() {
+        let mut doc = Document::new(&NewDocument {
+            margins: designcraft_doc::Margins { top: 47.0, bottom: 36.0, inside: 36.0, outside: 36.0 },
+            ..Default::default()
+        });
+        doc.settings.baseline_grid.start = 10.0;
+        doc.settings.baseline_grid.increment = 12.0;
+        doc.settings.baseline_grid.relative_to = GridRelative::TopOfPage;
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let cx = ctx_on(&doc, &sel, &cache, &layout);
+        // TopOfPage lines: 10, 22, 34, 46, 58, 70... Rect at y=69 snaps +1.0 to 70 (margin at 47 is far).
+        let hit_page = snap(&cx, y_req(Rect::new(100.0, 69.0, 140.0, 100.0)));
+        assert!((hit_page.delta.y - 1.0).abs() < 1e-6, "got {}", hit_page.delta.y);
+
+        doc.settings.baseline_grid.relative_to = GridRelative::TopMargin;
+        let layout = CanvasLayout::new(&doc, false);
+        let cx = ctx_on(&doc, &sel, &cache, &layout);
+        // TopMargin lines: 47 + 10 = 57, 69, 81... Rect at y=70.5 snaps -1.5 to 69.
+        let hit_margin = snap(&cx, y_req(Rect::new(100.0, 70.5, 140.0, 100.0)));
+        assert!((hit_margin.delta.y - -1.5).abs() < 1e-6, "got {}", hit_margin.delta.y);
     }
 }

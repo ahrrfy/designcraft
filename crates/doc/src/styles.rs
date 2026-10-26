@@ -764,9 +764,59 @@ impl Styles {
     pub fn object_style(&self, name: &str) -> Option<&ObjectStyle> {
         self.object.iter().find(|s| s.name == name)
     }
-    /// The effects object style `name` sets, if any (for new items that get a default style).
+    /// The object style chain from root to `name` (cycle-safe): resolution starts at its first.
+    pub fn object_chain(&self, name: &str) -> Vec<&ObjectStyle> {
+        let mut chain = Vec::new();
+        let mut cur = self.object_style(name);
+        while let Some(s) = cur {
+            if chain.len() >= MAX_DEPTH || chain.iter().any(|c: &&ObjectStyle| c.name == s.name) {
+                break;
+            }
+            chain.push(s);
+            cur = if s.name == NO_OBJECT_STYLE {
+                None
+            } else {
+                s.based_on.as_deref().filter(|b| *b != NO_OBJECT_STYLE).and_then(|b| self.object_style(b))
+            };
+        }
+        chain.reverse();
+        chain
+    }
+    /// Resolve object style inheritance (`based_on` from root to `name`, cycle-safe).
+    pub fn resolve_object_style(&self, name: &str) -> Option<ObjectStyle> {
+        let chain = self.object_chain(name);
+        let leaf = *chain.last()?;
+        let mut out = ObjectStyle { name: leaf.name.clone(), based_on: leaf.based_on.clone(), ..Default::default() };
+        for s in chain {
+            if let Some(fill) = &s.fill {
+                out.fill = Some(fill.clone());
+            }
+            if let Some(stroke) = &s.stroke {
+                out.stroke = Some(stroke.clone());
+            }
+            if let Some(ps) = &s.paragraph_style {
+                out.paragraph_style = Some(ps.clone());
+            }
+            if let Some(tf) = &s.text_frame {
+                out.text_frame = Some(tf.clone());
+            }
+            if let Some(fx) = &s.effects {
+                out.effects = Some(fx.clone());
+            }
+        }
+        Some(out)
+    }
+    /// Apply the resolved object style `name` (including `based_on` ancestors) to `it`.
+    pub fn apply_object_style(&self, name: &str, it: &mut Item) -> bool {
+        let Some(os) = self.resolve_object_style(name) else {
+            return false;
+        };
+        os.apply_to(it);
+        true
+    }
+    /// The effects object style `name` sets (walking `based_on`), if any (for new items that get a default style).
     pub fn object_effects(&self, name: &str) -> Option<&Effects> {
-        self.object_style(name)?.effects.as_ref()
+        self.object_chain(name).into_iter().rev().find_map(|s| s.effects.as_ref())
     }
 
     /// The paragraph style chain from root to `name` (cycle-safe): resolution starts at its first.
@@ -1021,5 +1071,80 @@ mod tests {
         let names = ["Body", "Body 2"];
         assert_eq!(Styles::unique_name(|n| names.contains(&n), "Body"), "Body 3");
         assert_eq!(Styles::unique_name(|n| names.contains(&n), "Head"), "Head");
+    }
+
+    #[test]
+    fn object_style_resolves_based_on_chain_with_cycle_and_depth_guards() {
+        let mut fx_root = Effects::default();
+        fx_root.drop_shadow.on = true;
+        fx_root.drop_shadow.opacity = 0.4;
+        let mut styles = Styles::default();
+        styles.object.extend([
+            ObjectStyle {
+                name: "Root".into(),
+                fill: Some(Fill::swatch("Paper")),
+                stroke: Some(Stroke { weight: 3.0, ..Default::default() }),
+                effects: Some(fx_root.clone()),
+                ..Default::default()
+            },
+            ObjectStyle {
+                name: "Mid".into(),
+                based_on: Some("Root".into()),
+                stroke: Some(Stroke { weight: 1.5, ..Default::default() }),
+                paragraph_style: Some("Caption".into()),
+                ..Default::default()
+            },
+            ObjectStyle { name: "Leaf".into(), based_on: Some("Mid".into()), fill: Some(Fill::swatch("Accent")), ..Default::default() },
+            ObjectStyle { name: "CycleA".into(), based_on: Some("CycleB".into()), fill: Some(Fill::swatch("A")), ..Default::default() },
+            ObjectStyle {
+                name: "CycleB".into(),
+                based_on: Some("CycleA".into()),
+                stroke: Some(Stroke { weight: 4.0, ..Default::default() }),
+                effects: Some(fx_root.clone()),
+                ..Default::default()
+            },
+        ]);
+
+        let resolved = styles.resolve_object_style("Leaf").unwrap();
+        assert_eq!(resolved.name, "Leaf");
+        assert_eq!(resolved.fill, Some(Fill::swatch("Accent")));
+        assert_eq!(resolved.stroke.as_ref().map(|s| s.weight), Some(1.5));
+        assert_eq!(resolved.paragraph_style.as_deref(), Some("Caption"));
+        assert_eq!(resolved.effects, Some(fx_root.clone()));
+        assert_eq!(styles.object_effects("Leaf"), Some(&fx_root));
+
+        let mut item = Item::new(
+            crate::ItemId(1),
+            crate::LayerId(1),
+            crate::Shape::Rectangle,
+            designcraft_geom::shapes::rectangle(designcraft_geom::Rect::new(0.0, 0.0, 50.0, 50.0)),
+        );
+        assert!(styles.apply_object_style("Leaf", &mut item));
+        assert_eq!(item.fill, Fill::swatch("Accent"));
+        assert_eq!(item.stroke.weight, 1.5);
+        assert_eq!(item.effects, fx_root);
+
+        // Cyclic `based_on` terminates cleanly and merges non-overridden parent attributes.
+        let cyc = styles.resolve_object_style("CycleA").unwrap();
+        assert_eq!(cyc.fill, Some(Fill::swatch("A")));
+        assert_eq!(cyc.stroke.as_ref().map(|s| s.weight), Some(4.0));
+        assert_eq!(styles.object_effects("CycleA"), Some(&fx_root));
+
+        // Depth guard caps chains at `MAX_DEPTH` (32).
+        let deep = Styles {
+            object: (0..40)
+                .map(|i| ObjectStyle {
+                    name: format!("O{i}"),
+                    based_on: Some(format!("O{}", i + 1)),
+                    fill: (i == 32).then(|| Fill::swatch("TooDeep")),
+                    stroke: (i == 31).then(|| Stroke { weight: 7.0, ..Default::default() }),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Styles::default()
+        };
+        let r = deep.resolve_object_style("O0").unwrap();
+        assert!(r.fill.is_none());
+        assert_eq!(r.stroke.as_ref().map(|s| s.weight), Some(7.0));
     }
 }

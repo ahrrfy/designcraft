@@ -696,7 +696,14 @@ pub fn frame_specs(doc: &Document, sid: StoryId) -> Vec<FrameSpec> {
             _ => None,
         };
         let g = &doc.settings.baseline_grid;
-        let (inc, start) = tf.options.baseline_grid.unwrap_or((g.increment, g.start));
+        let top_margin = match (g.relative_to, spread) {
+            (designcraft_doc::GridRelative::TopMargin, Some(sp)) => {
+                let cx = loc.as_ref().map_or_else(|| item.bounds().center().x, |l| (doc.parent_xf(l) * item.bounds().center()).x);
+                sp.page_at_x(cx).and_then(|pi| sp.pages.get(pi)).map_or(0.0, |pg| if pg.margins.top.is_finite() { pg.margins.top } else { 0.0 })
+            }
+            _ => 0.0,
+        };
+        let (inc, start) = tf.options.baseline_grid.unwrap_or((g.increment, g.start + top_margin));
         // Grid lines are at spread y = start + n·inc (page tops are y = 0); map into inner space (translation only).
         let ty = xf.translation().y;
         let grid = (inc > 0.0).then_some((start - ty, inc));
@@ -3589,7 +3596,7 @@ fn tab_leader(tab: &Glyph, leader: &str, x: f64, w: f64, origin: f64, out: &mut 
         for &(gid, adv) in &glyphs {
             out.push(PlacedGlyph {
                 rendered_char: '\t',
-                face: tab.face,
+                face: tab.face.clone(),
                 gid,
                 x: at,
                 y: -tab.shift + tab.dy,
@@ -3712,7 +3719,7 @@ fn place(g: &Glyph, x: f64) -> PlacedGlyph {
         || g.ch == shape::HIDDEN);
     PlacedGlyph {
         rendered_char: g.rendered_char,
-        face: g.face,
+        face: g.face.clone(),
         gid: g.gid,
         x: x + g.dx,
         y: -g.shift + g.dy,

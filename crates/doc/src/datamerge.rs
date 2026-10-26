@@ -3,9 +3,110 @@
 //! Phase 1 stores at most one source. The list is the seam for a later multi-source manager.
 //! Preview is session state and is not stored here.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ItemId, StoryId};
+
+/// Copy-on-write vector backed by an [`Arc`], so cloning a [`Document`](crate::Document) with a
+/// large data-merge table is O(1) while mutations clone on demand through [`Arc::make_mut`].
+#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SharedVec<T>(Arc<Vec<T>>);
+
+impl<T> SharedVec<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+}
+
+impl<T> Default for SharedVec<T> {
+    fn default() -> Self {
+        Self(Arc::new(Vec::new()))
+    }
+}
+
+impl<T: PartialEq> PartialEq for SharedVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl<T> std::ops::Deref for SharedVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for SharedVec<T> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T, I: std::slice::SliceIndex<[T]>> std::ops::Index<I> for SharedVec<T> {
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        std::ops::Index::index(&*self.0, index)
+    }
+}
+
+impl<T: Clone, I: std::slice::SliceIndex<[T]>> std::ops::IndexMut<I> for SharedVec<T> {
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        std::ops::IndexMut::index_mut(Arc::make_mut(&mut self.0), index)
+    }
+}
+
+impl<T> From<Vec<T>> for SharedVec<T> {
+    fn from(v: Vec<T>) -> Self {
+        Self(Arc::new(v))
+    }
+}
+
+impl<T> FromIterator<T> for SharedVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a mut SharedVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::make_mut(&mut self.0).iter_mut()
+    }
+}
+
+impl<T: Clone> IntoIterator for SharedVec<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::unwrap_or_clone(self.0).into_iter()
+    }
+}
 
 /// How a column is read when a placeholder does not say otherwise.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,8 +354,8 @@ impl MergeOptions {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataMerge {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<DataSource>,
+    #[serde(default, skip_serializing_if = "SharedVec::is_empty")]
+    pub sources: SharedVec<DataSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub placeholders: Vec<Placeholder>,
     #[serde(default, skip_serializing_if = "MergeOptions::is_default")]
@@ -264,5 +365,41 @@ pub struct DataMerge {
 impl DataMerge {
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty() && self.placeholders.is_empty() && self.options.is_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloning_data_merge_with_large_source_shares_allocation_until_mutated() {
+        let rows: Vec<Vec<String>> = (0..100_000).map(|i| vec![format!("Person {i}")]).collect();
+        let mut dm = DataMerge::default();
+        dm.sources.push(DataSource {
+            id: 1,
+            path: None,
+            relative_path: None,
+            name: "people.csv".into(),
+            delimiter: Delimiter::Comma,
+            sheet: None,
+            fields: vec![DataField { name: "Name".into(), kind: DataFieldKind::Text }],
+            rows,
+            fingerprint: None,
+            status: SourceStatus::Ok,
+            warnings: Vec::new(),
+        });
+        let mut copy = dm.clone();
+        assert!(SharedVec::ptr_eq(&dm.sources, &copy.sources));
+        assert_eq!(dm, copy);
+
+        copy.sources[0].status = SourceStatus::Modified;
+        assert!(!SharedVec::ptr_eq(&dm.sources, &copy.sources));
+        assert_eq!(dm.sources[0].status, SourceStatus::Ok);
+        assert_eq!(copy.sources[0].status, SourceStatus::Modified);
+
+        let json = serde_json::to_string(&DataMerge { sources: vec![copy.sources[0].clone()].into(), ..Default::default() }).unwrap();
+        let round: DataMerge = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.sources.len(), 1);
     }
 }

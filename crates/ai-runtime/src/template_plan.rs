@@ -33,39 +33,257 @@ fn counting_family(family: &PageFamily, template: &[EngineAction]) -> bool {
     family.id == CAMBRIDGE_ID || has_unbound_counting_frame(template)
 }
 
-// Only the shipped, explicitly identified Cambridge topology is supported. A
-// changed skill never gains permission merely by copying its family/label IDs.
+// Dynamic semantic CPA topology resolution: validates all labeled ten-frame,
+// number-bond, text, and graphic components by semantic label/slot metadata
+// rather than brittle step indices or fixed action counts.
 const CAMBRIDGE_ID: &str = "cambridge-cpa-grammar";
-const CAMBRIDGE_NATIVE: &str = include_str!("../../../skills/kg-oxford-cambridge-style/templates/cambridge-cpa-grammar.json");
 const CAMBRIDGE_EXTRA_ACTIONS: usize = 29; // 2 divider triples, 7 counter triples, group + label.
 
-fn bindable_counting_family(family: &PageFamily, template: &[EngineAction]) -> bool {
-    static NATIVE: std::sync::OnceLock<Option<Vec<EngineAction>>> = std::sync::OnceLock::new();
-    let slots = [
-        ("title-main", 13),
-        ("header-tag", 21),
-        ("grammar-prompt", 39),
-        ("grammar-q", 55),
-        ("grammar-a", 69),
-        ("grammar-rule-1", 83),
-        ("grammar-rule-2", 91),
-        ("grammar-focus", 99),
-        ("cpa-prompt", 105),
-        ("cpa-concrete-label", 121),
-        ("cpa-pictorial-label", 157),
-        ("cpa-bond-label", 193),
+struct CpaTopology {
+    outer_rect: [f64; 4],
+    v1_line: usize,
+    v2_line: usize,
+    tokens: [(usize, usize); 3],
+    tenframe_group: usize,
+}
+
+fn parse_step_id_ref(token: &str, current_index: usize) -> Option<usize> {
+    let body = token.strip_prefix("${").and_then(|s| s.strip_suffix('}')).or_else(|| token.strip_prefix('$'))?;
+    let step_str = body.strip_suffix(".id")?;
+    let step = if step_str == "last" { current_index.checked_sub(1)? } else { step_str.parse::<usize>().ok()? };
+    (step < current_index).then_some(step)
+}
+
+fn action_rect4(action: &EngineAction, key: &str) -> Option<[f64; 4]> {
+    let items = action.params.get(key)?.as_array()?;
+    if items.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0; 4];
+    for (dst, val) in out.iter_mut().zip(items) {
+        let n = val.as_f64()?;
+        if !n.is_finite() {
+            return None;
+        }
+        *dst = n;
+    }
+    Some(out)
+}
+
+fn action_point2(action: &EngineAction, key: &str) -> Option<[f64; 2]> {
+    let items = action.params.get(key)?.as_array()?;
+    if items.len() != 2 {
+        return None;
+    }
+    let x = items.first()?.as_f64()?;
+    let y = items.get(1)?.as_f64()?;
+    (x.is_finite() && y.is_finite()).then_some([x, y])
+}
+
+fn collect_single_id_labels(template: &[EngineAction]) -> Option<BTreeMap<&str, usize>> {
+    const ALLOWED_TF_LABELS: [&str; 7] = [
+        "part.cpa.tf.outer",
+        "part.cpa.tf.mid-h",
+        "part.cpa.tf.v1",
+        "part.cpa.tf.v2",
+        "part.cpa.tf.token-1",
+        "part.cpa.tf.token-2",
+        "part.cpa.tf.token-3",
     ];
-    family.id == CAMBRIDGE_ID
-        && family.text_slots.len() == slots.len()
-        && slots.iter().all(|(id, command)| family.text_slots.iter().any(|slot| slot.id == *id && slot.command == *command))
-        && family.image_slots.len() == 2
-        && [("grammar-scene", [48.0, 138.0, 332.0, 404.0]), ("cpa-concrete", [48.0, 440.0, 206.0, 684.0])].iter().all(|(id, rect)| {
-            family.image_slots.iter().any(|slot| {
-                slot.id == *id && slot.rect == *rect && slot.views.is_empty() && slot.crop.is_none() && slot.source_aspect_ratio.is_none()
+    let mut labels = BTreeMap::new();
+    for (idx, action) in template.iter().enumerate() {
+        if action.command != "object.label" {
+            continue;
+        }
+        let label = action.params.get("label").and_then(Value::as_str)?;
+        if label.starts_with("part.cpa.tf.") && !ALLOWED_TF_LABELS.contains(&label) {
+            return None;
+        }
+        let Some(ids) = action.params.get("ids").and_then(Value::as_array) else {
+            if label.starts_with("part.cpa.") || label.starts_with("group.cpa.") {
+                return None;
+            }
+            continue;
+        };
+        if ids.len() == 1
+            && let Some(id_str) = ids.first().and_then(Value::as_str)
+            && let Some(target) = parse_step_id_ref(id_str, idx)
+        {
+            if labels.insert(label, target).is_some() && (label.starts_with("part.cpa.") || label.starts_with("group.cpa.")) {
+                return None;
+            }
+        } else if label.starts_with("part.cpa.") || label.starts_with("group.cpa.") {
+            return None;
+        }
+    }
+    Some(labels)
+}
+
+fn resolve_cpa_topology_actions(template: &[EngineAction]) -> Option<CpaTopology> {
+    if template.len().checked_add(CAMBRIDGE_EXTRA_ACTIONS).is_none_or(|n| n > MAX_ACTIONS) {
+        return None;
+    }
+    let labels = collect_single_id_labels(template)?;
+    let outer_idx = *labels.get("part.cpa.tf.outer")?;
+    let outer_act = template.get(outer_idx)?;
+    if outer_act.command != "frame.create"
+        || outer_act.params.get("shape").and_then(Value::as_str) != Some("rectangle")
+        || outer_act.params.get("content").and_then(Value::as_str) != Some("unassigned")
+    {
+        return None;
+    }
+    let outer_rect = action_rect4(outer_act, "rect")?;
+    let [x0, y0, x1, y1] = outer_rect;
+    let width = x1 - x0;
+    let height = y1 - y0;
+    if width < 50.0 || height < 20.0 {
+        return None;
+    }
+
+    let mid_h_idx = *labels.get("part.cpa.tf.mid-h")?;
+    let mid_h_act = template.get(mid_h_idx)?;
+    if mid_h_act.command != "line.create" {
+        return None;
+    }
+    let mid_a = action_point2(mid_h_act, "a")?;
+    let mid_b = action_point2(mid_h_act, "b")?;
+    let mid_y = (y0 + y1) * 0.5;
+    if (mid_a[0] - x0).abs() > 0.05 || (mid_b[0] - x1).abs() > 0.05 || (mid_a[1] - mid_y).abs() > 0.05 || (mid_b[1] - mid_y).abs() > 0.05 {
+        return None;
+    }
+
+    let v1_line = *labels.get("part.cpa.tf.v1")?;
+    let v2_line = *labels.get("part.cpa.tf.v2")?;
+    if v1_line == v2_line {
+        return None;
+    }
+    for v_idx in [v1_line, v2_line] {
+        let v_act = template.get(v_idx)?;
+        if v_act.command != "line.create" {
+            return None;
+        }
+        let va = action_point2(v_act, "a")?;
+        let vb = action_point2(v_act, "b")?;
+        if (va[0] - vb[0]).abs() > 0.05 || va[0] <= x0 + 1.0 || va[0] >= x1 - 1.0 || (va[1] - y0).abs() > 0.05 || (vb[1] - y1).abs() > 0.05 {
+            return None;
+        }
+    }
+
+    let mut tokens = [(0usize, 0usize); 3];
+    for (slot_out, token_label) in tokens.iter_mut().zip(["part.cpa.tf.token-1", "part.cpa.tf.token-2", "part.cpa.tf.token-3"]) {
+        let frame_idx = *labels.get(token_label)?;
+        let frame_act = template.get(frame_idx)?;
+        if frame_act.command != "frame.create"
+            || frame_act.params.get("shape").and_then(Value::as_str) != Some("ellipse")
+            || frame_act.params.get("content").and_then(Value::as_str) != Some("unassigned")
+        {
+            return None;
+        }
+        let tr = action_rect4(frame_act, "rect")?;
+        if tr[0] < x0 - 0.05 || tr[1] < y0 - 0.05 || tr[2] > x1 + 0.05 || tr[3] > y1 + 0.05 {
+            return None;
+        }
+        let mut fill_matches = template.iter().enumerate().filter(|(idx, act)| {
+            act.command == "object.fill"
+                && act.params.get("swatch").and_then(Value::as_str).is_some()
+                && act.params.get("ids").and_then(Value::as_array).is_some_and(|ids| {
+                    ids.len() == 1 && ids.first().and_then(Value::as_str).and_then(|s| parse_step_id_ref(s, *idx)) == Some(frame_idx)
+                })
+        });
+        let (fill_idx, _) = fill_matches.next()?;
+        if fill_matches.next().is_some() {
+            return None;
+        }
+        *slot_out = (frame_idx, fill_idx);
+    }
+    if tokens[0].0 == tokens[1].0 || tokens[0].0 == tokens[2].0 || tokens[1].0 == tokens[2].0 {
+        return None;
+    }
+
+    let tenframe_group = *labels.get("group.cpa.pictorial-tenframe")?;
+    let group_act = template.get(tenframe_group)?;
+    if group_act.command != "object.group" {
+        return None;
+    }
+    let group_members: BTreeSet<usize> =
+        group_act.params.get("ids")?.as_array()?.iter().filter_map(|v| v.as_str().and_then(|s| parse_step_id_ref(s, tenframe_group))).collect();
+    for required_member in [outer_idx, mid_h_idx, v1_line, v2_line, tokens[0].0, tokens[1].0, tokens[2].0] {
+        if !group_members.contains(&required_member) {
+            return None;
+        }
+    }
+
+    for nb_label in ["part.cpa.nb.whole", "part.cpa.nb.part-1", "part.cpa.nb.part-2"] {
+        let nb_idx = *labels.get(nb_label)?;
+        let nb_act = template.get(nb_idx)?;
+        if nb_act.command != "frame.create" || nb_act.params.get("shape").and_then(Value::as_str) != Some("ellipse") {
+            return None;
+        }
+    }
+    let nb_group_idx = *labels.get("group.cpa.abstract-numberbond")?;
+    if template.get(nb_group_idx)?.command != "object.group" {
+        return None;
+    }
+
+    Some(CpaTopology { outer_rect, v1_line, v2_line, tokens, tenframe_group })
+}
+
+fn bindable_counting_family(family: &PageFamily, template: &[EngineAction]) -> bool {
+    const REQUIRED_CPA_TEXT_SLOTS: [(&str, &str); 12] = [
+        ("title-main", "part.cambridge-cpa-grammar.title-main"),
+        ("header-tag", "part.ui.header.tag-text"),
+        ("grammar-prompt", "part.cambridge-cpa-grammar.grammar-prompt"),
+        ("grammar-q", "part.bubble.grammar-q.text"),
+        ("grammar-a", "part.bubble.grammar-a.text"),
+        ("grammar-rule-1", "part.grammar.rule-1-txt"),
+        ("grammar-rule-2", "part.grammar.rule-2-txt"),
+        ("grammar-focus", "part.grammar.contraction-txt"),
+        ("cpa-prompt", "part.cambridge-cpa-grammar.cpa-prompt"),
+        ("cpa-concrete-label", "part.cpa.concrete.txt"),
+        ("cpa-pictorial-label", "part.cpa.pictorial.txt"),
+        ("cpa-bond-label", "part.cpa.eq.text"),
+    ];
+    const REQUIRED_CPA_IMAGE_SLOTS: [(&str, &str); 2] = [("grammar-scene", "part.art.grammar-scene"), ("cpa-concrete", "part.art.cpa-concrete")];
+    if family.id != CAMBRIDGE_ID
+        || family.text_slots.len() != REQUIRED_CPA_TEXT_SLOTS.len()
+        || family.image_slots.len() != REQUIRED_CPA_IMAGE_SLOTS.len()
+    {
+        return false;
+    }
+    let Some(labels) = collect_single_id_labels(template) else {
+        return false;
+    };
+    let text_ok = REQUIRED_CPA_TEXT_SLOTS.iter().all(|(slot_id, expected_label)| {
+        let Some(slot) = family.text_slots.iter().find(|s| s.id == *slot_id) else {
+            return false;
+        };
+        labels.get(expected_label) == Some(&slot.command)
+            && template.get(slot.command).is_some_and(|act| {
+                act.command == "frame.create"
+                    && act.params.get("content").and_then(Value::as_str) == Some("text")
+                    && act.params.get("text").and_then(Value::as_str).is_some()
             })
-        })
-        && template.len() == 199
-        && NATIVE.get_or_init(|| serde_json::from_str(CAMBRIDGE_NATIVE).ok()).as_ref().is_some_and(|native| native.as_slice() == template)
+    });
+    let images_ok = REQUIRED_CPA_IMAGE_SLOTS.iter().all(|(slot_id, expected_label)| {
+        let Some(slot) = family.image_slots.iter().find(|s| s.id == *slot_id) else {
+            return false;
+        };
+        if !slot.views.is_empty() || slot.crop.is_some() || slot.source_aspect_ratio.is_some() {
+            return false;
+        }
+        let Some(&frame_idx) = labels.get(expected_label) else {
+            return false;
+        };
+        template
+            .get(frame_idx)
+            .and_then(|act| {
+                (act.command == "frame.create" && act.params.get("content").and_then(Value::as_str) == Some("graphic"))
+                    .then(|| action_rect4(act, "rect"))
+                    .flatten()
+            })
+            .is_some_and(|rect| rect.iter().zip(slot.rect).all(|(a, b)| (a - b).abs() <= 0.05))
+    });
+    text_ok && images_ok && resolve_cpa_topology_actions(template).is_some()
 }
 
 /// Math can retain the template path only when every fixed counting template is
@@ -233,10 +451,12 @@ fn replace_template_param(template: &mut [EngineAction], index: usize, key: &str
     Ok(())
 }
 
-fn counter_rect(index: u32) -> [f64; 4] {
-    // Two rows of five cells, inside the original 132 x 132 point outer frame.
-    let x = 232.0 + (f64::from(index % 5) + 0.5) * 26.4;
-    let y = 480.0 + (f64::from(index / 5) + 0.5) * 66.0;
+fn counter_rect_in(outer_rect: [f64; 4], index: u32) -> [f64; 4] {
+    let [x0, y0, x1, y1] = outer_rect;
+    let col_w = (x1 - x0) / 5.0;
+    let row_h = (y1 - y0) / 2.0;
+    let x = x0 + (f64::from(index % 5) + 0.5) * col_w;
+    let y = y0 + (f64::from(index / 5) + 0.5) * row_h;
     [x - 9.0, y - 9.0, x + 9.0, y + 9.0]
 }
 
@@ -251,24 +471,27 @@ fn counter_swatch(index: u32, values: NumberTriplet) -> &'static str {
 }
 
 fn bound_counting_template(template: &[EngineAction], values: NumberTriplet) -> Result<Vec<EngineAction>, String> {
+    let topo = resolve_cpa_topology_actions(template).ok_or("Supported CPA topology disappeared")?;
+    let [x0, y0, x1, y1] = topo.outer_rect;
+    let col_w = (x1 - x0) / 5.0;
     let mut actions = template.to_vec();
-    for (index, column) in [(142, 1), (145, 2)] {
-        let x = 232.0 + f64::from(column) * 26.4;
-        replace_template_param(&mut actions, index, "a", json!([x, 480.0]))?;
-        replace_template_param(&mut actions, index, "b", json!([x, 612.0]))?;
+    for (index, column) in [(topo.v1_line, 1u32), (topo.v2_line, 2u32)] {
+        let x = x0 + f64::from(column) * col_w;
+        replace_template_param(&mut actions, index, "a", json!([x, y0]))?;
+        replace_template_param(&mut actions, index, "b", json!([x, y1]))?;
     }
-    for (counter, (frame, fill)) in [0u32, 1, 2].into_iter().zip([(148, 149), (151, 152), (154, 155)]) {
-        replace_template_param(&mut actions, frame, "rect", json!(counter_rect(counter)))?;
+    for (counter, (frame, fill)) in [0u32, 1, 2].into_iter().zip(topo.tokens) {
+        replace_template_param(&mut actions, frame, "rect", json!(counter_rect_in(topo.outer_rect, counter)))?;
         replace_template_param(&mut actions, fill, "swatch", json!(counter_swatch(counter, values)))?;
     }
     // Append after all original commands: no authored index, text-slot target,
     // original group member or result reference changes its meaning.
-    let mut members = vec![json!("$161.id")];
-    for column in [3, 4] {
+    let mut members = vec![json!(format!("${}.id", topo.tenframe_group))];
+    for column in [3u32, 4u32] {
         let index = actions.len();
-        let x = 232.0 + f64::from(column) * 26.4;
+        let x = x0 + f64::from(column) * col_w;
         members.push(json!(format!("${index}.id")));
-        actions.push(native_action("line.create", json!({"spread":0,"a":[x,480.0],"b":[x,612.0]})));
+        actions.push(native_action("line.create", json!({"spread":0,"a":[x,y0],"b":[x,y1]})));
         actions.push(native_action(
             "object.stroke",
             json!({"ids":[format!("${index}.id")],"swatch":"C=100 M=90 Y=10 K=0","tint":1.0,"weight":0.7,"cap":"round","join":"round"}),
@@ -278,7 +501,10 @@ fn bound_counting_template(template: &[EngineAction], values: NumberTriplet) -> 
     for counter in 3u32..10 {
         let index = actions.len();
         members.push(json!(format!("${index}.id")));
-        actions.push(native_action("frame.create", json!({"spread":0,"rect":counter_rect(counter),"content":"unassigned","shape":"ellipse"})));
+        actions.push(native_action(
+            "frame.create",
+            json!({"spread":0,"rect":counter_rect_in(topo.outer_rect, counter),"content":"unassigned","shape":"ellipse"}),
+        ));
         actions.push(native_action("object.fill", json!({"ids":[format!("${index}.id")],"swatch":counter_swatch(counter, values),"tint":1.0})));
         actions.push(native_action("object.label", json!({"ids":[format!("${index}.id")],"label":format!("part.cpa.tf.token-{}",counter + 1)})));
     }
@@ -305,8 +531,8 @@ fn profile(skill: &SkillSnapshot) -> Result<&DesignProfile, String> {
         let mut ids = BTreeSet::new();
         let mut targets = BTreeSet::new();
         for slot in &family.text_slots {
-            if slot.id.is_empty() || !ids.insert(&slot.id) || !targets.insert(slot.command) || slot.max_chars == 0 {
-                return Err("Page template text slots must have unique IDs and command targets".into());
+            if slot.id.is_empty() || !ids.insert(&slot.id) || !targets.insert(slot.command) || !(1..=256).contains(&slot.max_chars) {
+                return Err("Page template text slots must have unique IDs, command targets, and max_chars in 1..=256".into());
             }
             let target = actions.get(slot.command).ok_or("Text slot command is outside its native template")?;
             if target.command != "frame.create"
@@ -1857,9 +2083,20 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
         }));
     }
 
+    let family_slot_max_chars: BTreeMap<&str, BTreeMap<&str, usize>> = profile
+        .page_families
+        .iter()
+        .filter(|family| declared_families.contains(&family.id.as_str()))
+        .map(|family| {
+            let slots = family.text_slots.iter().map(|slot| (slot.id.as_str(), slot.max_chars)).collect();
+            (family.id.as_str(), slots)
+        })
+        .collect();
+
     Ok(json!({
         "outline_status": "Suggested static domain outline (not live external research or standards retrieval); educator review and verification are required.",
         "series_identity_policy": "Use the user's original series identity and title; do not reproduce publisher ribbons/logos or claim publisher affiliation, endorsement, certification, or measured similarity.",
+        "family_slot_max_chars": family_slot_max_chars,
         "selected_profile_authority": {
             "style_id": skill.skill_id,
             "name": profile.name,
@@ -2050,7 +2287,9 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
     }
     let profile = profile(skill)?;
     let end = scope_end(scope)?;
-    let content: ContentPlan = serde_json::from_str(text).map_err(|e| format!("Invalid template content: {e}"))?;
+    let mut de = serde_json::Deserializer::from_str(text);
+    let content: ContentPlan = serde_path_to_error::deserialize(&mut de).map_err(|e| format!("Invalid template content: {e}"))?;
+    de.end().map_err(|e| format!("Invalid template content: {e}"))?;
     if !bounded_text(&content.title, 256) || u64::try_from(content.pages.len()).map_err(|_| "Too many pages")? != u64::from(scope.count) {
         return Err("Template content title or page count is invalid".into());
     }
@@ -2404,6 +2643,8 @@ fn append_images(
             slot.rect
         };
         plan.images.push(ImagePlacement {
+            family_id: Some(family.id.clone()),
+            slot_id: Some(slot.id.clone()),
             repeat_rects: Vec::new(),
             repeat_groups: Vec::new(),
             prompt,
@@ -2440,22 +2681,45 @@ fn validate_tree(value: &Value, depth: usize, remaining: &mut usize) -> Result<(
 fn rebase(value: &mut Value, index: usize, offset: usize) -> Result<(), String> {
     match value {
         Value::String(text) => {
-            if text.contains("${") {
+            let (raw_body, was_braced) = if let Some(inner) = text.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+                if inner.contains(['$', '{', '}']) {
+                    return Err("Interpolated native template references are unsupported; use $N.path".into());
+                }
+                (Some(inner), true)
+            } else if text.contains("${") {
                 return Err("Interpolated native template references are unsupported; use $N.path".into());
-            }
-            if let Some(body) = text.strip_prefix('$') {
-                let looks_like_reference = body.starts_with("last") || body.bytes().next().is_some_and(|b| b.is_ascii_digit());
+            } else {
+                (text.strip_prefix('$'), false)
+            };
+            if let Some(body) = raw_body {
+                let looks_like_reference =
+                    was_braced || body == "last" || body.starts_with("last.") || body.bytes().next().is_some_and(|b| b.is_ascii_digit());
                 if looks_like_reference {
-                    let (source, path) = body.split_once('.').ok_or("Native template reference requires $N.path")?;
-                    let source = source.parse::<usize>().map_err(|_| "Invalid native template reference index")?;
-                    if source >= index
-                        || path.is_empty()
-                        || !path.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+                    let (source_tok, path_opt) = match body.split_once('.') {
+                        Some((s, p)) => (s, Some(p)),
+                        None => (body, None),
+                    };
+                    let source = if source_tok == "last" {
+                        index.checked_sub(1).ok_or("Native template $last reference has no preceding action in the same page")?
+                    } else {
+                        source_tok.parse::<usize>().map_err(|_| "Invalid native template reference index")?
+                    };
+                    if source >= index {
+                        return Err("Native template references must address an earlier result in the same page".into());
+                    }
+                    if let Some(path) = path_opt
+                        && (path.is_empty()
+                            || !path
+                                .split('.')
+                                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')))
                     {
                         return Err("Native template references must address an earlier result in the same page".into());
                     }
                     let rebased = source.checked_add(offset).ok_or("Native template reference index overflow")?;
-                    *text = format!("${rebased}.{path}");
+                    *text = match path_opt {
+                        Some(path) => format!("${rebased}.{path}"),
+                        None => format!("${rebased}"),
+                    };
                 }
             }
         }
@@ -2791,7 +3055,7 @@ mod tests {
         let mut skill = skill();
         preflight(&skill, scope(), OutputMode::NativeOnly).unwrap();
         assert!(preflight(&skill, BatchScope { start: 0, count: 200 }, OutputMode::NativeOnly).is_err());
-        skill.templates.get_mut("templates/practice.json").unwrap()[1].params["ids"] = json!(["${0.id}"]);
+        skill.templates.get_mut("templates/practice.json").unwrap()[1].params["ids"] = json!(["item-${0.id}"]);
         assert!(preflight(&skill, scope(), OutputMode::NativeOnly).is_err());
     }
 
@@ -3553,5 +3817,112 @@ mod tests {
                 std::fs::write(dir.join(format!("page-{}.png", page_idx + 1)), &png).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn wave3_rebase_normalizes_braced_and_last_step_references() {
+        let mut plain = json!("$0.id");
+        rebase(&mut plain, 2, 10).unwrap();
+        assert_eq!(plain, json!("$10.id"));
+
+        let mut braced = json!("${0.id}");
+        rebase(&mut braced, 2, 10).unwrap();
+        assert_eq!(braced, json!("$10.id"));
+
+        let mut bare_braced = json!("${1}");
+        rebase(&mut bare_braced, 2, 10).unwrap();
+        assert_eq!(bare_braced, json!("$11"));
+
+        let mut last_field = json!("$last.id");
+        rebase(&mut last_field, 3, 10).unwrap();
+        assert_eq!(last_field, json!("$12.id"));
+
+        let mut braced_last = json!("${last.id}");
+        rebase(&mut braced_last, 3, 10).unwrap();
+        assert_eq!(braced_last, json!("$12.id"));
+
+        let mut bare_last = json!("$last");
+        rebase(&mut bare_last, 3, 10).unwrap();
+        assert_eq!(bare_last, json!("$12"));
+
+        assert!(rebase(&mut json!("$last.id"), 0, 10).is_err());
+        assert!(rebase(&mut json!("item-${0.id}"), 2, 10).is_err());
+    }
+
+    #[test]
+    fn wave3_shifted_cambridge_cpa_template_resolves_dynamically_without_hardcoded_indices() {
+        let mut style = cambridge_skill();
+        let shift = 3usize;
+        {
+            let tpl = style.templates.get_mut("templates/cambridge-cpa-grammar.json").unwrap();
+            for (idx, action) in tpl.iter_mut().enumerate() {
+                rebase(&mut action.params, idx, shift).unwrap();
+            }
+            let prefix = vec![
+                native_action("frame.create", json!({"spread":0,"rect":[46.0,46.0,60.0,60.0],"content":"unassigned","shape":"rectangle"})),
+                native_action("object.fill", json!({"ids":["${0.id}"],"swatch":"[Paper]","tint":0.1})),
+                native_action("object.label", json!({"ids":["$last.id"],"label":"part.ui.header.ribbon-extra"})),
+            ];
+            // Wait: action 2 references $last.id -> action 1? No, object.fill returns null; reference $0.id!
+            let mut full = vec![
+                native_action("frame.create", json!({"spread":0,"rect":[46.0,46.0,60.0,60.0],"content":"unassigned","shape":"rectangle"})),
+                native_action("object.label", json!({"ids":["$last.id"],"label":"part.ui.header.ribbon-extra"})),
+                native_action("object.fill", json!({"ids":["${0.id}"],"swatch":"[Paper]","tint":0.1})),
+            ];
+            let _ = prefix;
+            full.append(tpl);
+            *tpl = full;
+        }
+        for slot in &mut style.design_profile.as_mut().unwrap().page_families[0].text_slots {
+            slot.command += shift;
+        }
+        assert_eq!(style.templates["templates/cambridge-cpa-grammar.json"].len(), 199 + shift);
+        assert!(!requires_adaptive_math("Mathematics CPA addition", std::slice::from_ref(&style)));
+        let content = cambridge_content(&style, "3 + 5 = 8");
+        let plan = compile(&content.to_string(), &style, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap();
+        assert_eq!(plan.commands.len(), 199 + shift + CAMBRIDGE_EXTRA_ACTIONS);
+        let mut session = designcraft_engine::Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
+        session.execute("production.apply", &json!({"commands":plan.commands,"outputMode":"native_only"})).unwrap();
+    }
+
+    #[test]
+    fn wave3_max_chars_propagates_to_blueprint_and_serde_path_reports_exact_field() {
+        let mut s = skill();
+        s.design_profile.as_mut().unwrap().page_families[0].text_slots[0].max_chars = 140;
+        let bp = curriculum_blueprint("Science discovery", &s, BatchScope { start: 0, count: 1 }, 4).unwrap();
+        assert_eq!(bp["family_slot_max_chars"]["practice"]["heading"], json!(140));
+
+        // Explicit (family_id, slot_id) populated on compiled template image placements (including RTL pages).
+        let arabic_content = json!({
+            "title": "درس العلوم",
+            "pages": [{
+                "page": 0,
+                "family": "practice",
+                "text": {"heading": "نَبَاتٌ جَمِيلٌ"},
+                "illustrations": [{"slot": "picture", "prompt": "Green sprout in soil"}]
+            }]
+        });
+        let plan = compile(&arabic_content.to_string(), &s, BatchScope { start: 0, count: 1 }, OutputMode::NativeWithImages).unwrap();
+        assert_eq!(plan.images.len(), 1);
+        assert_eq!(plan.images[0].family_id.as_deref(), Some("practice"));
+        assert_eq!(plan.images[0].slot_id.as_deref(), Some("picture"));
+
+        // serde_path_to_error surfaces the exact failing JSON path.
+        let bad_json = json!({
+            "title": "Broken",
+            "pages": [{"page": 0, "family": "practice", "text": ["not-an-object"]}]
+        });
+        let err = compile(&bad_json.to_string(), &s, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap_err();
+        assert!(err.contains("pages[0].text"), "expected exact field path in error, got: {err}");
+
+        // Trailing or concatenated JSON objects must be rejected rather than silently ignored.
+        let valid_only = json!({
+            "title": "درس العلوم",
+            "pages": [{"page": 0, "family": "practice", "text": {"heading": "نَبَاتٌ جَمِيلٌ"}, "illustrations": []}]
+        });
+        let concatenated = format!("{valid_only} {{\"extra\":true}}");
+        let trailing_err = compile(&concatenated, &s, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap_err();
+        assert!(trailing_err.contains("Invalid template content"), "{trailing_err}");
     }
 }

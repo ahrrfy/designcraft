@@ -22,7 +22,7 @@ fn shared_client() -> Result<Client, String> {
     CLIENT
         .get_or_init(|| {
             Client::builder()
-                .connect_timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(15))
                 .timeout(NETWORK_TIMEOUT)
                 .pool_max_idle_per_host(2)
                 .pool_idle_timeout(Duration::from_secs(60))
@@ -115,10 +115,15 @@ impl<'a> Transport<'a> {
             request = request.timeout(GENERATION_TIMEOUT);
         }
         if let Some(key) = self.key {
-            let mut value = HeaderValue::from_str(if self.provider == ProviderKind::Gemini { key } else { "" }).map_err(|_| "Invalid API key")?;
-            if self.provider != ProviderKind::Gemini {
-                value = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| "Invalid API key")?;
-            }
+            let mut value = if self.provider == ProviderKind::Gemini {
+                HeaderValue::from_str(key).map_err(|_| "Invalid API key")?
+            } else {
+                use zeroize::Zeroize;
+                let mut bearer = format!("Bearer {key}");
+                let parsed = HeaderValue::from_str(&bearer);
+                bearer.zeroize();
+                parsed.map_err(|_| "Invalid API key")?
+            };
             value.set_sensitive(true);
             request =
                 if self.provider == ProviderKind::Gemini { request.header("x-goog-api-key", value) } else { request.header(AUTHORIZATION, value) };
@@ -156,21 +161,161 @@ impl<'a> Transport<'a> {
     }
 }
 
-fn send_raw(request: RequestBuilder) -> Result<Response, String> {
-    request.send().map_err(|error| {
-        // Do not expose reqwest errors: they can contain full URLs and credentials.
-        let detail = if error.is_connect() {
-            if error.is_timeout() {
-                "AI provider connection timed out; no automatic retry was sent"
-            } else {
-                "AI provider connection failed; no automatic retry was sent"
+const MAX_LIVE_HTTP_WORKERS: usize = 16;
+static LIVE_HTTP_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ACTIVE_LOCAL_ORIGINS: OnceLock<std::sync::Mutex<std::collections::BTreeSet<(u8, String)>>> = OnceLock::new();
+
+struct HttpWorkerSlot;
+
+impl HttpWorkerSlot {
+    fn acquire() -> Result<Self, String> {
+        let mut current = LIVE_HTTP_WORKERS.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_LIVE_HTTP_WORKERS {
+                return Err("Too many cancelled AI HTTP requests are still shutting down; wait before starting another request".into());
             }
-        } else if error.is_timeout() {
-            "AI provider response timed out; request outcome is unknown; no automatic retry was sent"
-        } else {
-            "AI provider request failed before a complete response; request outcome is unknown; no automatic retry was sent"
+            match LIVE_HTTP_WORKERS.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for HttpWorkerSlot {
+    fn drop(&mut self) {
+        LIVE_HTTP_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct LocalOriginRelease {
+    key: (u8, String),
+}
+
+impl Drop for LocalOriginRelease {
+    fn drop(&mut self) {
+        if let Some(origins) = ACTIVE_LOCAL_ORIGINS.get() {
+            let mut guard = origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&self.key);
+        }
+    }
+}
+
+thread_local! {
+    static CURRENT_ORIGIN_LEASE: std::cell::RefCell<std::sync::Weak<LocalOriginRelease>> =
+        const { std::cell::RefCell::new(std::sync::Weak::new()) };
+}
+
+struct LocalOriginLease {
+    token: Option<std::sync::Arc<LocalOriginRelease>>,
+}
+
+impl LocalOriginLease {
+    fn acquire(provider: ProviderKind, base: &Url) -> Result<Self, String> {
+        let tag = match provider {
+            ProviderKind::Ollama => 1_u8,
+            ProviderKind::ComfyUi => 2_u8,
+            ProviderKind::OpenAi | ProviderKind::Gemini => return Ok(Self { token: None }),
         };
-        detail.into()
+        let key = (tag, base.origin().ascii_serialization());
+        let origins = ACTIVE_LOCAL_ORIGINS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        {
+            let mut guard = origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !guard.insert(key.clone()) {
+                return Err("Another local inference is running; wait before sending another request".into());
+            }
+        }
+        let token = std::sync::Arc::new(LocalOriginRelease { key });
+        let weak = std::sync::Arc::downgrade(&token);
+        CURRENT_ORIGIN_LEASE.with(|slot| {
+            let _ = slot.replace(weak);
+        });
+        Ok(Self { token: Some(token) })
+    }
+}
+
+impl Drop for LocalOriginLease {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let weak = std::sync::Arc::downgrade(&token);
+            CURRENT_ORIGIN_LEASE.with(|slot| {
+                let clear = std::sync::Weak::ptr_eq(&slot.borrow(), &weak);
+                if clear {
+                    let _ = slot.replace(std::sync::Weak::new());
+                }
+            });
+        }
+    }
+}
+
+fn current_origin_lease() -> Option<std::sync::Arc<LocalOriginRelease>> {
+    CURRENT_ORIGIN_LEASE.with(|slot| slot.borrow().upgrade())
+}
+
+fn await_cancelable<T: Send + 'static>(
+    cancel: &AtomicBool,
+    work: impl FnOnce(std::sync::Arc<AtomicBool>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    check_cancel(cancel)?;
+    let worker_slot = HttpWorkerSlot::acquire()?;
+    let origin_lease = current_origin_lease();
+    let local_lease = if origin_lease.is_some() { super::current_local_lease() } else { None };
+    let bg_cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_cancel = std::sync::Arc::clone(&bg_cancel);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("dc-ai-http".into())
+        .spawn(move || {
+            let outcome = {
+                let _slot = worker_slot;
+                let _local_lease = local_lease;
+                let _origin_lease = origin_lease;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(worker_cancel)))
+                    .unwrap_or_else(|_| Err("AI provider HTTP worker failed unexpectedly; no automatic retry was sent".into()))
+            };
+            let _ = tx.send(outcome);
+        })
+        .map_err(|_| "Cannot spawn bounded AI HTTP worker".to_string())?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            bg_cancel.store(true, Ordering::Relaxed);
+            return Err("AI request cancelled".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => {
+                if cancel.load(Ordering::Relaxed) {
+                    bg_cancel.store(true, Ordering::Relaxed);
+                    return Err("AI request cancelled".into());
+                }
+                return result;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bg_cancel.store(true, Ordering::Relaxed);
+                check_cancel(cancel)?;
+                return Err("AI provider HTTP worker disconnected before completion; no automatic retry was sent".into());
+            }
+        }
+    }
+}
+
+fn send_raw(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String> {
+    await_cancelable(cancel, move |_bg_cancel| {
+        request.send().map_err(|error| {
+            // Do not expose reqwest errors: they can contain full URLs and credentials.
+            let detail = if error.is_connect() {
+                if error.is_timeout() {
+                    "AI provider connection timed out; no automatic retry was sent"
+                } else {
+                    "AI provider connection failed; no automatic retry was sent"
+                }
+            } else if error.is_timeout() {
+                "AI provider response timed out; request outcome is unknown; no automatic retry was sent"
+            } else {
+                "AI provider request failed before a complete response; request outcome is unknown; no automatic retry was sent"
+            };
+            detail.into()
+        })
     })
 }
 
@@ -187,7 +332,7 @@ fn retry_after_delay_ms(response: &Response) -> Option<u64> {
 fn sleep_cancelable(mut remaining_ms: u64, cancel: &AtomicBool) -> Result<(), String> {
     check_cancel(cancel)?;
     while remaining_ms > 0 {
-        let slice = remaining_ms.min(50);
+        let slice = remaining_ms.min(25);
         std::thread::sleep(Duration::from_millis(slice));
         check_cancel(cancel)?;
         remaining_ms = remaining_ms.saturating_sub(slice);
@@ -216,7 +361,7 @@ fn check_http_status(response: Response) -> Result<Response, String> {
 
 fn send_once(request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, String> {
     check_cancel(cancel)?;
-    let response = send_raw(request)?;
+    let response = send_raw(request, cancel)?;
     check_cancel(cancel)?;
     check_http_status(response)
 }
@@ -227,7 +372,7 @@ fn send(mut request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, St
         check_cancel(cancel)?;
         let retry_clone = if attempt < 2 { request.try_clone() } else { None };
         // Timeouts, connection errors, and read failures return Err from send_raw and are NEVER retried.
-        let response = send_raw(request)?;
+        let response = send_raw(request, cancel)?;
         check_cancel(cancel)?;
         let code = response.status().as_u16();
         if matches!(code, 429 | 503)
@@ -245,25 +390,29 @@ fn send(mut request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, St
 }
 
 fn read_bounded(mut response: Response, cancel: &AtomicBool, limit: usize) -> Result<Vec<u8>, String> {
+    check_cancel(cancel)?;
     if response.content_length().is_some_and(|size| size > limit as u64) {
         return Err("AI response exceeds size limit".into());
     }
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        check_cancel(cancel)?;
-        let count = response.read(&mut chunk).map_err(|error| response_read_error(&error))?;
-        if count == 0 {
-            break;
+    await_cancelable(cancel, move |bg_cancel| {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            if bg_cancel.load(Ordering::Relaxed) {
+                return Err("AI request cancelled".into());
+            }
+            let count = response.read(&mut chunk).map_err(|error| response_read_error(&error))?;
+            if count == 0 {
+                break;
+            }
+            if bytes.len().saturating_add(count) > limit {
+                return Err("AI response exceeds size limit".into());
+            }
+            let part = chunk.get(..count).ok_or("Invalid AI response chunk")?;
+            bytes.extend_from_slice(part);
         }
-        if bytes.len().saturating_add(count) > limit {
-            return Err("AI response exceeds size limit".into());
-        }
-        let part = chunk.get(..count).ok_or("Invalid AI response chunk")?;
-        bytes.extend_from_slice(part);
-    }
-    check_cancel(cancel)?;
-    Ok(bytes)
+        Ok(bytes)
+    })
 }
 
 fn response_read_error(error: &std::io::Error) -> &'static str {
@@ -597,6 +746,7 @@ pub(super) fn generate(
     cancel: &AtomicBool,
 ) -> Result<GenerationResponse, String> {
     let transport = Transport::new(selection, key)?;
+    let _origin_lease = LocalOriginLease::acquire(transport.provider, &transport.base)?;
     generate_with_post(selection, request, cancel, |path, body, once| {
         if once { transport.post_once(path, body, cancel, MAX_JSON_BYTES) } else { transport.post(path, body, cancel, MAX_JSON_BYTES) }
     })
@@ -1087,6 +1237,7 @@ pub(super) fn generate_comfy(
         return Err("ComfyUI timeout or poll interval outside supported limits".into());
     }
     let transport = Transport::new(selection, key)?;
+    let _origin_lease = LocalOriginLease::acquire(transport.provider, &transport.base)?;
     check_cancel(cancel)?;
     // Once submitted, capture its id even if cancellation arrives while waiting
     // for the response, so cleanup can address exactly this pending queue item.
@@ -1165,13 +1316,7 @@ fn poll_comfy(
             }
         }
         // Short slices make cancellation responsive between bounded HTTP calls.
-        let mut remaining = request.poll_interval_ms;
-        while remaining > 0 {
-            check_cancel(cancel)?;
-            let sleep = remaining.min(50);
-            std::thread::sleep(Duration::from_millis(sleep));
-            remaining = remaining.saturating_sub(sleep);
-        }
+        sleep_cancelable(request.poll_interval_ms, cancel)?;
     }
 }
 

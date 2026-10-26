@@ -9,6 +9,7 @@ use designcraft_ai_providers::{SecretString, validate_endpoint};
 use designcraft_ai_types::{ModelSelection, ProviderKind};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use zeroize::Zeroize;
 
 const SERVICE: &str = "org.storytold.designcraft.ai.v1";
 const MAX_SECRET_BYTES: usize = 1280;
@@ -33,8 +34,9 @@ pub(crate) struct SessionKey {
 impl SessionKey {
     pub(crate) fn new(selection: &ModelSelection, secret: SecretString) -> Result<Self, String> {
         validate_secret(&secret)?;
-        let endpoint = validate_endpoint(selection)?.to_string();
+        let mut endpoint = validate_endpoint(selection)?.to_string();
         if endpoint.contains(secret.expose()) {
+            endpoint.zeroize();
             return Err("API key must not occur in endpoint URLs".into());
         }
         Ok(Self { provider: selection.provider, endpoint, secret })
@@ -49,8 +51,22 @@ impl SessionKey {
     }
 }
 
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.endpoint.zeroize();
+    }
+}
+
 pub(crate) fn selected_key(keys: &[SessionKey], selection: &ModelSelection) -> Option<SecretString> {
     selected_key_with(keys, selection, |name| std::env::var(name).ok())
+}
+
+fn into_validated_secret(mut raw: String) -> Result<SecretString, String> {
+    if raw.is_empty() || raw.len() > MAX_SECRET_BYTES || raw.chars().any(char::is_control) {
+        raw.zeroize();
+        return Err("API key is empty, too long, or contains control characters".into());
+    }
+    Ok(SecretString::new(raw))
 }
 
 fn selected_key_with(keys: &[SessionKey], selection: &ModelSelection, environment: impl FnOnce(&str) -> Option<String>) -> Option<SecretString> {
@@ -67,9 +83,7 @@ fn selected_key_with(keys: &[SessionKey], selection: &ModelSelection, environmen
     if endpoint != canonical {
         return None;
     }
-    let secret = SecretString::new(environment(name)?);
-    validate_secret(&secret).ok()?;
-    Some(secret)
+    into_validated_secret(environment(name)?).ok()
 }
 
 impl std::fmt::Debug for Vault {
@@ -98,8 +112,10 @@ impl Vault {
     }
 
     pub fn load(&self, selection: &ModelSelection) -> Result<Option<SecretString>, String> {
-        let target = self.target(selection)?;
-        let secret = guard(|| NativeBackend.load(&target))?;
+        let mut target = self.target(selection)?;
+        let secret = guard(|| NativeBackend.load(&target));
+        target.zeroize();
+        let secret = secret?;
         if let Some(secret) = &secret {
             validate_secret(secret)?;
         }
@@ -107,23 +123,32 @@ impl Vault {
     }
 
     pub fn remove(&self, selection: &ModelSelection) -> Result<(), String> {
-        let target = self.target(selection)?;
-        guard(|| NativeBackend.remove(&target))
+        let mut target = self.target(selection)?;
+        let result = guard(|| NativeBackend.remove(&target));
+        target.zeroize();
+        result
     }
 
     /// Returns only presence. The key is never loaded into UI/snapshot DTOs.
     pub fn presence(&self, selection: &ModelSelection) -> Result<bool, String> {
-        let target = self.target(selection)?;
-        guard(|| NativeBackend.presence(&target))
+        let mut target = self.target(selection)?;
+        let result = guard(|| NativeBackend.presence(&target));
+        target.zeroize();
+        result
     }
 
     fn save_with(&self, backend: &impl Backend, selection: &ModelSelection, secret: &SecretString) -> Result<(), String> {
         validate_secret(secret)?;
-        if validate_endpoint(selection)?.as_str().contains(secret.expose()) {
+        let mut endpoint = String::from(validate_endpoint(selection)?);
+        let leaked_in_endpoint = endpoint.contains(secret.expose());
+        endpoint.zeroize();
+        if leaked_in_endpoint {
             return Err("API key must not occur in endpoint URLs".into());
         }
-        let target = self.target(selection)?;
-        guard(|| backend.save(&target, secret))
+        let mut target = self.target(selection)?;
+        let result = guard(|| backend.save(&target, secret));
+        target.zeroize();
+        result
     }
 
     fn target(&self, selection: &ModelSelection) -> Result<String, String> {
@@ -335,6 +360,22 @@ mod tests {
                 assert!(selected_key_with(&[], &custom, |_| panic!("must not read environment for an unauthorized endpoint")).is_none());
             }
         }
+    }
+
+    #[test]
+    fn sec07_temporary_secret_validation_and_endpoint_leak_rejections_cleanly_fail() {
+        assert!(into_validated_secret(String::new()).is_err());
+        assert!(into_validated_secret("bad\0key".into()).is_err());
+        let ok = into_validated_secret("synthetic-valid-secret".into()).unwrap();
+        assert_eq!(ok.expose(), "synthetic-valid-secret");
+
+        let leaked_sel = ModelSelection {
+            provider: ProviderKind::OpenAi,
+            model: "test-model".into(),
+            endpoint: Some("https://proxy.example/synthetic-valid-secret/v1/".into()),
+        };
+        assert!(SessionKey::new(&leaked_sel, SecretString::new("synthetic-valid-secret".into())).is_err());
+        assert!(selected_key_with(&[], &model(), |_| Some("invalid\nenv\nsecret".into())).is_none());
     }
 
     #[cfg(not(windows))]

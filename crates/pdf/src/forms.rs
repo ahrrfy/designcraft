@@ -77,6 +77,20 @@ fn pdf_string(s: &str) -> String {
     o
 }
 
+/// Body of a PDF Name object (without the leading `/`), with `#XX` escapes for non-graphic bytes,
+/// whitespace and PDF delimiters (`#`, `(`, `)`, `<`, `>`, `[`, `]`, `{`, `}`, `/`, `%`).
+fn pdf_name_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if !b.is_ascii_graphic() || b"#()<>[]{}/%".contains(&b) {
+            let _ = write!(out, "#{b:02X}");
+        } else {
+            out.push(char::from(b));
+        }
+    }
+    out
+}
+
 /// Add `fields` and `media` to `pdf` (page indices in output order). `None` when the file's
 /// structure isn't the simple kind this understands.
 pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -> Option<Vec<u8>> {
@@ -117,7 +131,7 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
         let Some(&page_ref) = kids.get(*page) else { continue };
         let (file, spec, rendition, screen) = (next, next + 1, next + 2, next + 3);
         next += 4;
-        let mut body = format!("<</Type/EmbeddedFile/Subtype/{}/Length {}>>\nstream\n", mime.replace('/', "#2F"), data.len()).into_bytes();
+        let mut body = format!("<</Type/EmbeddedFile/Subtype/{}/Length {}>>\nstream\n", pdf_name_body(mime), data.len()).into_bytes();
         body.extend_from_slice(data);
         body.extend_from_slice(b"\nendstream");
         put(&mut out, file, &body);
@@ -254,4 +268,18 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
     let _ = write!(x, "trailer\n<</Size {next}/Root {root} 0 R{info}{id}/Prev {prev}>>\nstartxref\n{xref_at}\n%%EOF\n");
     out.extend_from_slice(x.as_bytes());
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_name_body_escapes_delimiters_whitespace_and_hash() {
+        assert_eq!(pdf_name_body("video/mp4"), "video#2Fmp4");
+        let hostile = "video/mp4>>/Launch(cmd)<< #%\n\x00";
+        let escaped = pdf_name_body(hostile);
+        assert_eq!(escaped, "video#2Fmp4#3E#3E#2FLaunch#28cmd#29#3C#3C#20#23#25#0A#00");
+        assert!(!escaped.bytes().any(|b| !b.is_ascii_graphic() || b"()<>[]{}/%".contains(&b)));
+    }
 }

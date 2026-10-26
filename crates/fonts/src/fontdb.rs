@@ -2,8 +2,10 @@
 //! time a lookup needs them, native only), outline cache.
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use kurbo::BezPath;
 use skrifa::instance::{Location, LocationRef, Size};
@@ -139,40 +141,26 @@ pub struct FontFace {
     postscript: std::sync::OnceLock<Option<String>>,
 }
 
-/// A cheap `Copy` handle to a face. Faces are never unloaded, so the handle lives for the rest of
-/// the process; unlike cloning an `Arc`, copying it touches no shared reference count (which made
-/// parallel composition scale negatively).
-#[derive(Clone, Copy)]
-pub struct FaceRef(&'static FontFace);
+/// Reference-counted handle to a loaded face. Unlike leaking into `'static`, faces loaded from a
+/// closed document scope or superseded by [`FontDb::reload_fonts`] are freed once no cache or
+/// composed story holds them.
+#[derive(Clone)]
+pub struct FaceRef(Arc<FontFace>);
 
 impl FaceRef {
-    /// The handle for a loaded face (memoised per face).
+    /// The handle for a loaded face.
     pub fn of(face: &Arc<FontFace>) -> FaceRef {
-        static LEAKED: RwLock<Vec<Option<&'static FontFace>>> = RwLock::new(Vec::new());
-        let id = face.id as usize;
-        if let Some(Some(f)) = LEAKED.read().unwrap_or_else(|e| e.into_inner()).get(id) {
-            return FaceRef(f);
-        }
-        let mut w = LEAKED.write().unwrap_or_else(|e| e.into_inner());
-        if w.len() <= id {
-            w.resize(id + 1, None);
-        }
-        let f: &'static FontFace = w[id].unwrap_or_else(|| {
-            let keep: &'static Arc<FontFace> = Box::leak(Box::new(face.clone()));
-            keep
-        });
-        w[id] = Some(f);
-        FaceRef(f)
+        FaceRef(face.clone())
     }
-    pub fn get(self) -> &'static FontFace {
-        self.0
+    pub fn get(&self) -> &FontFace {
+        &self.0
     }
 }
 
 impl std::ops::Deref for FaceRef {
     type Target = FontFace;
     fn deref(&self) -> &FontFace {
-        self.0
+        &self.0
     }
 }
 
@@ -424,10 +412,10 @@ pub struct FontDb {
     /// The document font files read, by path: (length, modification time, faces). A document
     /// opened again finds its unchanged files here instead of reading them again.
     #[cfg(not(target_arch = "wasm32"))]
-    document_files: Mutex<HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Vec<Arc<FontFace>>)>>,
+    document_files: Mutex<HashMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>, Vec<std::sync::Weak<FontFace>>)>>,
     /// Variable font instances (`Style {wght:650}`), made on first use, by base face and style.
-    instances: RwLock<HashMap<(u32, String), Arc<FontFace>>>,
-    outlines: Mutex<HashMap<(u32, u32), Arc<BezPath>>>,
+    instances: quick_cache::sync::Cache<(u32, String), Arc<FontFace>>,
+    outlines: quick_cache::sync::Cache<(u32, u32), Arc<BezPath>>,
     #[cfg(not(target_arch = "wasm32"))]
     catalog: RwLock<Vec<CatalogEntry>>,
     /// Each installed font file read into the shared fonts, with its (length, modification time)
@@ -636,7 +624,6 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// Scopes are never reused: a closed document's scope finds no fonts ever after.
 #[cfg(not(target_arch = "wasm32"))]
 static NEXT_SCOPE: AtomicU32 = AtomicU32::new(1);
-const OUTLINE_CACHE_MAX: usize = 50_000;
 
 fn aliases(font: &skrifa::FontRef<'_>, ids: &[StringId]) -> Vec<String> {
     let mut names: Vec<String> =
@@ -1090,8 +1077,8 @@ impl FontDb {
             scopes: RwLock::new(HashMap::new()),
             #[cfg(not(target_arch = "wasm32"))]
             document_files: Mutex::new(HashMap::new()),
-            instances: RwLock::new(HashMap::new()),
-            outlines: Mutex::new(HashMap::new()),
+            instances: quick_cache::sync::Cache::new(512),
+            outlines: quick_cache::sync::Cache::new(16_384),
             #[cfg(not(target_arch = "wasm32"))]
             catalog: RwLock::new(Vec::new()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1280,8 +1267,8 @@ impl FontDb {
                     }
                     keep
                 });
-                self.instances.write().unwrap_or_else(|e| e.into_inner()).retain(|(base, _), f| !dropped.contains(base) && !stale(f));
-                self.outlines.lock().unwrap_or_else(|e| e.into_inner()).retain(|(face, _), _| !dropped.contains(face));
+                self.instances.retain(|(base, _), f| !dropped.contains(base) && !stale(f));
+                self.outlines.retain(|(face, _), _| !dropped.contains(face));
                 log::debug!("reloading {} changed font files ({} faces)", changed.len(), dropped.len());
             }
             ReloadedFonts { cataloged, changed }
@@ -1471,10 +1458,17 @@ impl FontDb {
         room: u64,
     ) -> Result<(Vec<Arc<FontFace>>, u64), String> {
         use std::io::Read;
-        if let Some((len, m, faces)) = self.document_files.lock().unwrap_or_else(|e| e.into_inner()).get(path)
-            && (*len, *m) == (listed, modified)
         {
-            return Ok((faces.clone(), listed));
+            let mut guard = self.document_files.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((len, m, weaks)) = guard.get(path)
+                && (*len, *m) == (listed, modified)
+            {
+                let upgraded: Vec<Arc<FontFace>> = weaks.iter().filter_map(std::sync::Weak::upgrade).collect();
+                if upgraded.len() == weaks.len() && !upgraded.is_empty() {
+                    return Ok((upgraded, listed));
+                }
+            }
+            guard.retain(|_, (_, _, ws)| ws.iter().all(|w| w.strong_count() > 0));
         }
         // One byte past the limit catches a file that grew since it was listed.
         let mut data = Vec::new();
@@ -1499,14 +1493,28 @@ impl FontDb {
         if faces.is_empty() {
             return Err("not a font DesignCraft can read".into());
         }
-        self.document_files.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), (listed, modified, faces.clone()));
+        let weaks: Vec<std::sync::Weak<FontFace>> = faces.iter().map(Arc::downgrade).collect();
+        self.document_files.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_path_buf(), (listed, modified, weaks));
         Ok((faces, len))
     }
 
-    /// Close a document's font scope: its fonts are no longer found (in it or anywhere). Their
-    /// files stay read, for the document opening again.
+    /// Close a document's font scope: its fonts are no longer found (in it or anywhere), and
+    /// unreferenced document font entries/outlines/instances are pruned so closed documents do not
+    /// retain font data indefinitely.
     pub fn close_scope(&self, scope: u32) {
-        self.scopes.write().unwrap_or_else(|e| e.into_inner()).remove(&scope);
+        let removed = self.scopes.write().unwrap_or_else(|e| e.into_inner()).remove(&scope);
+        let Some(faces) = removed else { return };
+        let weak_faces: Vec<(u32, std::sync::Weak<FontFace>)> = faces.iter().map(|f| (f.id, Arc::downgrade(f))).collect();
+        drop(faces);
+        let dead_ids: std::collections::HashSet<u32> = weak_faces.into_iter().filter_map(|(id, w)| (w.strong_count() == 0).then_some(id)).collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.document_files.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, _, ws)| ws.iter().all(|w| w.strong_count() > 0));
+        }
+        if !dead_ids.is_empty() {
+            self.instances.retain(|(base, _), f| !dead_ids.contains(base) && !dead_ids.contains(&f.id));
+            self.outlines.retain(|(face, _), _| !dead_ids.contains(face));
+        }
     }
 
     /// The shared fonts' face for `family` + `style` (see [`ScopedFonts::face`]).
@@ -1624,16 +1632,12 @@ impl FontDb {
     /// disappears.
     pub fn outline(&self, face: &FontFace, gid: u32) -> Arc<BezPath> {
         let key = (face.id, gid);
-        if let Some(p) = self.outlines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return p.clone();
+        if let Some(p) = self.outlines.get(&key) {
+            return p;
         }
         let drawn = font_outline(face, gid);
         let p = Arc::new(if gid == 0 && drawn.elements().is_empty() { self.missing_box(face).unwrap_or(drawn) } else { drawn });
-        let mut cache = self.outlines.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.len() >= OUTLINE_CACHE_MAX {
-            cache.clear();
-        }
-        cache.insert(key, p.clone());
+        self.outlines.insert(key, p.clone());
         p
     }
 }
@@ -1992,8 +1996,8 @@ impl ScopedFonts<'_> {
             return Some(base);
         }
         let key = (base.id, style.to_string());
-        if let Some(f) = self.db.instances.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return Some(f.clone());
+        if let Some(f) = self.db.instances.get(&key) {
+            return Some(f);
         }
         let mut coords = base.coords.clone();
         for kv in style[open + 1..].trim_end_matches('}').split(',') {
@@ -2009,8 +2013,9 @@ impl ScopedFonts<'_> {
                 None => coords.push((tag, v)),
             }
         }
-        let f = make_face(base.bytes.clone(), base.source.clone(), base.index, base.family.clone(), style.to_string(), coords)?;
-        Some(self.db.instances.write().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert_with(|| Arc::new(f)).clone())
+        let f = Arc::new(make_face(base.bytes.clone(), base.source.clone(), base.index, base.family.clone(), style.to_string(), coords)?);
+        self.db.instances.insert(key, f.clone());
+        Some(f)
     }
 
     fn find(&self, family: &str, style: &str) -> Option<Arc<FontFace>> {
@@ -2258,5 +2263,46 @@ mod tests_heights {
             let face = face_of(undeclared(font_mapping("Heights", glyphs).unwrap()));
             assert_eq!((face.cap_height, face.x_height), (face.ascent * 0.72, face.ascent * 0.5), "{glyphs:?}");
         }
+    }
+
+    #[test]
+    fn face_ref_releases_arc_without_process_lifetime_leak() {
+        let arc = Arc::new(face_of(font_mapping("TransientFace", &[('A', 'A')]).unwrap()));
+        let weak = Arc::downgrade(&arc);
+        let fref = FaceRef::of(&arc);
+        assert_eq!(fref.get().family, "Test");
+        drop(arc);
+        assert_eq!(weak.strong_count(), 1);
+        drop(fref);
+        assert_eq!(weak.strong_count(), 0, "dropping last FaceRef must free FontFace");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn close_scope_prunes_unreferenced_document_files_and_outlines() {
+        let dir = std::env::temp_dir().join(format!("dc-docfont-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ephemeral.ttf");
+        std::fs::write(&file, font_mapping("DocFont Ephemeral", &[('e', 'e')]).unwrap()).unwrap();
+
+        let db = FontDb::with_font_dirs(vec![]);
+        let loaded = db.load_document_fonts(&dir, &|_| Ok(()));
+        assert!(loaded.scope > 0);
+        let weak = {
+            let face = db.scoped(loaded.scope).face("DocFont Ephemeral", "Regular");
+            let gid = face.glyph_for('e');
+            let _ = db.outline(&face, gid);
+            assert!(db.outlines.contains_key(&(face.id(), gid)));
+            Arc::downgrade(&face)
+        };
+        assert_eq!(db.document_files.lock().unwrap().len(), 1);
+
+        db.close_scope(loaded.scope);
+        assert_eq!(weak.strong_count(), 0, "unreferenced document font must be freed on close_scope");
+        assert!(db.document_files.lock().unwrap().is_empty(), "dead Weak entries must be pruned");
+        assert!(db.outlines.is_empty(), "outlines of dead document faces must be pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
