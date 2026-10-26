@@ -528,20 +528,18 @@ fn has_soft_effects(e: &designcraft_doc::Effects) -> bool {
         || e.directional_feather.on
 }
 
-/// Soft effects other than the gradient feather (on the item or its resolved object style), or a
-/// knockout group.
-fn raster_effects(d: &designcraft_doc::Document, it: &designcraft_doc::Item) -> bool {
+/// Soft effects other than the gradient feather (which PDF export draws itself), or a knockout
+/// group. Effective object-style effects (including `basedOn` chains) are already materialized on
+/// `it.effects`, while local overrides that disable a style's effect keep `on == false` on the item.
+fn raster_effects(it: &designcraft_doc::Item) -> bool {
     // Knockout groups too: PDF output here has no knockout transparency groups.
-    it.knockout
-        || has_soft_effects(&it.effects)
-        || d.styles.object_effects(&it.object_style).is_some_and(has_soft_effects)
-        || super::style::resolved_object_style(&d.styles, &it.object_style).and_then(|s| s.effects).as_ref().is_some_and(has_soft_effects)
+    it.knockout || has_soft_effects(&it.effects)
 }
 
 /// A copy of `d` where spread-level objects with soft effects are 300 ppi images of their whole
 /// appearance (transparent around them, so they composite over what's behind).
 fn rasterize_effects(d: &designcraft_doc::Document, cache: &designcraft_compose::Cache) -> (Option<designcraft_doc::Document>, usize) {
-    rasterize_where(d, cache, 300.0, true, |it| raster_effects(d, it) && !threaded(d, it))
+    rasterize_where(d, cache, 300.0, true, |it| raster_effects(it) && !threaded(d, it))
 }
 
 /// A copy of `d` where the spread-level objects `pred` picks are images of their appearance at
@@ -567,30 +565,12 @@ fn rasterize_where(
     let mut n = 0;
     for (si, id) in todo {
         let Some(it) = d.item(id) else { continue };
-        let style_fx = (!has_soft_effects(&it.effects))
-            .then(|| {
-                super::style::resolved_object_style(&d.styles, &it.object_style)
-                    .and_then(|s| s.effects)
-                    .or_else(|| d.styles.object_effects(&it.object_style).cloned())
-                    .filter(has_soft_effects)
-            })
-            .flatten();
-        let outset = match &style_fx {
-            Some(fx) => {
-                let mut tmp = it.clone();
-                tmp.effects = fx.clone();
-                designcraft_render::effect_outset(&tmp)
-            }
-            None => designcraft_render::effect_outset(it),
-        };
+        let outset = designcraft_render::effect_outset(it);
         let reach = it.bounds().inflate(outset + it.stroke.extent() + 2.0, outset + it.stroke.extent() + 2.0);
         // Just this object on its spread, no paper.
         let mut solo = d.clone();
         let sp = std::sync::Arc::make_mut(&mut solo.spreads[si]);
         sp.items.retain(|x| x.id == id);
-        if let (Some(fx), Some(only)) = (style_fx, sp.items.first_mut()) {
-            std::sync::Arc::make_mut(only).effects = fx;
-        }
         for pg in &mut sp.pages {
             pg.show_parent_items = false;
         }
@@ -1421,18 +1401,31 @@ mod pdf_fixes_tests {
         s.execute("style.object.create", &json!({"name": "Shadow Child", "basedOn": "Shadow Base", "fill": "[Black]"})).unwrap();
         let id = ItemId(s.execute("frame.create", &json!({"rect": [72, 72, 180, 180]})).unwrap()["id"].as_u64().unwrap());
         s.execute("style.object.apply", &json!({"name": "Shadow Child", "ids": [id.0]})).unwrap();
-        // Simulate an unmaterialised/imported style reference where item.effects itself is unset.
-        s.edit(|d, _| {
-            d.item_mut(id).unwrap().effects = Default::default();
-            Ok(())
-        })
-        .unwrap();
 
         let r = s.execute("file.exportPdf", &json!({})).unwrap();
         assert!(
             r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("1 object(s) with soft effects")),
-            "expected soft-effect rasterisation warning, got: {}",
+            "expected inherited soft-effect rasterisation warning, got: {}",
             r["warnings"]
+        );
+
+        // Explicitly disabling the inherited drop shadow on the item must be respected in export
+        // rather than re-injecting the object style's shadow.
+        s.execute("object.dropShadow", &json!({"ids": [id.0], "on": false})).unwrap();
+        let r_disabled = s.execute("file.exportPdf", &json!({})).unwrap();
+        assert!(
+            !r_disabled["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("soft effects")),
+            "explicitly disabled shadow must not be rasterised from style, got: {}",
+            r_disabled["warnings"]
+        );
+
+        // Clearing overrides restores the style's inherited shadow and exports it again.
+        s.execute("style.object.clearOverrides", &json!({"ids": [id.0]})).unwrap();
+        let r_restored = s.execute("file.exportPdf", &json!({})).unwrap();
+        assert!(
+            r_restored["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("1 object(s) with soft effects")),
+            "expected restored soft-effect rasterisation warning, got: {}",
+            r_restored["warnings"]
         );
     }
 

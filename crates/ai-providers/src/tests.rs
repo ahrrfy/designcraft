@@ -963,9 +963,25 @@ mod native_tests {
         assert_eq!(err, "AI request cancelled");
         assert!(elapsed < std::time::Duration::from_millis(400), "expected cancellation in < 400ms, took {elapsed:?}");
 
+        // While the cancelled blocking request is still stalled on the local server, a second
+        // local generation to that origin must be rejected rather than bypassing single-request admission.
+        let concurrent_err = generate(&sel, None, &request(), &AtomicBool::new(false)).unwrap_err();
+        assert!(concurrent_err.contains("Another local inference is running"), "{concurrent_err}");
+
         let (lock, cvar) = &*release_stall;
         *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         cvar.notify_all();
         server.join().unwrap();
+
+        // Once the detached HTTP worker finishes unwinding, the local origin slot is released.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let probe = generate(&sel, None, &request(), &AtomicBool::new(false));
+            if probe.as_ref().is_err_and(|msg| !msg.contains("Another local inference is running")) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "local origin slot remained stuck after worker exit: {probe:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

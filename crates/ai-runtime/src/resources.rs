@@ -6,10 +6,8 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ACTIVE_GPU_ADAPTER: Mutex<Option<GpuSnapshot>> = Mutex::new(None);
 
 /// Record an active graphics adapter hint (for example from `wgpu::AdapterInfo` at UI startup)
@@ -68,34 +66,24 @@ pub(crate) fn test_admission_snapshot() -> Option<ResourceSnapshot> {
     TEST_ADMISSION_SNAPSHOT.with(|current| current.borrow().clone())
 }
 
-/// Held throughout one local inference request (including Comfy polling).
-/// One process-wide slot prevents concurrent local generation from profiles.
+/// Held throughout one local inference request (including Comfy polling and any detached HTTP
+/// worker unwinding after cancellation). One process-wide slot prevents concurrent local generation.
 pub struct LocalRequestGuard {
-    held: bool,
-}
-impl Drop for LocalRequestGuard {
-    fn drop(&mut self) {
-        if self.held {
-            LOCAL_INFERENCE_ACTIVE.store(false, Ordering::Release);
-        }
-    }
+    _lease: designcraft_ai_providers::LocalInferenceLease,
 }
 
 impl LocalRequestGuard {
     pub fn acquire(selection: &ModelSelection, policy: &LocalResourcePolicy) -> Result<Self, String> {
         policy.validate()?;
         if !matches!(selection.provider, ProviderKind::Ollama | ProviderKind::ComfyUi) {
-            return Ok(Self { held: false });
+            return Ok(Self { _lease: designcraft_ai_providers::LocalInferenceLease::inactive() });
         }
         if selection.provider == ProviderKind::Ollama && is_cloud_model(&selection.model) {
             return Err("Cloud-tagged Ollama models are disabled in local generation; choose a downloaded local model".into());
         }
         let snapshot = admission_memory_snapshot();
         admit_memory(policy, &snapshot)?;
-        LOCAL_INFERENCE_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| "Another local inference is running; wait before sending another request".to_string())?;
-        Ok(Self { held: true })
+        Ok(Self { _lease: designcraft_ai_providers::LocalInferenceLease::acquire()? })
     }
 }
 
@@ -664,5 +652,114 @@ mod tests {
         let hints = active_or_env_gpu_hints();
         clear_active_gpu_adapter();
         assert!(hints.iter().any(|g| g.name == "Intel(R) Arc(TM) B580 Graphics" && g.total_vram_mb == 12_288));
+    }
+
+    #[test]
+    fn cancelled_local_http_retains_request_guard_admission_until_worker_exits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _healthy = TestAdmissionGuard::healthy();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let release_stall = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let server_release = std::sync::Arc::clone(&release_stall);
+        let server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf);
+                let (lock, cvar) = &*server_release;
+                let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = cvar.wait_timeout_while(guard, Duration::from_secs(10), |released| !*released);
+            }
+        });
+
+        let policy = LocalResourcePolicy::default();
+        let ollama = ModelSelection { provider: ProviderKind::Ollama, model: "llama3.2:latest".into(), endpoint: Some(endpoint) };
+        let comfy = ModelSelection { provider: ProviderKind::ComfyUi, model: "sdxl.safetensors".into(), endpoint: None };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel_trigger = std::sync::Arc::clone(&cancel);
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            cancel_trigger.store(true, Ordering::Relaxed);
+        });
+
+        let req = designcraft_ai_providers::GenerationRequest {
+            system: "sys".into(),
+            prompt: "hello".into(),
+            json_schema: serde_json::json!({"type": "object"}),
+            max_output_tokens: 64,
+            images: Vec::new(),
+            resources: policy.clone(),
+        };
+        {
+            let _guard = LocalRequestGuard::acquire(&ollama, &policy).unwrap();
+            let err = designcraft_ai_providers::generate(&ollama, None, &req, &cancel).unwrap_err();
+            assert_eq!(err, "AI request cancelled");
+        }
+        canceller.join().unwrap();
+
+        // Even after LocalRequestGuard dropped on the cancelled caller, the process-wide local
+        // admission slot must stay held while the detached HTTP worker is still blocked.
+        let blocked = LocalRequestGuard::acquire(&comfy, &policy).err().expect("expected local admission to stay busy");
+        assert!(blocked.contains("Another local inference is running"), "{blocked}");
+
+        let (lock, cvar) = &*release_stall;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+        server.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reacquired = loop {
+            match LocalRequestGuard::acquire(&comfy, &policy) {
+                Ok(guard) => break guard,
+                Err(err) => {
+                    assert!(Instant::now() < deadline, "local admission slot did not release after HTTP worker exited: {err}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        drop(reacquired);
+
+        // Defense-in-depth: a cancelled non-inference HTTP worker (`origin_lease.is_none()`, same
+        // branch taken by cloud Gemini/OpenAI calls) spawned while an outer LocalRequestGuard is
+        // held on the same thread must NEVER inherit the local admission token.
+        let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe_endpoint = format!("http://{}/", probe_listener.local_addr().unwrap());
+        let probe_release = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let probe_server_release = std::sync::Arc::clone(&probe_release);
+        let probe_server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = probe_listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut hello = [0u8; 1024];
+                let _ = socket.read(&mut hello);
+                let (lock, cvar) = &*probe_server_release;
+                let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = cvar.wait_timeout_while(guard, Duration::from_secs(10), |released| !*released);
+            }
+        });
+        let probe_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let probe_cancel_trigger = std::sync::Arc::clone(&probe_cancel);
+        let probe_canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            probe_cancel_trigger.store(true, Ordering::Relaxed);
+        });
+        let discovery = ModelSelection { provider: ProviderKind::Ollama, model: "llama3.2:latest".into(), endpoint: Some(probe_endpoint) };
+        {
+            let _outer_local = LocalRequestGuard::acquire(&comfy, &policy).unwrap();
+            let err = designcraft_ai_providers::list_models(&discovery, None, &probe_cancel).unwrap_err();
+            assert_eq!(err, "AI request cancelled");
+        }
+        probe_canceller.join().unwrap();
+
+        // While the non-inference HTTP socket is still stalled, local admission must already be free!
+        let immediate_local = LocalRequestGuard::acquire(&comfy, &policy).expect("non-inference HTTP worker must not retain local admission");
+        drop(immediate_local);
+
+        let (lock, cvar) = &*probe_release;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+        probe_server.join().unwrap();
     }
 }

@@ -208,6 +208,64 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) { Err("AI request cancelled".into()) } else { Ok(()) }
 }
 
+static LOCAL_INFERENCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct LocalSlotRelease;
+
+impl Drop for LocalSlotRelease {
+    fn drop(&mut self) {
+        LOCAL_INFERENCE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+thread_local! {
+    static CURRENT_LOCAL_LEASE: std::cell::RefCell<std::sync::Weak<LocalSlotRelease>> =
+        const { std::cell::RefCell::new(std::sync::Weak::new()) };
+}
+
+/// Process-wide single-local-request admission lease shared with any spawned HTTP worker so a
+/// cancelled blocking request keeps the admission slot occupied until the background call stops.
+pub struct LocalInferenceLease {
+    token: Option<std::sync::Arc<LocalSlotRelease>>,
+}
+
+impl LocalInferenceLease {
+    pub fn inactive() -> Self {
+        Self { token: None }
+    }
+
+    pub fn acquire() -> Result<Self, String> {
+        LOCAL_INFERENCE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "Another local inference is running; wait before sending another request".to_string())?;
+        let token = std::sync::Arc::new(LocalSlotRelease);
+        let weak = std::sync::Arc::downgrade(&token);
+        CURRENT_LOCAL_LEASE.with(|slot| {
+            let _ = slot.replace(weak);
+        });
+        Ok(Self { token: Some(token) })
+    }
+}
+
+impl Drop for LocalInferenceLease {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let weak = std::sync::Arc::downgrade(&token);
+            CURRENT_LOCAL_LEASE.with(|slot| {
+                let clear = std::sync::Weak::ptr_eq(&slot.borrow(), &weak);
+                if clear {
+                    let _ = slot.replace(std::sync::Weak::new());
+                }
+            });
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn current_local_lease() -> Option<std::sync::Arc<LocalSlotRelease>> {
+    CURRENT_LOCAL_LEASE.with(|slot| slot.borrow().upgrade())
+}
+
 fn is_forbidden_cloud_ipv4(ip: std::net::Ipv4Addr) -> bool {
     let octets = ip.octets();
     ip.is_loopback()

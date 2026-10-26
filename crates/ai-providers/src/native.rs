@@ -161,19 +161,118 @@ impl<'a> Transport<'a> {
     }
 }
 
+const MAX_LIVE_HTTP_WORKERS: usize = 16;
+static LIVE_HTTP_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ACTIVE_LOCAL_ORIGINS: OnceLock<std::sync::Mutex<std::collections::BTreeSet<(u8, String)>>> = OnceLock::new();
+
+struct HttpWorkerSlot;
+
+impl HttpWorkerSlot {
+    fn acquire() -> Result<Self, String> {
+        let mut current = LIVE_HTTP_WORKERS.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_LIVE_HTTP_WORKERS {
+                return Err("Too many cancelled AI HTTP requests are still shutting down; wait before starting another request".into());
+            }
+            match LIVE_HTTP_WORKERS.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Ok(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for HttpWorkerSlot {
+    fn drop(&mut self) {
+        LIVE_HTTP_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct LocalOriginRelease {
+    key: (u8, String),
+}
+
+impl Drop for LocalOriginRelease {
+    fn drop(&mut self) {
+        if let Some(origins) = ACTIVE_LOCAL_ORIGINS.get() {
+            let mut guard = origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&self.key);
+        }
+    }
+}
+
+thread_local! {
+    static CURRENT_ORIGIN_LEASE: std::cell::RefCell<std::sync::Weak<LocalOriginRelease>> =
+        const { std::cell::RefCell::new(std::sync::Weak::new()) };
+}
+
+struct LocalOriginLease {
+    token: Option<std::sync::Arc<LocalOriginRelease>>,
+}
+
+impl LocalOriginLease {
+    fn acquire(provider: ProviderKind, base: &Url) -> Result<Self, String> {
+        let tag = match provider {
+            ProviderKind::Ollama => 1_u8,
+            ProviderKind::ComfyUi => 2_u8,
+            ProviderKind::OpenAi | ProviderKind::Gemini => return Ok(Self { token: None }),
+        };
+        let key = (tag, base.origin().ascii_serialization());
+        let origins = ACTIVE_LOCAL_ORIGINS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        {
+            let mut guard = origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !guard.insert(key.clone()) {
+                return Err("Another local inference is running; wait before sending another request".into());
+            }
+        }
+        let token = std::sync::Arc::new(LocalOriginRelease { key });
+        let weak = std::sync::Arc::downgrade(&token);
+        CURRENT_ORIGIN_LEASE.with(|slot| {
+            let _ = slot.replace(weak);
+        });
+        Ok(Self { token: Some(token) })
+    }
+}
+
+impl Drop for LocalOriginLease {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let weak = std::sync::Arc::downgrade(&token);
+            CURRENT_ORIGIN_LEASE.with(|slot| {
+                let clear = std::sync::Weak::ptr_eq(&slot.borrow(), &weak);
+                if clear {
+                    let _ = slot.replace(std::sync::Weak::new());
+                }
+            });
+        }
+    }
+}
+
+fn current_origin_lease() -> Option<std::sync::Arc<LocalOriginRelease>> {
+    CURRENT_ORIGIN_LEASE.with(|slot| slot.borrow().upgrade())
+}
+
 fn await_cancelable<T: Send + 'static>(
     cancel: &AtomicBool,
     work: impl FnOnce(std::sync::Arc<AtomicBool>) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     check_cancel(cancel)?;
+    let worker_slot = HttpWorkerSlot::acquire()?;
+    let origin_lease = current_origin_lease();
+    let local_lease = if origin_lease.is_some() { super::current_local_lease() } else { None };
     let bg_cancel = std::sync::Arc::new(AtomicBool::new(false));
     let worker_cancel = std::sync::Arc::clone(&bg_cancel);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("dc-ai-http".into())
         .spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(worker_cancel)))
-                .unwrap_or_else(|_| Err("AI provider HTTP worker failed unexpectedly; no automatic retry was sent".into()));
+            let outcome = {
+                let _slot = worker_slot;
+                let _local_lease = local_lease;
+                let _origin_lease = origin_lease;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(worker_cancel)))
+                    .unwrap_or_else(|_| Err("AI provider HTTP worker failed unexpectedly; no automatic retry was sent".into()))
+            };
             let _ = tx.send(outcome);
         })
         .map_err(|_| "Cannot spawn bounded AI HTTP worker".to_string())?;
@@ -647,6 +746,7 @@ pub(super) fn generate(
     cancel: &AtomicBool,
 ) -> Result<GenerationResponse, String> {
     let transport = Transport::new(selection, key)?;
+    let _origin_lease = LocalOriginLease::acquire(transport.provider, &transport.base)?;
     generate_with_post(selection, request, cancel, |path, body, once| {
         if once { transport.post_once(path, body, cancel, MAX_JSON_BYTES) } else { transport.post(path, body, cancel, MAX_JSON_BYTES) }
     })
@@ -1137,6 +1237,7 @@ pub(super) fn generate_comfy(
         return Err("ComfyUI timeout or poll interval outside supported limits".into());
     }
     let transport = Transport::new(selection, key)?;
+    let _origin_lease = LocalOriginLease::acquire(transport.provider, &transport.base)?;
     check_cancel(cancel)?;
     // Once submitted, capture its id even if cancellation arrives while waiting
     // for the response, so cleanup can address exactly this pending queue item.

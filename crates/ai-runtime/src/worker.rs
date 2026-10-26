@@ -597,7 +597,7 @@ impl Runner<'_> {
     }
     fn generate_plan_candidate(&mut self, selection: &ModelSelection, request: &GenerationRequest) -> Result<GenerationResponse, String> {
         check_cancel(self.cancel)?;
-        let _resources = crate::resources::LocalRequestGuard::acquire(selection, &request.resources)?;
+        let resources = crate::resources::LocalRequestGuard::acquire(selection, &request.resources)?;
         let input = request.system.len().saturating_add(request.prompt.len()).saturating_add(bounded_json(&request.json_schema, MAX_PROMPT)?.len());
         if input > MAX_PROMPT {
             return Err("AI prompt exceeds the bounded context limit".into());
@@ -607,6 +607,7 @@ impl Runner<'_> {
             self.ledger.reserve_with_output(input, request.images.len(), selection.provider, false, None, Some(request.max_output_tokens))?;
         self.usage()?;
         let result = guarded(|| self.provider.generate(selection, key.as_ref().map(providers::SecretString::expose), request, self.cancel));
+        drop(resources);
         self.ledger.record(reservation, result.as_ref().ok().map(|response| &response.usage));
         self.usage()?;
         check_cancel(self.cancel)?;
@@ -1267,13 +1268,14 @@ impl Runner<'_> {
                 if let Some(comfy) = &image_request.comfy {
                     crate::resources::check_comfy_workflow(&comfy.workflow, &settings.resources)?;
                 }
-                let _resources = crate::resources::LocalRequestGuard::acquire(&settings.image_model, &settings.resources)?;
+                let resources = crate::resources::LocalRequestGuard::acquire(&settings.image_model, &settings.resources)?;
                 // Reserve an explicit image allowance too; unknown image token usage is not free.
                 let reservation = self.ledger.reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
                 self.usage()?;
                 let response = guarded(|| {
                     self.provider.images(&settings.image_model, key.as_ref().map(providers::SecretString::expose), &image_request, self.cancel)
                 });
+                drop(resources);
                 self.ledger.record(reservation, response.as_ref().ok().map(|response| &response.usage));
                 self.usage()?;
                 check_cancel(self.cancel)?;
@@ -2960,7 +2962,9 @@ fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
     let value: Value = serde_json::from_str(text).map_err(|e| format!("Invalid structured JSON: {e}"))?;
     bounded_json(&value, MAX_JSON)?;
     let mut de = serde_json::Deserializer::from_str(text);
-    serde_path_to_error::deserialize(&mut de).map_err(|e| format!("Invalid structured response: {e}"))
+    let parsed = serde_path_to_error::deserialize(&mut de).map_err(|e| format!("Invalid structured response: {e}"))?;
+    de.end().map_err(|e| format!("Invalid structured response: {e}"))?;
+    Ok(parsed)
 }
 fn validate_actions(actions: &[EngineAction], catalog: &Value, mode: OutputMode) -> Result<(), String> {
     let allowed = allowed_commands(catalog, mode)?;
@@ -9209,5 +9213,94 @@ mod tests {
         )
         .unwrap_err();
         assert!(native_err.contains("commands[0].command"), "native_err={native_err}");
+    }
+
+    #[test]
+    fn local_comfy_image_releases_local_admission_before_cloud_review_runs() {
+        struct HybridReviewProbe {
+            held_during_images: AtomicBool,
+            free_during_cloud_review: AtomicBool,
+        }
+        impl Provider for HybridReviewProbe {
+            fn generate(&self, sel: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                assert_eq!(sel.provider, ProviderKind::Gemini);
+                let probe = crate::resources::LocalRequestGuard::acquire(
+                    &ModelSelection { provider: ProviderKind::Ollama, model: "llama3.2:latest".into(), endpoint: None },
+                    &designcraft_ai_types::LocalResourcePolicy::default(),
+                );
+                self.free_during_cloud_review.store(probe.is_ok(), Ordering::SeqCst);
+                drop(probe);
+                Ok(GenerationResponse { text: r#"{"verdict":"pass","reasons":[]}"#.into(), usage: Usage::default(), error: None })
+            }
+            fn images(&self, sel: &ModelSelection, _: Option<&str>, _: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                assert_eq!(sel.provider, ProviderKind::ComfyUi);
+                let probe = crate::resources::LocalRequestGuard::acquire(
+                    &ModelSelection { provider: ProviderKind::Ollama, model: "llama3.2:latest".into(), endpoint: None },
+                    &designcraft_ai_types::LocalResourcePolicy::default(),
+                );
+                self.held_during_images.store(probe.is_err(), Ordering::SeqCst);
+                let mut png = Vec::new();
+                let img = image::RgbaImage::from_pixel(32, 32, image::Rgba([20, 80, 140, 255]));
+                img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+                Ok(ImageResponse {
+                    images: vec![providers::GeneratedImage { bytes: png, filename: "probe.png".into(), mime_type: "image/png".into() }],
+                    usage: Usage::default(),
+                    error: None,
+                })
+            }
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+        }
+
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _healthy = crate::resources::TestAdmissionGuard::healthy();
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+        let base = session.doc().unwrap().clone();
+        let plan = ProductionPlan {
+            title: "Hybrid Probe".into(),
+            commands: vec![EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread": 0, "content": "graphic", "rect": [72.0, 72.0, 172.0, 172.0]}),
+            }],
+            images: vec![designcraft_ai_types::protocol::ImagePlacement {
+                family_id: None,
+                slot_id: None,
+                repeat_rects: vec![],
+                repeat_groups: vec![],
+                prompt: "Blue square emblem".into(),
+                page: 0,
+                rect: [72.0, 72.0, 172.0, 172.0],
+                label: "Emblem".into(),
+            }],
+        };
+        let settings = AiSettings {
+            output_mode: OutputMode::NativeWithImages,
+            verify_generated_images: true,
+            text_model: ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None },
+            image_model: ModelSelection { provider: ProviderKind::ComfyUi, model: "sdxl.safetensors".into(), endpoint: None },
+            comfy_workflow: Some(json!({"1": {"class_type": "KSampler", "inputs": {"steps": 10}}})),
+            ..Default::default()
+        };
+        let mut ledger = UsageLedger::new(BudgetSpec::default()).unwrap();
+        let (sender, _rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let probe = HybridReviewProbe { held_during_images: AtomicBool::new(false), free_during_cloud_review: AtomicBool::new(false) };
+        let mut runner = Runner {
+            cache_root: None,
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &probe,
+        };
+        let mut cache = BTreeMap::new();
+        let mut bytes_used = 0usize;
+        runner.expand_images_with_geometry(plan, &settings, &mut cache, &mut bytes_used, None, None, Some(&base)).unwrap();
+        assert!(probe.held_during_images.load(Ordering::SeqCst), "local admission must be active during ComfyUI image generation");
+        assert!(probe.free_during_cloud_review.load(Ordering::SeqCst), "local admission must be released before cloud Gemini review starts");
     }
 }

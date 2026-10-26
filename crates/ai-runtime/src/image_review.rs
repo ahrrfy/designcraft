@@ -160,6 +160,7 @@ pub(crate) fn parse(text: &str) -> Result<ReviewVerdict, String> {
     let mut de = serde_json::Deserializer::from_str(text);
     let review: ReviewVerdict =
         serde_path_to_error::deserialize(&mut de).map_err(|error| format!("Invalid illustration review response: {error}"))?;
+    de.end().map_err(|error| format!("Invalid illustration review response: {error}"))?;
     if review.reasons.len() > MAX_REASONS
         || review.reasons.iter().any(|reason| reason.trim().is_empty() || reason.contains('\0') || reason.chars().count() > MAX_REASON_CHARS)
     {
@@ -375,5 +376,19 @@ mod tests {
         let decoded = image::load_from_memory(&inspection.bytes).unwrap();
         assert!(decoded.width() <= MAX_INSPECTION_SIDE && decoded.height() <= MAX_INSPECTION_SIDE);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&request.prompt).unwrap()["reduced_inspection_reference"], true);
+    }
+
+    #[test]
+    fn image_review_parse_rejects_concatenated_verdicts_and_trailing_tokens() {
+        let concatenated = r#"{"verdict":"pass","reasons":[]} {"verdict":"fail","reasons":["wrong count"]}"#;
+        let err = parse(concatenated).unwrap_err();
+        assert!(err.contains("Invalid illustration review response"), "{err}");
+
+        let trailing_garbage = "{\"verdict\":\"pass\",\"reasons\":[]}\ntrailing";
+        let err2 = parse(trailing_garbage).unwrap_err();
+        assert!(err2.contains("Invalid illustration review response"), "{err2}");
+
+        let valid_ws = "  {\"verdict\":\"pass\",\"reasons\":[]} \n\t ";
+        assert_eq!(parse(valid_ws).unwrap().verdict, Verdict::Pass);
     }
 }

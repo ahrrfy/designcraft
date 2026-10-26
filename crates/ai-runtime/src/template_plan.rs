@@ -2289,6 +2289,7 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
     let end = scope_end(scope)?;
     let mut de = serde_json::Deserializer::from_str(text);
     let content: ContentPlan = serde_path_to_error::deserialize(&mut de).map_err(|e| format!("Invalid template content: {e}"))?;
+    de.end().map_err(|e| format!("Invalid template content: {e}"))?;
     if !bounded_text(&content.title, 256) || u64::try_from(content.pages.len()).map_err(|_| "Too many pages")? != u64::from(scope.count) {
         return Err("Template content title or page count is invalid".into());
     }
@@ -3914,5 +3915,14 @@ mod tests {
         });
         let err = compile(&bad_json.to_string(), &s, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap_err();
         assert!(err.contains("pages[0].text"), "expected exact field path in error, got: {err}");
+
+        // Trailing or concatenated JSON objects must be rejected rather than silently ignored.
+        let valid_only = json!({
+            "title": "درس العلوم",
+            "pages": [{"page": 0, "family": "practice", "text": {"heading": "نَبَاتٌ جَمِيلٌ"}, "illustrations": []}]
+        });
+        let concatenated = format!("{valid_only} {{\"extra\":true}}");
+        let trailing_err = compile(&concatenated, &s, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap_err();
+        assert!(trailing_err.contains("Invalid template content"), "{trailing_err}");
     }
 }
