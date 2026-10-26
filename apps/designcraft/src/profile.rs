@@ -28,8 +28,69 @@ fn config_dir_with(os: &str, env: impl Fn(&str) -> Option<OsString>, exe_dir: Op
 
 /// The folder that holds settings and recovery data instead of the user's profile:
 /// `DESIGNCRAFT_CONFIG_DIR` (empty: none at all), else a portable install's data folder.
+const MAX_LAUNCHER_MANIFEST_BYTES: u64 = 65_536;
+
+fn valid_git_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_manifest_profile(manifest_path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let meta = std::fs::metadata(manifest_path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_LAUNCHER_MANIFEST_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(manifest_path).ok()?.take(MAX_LAUNCHER_MANIFEST_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_LAUNCHER_MANIFEST_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?.trim_start_matches('\u{feff}');
+    let val: serde_json::Value = serde_json::from_str(text).ok()?;
+    let raw = val.get("profile")?.as_str()?.trim();
+    if raw.is_empty() || raw.contains(['\0', '\r', '\n']) {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    (path.is_absolute() && writable(&path)).then_some(path)
+}
+
+fn managed_launcher_profile_dir(env: &impl Fn(&str) -> Option<OsString>, exe_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(manifest_os) = env("DESIGNCRAFT_PREVIEW_MANIFEST") {
+        let manifest_path = PathBuf::from(manifest_os);
+        if manifest_path.is_absolute()
+            && let Some(profile) = read_manifest_profile(&manifest_path)
+        {
+            return Some(profile);
+        }
+    }
+    let commit_dir = exe_dir.filter(|p| p.is_absolute())?;
+    let commit_name = commit_dir.file_name()?.to_str().filter(|s| valid_git_commit(s))?;
+    let _ = commit_name;
+    let versions_dir = commit_dir.parent().filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("versions")))?;
+    let managed_dir =
+        versions_dir.parent().filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("managed-updates")))?;
+    let outputs_dir = managed_dir.parent()?;
+    let primary = outputs_dir.join("current-gemini-integrated-trial.json");
+    if let Some(profile) = read_manifest_profile(&primary) {
+        return Some(profile);
+    }
+    for entry in std::fs::read_dir(outputs_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path != primary
+            && path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("json"))
+            && let Some(profile) = read_manifest_profile(&path)
+        {
+            return Some(profile);
+        }
+    }
+    None
+}
+
 fn root_with(env: impl Fn(&str) -> Option<OsString>, exe_dir: Option<&Path>) -> Option<OsString> {
-    env("DESIGNCRAFT_CONFIG_DIR").or_else(|| exe_dir.and_then(portable_dir).map(PathBuf::into_os_string))
+    env("DESIGNCRAFT_CONFIG_DIR")
+        .or_else(|| managed_launcher_profile_dir(&env, exe_dir).map(PathBuf::into_os_string))
+        .or_else(|| exe_dir.and_then(portable_dir).map(PathBuf::into_os_string))
 }
 
 /// `<dir>/DesignCraftData` when `dir` holds [`PORTABLE_MARKER`], where `dir` is the folder the
@@ -74,7 +135,7 @@ fn app_bundle_parent(exe_dir: &Path) -> Option<&Path> {
 }
 
 fn unwritable_portable_dir_with(env: impl Fn(&str) -> Option<OsString>, exe_dir: Option<&Path>) -> Option<PathBuf> {
-    if env("DESIGNCRAFT_CONFIG_DIR").is_some() {
+    if env("DESIGNCRAFT_CONFIG_DIR").is_some() || managed_launcher_profile_dir(&env, exe_dir).is_some() {
         return None;
     }
     exe_dir.and_then(marked_data_dir).filter(|data| !writable(data))
@@ -184,6 +245,25 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&plain);
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn managed_updates_version_uses_adjacent_launcher_profile_before_portable_marker() {
+        let root = std::env::temp_dir().join(format!("designcraft-managed-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sha = "7d6c803056b79af9bec58118b5940fc7c5fd6c5a";
+        let exe_dir = root.join("outputs/managed-updates/versions").join(sha);
+        let shared_profile = root.join("outputs/ai-preview-profile");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join(PORTABLE_MARKER), "").unwrap();
+        let manifest = serde_json::json!({
+            "profile": shared_profile.to_string_lossy(),
+            "executable": exe_dir.join("designcraft.exe").to_string_lossy(),
+        });
+        std::fs::write(root.join("outputs/current-gemini-integrated-trial.json"), manifest.to_string()).unwrap();
+
+        assert_eq!(config_dir_with("windows", environment, Some(&exe_dir)), Some(shared_profile));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Unix only: permissions are how a test makes a folder read-only. Root writes through them,

@@ -167,8 +167,22 @@ fn parse_initial_arabic_locale_signals(
     {
         return resolved;
     }
-    for candidate in [preferred_ui_languages, locale_name].into_iter().flatten() {
-        let first = candidate.split(['\0', '\r', '\n', ';', ',']).find(|s| !s.trim().is_empty()).unwrap_or("");
+    if let Some(pref) = preferred_ui_languages {
+        let first = pref.split(['\0', '\r', '\n', ';', ',']).find(|s| !s.trim().is_empty()).unwrap_or("");
+        if parse_lang_tag(first) == Some("ar") {
+            return "ar";
+        }
+    }
+    if preferred_ui_languages.is_none_or(|p| p.trim().is_empty())
+        && let Some(langs) = user_profile_languages
+    {
+        let first = langs.split(['\0', '\r', '\n', ';', ',']).find(|s| !s.trim().is_empty()).unwrap_or("");
+        if parse_lang_tag(first) == Some("ar") {
+            return "ar";
+        }
+    }
+    if let Some(loc) = locale_name {
+        let first = loc.split(['\0', '\r', '\n', ';', ',']).find(|s| !s.trim().is_empty()).unwrap_or("");
         if parse_lang_tag(first) == Some("ar") {
             return "ar";
         }
@@ -241,11 +255,12 @@ fn load_prefs(app: &mut DesignApp) {
         return;
     }
     if let Some(p) = prefs_path() {
-        if let Ok(bytes) = std::fs::read(&p) {
-            if let Ok(ui) = designcraft_ui_egui::UiState::from_preferences_json(&bytes) {
-                app.ui = ui;
-            }
-        } else if !p.exists() {
+        if let Ok(bytes) = std::fs::read(&p)
+            && let Ok(ui) = designcraft_ui_egui::UiState::from_preferences_json(&bytes)
+        {
+            app.ui = ui;
+        }
+        if !app.ui.language_explicit && app.ui.language.is_empty() {
             let detected = detect_initial_ui_language();
             if !detected.is_empty() {
                 app.ui.language = detected.into();
@@ -940,5 +955,6 @@ mod exit_recovery_tests {
         assert_eq!(parse_initial_arabic_locale_signals(None, None, Some("en-US"), Some("1256"), Some("720"), Some("en-US\0ar-IQ")), "ar");
         assert_eq!(parse_initial_arabic_locale_signals(None, Some("ar-EG\0en-US"), Some("en-US"), Some("1252"), Some("437"), None), "ar");
         assert_eq!(parse_initial_arabic_locale_signals(None, Some("en-US"), Some("en-US"), Some("1252"), Some("437"), Some("en-US\0ar-IQ")), "");
+        assert_eq!(parse_initial_arabic_locale_signals(None, None, Some("en-US"), Some("1252"), Some("437"), Some("ar-IQ\0en-US")), "ar");
     }
 }

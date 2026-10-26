@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod design;
 pub mod protocol;
 pub use design::{DesignCorrection, DesignImageSlot, DesignProfile, DesignStyleUse, DesignTextSlot, PageFamily};
+pub use protocol::ArabicTashkeelMode;
 pub mod resources;
 pub use resources::{GpuSnapshot, LocalResourcePolicy, ResourceSnapshot};
 

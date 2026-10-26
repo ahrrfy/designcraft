@@ -4,6 +4,7 @@ mod anchored;
 pub mod anchors;
 mod articles;
 pub mod book;
+pub mod book_polish;
 mod buttons;
 pub(crate) mod captions;
 mod changes;
@@ -229,6 +230,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(rulers::specs());
         v.extend(links::specs());
         v.extend(fonts::specs());
+        v.extend(book_polish::specs());
         v.extend(spelling::specs());
         v.extend(datamerge::specs());
         v.extend(interactive::specs());

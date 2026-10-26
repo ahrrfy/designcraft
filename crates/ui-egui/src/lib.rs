@@ -241,6 +241,9 @@ pub struct UiState {
     pub story_editor_size: f32,
     /// Preferences › General › Interface Language: supported codes are listed in `i18n::LANGUAGES`.
     pub language: String,
+    /// True once `app.language` was explicitly set so legacy `""` files still auto-detect OS Arabic locale.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub language_explicit: bool,
     /// Edit › Transparency Flattener Presets: "" (none), "high", "medium" or "low" for PDF export.
     pub flattener: String,
     /// File › Export PDF… options (persisted; see `PdfExportSettings`).
@@ -397,6 +400,7 @@ impl Default for UiState {
             proof_setup: Default::default(),
             dynamic_spelling: false,
             language: String::new(),
+            language_explicit: false,
             flattener: String::new(),
             pdf_export: PdfExportSettings::default(),
             separation: None,

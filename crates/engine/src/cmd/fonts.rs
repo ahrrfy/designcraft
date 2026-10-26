@@ -22,7 +22,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Find/Replace Font…",
             ["Type"],
             None,
-            "{family, style?, toFamily, toStyle?, redefineStyles?: true} — replaces the font in text and (by default) in paragraph and character styles",
+            "{family?, style?, toFamily, toStyle?, redefineStyles?: true, script?: arabic|latin, pages?: [start, end]} — replaces the font in text and (by default) in paragraph and character styles",
             has_doc,
             replace
         ),
@@ -165,6 +165,41 @@ fn swap(a: &mut CharAttrs, family: &str, style: Option<&str>, to_family: &str, t
 }
 
 fn replace(s: &mut Session, p: &Value) -> Result<Value> {
+    let script = str_param(p, "script").map(|v| v.trim().to_ascii_lowercase());
+    if let Some(sc) = script.as_deref()
+        && !matches!(sc, "arabic" | "latin")
+    {
+        return Err(bad("font.replace", "`script` must be `arabic` or `latin`"));
+    }
+    let page_range = super::book_polish::parse_pages_range("font.replace", p, s.doc()?.doc.spreads.iter().map(|sp| sp.pages.len()).sum())?;
+    if script.as_deref() == Some("arabic") {
+        let family_opt = str_param(p, "family").map(str::to_string);
+        let style = str_param(p, "style").map(str::to_string);
+        let to_family = str_param(p, "toFamily").ok_or_else(|| bad("font.replace", "missing toFamily"))?.to_string();
+        let db = designcraft_fonts::FontDb::global().scoped(s.doc()?.doc.font_scope);
+        let matched = db
+            .resolve_arabic_font(&to_family)
+            .ok_or_else(|| bad("font.replace", "Choose an installed replacement Arabic font family with Unicode Arabic glyphs"))?;
+        return s.edit(|d, _| {
+            let targets = super::book_polish::stories_on_pages(d, page_range, &[]);
+            let original_styles = d.styles.clone();
+            let scoped_db = designcraft_fonts::FontDb::global().scoped(d.font_scope);
+            let mut changed = 0usize;
+            for sid in targets {
+                if let Some(st) = d.story_mut(sid) {
+                    changed = changed.saturating_add(super::book_polish::replace_arabic_in_story(
+                        st,
+                        &original_styles,
+                        &scoped_db,
+                        &matched,
+                        family_opt.as_deref(),
+                        style.as_deref(),
+                    ));
+                }
+            }
+            Ok(json!({"changed": changed, "resolvedFamily": matched.family}))
+        });
+    }
     let family = str_param(p, "family").ok_or_else(|| bad("font.replace", "missing family"))?.to_string();
     let style = str_param(p, "style").map(str::to_string);
     let to_family = str_param(p, "toFamily").ok_or_else(|| bad("font.replace", "missing toFamily"))?.to_string();
@@ -190,7 +225,7 @@ fn replace(s: &mut Session, p: &Value) -> Result<Value> {
         // Resolve text against the original styles before redefining them. Font family and
         // style can be inherited independently through paragraph and character formatting.
         let original_styles = d.styles.clone();
-        let ids: Vec<_> = d.stories.keys().copied().collect();
+        let ids: Vec<_> = super::book_polish::stories_on_pages(d, page_range, &[]).into_iter().collect();
         for sid in ids {
             let Some(st) = d.story_mut(sid) else { continue };
             let mut pending = vec![st];

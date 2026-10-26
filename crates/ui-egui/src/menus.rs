@@ -1203,6 +1203,7 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
                 return Some(Err(format!("unknown language `{v}`")));
             }
             app.ui.language = v.to_string();
+            app.ui.language_explicit = true;
             Ok(json!(v))
         }
         "app.flattener" => {

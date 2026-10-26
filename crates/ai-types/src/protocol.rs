@@ -35,6 +35,17 @@ pub struct TokenRates {
     pub image_reserve_usd: Option<f64>,
 }
 
+/// Controls Arabic vowelization (tashkeel) density during generation and polish.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArabicTashkeelMode {
+    #[default]
+    Auto,
+    None,
+    Light,
+    Full,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
@@ -57,6 +68,12 @@ pub struct AiSettings {
     /// Zero retains one-shot production for at most eight pages. Larger books require batches.
     pub pages_per_batch: u32,
     pub resources: crate::LocalResourcePolicy,
+    /// Controls Arabic vowelization (tashkeel) density during generation and polish.
+    #[serde(default)]
+    pub arabic_tashkeel: ArabicTashkeelMode,
+    /// Optional preferred Arabic font family (e.g. "Al-Jazeera-Arabic", "Cairo"); None picks best installed face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arabic_font: Option<String>,
 }
 impl Default for AiSettings {
     fn default() -> Self {
@@ -74,6 +91,8 @@ impl Default for AiSettings {
             comfy_workflow: None,
             pages_per_batch: 2,
             resources: crate::LocalResourcePolicy::default(),
+            arabic_tashkeel: ArabicTashkeelMode::Auto,
+            arabic_font: None,
         }
     }
 }

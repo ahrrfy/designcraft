@@ -2029,6 +2029,8 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("Working CMYK", "CMYK العامل"),
     ("a, b, c, d...", "أ، ب، ج، د..."),
     ("i, ii, iii, iv...", "أ، ب، ج، د..."),
+    ("Arabic Diacritics…", "التشكيل العربي…"),
+    ("Polish Arabic Book…", "تحسين الكتاب العربي بالكامل…"),
     ("lowercase", "صغير"),
 ];
 

@@ -5,7 +5,7 @@ use crate::vault::{SessionKey, selected_key};
 use base64::Engine;
 use designcraft_ai_providers::{self as providers, ComfyRequest, GenerationRequest, GenerationResponse, ImageInput, ImageRequest, ImageResponse};
 use designcraft_ai_skills::{CachedAnalysis, NativeManifest, PackageFiles, SkillRegistry, SkillSnapshot};
-use designcraft_ai_types::protocol::{AiSettings, BudgetSpec, ProductionPlan, TaskRequest, UsageSummary};
+use designcraft_ai_types::protocol::{AiSettings, BudgetSpec, ImagePlacement, ProductionPlan, TaskRequest, UsageSummary};
 use designcraft_ai_types::{EngineAction, ModelSelection, OutputMode, ProviderKind};
 use designcraft_engine::{DocState, Prefs, Session};
 use serde::Deserialize;
@@ -313,7 +313,7 @@ impl Runner<'_> {
             }
             strip(&mut prompt, 0);
         }
-        crate::production_cache::digest(&json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id})).map(Some)
+        crate::production_cache::digest(&json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"arabicTashkeel":request.settings.arabic_tashkeel,"arabicFont":request.settings.arabic_font,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id})).map(Some)
     }
     #[allow(clippy::too_many_arguments)]
     fn cached_plan(
@@ -343,13 +343,15 @@ impl Runner<'_> {
         let valid = (|| {
             crate::native_layout::normalize_command_aliases(&mut plan);
             validate_actions(&plan.commands, catalog, OutputMode::NativeOnly)?;
-            prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
+            prepare_editorial_plan_with_mode(&mut plan, &request.prompt, context, None, request.settings.arabic_tashkeel)?;
             if let Some(scope) = scope {
                 validate_batch_plan(&plan, scope)?;
                 crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
             }
             if let Some(contract) = &self.print {
                 self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
+            } else if let Some(explicit_contract) = explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt) {
+                self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, &explicit_contract)?)?;
             }
             self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
             validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
@@ -597,11 +599,12 @@ impl Runner<'_> {
     }
     fn generate_plan_candidate(&mut self, selection: &ModelSelection, request: &GenerationRequest) -> Result<GenerationResponse, String> {
         check_cancel(self.cancel)?;
-        let resources = crate::resources::LocalRequestGuard::acquire(selection, &request.resources)?;
         let input = request.system.len().saturating_add(request.prompt.len()).saturating_add(bounded_json(&request.json_schema, MAX_PROMPT)?.len());
         if input > MAX_PROMPT {
             return Err("AI prompt exceeds the bounded context limit".into());
         }
+        self.ledger.clone().reserve_with_output(input, request.images.len(), selection.provider, false, None, Some(request.max_output_tokens))?;
+        let resources = crate::resources::LocalRequestGuard::acquire(selection, &request.resources)?;
         let key = selected_key(self.keys, selection);
         let reservation =
             self.ledger.reserve_with_output(input, request.images.len(), selection.provider, false, None, Some(request.max_output_tokens))?;
@@ -655,6 +658,15 @@ impl Runner<'_> {
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
         if current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook) {
             opened_document_geometry(&mut context, &base)?;
+        }
+        if current_document
+            && scope.is_none()
+            && !explicit_script
+            && base.doc.page_count() >= 2
+            && let Some(plan) = try_build_whole_book_polish_plan(&request, &base, &prefs, self.cancel)?
+        {
+            self.progress("Applying verified whole-book Arabic typography and layout polish", 0.9)?;
+            return Ok(Product::Plan(plan));
         }
         let profiles = skills.iter().filter_map(|s| s.design_profile.as_ref()).collect::<Vec<_>>();
         if profiles.len() > 1 {
@@ -925,9 +937,13 @@ impl Runner<'_> {
                     .transpose();
                 native_text.and_then(|text| parse_plan(text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog)).and_then(
                     |mut plan| {
-                        prepare_editorial_plan(&mut plan, &request.prompt, context, None)?;
+                        prepare_editorial_plan_with_mode(&mut plan, &request.prompt, context, None, request.settings.arabic_tashkeel)?;
                         if let Some(contract) = &self.print {
                             self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
+                        } else if let Some(explicit_contract) =
+                            explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt)
+                        {
+                            self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, &explicit_contract)?)?;
                         }
                         if let Some(scope) = scope {
                             crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
@@ -1231,7 +1247,7 @@ impl Runner<'_> {
         let mut filled_frames = BTreeSet::new();
         let mut filled_existing_frames = BTreeSet::new();
         let mut placed_bytes = 0usize;
-        for placement in &plan.images {
+        for (placement_idx, placement) in plan.images.iter().enumerate() {
             self.progress(&format!("Generating illustration for page {}", placement.page.saturating_add(1)), 0.55)?;
             let cache_key = image_memory_key(placement, &style_context, settings)?;
             let image = if let Some(image) = cache.get(&cache_key) {
@@ -1247,27 +1263,28 @@ impl Runner<'_> {
                     None
                 };
                 let source_ratio = image_source_ratio(placement, declared_image_slot(placement, profile))?;
-                let image_request = ImageRequest {
-                    prompt: format!(
-                        "{}\nReturn exactly ONE complete final illustration for this single placement, without alternative versions or a sequence. No page layout, captions, typography or surrounding design. Target frame proportions: {:.4} x {:.4} points.\n{}",
-                        crate::image_repetition::unit_prompt(placement),
-                        source_ratio,
-                        1.0,
-                        style_context
-                    ),
-                    size: self.print_image_size(placement, profile, &settings.image_model)?,
+                let base_image_prompt = format!(
+                    "{}\nReturn exactly ONE complete final illustration for this single placement, without alternative versions or a sequence. No page layout, captions, typography or surrounding design. Target frame proportions: {:.4} x {:.4} points.\n{}",
+                    crate::image_repetition::unit_prompt(placement),
+                    source_ratio,
+                    1.0,
+                    style_context
+                );
+                let comfy_bytes = settings.comfy_workflow.as_ref().map(|v| bounded_json(v, MAX_JSON).map(|s| s.len())).transpose()?.unwrap_or(0);
+                let image_size = self.print_image_size(placement, profile, &settings.image_model)?;
+                let mut image_request = ImageRequest {
+                    prompt: base_image_prompt.clone(),
+                    size: image_size.clone(),
                     quality: None,
-                    comfy,
+                    comfy: comfy.clone(),
                     resources: settings.resources.clone(),
                 };
-                let input = image_request
-                    .prompt
-                    .len()
-                    .saturating_add(settings.comfy_workflow.as_ref().map(|v| bounded_json(v, MAX_JSON).map(|s| s.len())).transpose()?.unwrap_or(0));
                 let key = selected_key(self.keys, &settings.image_model);
-                if let Some(comfy) = &image_request.comfy {
-                    crate::resources::check_comfy_workflow(&comfy.workflow, &settings.resources)?;
+                if let Some(comfy_req) = &image_request.comfy {
+                    crate::resources::check_comfy_workflow(&comfy_req.workflow, &settings.resources)?;
                 }
+                let input = image_request.prompt.len().saturating_add(comfy_bytes);
+                self.ledger.clone().reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
                 let resources = crate::resources::LocalRequestGuard::acquire(&settings.image_model, &settings.resources)?;
                 // Reserve an explicit image allowance too; unknown image token usage is not free.
                 let reservation = self.ledger.reserve(input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
@@ -1283,38 +1300,117 @@ impl Runner<'_> {
                 if let Some(error) = &response.error {
                     return Err(error.clone());
                 }
-                let image = self.choose_placement_image(response.images, placement, profile)?;
+                let mut image = self.choose_placement_image(response.images, placement, profile)?;
+                let mut allow_cache = true;
                 if settings.verify_generated_images {
                     self.progress(&format!("Reviewing illustration subjects for page {}", placement.page.saturating_add(1)), 0.65)?;
                     let review_request = crate::image_review::request(placement, &image, settings)?;
-                    let reduced = serde_json::from_str::<Value>(&review_request.prompt)
+                    let mut reduced = serde_json::from_str::<Value>(&review_request.prompt)
                         .map_err(|error| error.to_string())?
                         .get("reduced_inspection_reference")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     let response = self.generate(&settings.text_model, &review_request)?;
-                    let review = crate::image_review::parse(&response.text)?;
-                    if review.verdict == crate::image_review::Verdict::Fail {
-                        return Err(format!(
-                            "Illustration for page {} failed advisory visual review: {}. The rejected artwork was not cached and this review group was not published",
-                            placement.page.saturating_add(1),
+                    let mut review = crate::image_review::parse(&response.text)?;
+                    if review.verdict == crate::image_review::Verdict::Fail && settings.allow_paid_repairs && settings.budget.repair_attempts > 0 {
+                        let remaining = plan.images.get(placement_idx.saturating_add(1)..).unwrap_or(&[]);
+                        let corrective_prompt = format!(
+                            "{base_image_prompt}\nCRITICAL VISUAL CORRECTION REQUIRED (fix this exact defect from the previous attempt): {}",
                             review.reasons.join("; ")
-                        ));
+                        );
+                        let retry_admitted = (|| -> Result<(), String> {
+                            let mut trial = self.ledger.clone();
+                            let retry_input = corrective_prompt.len().saturating_add(comfy_bytes);
+                            trial.reserve(retry_input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
+                            let rev_input = review_request
+                                .system
+                                .len()
+                                .saturating_add(review_request.prompt.len())
+                                .saturating_add(bounded_json(&review_request.json_schema, MAX_PROMPT)?.len());
+                            trial.reserve_with_output(
+                                rev_input,
+                                review_request.images.len(),
+                                settings.text_model.provider,
+                                false,
+                                None,
+                                Some(review_request.max_output_tokens),
+                            )?;
+                            project_slice_image_requests(&mut trial, remaining, settings, profile, &style_context, cache)
+                        })()
+                        .is_ok();
+                        if retry_admitted {
+                            self.progress(
+                                &format!("Regenerating flagged illustration on page {} (1-shot visual correction)", placement.page.saturating_add(1)),
+                                0.68,
+                            )?;
+                            image_request.prompt = corrective_prompt;
+                            let retry_input = image_request.prompt.len().saturating_add(comfy_bytes);
+                            self.ledger.clone().reserve(retry_input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
+                            let retry_guard = crate::resources::LocalRequestGuard::acquire(&settings.image_model, &settings.resources)?;
+                            let retry_res =
+                                self.ledger.reserve(retry_input, 1, settings.image_model.provider, true, settings.image_rates.as_ref())?;
+                            self.usage()?;
+                            let retry_resp = guarded(|| {
+                                self.provider.images(
+                                    &settings.image_model,
+                                    key.as_ref().map(providers::SecretString::expose),
+                                    &image_request,
+                                    self.cancel,
+                                )
+                            });
+                            drop(retry_guard);
+                            self.ledger.record(retry_res, retry_resp.as_ref().ok().map(|r| &r.usage));
+                            self.usage()?;
+                            check_cancel(self.cancel)?;
+                            if let Ok(ok_resp) = retry_resp
+                                && ok_resp.error.is_none()
+                                && let Ok(corrected_img) = self.choose_placement_image(ok_resp.images, placement, profile)
+                            {
+                                image = corrected_img;
+                                let re_req = crate::image_review::request(placement, &image, settings)?;
+                                reduced = serde_json::from_str::<Value>(&re_req.prompt)
+                                    .map_err(|error| error.to_string())?
+                                    .get("reduced_inspection_reference")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                let re_resp = self.generate(&settings.text_model, &re_req)?;
+                                review = crate::image_review::parse(&re_resp.text)?;
+                            }
+                        }
                     }
-                    let uncertain = review.verdict == crate::image_review::Verdict::Uncertain;
-                    self.diagnostics(vec![json!({"kind":"illustrationSemanticReview","severity":if uncertain {"warning"} else {"info"},"page":placement.page.saturating_add(1),"verdict":if uncertain {"uncertain"} else {"pass"},"reasons":review.reasons,"reducedInspectionReference":reduced,"message":if uncertain {"Illustration review is uncertain; explicit human visual review is required."} else {"Illustration passed advisory model review; this is not a semantic correctness guarantee or human approval."}})])?;
-                }
-                if let Some(root) = &self.cache_root {
-                    let disk_key = self.image_disk_key(placement, &style_context, profile, settings)?;
-                    if let Err(error) = crate::production_cache::store_image(root, &disk_key, &image) {
-                        self.cache_notice(format!("Could not cache this illustration: {error}"))?;
+                    if review.verdict == crate::image_review::Verdict::Fail {
+                        allow_cache = false;
+                        self.diagnostics(vec![json!({
+                            "kind": "illustrationSemanticReview",
+                            "severity": "warning",
+                            "page": placement.page.saturating_add(1),
+                            "verdict": "advisory_fail",
+                            "reasons": review.reasons,
+                            "reducedInspectionReference": reduced,
+                            "message": format!(
+                                "Advisory visual review flagged illustration on page {} ({}); artwork was NOT cached and requires human visual inspection before approving the proof.",
+                                placement.page.saturating_add(1),
+                                review.reasons.join("; ")
+                            )
+                        })])?;
+                    } else {
+                        let uncertain = review.verdict == crate::image_review::Verdict::Uncertain;
+                        self.diagnostics(vec![json!({"kind":"illustrationSemanticReview","severity":if uncertain {"warning"} else {"info"},"page":placement.page.saturating_add(1),"verdict":if uncertain {"uncertain"} else {"pass"},"reasons":review.reasons,"reducedInspectionReference":reduced,"message":if uncertain {"Illustration review is uncertain; explicit human visual review is required."} else {"Illustration passed advisory model review; this is not a semantic correctness guarantee or human approval."}})])?;
                     }
                 }
-                *bytes_used = bytes_used
-                    .checked_add(image.bytes.len())
-                    .filter(|bytes| *bytes <= MAX_UNIQUE_RASTER_BYTES)
-                    .ok_or("Unique generated image sources exceed this plan's 32-MiB raster budget")?;
-                cache.insert(cache_key, image.clone());
+                if allow_cache {
+                    if let Some(root) = &self.cache_root {
+                        let disk_key = self.image_disk_key(placement, &style_context, profile, settings)?;
+                        if let Err(error) = crate::production_cache::store_image(root, &disk_key, &image) {
+                            self.cache_notice(format!("Could not cache this illustration: {error}"))?;
+                        }
+                    }
+                    *bytes_used = bytes_used
+                        .checked_add(image.bytes.len())
+                        .filter(|bytes| *bytes <= MAX_UNIQUE_RASTER_BYTES)
+                        .ok_or("Unique generated image sources exceed this plan's 32-MiB raster budget")?;
+                    cache.insert(cache_key, image.clone());
+                }
                 image
             };
             let declared = declared_image_slot(placement, profile);
@@ -1535,7 +1631,12 @@ impl Runner<'_> {
         let generation = GenerationRequest {
             system: format!(
                 "{}\n{EDITORIAL_POLICY}\nWhen multiple declared families are available, avoid document.previousTemplateFamily on the first requested page and vary subsequent families, unless the user explicitly requests identical layouts. That field is inferred from actual native item labels; null means unknown, not an approval.",
-                crate::template_plan::system_for_brief_with_mode(style, &request.prompt, request.settings.output_mode)?
+                crate::template_plan::system_for_brief_with_options(
+                    style,
+                    &request.prompt,
+                    request.settings.output_mode,
+                    request.settings.arabic_tashkeel
+                )?
             ),
             prompt,
             json_schema: schema,
@@ -1590,12 +1691,55 @@ impl Runner<'_> {
             let response = self.generate(&request.settings.text_model, &generation)?;
             self.progress("Compiling page content into native engine commands locally", 0.45)?;
             let mut step_notes = Vec::new();
+            let total_pages_hint = match request.target {
+                designcraft_ai_types::protocol::TaskTarget::NewA4 { pages } => pages,
+                _ => u32::try_from(base.doc.spreads.len()).unwrap_or(scope.start.saturating_add(scope.count)),
+            }
+            .max(scope.start.saturating_add(scope.count));
             let validation: Result<ProductionPlan, String> = (|| {
-                let mut raw = crate::template_plan::compile_for_brief(&response.text, style, scope, request.settings.output_mode, &request.prompt)?;
+                let mut raw = crate::template_plan::compile_for_brief_with_context(
+                    &response.text,
+                    style,
+                    scope,
+                    request.settings.output_mode,
+                    &request.prompt,
+                    crate::template_plan::TemplateCompileContext {
+                        base: Some(base),
+                        facing_pages: request.settings.facing_pages || base.doc.settings.facing_pages,
+                        total_pages: total_pages_hint,
+                        subject: None,
+                    },
+                )?;
                 validate_template_family_sequence(&raw, style, previous.clone(), scope, &families, &request.prompt)?;
-                prepare_editorial_plan(&mut raw, &request.prompt, &context, None)?;
+                prepare_editorial_plan_with_mode(&mut raw, &request.prompt, &context, None, request.settings.arabic_tashkeel)?;
                 if let Some(contract) = &self.print {
                     step_notes.extend(crate::native_print_fonts::apply(&mut raw, base, prefs, contract)?);
+                } else if let Some(explicit_contract) = explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt)
+                {
+                    step_notes.extend(crate::native_print_fonts::apply(&mut raw, base, prefs, &explicit_contract)?);
+                } else if let Some(auto_contract) = auto_preferred_arabic_font_contract(base, &raw) {
+                    let mut candidate = raw.clone();
+                    let candidate_ok = (|| -> Result<Vec<Value>, String> {
+                        let mut notes = crate::native_print_fonts::apply(&mut candidate, base, prefs, &auto_contract)?;
+                        notes.extend(crate::native_layout::prepare(&mut candidate, base, prefs, self.cancel)?);
+                        validate_previous_body_layout(&candidate, base, prefs, Some(scope), &request.prompt)?;
+                        crate::design::check_image_slots(base, &candidate.images, profile)?;
+                        simulate_styled_with_ppi(
+                            &candidate,
+                            base,
+                            prefs,
+                            request.settings.output_mode,
+                            self.cancel,
+                            Some(scope),
+                            GeometryCheck::Profile(profile),
+                            required_min_ppi,
+                        )?;
+                        Ok(notes)
+                    })();
+                    if let Ok(notes) = candidate_ok {
+                        step_notes.extend(notes);
+                        return Ok(candidate);
+                    }
                 }
                 step_notes.extend(crate::native_layout::prepare(&mut raw, base, prefs, self.cancel)?);
                 validate_previous_body_layout(&raw, base, prefs, Some(scope), &request.prompt)?;
@@ -1864,11 +2008,22 @@ fn project_image_requests(
     style_context: &str,
     cache: &BTreeMap<String, providers::GeneratedImage>,
 ) -> Result<(), String> {
+    project_slice_image_requests(ledger, &plan.images, settings, profile, style_context, cache)
+}
+
+fn project_slice_image_requests(
+    ledger: &mut UsageLedger,
+    placements: &[ImagePlacement],
+    settings: &AiSettings,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    style_context: &str,
+    cache: &BTreeMap<String, providers::GeneratedImage>,
+) -> Result<(), String> {
     validate_image_review_settings(settings)?;
     let workflow_bytes =
         settings.comfy_workflow.as_ref().map(|value| bounded_json(value, MAX_PROMPT).map(|text| text.len())).transpose()?.unwrap_or(0);
     let review_image = settings.verify_generated_images.then(review_projection_image).transpose()?;
-    for placement in &plan.images {
+    for placement in placements {
         let _ = image_request_size(placement, profile, &settings.image_model)?;
         let cache_key = image_memory_key(placement, style_context, settings)?;
         if !cache.contains_key(&cache_key) {
@@ -2345,12 +2500,245 @@ fn strip_arabic_vowels_with_byte_map(text: &mut String) -> Option<Vec<usize>> {
     Some(map)
 }
 
+fn extract_arabic_fonts_from_prompt(prompt: &str) -> Vec<String> {
+    let lower = prompt.to_lowercase();
+    let mut found = Vec::new();
+    for (needles, canonical) in [
+        (&["خط الجزيرة", "الجزيرة", "al-jazeera", "aljazeera"][..], "Al-Jazeera-Arabic"),
+        (&["خط سلطان", "سلطاني", "سلطان", "sultan"][..], "Sultan"),
+        (&["خط القاهرة", "cairo"][..], "Cairo"),
+        (&["خط دبي", "dubai"][..], "Dubai"),
+        (&["خط صكال", "صكال مجلة", "sakkal"][..], "Sakkal Majalla"),
+        (&["خط أميري", "خط اميري", "amiri"][..], "Amiri"),
+        (&["خط تجوال", "tajawal"][..], "Tajawal"),
+    ] {
+        if needles.iter().any(|kw| lower.contains(kw)) {
+            found.push(canonical.to_owned());
+        }
+    }
+    found
+}
+
+fn resolve_installed_arabic_font_request(base: &DocState, setting_font: Option<&str>, prompt: &str) -> Option<String> {
+    let scoped = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+    if let Some(explicit) = setting_font.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(matched) = scoped.resolve_arabic_font(explicit)
+    {
+        return Some(matched.regular_family);
+    }
+    let prompt_candidates = extract_arabic_fonts_from_prompt(prompt);
+    for candidate in &prompt_candidates {
+        if let Some(matched) = scoped.resolve_arabic_font(candidate) {
+            return Some(matched.regular_family);
+        }
+    }
+    let lower = prompt.to_lowercase();
+    let asks_arabic_font_upgrade = !prompt_candidates.is_empty()
+        || ["تبديل الخط", "تغيير الخط", "الخط العربي", "خط واضح", "مثل خط", "replace arabic font", "change arabic font"]
+            .iter()
+            .any(|kw| lower.contains(kw));
+    if asks_arabic_font_upgrade {
+        return scoped.preferred_arabic_font().map(|m| m.regular_family);
+    }
+    None
+}
+
+fn explicit_arabic_font_contract(base: &DocState, setting_font: Option<&str>, prompt: &str) -> Option<crate::print_contract::PrintContract> {
+    let resolved = resolve_installed_arabic_font_request(base, setting_font, prompt)?;
+    Some(crate::print_contract::PrintContract { arabic_fonts: vec![resolved], ..Default::default() })
+}
+
+fn auto_preferred_arabic_font_contract(base: &DocState, plan: &ProductionPlan) -> Option<crate::print_contract::PrintContract> {
+    let has_tahoma_arabic = plan.commands.iter().any(|a| {
+        a.command == "type.char"
+            && a.params.get("attrs").and_then(Value::as_object).is_some_and(|attrs| {
+                attrs.get("language").and_then(Value::as_str) == Some("ar")
+                    && matches!(attrs.get("fontFamily").and_then(Value::as_str), Some("Tahoma" | "Arial"))
+            })
+    });
+    if !has_tahoma_arabic {
+        return None;
+    }
+    let scoped = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+    let preferred = scoped.preferred_arabic_font()?;
+    if matches!(preferred.regular_family.as_str(), "Tahoma" | "Arial") {
+        return None;
+    }
+    Some(crate::print_contract::PrintContract { arabic_fonts: vec![preferred.regular_family], ..Default::default() })
+}
+
+fn parse_arabic_or_ascii_u32(s: &str) -> Option<u32> {
+    let mut digits = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if ('\u{0660}'..='\u{0669}').contains(&ch) {
+            digits.push(char::from_u32(u32::from('0') + (u32::from(ch) - 0x0660))?);
+        } else if ('\u{06F0}'..='\u{06F9}').contains(&ch) {
+            digits.push(char::from_u32(u32::from('0') + (u32::from(ch) - 0x06F0))?);
+        }
+    }
+    digits.parse::<u32>().ok()
+}
+
+fn extract_page_range_from_prompt(prompt: &str, max_page: usize) -> Option<[usize; 2]> {
+    let normalized: String = prompt
+        .chars()
+        .map(|ch| {
+            if ('\u{0660}'..='\u{0669}').contains(&ch) {
+                char::from_u32(u32::from('0') + (u32::from(ch) - 0x0660)).unwrap_or(ch)
+            } else if ('\u{06F0}'..='\u{06F9}').contains(&ch) {
+                char::from_u32(u32::from('0') + (u32::from(ch) - 0x06F0)).unwrap_or(ch)
+            } else {
+                ch
+            }
+        })
+        .collect();
+    for sep in ['-', '–', '—'] {
+        for token in normalized.split_whitespace() {
+            let trimmed = token.trim_matches(|c: char| !c.is_ascii_digit() && c != sep);
+            if let Some((lhs, rhs)) = trimmed.split_once(sep)
+                && let (Some(a), Some(b)) = (parse_arabic_or_ascii_u32(lhs), parse_arabic_or_ascii_u32(rhs))
+                && a >= 1
+                && b >= a
+            {
+                let start = usize::try_from(a).ok()?.min(max_page).max(1);
+                let end = usize::try_from(b).ok()?.min(max_page).max(start);
+                return Some([start, end]);
+            }
+        }
+    }
+    None
+}
+
+fn try_build_whole_book_polish_plan(
+    request: &TaskRequest,
+    base: &DocState,
+    prefs: &Prefs,
+    cancel: &AtomicBool,
+) -> Result<Option<ProductionPlan>, String> {
+    let lower = request.prompt.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    let mentions_whole_book = has(&[
+        "جميع الصفحات",
+        "كل الصفحات",
+        "كافة الصفحات",
+        "على الكتاب بالكامل",
+        "الكتاب بالكامل",
+        "جميع صفحات",
+        "across all pages",
+        "all pages",
+        "entire book",
+        "whole book",
+    ]) || extract_page_range_from_prompt(&request.prompt, base.doc.page_count())
+        .is_some_and(|[s, e]| s == 1 && e >= base.doc.page_count().min(4));
+    if !mentions_whole_book {
+        return Ok(None);
+    }
+    let asks_new_content_generation = has(&["أضف صفحة", "اضف صفحة", "أنشئ كتاب", "انشئ كتاب", "ارسم صورة جديدة", "generate new pages"]);
+    if asks_new_content_generation {
+        return Ok(None);
+    }
+    let wants_strip_tashkeel = has(&[
+        "ازل التشكيل",
+        "أزل التشكيل",
+        "إزالة التشكيل",
+        "ازالة التشكيل",
+        "حذف التشكيل",
+        "بدون تشكيل",
+        "بلا تشكيل",
+        "الغاء التشكيل",
+        "إلغاء التشكيل",
+        "remove diacritics",
+        "strip tashkeel",
+    ]) || request.settings.arabic_tashkeel == designcraft_ai_types::ArabicTashkeelMode::None;
+    let wants_light_tashkeel = !wants_strip_tashkeel
+        && (has(&["تشكيل خفيف", "خفف التشكيل", "تقليل التشكيل", "light tashkeel", "lighten diacritics"])
+            || request.settings.arabic_tashkeel == designcraft_ai_types::ArabicTashkeelMode::Light);
+    let requested_font = resolve_installed_arabic_font_request(base, request.settings.arabic_font.as_deref(), &request.prompt);
+    let wants_numbering = has(&["ترقيم", "الترقيم", "الوحدات والصفحات", "رقم الوحدة", "unit badge", "page number", "numbering"]);
+    let wants_rtl_cells = has(&[
+        "الكلمات وبين الصور",
+        "الصورة وتحتها الكلمة",
+        "ليس متطابقة",
+        "ليست متطابقة",
+        "تطابق الصور",
+        "ترتيب الصور",
+        "ترتيب البطاقات",
+        "card order",
+        "image mismatch",
+    ]);
+    if !wants_strip_tashkeel && !wants_light_tashkeel && requested_font.is_none() && !wants_numbering && !wants_rtl_cells {
+        return Ok(None);
+    }
+    let mut params = serde_json::Map::new();
+    if wants_strip_tashkeel {
+        params.insert("tashkeel".into(), json!("none"));
+    } else if wants_light_tashkeel {
+        params.insert("tashkeel".into(), json!("light"));
+    } else {
+        params.insert("tashkeel".into(), json!("keep"));
+    }
+    if let Some(font) = requested_font {
+        params.insert("arabicFont".into(), json!(font));
+    }
+    params.insert("fixNumbering".into(), json!(wants_numbering || mentions_whole_book));
+    params.insert("fixRtlCells".into(), json!(wants_rtl_cells || mentions_whole_book));
+    params.insert("fitOverset".into(), json!(true));
+    if let Some(range) = extract_page_range_from_prompt(&request.prompt, base.doc.page_count()) {
+        params.insert("pages".into(), json!(range));
+    }
+    let plan = ProductionPlan {
+        title: "تحسين الكتاب العربي بالكامل".into(),
+        commands: vec![EngineAction { command: "book.polishArabic".into(), params: Value::Object(params) }],
+        images: Vec::new(),
+    };
+    let required_min_ppi = crate::print_contract::PrintContract::from_prompt(&request.prompt)?.and_then(|c| c.min_image_ppi());
+    if simulate_styled_with_ppi(
+        &plan,
+        base,
+        prefs,
+        request.settings.output_mode,
+        cancel,
+        None,
+        GeometryCheck::OpenedDocument { allow_geometry_edits: false },
+        required_min_ppi,
+    )
+    .is_ok()
+    {
+        Ok(Some(plan))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Local editorial checks run before image reservations on either production path.
 fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Value, scope: Option<BatchScope>) -> Result<(), String> {
+    prepare_editorial_plan_with_mode(plan, prompt, context, scope, designcraft_ai_types::ArabicTashkeelMode::Auto)
+}
+
+fn prepare_editorial_plan_with_mode(
+    plan: &mut ProductionPlan,
+    prompt: &str,
+    context: &Value,
+    scope: Option<BatchScope>,
+    tashkeel_mode: designcraft_ai_types::ArabicTashkeelMode,
+) -> Result<(), String> {
     let lower = prompt.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
-    let explicit_removal = has(&["أزل التشكيل", "إزالة التشكيل", "حذف التشكيل", "remove diacritics", "remove vowel marks"]);
+    let explicit_removal = has(&[
+        "ازل التشكيل",
+        "أزل التشكيل",
+        "إزالة التشكيل",
+        "ازالة التشكيل",
+        "حذف التشكيل",
+        "الغاء التشكيل",
+        "إلغاء التشكيل",
+        "remove diacritics",
+        "remove vowel marks",
+    ]);
     let explicitly_plain = explicit_removal
+        || tashkeel_mode == designcraft_ai_types::ArabicTashkeelMode::None
         || has(&[
             "دون تشكيل",
             "بدون تشكيل",
@@ -2364,42 +2752,32 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
             "unvocalized",
         ]);
     let has_vocalization_request = !explicitly_plain
-        && (has(&[
-            "مشكول",
-            "مشكل",
-            "مشكّل",
-            "التشكيل",
-            "تشكيل",
-            "مع التشكيل",
-            "بالتشكيل",
-            "بالحركات",
-            "الحركات",
-            "حركات الحروف",
-            "فتحة",
-            "ضمة",
-            "كسرة",
-            "سكون",
-            "شدة",
-            "تنوين",
-            "تأسيس",
-            "نورانية",
-            "هجاء",
-            "تهجئة",
-            "روضة",
-            "تمهيدي",
-            "kg1",
-            "kg2",
-            "kg 1",
-            "kg 2",
-            "fully vocalized",
-            "with diacritics",
-            "phonics",
-        ]) || context.pointer("/document/mastermind_orchestration/active_skill_synergy").and_then(Value::as_array).is_some_and(|skills| {
-            skills
-                .iter()
-                .filter_map(|s| s.get("skill_id").and_then(Value::as_str))
-                .any(|id| id == "kg-oxford-cambridge-style" || id.starts_with("early-years-") || id.contains("phonics"))
-        }));
+        && (matches!(tashkeel_mode, designcraft_ai_types::ArabicTashkeelMode::Full | designcraft_ai_types::ArabicTashkeelMode::Light)
+            || has(&[
+                "مشكول",
+                "مشكل",
+                "مشكّل",
+                "التشكيل",
+                "تشكيل",
+                "مع التشكيل",
+                "بالتشكيل",
+                "بالحركات",
+                "الحركات",
+                "حركات الحروف",
+                "فتحة",
+                "ضمة",
+                "كسرة",
+                "سكون",
+                "شدة",
+                "تنوين",
+                "تأسيس",
+                "نورانية",
+                "هجاء",
+                "تهجئة",
+                "fully vocalized",
+                "with diacritics",
+                "phonics",
+            ]));
     let parsed_script = crate::script_contract::parse(prompt)?;
     let script_requires_verbatim_vocalization = parsed_script
         .as_ref()
@@ -2420,7 +2798,7 @@ fn prepare_editorial_plan(plan: &mut ProductionPlan, prompt: &str, context: &Val
     });
     let plain = if script_requires_verbatim_vocalization {
         false
-    } else if explicit_removal {
+    } else if explicit_removal || tashkeel_mode == designcraft_ai_types::ArabicTashkeelMode::None {
         true
     } else if script_has_vocalized_copy {
         false
@@ -2799,7 +3177,10 @@ fn native_result_contract(command: &str) -> Option<Value> {
         | "table.unmerge"
         | "table.setRowHeight"
         | "table.setColumnWidth"
-        | "table.distributeColumns" => Value::Null,
+        | "table.distributeColumns"
+        | "font.replace"
+        | "type.diacritics"
+        | "book.polishArabic" => Value::Null,
         _ => return None,
     })
 }
@@ -7742,10 +8123,19 @@ mod tests {
             assert_eq!(provider.reviews.get(), 1);
             assert_eq!(runner.ledger.summary().requests, 2);
             if verdict == "fail" {
-                assert!(result.unwrap_err().contains("failed advisory visual review"));
-                assert!(cache.is_empty());
+                let first = result.expect("advisory fail should soft-warn for human proof instead of hard-aborting the spread");
+                assert!(!first.commands.is_empty());
+                assert!(cache.is_empty(), "Flagged artwork must not enter memory cache");
                 assert_eq!(bytes, 0);
-                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0, "Rejected artwork must not enter the disk cache");
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0, "Flagged artwork must not enter the disk cache");
+                let diagnostics: Vec<_> =
+                    receiver.try_iter().filter_map(|message| if let Message::Diagnostic(issue) = message { Some(issue) } else { None }).collect();
+                assert!(
+                    diagnostics.iter().any(|issue| {
+                        issue["kind"] == "illustrationSemanticReview" && issue["verdict"] == "advisory_fail" && issue["severity"] == "warning"
+                    }),
+                    "Expected advisory_fail warning diagnostic, got {diagnostics:?}"
+                );
             } else {
                 let first = result.unwrap();
                 assert_eq!(cache.len(), 1);
@@ -9302,5 +9692,108 @@ mod tests {
         runner.expand_images_with_geometry(plan, &settings, &mut cache, &mut bytes_used, None, None, Some(&base)).unwrap();
         assert!(probe.held_during_images.load(Ordering::SeqCst), "local admission must be active during ComfyUI image generation");
         assert!(probe.free_during_cloud_review.load(Ordering::SeqCst), "local admission must be released before cloud Gemini review starts");
+    }
+
+    #[test]
+    fn ai31_image_review_fail_retries_single_image_when_paid_repairs_allowed() {
+        struct RetryReviewMock {
+            images: std::cell::Cell<u32>,
+            reviews: std::cell::Cell<u32>,
+            second_prompt: std::cell::RefCell<String>,
+        }
+        impl Provider for RetryReviewMock {
+            fn models(&self, _: &ModelSelection, _: Option<&str>, _: &AtomicBool) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+            fn generate(&self, _: &ModelSelection, _: Option<&str>, _: &GenerationRequest, _: &AtomicBool) -> Result<GenerationResponse, String> {
+                let n = self.reviews.get() + 1;
+                self.reviews.set(n);
+                let text = if n == 1 {
+                    r#"{"verdict":"fail","reasons":["Child uses left hand instead of right hand"]}"#
+                } else {
+                    r#"{"verdict":"pass","reasons":["Child clearly uses right hand"]}"#
+                };
+                Ok(GenerationResponse { text: text.into(), usage: Usage::default(), error: None })
+            }
+            fn images(&self, _: &ModelSelection, _: Option<&str>, req: &ImageRequest, _: &AtomicBool) -> Result<ImageResponse, String> {
+                let n = self.images.get() + 1;
+                self.images.set(n);
+                if n == 2 {
+                    *self.second_prompt.borrow_mut() = req.prompt.clone();
+                }
+                let mut png = Vec::new();
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(400, 400, image::Rgba([30, 120, 200, 255])))
+                    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                    .unwrap();
+                Ok(ImageResponse {
+                    images: vec![providers::GeneratedImage { filename: "retry.png".into(), mime_type: "image/png".into(), bytes: png }],
+                    usage: Usage::default(),
+                    error: None,
+                })
+            }
+        }
+
+        let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let directory = tempfile::tempdir().unwrap();
+        let provider = RetryReviewMock {
+            images: std::cell::Cell::new(0),
+            reviews: std::cell::Cell::new(0),
+            second_prompt: std::cell::RefCell::new(String::new()),
+        };
+        let mut settings = review_settings(8);
+        settings.allow_paid_repairs = true;
+        settings.budget.repair_attempts = 2;
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+        let (sender, _receiver) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut runner = Runner {
+            cache_root: Some(directory.path().to_path_buf()),
+            print: None,
+            planning_only: false,
+            ledger: &mut ledger,
+            keys: &[],
+            cancel: &cancel,
+            sender: &sender,
+            provider: &provider,
+        };
+        let mut cache = BTreeMap::new();
+        let mut bytes = 0;
+        let expanded = runner.expand_images(review_plan(), &settings, &mut cache, &mut bytes, None).unwrap();
+        assert!(!expanded.commands.is_empty());
+        assert_eq!(provider.images.get(), 2, "expected 1 corrective retry");
+        assert_eq!(provider.reviews.get(), 2, "expected re-review after corrective retry");
+        assert!(provider.second_prompt.borrow().contains("CRITICAL VISUAL CORRECTION REQUIRED"));
+        assert_eq!(cache.len(), 1, "repaired pass artwork enters cache");
+    }
+
+    #[test]
+    fn ai31_whole_book_arabic_polish_prompt_builds_validated_native_plan() {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({"preset":"A4","pages":4,"facingPages":true,"binding":"rightToLeft"})).unwrap();
+        session
+            .execute("frame.create", &json!({"spread":0,"rect":[80.0,80.0,450.0,160.0],"content":"text","text":"السَّلَامُ عَلَيْكُمْ","caret":false}))
+            .unwrap();
+        let base = session.doc().unwrap().clone();
+        let req = TaskRequest {
+            prompt: "ازل التشكيل من الحروف ونريد تبديل الخط العربي بخط واضح مثل خط الجزيرة وايضا يوجد خطا في الترقيم الوحدات والصفحات طبق هذه التعديلات على جميع الصفحات من 1-4".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: true,
+            target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let cancel = AtomicBool::new(false);
+        let plan = try_build_whole_book_polish_plan(&req, &base, &session.prefs, &cancel).unwrap().expect("expected whole-book polish plan");
+        assert_eq!(plan.commands.len(), 1);
+        assert_eq!(plan.commands[0].command, "book.polishArabic");
+        assert_eq!(plan.commands[0].params["tashkeel"], json!("none"));
+        let scoped = designcraft_fonts::FontDb::global().scoped(base.doc.font_scope);
+        let expected_font = scoped.resolve_arabic_font("Al-Jazeera-Arabic").or_else(|| scoped.preferred_arabic_font()).map(|m| m.regular_family);
+        if let Some(expected) = expected_font {
+            assert_eq!(plan.commands[0].params["arabicFont"], json!(expected));
+        } else {
+            assert!(plan.commands[0].params.get("arabicFont").is_none());
+        }
     }
 }

@@ -7,7 +7,7 @@ use crate::{DesignApp, rtl};
 use designcraft_ai_types::protocol::{
     AiRequest, AiSettings, AiSnapshot, BatchSnapshot, ProductionDraft, SkillCard, TaskRequest, TaskTarget, TokenRates,
 };
-use designcraft_ai_types::{ModelSelection, OutputMode, ProviderKind, is_non_image_model, supports_gemini_image_review};
+use designcraft_ai_types::{ArabicTashkeelMode, ModelSelection, OutputMode, ProviderKind, is_non_image_model, supports_gemini_image_review};
 use serde_json::Value;
 
 const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
@@ -614,6 +614,8 @@ pub struct AiUiState {
     pick_target_document: bool,
     open_target_document_requested: bool,
     expand_advanced_settings: Option<bool>,
+    polish_book_requested: bool,
+    polish_book_status: String,
 }
 impl std::fmt::Debug for AiUiState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -700,6 +702,8 @@ impl Default for AiUiState {
             pick_target_document: false,
             open_target_document_requested: false,
             expand_advanced_settings: None,
+            polish_book_requested: false,
+            polish_book_status: String::new(),
         }
     }
 }
@@ -769,6 +773,12 @@ impl AiUiState {
                     merged.image_rates = snapshot.settings.image_rates.clone();
                     merged.resources = snapshot.settings.resources.clone();
                     merged.comfy_workflow = snapshot.settings.comfy_workflow.clone();
+                    if snapshot.settings.arabic_tashkeel != ArabicTashkeelMode::Auto {
+                        merged.arabic_tashkeel = snapshot.settings.arabic_tashkeel;
+                    }
+                    if snapshot.settings.arabic_font.is_some() {
+                        merged.arabic_font = snapshot.settings.arabic_font.clone();
+                    }
                     self.sync_settings(merged);
                 }
                 if let Some(pages) = draft.progress.target_total_pages {
@@ -1237,6 +1247,7 @@ impl AiUiState {
             "executing" => ("Execution & preflight", "التنفيذ والفحص المطبعي"),
             "rendering_proof" => ("Proof preparation", "تجهيز البروفة"),
             "awaiting_human_proof" => ("Awaiting human proof", "بانتظار اعتماد البروفة"),
+            "waiting_for_idle" => ("Waiting for canvas idle", "بانتظار انتهاء التفاعل لنشر النتيجة"),
             _ => ("Processing", "قيد المعالجة"),
         };
         text(arabic, en, ar)
@@ -2004,7 +2015,24 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                             label(ui, a, "Some provider usage is unreported.", "بعض بيانات الاستخدام لم يبلغها المزود.");
                         }
                         for issue in &state.snapshot.current_issues {
-                            rtl::label(ui, serde_json::to_string_pretty(issue).unwrap_or_else(|_| issue.to_string()));
+                            if issue.get("kind").and_then(Value::as_str) == Some("advisory_fail") {
+                                let label_str = issue.get("label").and_then(Value::as_str).unwrap_or("");
+                                let reasons_str = issue
+                                    .get("reasons")
+                                    .and_then(Value::as_array)
+                                    .map(|arr| arr.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("؛ "))
+                                    .unwrap_or_default();
+                                rtl::label(
+                                    ui,
+                                    if a {
+                                        format!("ملاحظة فحص بصري استشاري ({label_str} — استمر الإنتاج للمراجعة البشرية): {reasons_str}")
+                                    } else {
+                                        format!("Advisory visual inspection note ({label_str} — kept for human proof review): {reasons_str}")
+                                    },
+                                );
+                            } else {
+                                rtl::label(ui, serde_json::to_string_pretty(issue).unwrap_or_else(|_| issue.to_string()));
+                            }
                         }
                     });
                 });
@@ -2073,6 +2101,14 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             }
         }
         requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
+    }
+    if std::mem::take(&mut app.ui.ai.polish_book_requested) {
+        if let Err(error) = run_polish_current_arabic_book(app, a, &mut requests) {
+            app.ui.ai.error = error;
+        } else {
+            app.ui.ai.error.clear();
+            ctx.request_repaint();
+        }
     }
     if !requests.is_empty() {
         ctx.request_repaint();
@@ -2519,6 +2555,126 @@ fn preserved_document_geometry<'a>(s: &AiUiState, documents: &'a [OpenDocument],
         return None;
     }
     documents.iter().find(|document| Some(document.index) == selected && (!s.continue_book || document.facing_pages))
+}
+
+fn run_polish_current_arabic_book(app: &mut DesignApp, a: bool, requests: &mut Vec<AiRequest>) -> Result<Value, String> {
+    if app.session.active().is_none() {
+        return Err(text(a, "Open an Arabic document first.", "افتح مستنداً عربياً أولاً.").into());
+    }
+    let tashkeel = match app.ui.ai.settings.arabic_tashkeel {
+        ArabicTashkeelMode::Auto | ArabicTashkeelMode::None => "none",
+        ArabicTashkeelMode::Light => "light",
+        ArabicTashkeelMode::Full => "keep",
+    };
+    let mut params = serde_json::Map::new();
+    params.insert("tashkeel".into(), Value::String(tashkeel.into()));
+    if let Some(font) = app.ui.ai.settings.arabic_font.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        params.insert("arabicFont".into(), Value::String(font.into()));
+    } else {
+        params.insert("arabicFont".into(), Value::String("auto".into()));
+    }
+    params.insert("fixNumbering".into(), Value::Bool(true));
+    params.insert("fixRtlCells".into(), Value::Bool(true));
+    params.insert("fitOverset".into(), Value::Bool(true));
+    let out = app.run("book.polishArabic", Value::Object(params))?;
+    let removed = out.get("diacriticsRemoved").and_then(Value::as_u64).unwrap_or(0);
+    let runs = out.get("fontRunsChanged").and_then(Value::as_u64).unwrap_or(0);
+    let family = out.get("arabicFamily").and_then(Value::as_str).unwrap_or("");
+    let units = out.get("unitBadgesFixed").and_then(Value::as_u64).unwrap_or(0);
+    let footers = out.get("footersFixed").and_then(Value::as_u64).unwrap_or(0);
+    let cards = out.get("assetsPermuted").and_then(Value::as_u64).unwrap_or(0);
+    let fitted = out.get("oversetFitted").and_then(Value::as_u64).unwrap_or(0);
+    app.ui.ai.polish_book_status = if a {
+        format!(
+            "تم تحسين الكتاب بخطوة تراجع واحدة: حُذفت {removed} حركة تشكيل · الخط '{family}' ({runs} مقطع) · الوحدات {units} · أرقام الصفحات {footers} · مطابقة البطاقات {cards} · معالجة الفائض {fitted}."
+        )
+    } else {
+        format!(
+            "Polished book in one undo step: removed {removed} diacritics · font '{family}' ({runs} runs) · unit badges {units} · footers {footers} · RTL card strips {cards} · overset fitted {fitted}."
+        )
+    };
+    let active_uid = app.session.active().map(|d| d.uid);
+    if let Some(batch) = app.ui.ai.snapshot.batch.as_ref()
+        && batch.status == "awaiting_human_proof"
+        && batch.document_uid == active_uid
+    {
+        requests.push(AiRequest::RefreshBatchProofs { job_id: batch.job_id.clone() });
+    }
+    Ok(out)
+}
+
+fn arabic_typography_and_polish_bar(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    documents: &[OpenDocument],
+    selected: Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
+    let mut settings_changed = false;
+    ui.horizontal_wrapped(|ui| {
+        label(ui, a, "Arabic diacritics (tashkeel)", "التشكيل العربي");
+        for (mode, en, ar) in [
+            (ArabicTashkeelMode::Auto, "Automatic (plain for children)", "تلقائي (بدون تشكيل كثيف للأطفال)"),
+            (ArabicTashkeelMode::None, "No diacritics", "بدون تشكيل"),
+            (ArabicTashkeelMode::Light, "Light (shadda & tanween)", "تشكيل خفيف"),
+            (ArabicTashkeelMode::Full, "Full vocalization", "تشكيل كامل"),
+        ] {
+            if ui.selectable_label(s.settings.arabic_tashkeel == mode, rtl::widget(ui, text(a, en, ar))).clicked()
+                && s.settings.arabic_tashkeel != mode
+            {
+                s.settings.arabic_tashkeel = mode;
+                settings_changed = true;
+            }
+        }
+    });
+    let available_fonts = designcraft_fonts::FontDb::global().scoped(0).available_arabic_families();
+    let current_font_label = s
+        .settings
+        .arabic_font
+        .as_deref()
+        .filter(|f| !f.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| text(a, "Automatic (best installed Arabic font)", "تلقائي (أفضل خط عربي مثبت)").to_owned());
+    ui.horizontal_wrapped(|ui| {
+        label(ui, a, "Arabic font", "الخط العربي");
+        egui::ComboBox::from_id_salt("ai_arabic_font").selected_text(rtl::widget(ui, &current_font_label)).show_ui(ui, |ui| {
+            if ui
+                .selectable_label(
+                    s.settings.arabic_font.is_none(),
+                    rtl::widget(ui, text(a, "Automatic (best installed Arabic font)", "تلقائي (أفضل خط عربي مثبت)")),
+                )
+                .clicked()
+                && s.settings.arabic_font.is_some()
+            {
+                s.settings.arabic_font = None;
+                settings_changed = true;
+            }
+            for family in &available_fonts {
+                let is_sel = s.settings.arabic_font.as_deref().is_some_and(|cur| cur.eq_ignore_ascii_case(family));
+                if ui.selectable_label(is_sel, rtl::widget(ui, family)).clicked() && !is_sel {
+                    s.settings.arabic_font = Some(family.clone());
+                    settings_changed = true;
+                }
+            }
+        });
+        if let Some(open_doc) = documents.iter().find(|d| Some(d.index) == selected) {
+            let btn_label = if a {
+                format!("تطبيق التحسينات على الكتاب الحالي بالكامل (١–{})", open_doc.pages)
+            } else {
+                format!("Polish entire Arabic book (1–{})", open_doc.pages)
+            };
+            if ui.add_enabled(!s.snapshot.busy, egui::Button::new(rtl::widget(ui, &btn_label))).clicked() {
+                s.polish_book_requested = true;
+            }
+        }
+    });
+    if !s.polish_book_status.is_empty() {
+        rtl::label(ui, &s.polish_book_status);
+    }
+    if settings_changed {
+        requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+    }
 }
 
 fn production_binding(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], selected: Option<usize>) {
@@ -3569,6 +3725,8 @@ fn production(
             egui::Button::new(rtl::widget(ui,text(a,"Preview curriculum locally (no API request)","معاينة خطة المنهج محلياً (دون طلب API)")))).clicked() {
             requests.push(AiRequest::PreviewProduction(s.production_task()));
         }
+        ui.separator();
+        arabic_typography_and_polish_bar(ui, s, a, documents, *activate_document, requests);
         if let Some(preview)=&s.snapshot.production_preview {
             egui::CollapsingHeader::new(rtl::widget(ui,text(a,"Last local curriculum preview","آخر معاينة محلية لخطة المنهج"))).default_open(true).show(ui,|ui| {
                 rtl::label(ui,format!("{} · {} · {} · {} {}",preview["blueprint"]["subject_domain"].as_str().unwrap_or(""),
@@ -7702,5 +7860,23 @@ mod tests {
         assert_eq!(applied.budget.token_limit, 50_000);
         assert_eq!(applied.budget.max_cost_usd, Some(0.50));
         assert_eq!(applied.budget.rates.as_ref().map(|r| r.output_per_million), Some(10.0));
+    }
+    #[test]
+    fn ai31_arabic_polish_bar_executes_whole_book_polish_in_one_undo_step() {
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"preset": "A4", "pages": 2, "facingPages": true, "binding": "rightToLeft"})).unwrap();
+        app.run("frame.create", json!({"spread": 0, "rect": [80.0, 80.0, 400.0, 160.0], "content": "text", "text": "السَّلَامُ عَلَيْكُمْ ﷺ"})).unwrap();
+        app.ui.ai.settings.arabic_tashkeel = ArabicTashkeelMode::None;
+        let mut requests = Vec::new();
+        let res = run_polish_current_arabic_book(&mut app, true, &mut requests).unwrap();
+        assert!(res["diacriticsRemoved"].as_u64().unwrap() > 0);
+        assert!(app.ui.ai.polish_book_status.contains("تم تحسين الكتاب"));
+        let doc = &app.session.active().unwrap().doc;
+        let text = &doc.stories.values().next().unwrap().text;
+        assert!(text.contains("السلام عليكم"));
+        assert!(text.contains('ﷺ'));
+        app.run("edit.undo", json!({})).unwrap();
+        let undone_text = &app.session.active().unwrap().doc.stories.values().next().unwrap().text;
+        assert!(undone_text.contains('\u{064E}'));
     }
 }
