@@ -391,6 +391,79 @@ pub(super) fn gemini_supports_json_schema(schema: &Value) -> bool {
     check_node(schema, 0)
 }
 
+const GEMINI_MAX_SCHEMA_ANY_OF_BRANCHES: usize = 4;
+const GEMINI_MAX_SCHEMA_UNROLLED_WEIGHT: usize = 48;
+
+pub(super) fn gemini_prepare_json_schema(schema: &Value) -> Option<Value> {
+    fn prepare_node(node: &Value, depth: usize, weight: &mut usize) -> Option<Value> {
+        if depth > 32 || *weight > GEMINI_MAX_SCHEMA_UNROLLED_WEIGHT {
+            return None;
+        }
+        let map = node.as_object()?;
+        *weight = weight.saturating_add(1);
+        if *weight > GEMINI_MAX_SCHEMA_UNROLLED_WEIGHT {
+            return None;
+        }
+        let mut out = serde_json::Map::with_capacity(map.len());
+        for (key, value) in map {
+            if matches!(key.as_str(), "minLength" | "maxLength" | "pattern") {
+                continue;
+            }
+            match key.as_str() {
+                "properties" => {
+                    let props = value.as_object()?;
+                    let mut clean_props = serde_json::Map::with_capacity(props.len());
+                    for (prop_name, prop_schema) in props {
+                        clean_props.insert(prop_name.clone(), prepare_node(prop_schema, depth.saturating_add(1), weight)?);
+                    }
+                    out.insert(key.clone(), Value::Object(clean_props));
+                }
+                "items" => {
+                    let repeat_raw =
+                        map.get("maxItems").and_then(Value::as_u64).or_else(|| map.get("minItems").and_then(Value::as_u64)).unwrap_or(1).clamp(1, 16);
+                    let repeat = usize::try_from(repeat_raw).unwrap_or(16);
+                    let mut item_weight = 0usize;
+                    let clean_items = prepare_node(value, depth.saturating_add(1), &mut item_weight)?;
+                    *weight = weight.saturating_add(item_weight.saturating_mul(repeat));
+                    if *weight > GEMINI_MAX_SCHEMA_UNROLLED_WEIGHT {
+                        return None;
+                    }
+                    out.insert(key.clone(), clean_items);
+                }
+                "prefixItems" => {
+                    let list = value.as_array()?;
+                    let mut clean_list = Vec::with_capacity(list.len());
+                    for item in list {
+                        clean_list.push(prepare_node(item, depth.saturating_add(1), weight)?);
+                    }
+                    out.insert(key.clone(), Value::Array(clean_list));
+                }
+                "anyOf" => {
+                    let list = value.as_array()?;
+                    if list.len() > GEMINI_MAX_SCHEMA_ANY_OF_BRANCHES {
+                        return None;
+                    }
+                    let mut clean_list = Vec::with_capacity(list.len());
+                    for branch in list {
+                        clean_list.push(prepare_node(branch, depth.saturating_add(1), weight)?);
+                    }
+                    out.insert(key.clone(), Value::Array(clean_list));
+                }
+                _ => {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (*weight <= GEMINI_MAX_SCHEMA_UNROLLED_WEIGHT).then_some(Value::Object(out))
+    }
+
+    if !gemini_supports_json_schema(schema) {
+        return None;
+    }
+    let mut weight = 0usize;
+    prepare_node(schema, 0, &mut weight)
+}
+
 fn sanitize_reason_token(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() || trimmed.len() > 32 {
@@ -460,10 +533,10 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
             let mut generation_config = json!({"responseMimeType":"application/json","maxOutputTokens":request.max_output_tokens});
             let normalized_model = model.to_ascii_lowercase();
             if (normalized_model.starts_with("gemini-2.5") || normalized_model.starts_with("gemini-3") || normalized_model.starts_with("gemini-4"))
-                && gemini_supports_json_schema(&request.json_schema)
+                && let Some(prepared_schema) = gemini_prepare_json_schema(&request.json_schema)
                 && let Some(config) = generation_config.as_object_mut()
             {
-                config.insert("responseJsonSchema".into(), request.json_schema.clone());
+                config.insert("responseJsonSchema".into(), prepared_schema);
             }
             if let Some(thinking_config) = gemini_thinking_config(model, request.max_output_tokens)
                 && let Some(config) = generation_config.as_object_mut()
@@ -523,15 +596,45 @@ pub(super) fn generate(
     request: &GenerationRequest,
     cancel: &AtomicBool,
 ) -> Result<GenerationResponse, String> {
-    let body = generation_body(selection, request)?;
     let transport = Transport::new(selection, key)?;
+    generate_with_post(selection, request, cancel, |path, body, once| {
+        if once { transport.post_once(path, body, cancel, MAX_JSON_BYTES) } else { transport.post(path, body, cancel, MAX_JSON_BYTES) }
+    })
+}
+
+pub(super) fn generate_with_post(
+    selection: &ModelSelection,
+    request: &GenerationRequest,
+    cancel: &AtomicBool,
+    mut post: impl FnMut(&str, &Value, bool) -> Result<Value, String>,
+) -> Result<GenerationResponse, String> {
+    let body = generation_body(selection, request)?;
     let path = match selection.provider {
         ProviderKind::OpenAi => "responses".into(),
         ProviderKind::Gemini => format!("models/{}:generateContent", model_id(selection)?),
         ProviderKind::Ollama => "api/chat".into(),
         ProviderKind::ComfyUi => return Err("ComfyUI requires an image workflow".into()),
     };
-    let response = transport.post(&path, &body, cancel, MAX_JSON_BYTES)?;
+    let response = match post(&path, &body, false) {
+        Ok(value) => value,
+        Err(error)
+            if selection.provider == ProviderKind::Gemini
+                && error.starts_with("AI provider HTTP 400:")
+                && body
+                    .get("generationConfig")
+                    .and_then(Value::as_object)
+                    .is_some_and(|cfg| cfg.contains_key("responseJsonSchema") || cfg.contains_key("thinkingConfig")) =>
+        {
+            crate::check_cancel(cancel)?;
+            let mut fallback_body = body;
+            if let Some(cfg) = fallback_body.get_mut("generationConfig").and_then(Value::as_object_mut) {
+                cfg.remove("responseJsonSchema");
+                cfg.remove("thinkingConfig");
+            }
+            post(&path, &fallback_body, true)?
+        }
+        Err(error) => return Err(error),
+    };
     parse_generation(selection.provider, &response)
 }
 

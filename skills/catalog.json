@@ -188,22 +188,22 @@
     {
       "id": "kg-oxford-cambridge-style",
       "files": {
-        "designcraft.json": "c693d1737fe5a583b4bf1488530ce5a311fe49d7130b3a485704d36173ae08e2",
+        "designcraft.json": "b32831795cfcc7f34e5ec2eb1ec192023cb99b223f8a1bcd3e1b710ce9922527",
         "references/cognitive-sensory-style-guide.md": "71a6268992f3dff639a1a8fd77bb5f900cba4158ecc521307d6ef620b3cb4d00",
         "references/independence.md": "600d649586a46d468573eb6f92f601a1932e5cbf70942295431f1cd3ba151ea7",
         "references/vector-vs-generative-matrix.md": "570a1de0a1ec4d4340948fb740ed730e8e47306b5cdbe99acd2bb9cd104caa31",
         "SKILL.md": "9612d881a9ef3ecd308fe6593afe51ddace6bbbf42f52baa96d71ae98060e65f",
         "templates/cambridge-cpa-grammar.json": "105dd10d825b974c997cd8bcf23f6a0e8a4bc5e91553c117254bc281ffc37f2f",
-        "templates/garnet-computing-systems-lab.json": "6de41380de3f8aa47540294a9008026cb8fb158f0fed3a420a673f57828c36e8",
-        "templates/international-curriculum-cover.json": "fa7c9d6558441fd5c737774fd399a479785a78201fedaaf8608cd3a08695a9f3",
-        "templates/international-scope-sequence.json": "e984f2556edea31636fb4264e37de3fd29d3c4f4a34a93b21cbb68108600d4ac",
-        "templates/oxford-fluency-project.json": "4e64a5697bef16ae592e748e18e0dece1ca85c9aa2603a6f4e792d10ce79b84d",
-        "templates/oxford-phonics-maze.json": "0802937b731c72a1e5915a4eb36dcefb31ba719d9fbdb687d9b52dd36ec211c6",
-        "templates/oxford-skills-time.json": "750672c8384f79bb4d9b98fa22c9fa1ac80cf221f1222699ac22694e89e21e8f",
-        "templates/oxford-song-colours.json": "504c6ddf40cd89ca3c71e3dba22ef0882fc1d96a4943bbd5d7a3228a5b3917fc",
-        "templates/oxford-vocab-story.json": "a13490e9e9693e7c8c70e5d395313149cd20ddf763320f381110ae6fed91204b",
-        "templates/oxford-workbook-print.json": "d071c68e631457a7806f618e7ca6a2dd51abc1e5db078ed7e643a39bbb2ba9fa",
-        "templates/sample_native_only.json": "60f56bce3b7dad7c975f1954d66d10d32f37616f713495a2e5972c8e0079f9b2"
+        "templates/garnet-computing-systems-lab.json": "d4cfb1a7295f4723e3a38be90fbd3341ec249940d2312bad86ce9e7217eb3293",
+        "templates/international-curriculum-cover.json": "68de5173e34c02f4db389a373557d54cd30dc222a260731ec0d8f3ddb53a0ffa",
+        "templates/international-scope-sequence.json": "7d2807927c235b53c74c43e55141340ff4f929618ee6c81b007bfc246a9fb377",
+        "templates/oxford-fluency-project.json": "500eefb88b513f5ee8fa2aa22cc1b17967fc7fe131333bf5c8d23015f73bc98b",
+        "templates/oxford-phonics-maze.json": "86f525dab4f11a5193fa02a3e9d95c993e4be05e3ed73a310b2be58c8a8c02c6",
+        "templates/oxford-skills-time.json": "d2ecb4852a1ea6a5f963a862895a5c0ce3e4b32cb3db68c97e04d96daf6b950a",
+        "templates/oxford-song-colours.json": "0907028854d52d414ba3295e5bd553c50e566cff812fce510e1c46a1665805f7",
+        "templates/oxford-vocab-story.json": "a297a1809cd0e7b75a368433190a1875d9b153dde663072c1b70180860f73965",
+        "templates/oxford-workbook-print.json": "f693d1227d52704f80b0032523d8db5464352f153b44d6ae3a05415ab3a0ee53",
+        "templates/sample_native_only.json": "0dc26f673dc586743e13e1deb0f7b70c6ec2eaae299d92bce8aaacc6db1e01c3"
       }
     },
     {

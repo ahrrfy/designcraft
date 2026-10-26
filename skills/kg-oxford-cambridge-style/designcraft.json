@@ -8,6 +8,7 @@
     "object.group",
     "object.label",
     "object.stroke",
+    "object.textFrameOptions",
     "path.create",
     "type.char",
     "type.para"
