@@ -3370,4 +3370,188 @@ mod tests {
         assert!(infer_learner_stage("كتاب الرياضيات للصف الثامن").contains("Middle"));
         assert!(infer_learner_stage("كراسة القراءة للصف الرابع").contains("Primary"));
     }
+
+    #[test]
+    fn ai29_arabic_cover_and_multipage_spreads_compile_clean_strokes_high_contrast_and_zero_preflight_errors() {
+        let manifest: Value = serde_json::from_str(include_str!("../../../skills/kg-oxford-cambridge-style/designcraft.json")).unwrap();
+        let ox_profile: DesignProfile = serde_json::from_value(manifest["design_profile"].clone()).unwrap();
+        let templates = BTreeMap::from([
+            (
+                "templates/international-curriculum-cover.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/international-curriculum-cover.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "templates/international-scope-sequence.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/international-scope-sequence.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "templates/oxford-vocab-story.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/oxford-vocab-story.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "templates/oxford-skills-time.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/oxford-skills-time.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "templates/oxford-fluency-project.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/oxford-fluency-project.json"
+                ))
+                .unwrap(),
+            ),
+        ]);
+        let mut ox_skill = skill();
+        ox_skill.skill_id = "kg-oxford-cambridge-style".into();
+        ox_skill.templates = templates;
+        let mut active_profile = ox_profile.clone();
+        active_profile.page_families.retain(|f| ox_skill.templates.contains_key(&f.template));
+        ox_skill.design_profile = Some(active_profile);
+
+        let brief = "صمم منهج دولي متكامل لمادة التربية الإسلامية لمرحلة الروضة KG2 بأسلوب أكسفورد وكامبريدج";
+        let mut session = designcraft_engine::Session::new();
+        session
+            .execute("file.new", &json!({"preset": "A4", "pages": 5, "facingPages": true, "binding": "rightToLeft", "margin": 42.519685}))
+            .unwrap();
+
+        // Batch 1 (Page 1 solo cover): vocalized Arabic copy matching live user run
+        let cover_json = json!({
+            "title": "نور الإيمان - الغلاف",
+            "pages": [{
+                "page": 0,
+                "family": "international-curriculum-cover",
+                "text": {
+                    "series-badge": "سِلْسِلَةُ نُورِ الْإِيمَانِ",
+                    "level-tag": "مَرْحَلَةُ الرَّوْضَةِ الثَّانِيَةِ KG2",
+                    "book-title": "مِنْهَاجُ نُورِ الْإِيمَانِ الدَّوْلِيُّ",
+                    "book-subtitle": "كِتَابُ الطِّفْلِ التَّفَاعُلِيُّ لِلْقِيَمِ وَالْعِبَادَاتِ وَالسِّيرَةِ",
+                    "hero-caption": "إِصْدَارٌ تَفَاعُلِيٌّ مُصَوَّرٌ",
+                    "pillars-heading": "مَحَاوِرُ التَّعَلُّمِ وَالْبِنَاءِ التَّرْبَوِيِّ:",
+                    "pillar-1": "١ الْعَقِيدَةُ وَالتَّفَكُّرُ فِي الْخَلْقِ",
+                    "pillar-2": "٢ الْآدَابُ الْيَوْمِيَّةُ وَالْأَذْكَارُ",
+                    "pillar-3": "٣ قِصَصُ السِّيرَةِ وَالْقُدْوَةِ الْحَسَنَةِ",
+                    "pillar-4": "٤ الْأَنْشِطَةُ الْعَمَلِيَّةُ وَالْمَشَارِيعُ",
+                    "student-card": "اسْمُ الطِّفْلِ: ____________________   الصَّفُّ / الشُّعْبَةُ: __________",
+                    "edition-footer": "مِنْهَاجٌ تَرْبَوِيٌّ أَصِيلٌ مُتَوَافِقٌ مَعَ مَعَايِيرِ الطُّفُولَةِ الْمُبَكِّرَةِ"
+                }
+            }]
+        });
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let canonical_b1 = crate::facing_pages::canonicalize(session.doc().unwrap(), &session.prefs).unwrap();
+        let mut b1 = compile_for_brief(&cover_json.to_string(), &ox_skill, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly, brief).unwrap();
+        crate::native_layout::prepare(&mut b1, &canonical_b1, &session.prefs, &cancel).unwrap();
+        let mapped_b1 = crate::facing_pages::map_plan(&b1, session.doc().unwrap()).unwrap();
+        session.execute("production.apply", &json!({"commands": mapped_b1.commands, "outputMode": "native_only", "requirePreflight": true})).unwrap();
+
+        // Assert cover visual polish invariants on the actual engine document:
+        let doc = &session.doc().unwrap().doc;
+        let mut by_label = BTreeMap::new();
+        for top in &doc.spreads[0].items {
+            top.walk(&mut |it| {
+                if !it.label.is_empty() {
+                    by_label.insert(it.label.clone(), it.clone());
+                }
+            });
+        }
+        let series_pill = by_label.get("part.cover.series-pill").expect("series-pill");
+        let series_txt = by_label.get("part.cover.series-txt").expect("series-txt");
+        let series_story = match &series_txt.content {
+            designcraft_engine::doc::Content::Text(tf) => doc.story(tf.story).unwrap(),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let (_, run_fmt) = series_story.runs().next().unwrap();
+        let (_, base_chars) = doc.styles.resolve_para(&series_story.paras[0]);
+        let series_txt_fill = doc.styles.resolve_char(&base_chars, run_fmt).fill;
+        assert!(
+            !(series_txt_fill == "[Paper]" && series_pill.fill.swatch != "C=100 M=90 Y=10 K=0" && series_pill.fill.tint < 0.75),
+            "series-txt must have high contrast against series-pill (got pill=({}, {}), text={series_txt_fill})",
+            series_pill.fill.swatch,
+            series_pill.fill.tint
+        );
+        for clean_inner in ["part.cover.title-inner", "part.cover.student-box", "part.cover.hero-dot", "part.cover.level-pill", "part.ui.footer.bar"]
+        {
+            let item = by_label.get(clean_inner).unwrap_or_else(|| panic!("missing {clean_inner}"));
+            assert!(
+                item.stroke.is_none(),
+                "{clean_inner} must not carry a harsh wireframe/default stroke, got swatch={} weight={}",
+                item.stroke.swatch,
+                item.stroke.weight
+            );
+        }
+        let footer_bar = by_label.get("part.ui.footer.bar").expect("footer.bar");
+        assert!(
+            footer_bar.bounds().height() <= 6.0,
+            "footer.bar should be a sleek editorial rule (<= 6pt), got height={}",
+            footer_bar.bounds().height()
+        );
+
+        // Batch 2 (Pages 2-3 RTL facing spread -> spread 1) & Batch 3 (Pages 4-5 RTL facing spread -> spread 2):
+        for (start, spread_idx, fam_a, fam_b) in
+            [(1u32, 1usize, "international-scope-sequence", "oxford-vocab-story"), (3u32, 2usize, "oxford-skills-time", "oxford-fluency-project")]
+        {
+            let make_slots = |fam_id: &str| -> BTreeMap<String, String> {
+                let fam = ox_skill.design_profile.as_ref().unwrap().page_families.iter().find(|f| f.id == fam_id).unwrap();
+                fam.text_slots.iter().enumerate().map(|(idx, s)| (s.id.clone(), format!("مُحْتَوًى تَعْلِيمِيٌّ مُتَكَامِلٌ {}", idx + 1))).collect()
+            };
+            let spread_json = json!({
+                "title": format!("دفعة الصفحات {}-{}", start + 1, start + 2),
+                "pages": [
+                    {"page": start, "family": fam_a, "text": make_slots(fam_a)},
+                    {"page": start + 1, "family": fam_b, "text": make_slots(fam_b)}
+                ]
+            });
+            let canonical_base = crate::facing_pages::canonicalize(session.doc().unwrap(), &session.prefs).unwrap();
+            let mut plan =
+                compile_for_brief(&spread_json.to_string(), &ox_skill, BatchScope { start, count: 2 }, OutputMode::NativeOnly, brief).unwrap();
+            crate::native_layout::prepare(&mut plan, &canonical_base, &session.prefs, &cancel).unwrap();
+            assert!(plan.commands.len() <= MAX_ACTIONS, "2-page Arabic spread exceeded 512 actions: {}", plan.commands.len());
+            let mapped = crate::facing_pages::map_plan(&plan, session.doc().unwrap()).unwrap();
+            session
+                .execute("production.apply", &json!({"commands": mapped.commands, "outputMode": "native_only", "requirePreflight": true}))
+                .unwrap();
+            let spread_doc = &session.doc().unwrap().doc;
+            let mut footer_count = 0usize;
+            for top in &spread_doc.spreads[spread_idx].items {
+                top.walk(&mut |it| {
+                    if it.label == "part.ui.header.unit-badge" || it.label == "part.ui.footer.bar" {
+                        assert!(it.stroke.is_none(), "{} on spread {} has unintended stroke {:?}", it.label, spread_idx, it.stroke);
+                    }
+                    if it.label == "part.ui.footer.bar" {
+                        footer_count += 1;
+                        assert!(it.bounds().height() <= 6.0);
+                    }
+                });
+            }
+            assert_eq!(footer_count, 2, "expected 2 clean footer bars on 2-page facing spread {spread_idx}");
+        }
+
+        // Render all 5 pages in-memory to verify rasterization succeeds cleanly:
+        let mut renderer = designcraft_render::Renderer::new();
+        let final_doc = session.doc().unwrap().doc.clone();
+        let save_dir = std::env::var_os("DC_AI29_SAVE_PNG_DIR").map(std::path::PathBuf::from);
+        if let Some(dir) = &save_dir {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for page_idx in 0..5usize {
+            let png = renderer
+                .render_page(&final_doc, &session.cache, page_idx, 1.5, false, &designcraft_render::RenderOptions::default())
+                .expect("render_page")
+                .to_png();
+            assert!(png.len() > 1024, "page {} PNG unexpectedly small: {} bytes", page_idx + 1, png.len());
+            if let Some(dir) = &save_dir {
+                std::fs::write(dir.join(format!("page-{}.png", page_idx + 1)), &png).unwrap();
+            }
+        }
+    }
 }

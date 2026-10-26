@@ -2018,7 +2018,22 @@ fn choose_compatible_skills(prompt: &str, entries: Vec<designcraft_ai_skills::Ca
     ranked.into_iter().take(6).map(|(_, id)| id).collect()
 }
 
+fn prompt_names_skill_id(prompt: &str, skill_id: &str) -> bool {
+    if skill_id.len() < 3 {
+        return false;
+    }
+    let lower_prompt = prompt.to_lowercase();
+    let lower_id = skill_id.to_lowercase();
+    lower_prompt.match_indices(&lower_id).any(|(idx, matched)| {
+        let before_ok = lower_prompt.get(..idx).and_then(|s| s.chars().next_back()).is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+        let after_idx = idx.saturating_add(matched.len());
+        let after_ok = lower_prompt.get(after_idx..).and_then(|s| s.chars().next()).is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-');
+        before_ok && after_ok
+    })
+}
+
 fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) -> usize {
+    let exact_id_boost = if prompt_names_skill_id(prompt, &entry.skill_id) { 80 } else { 0 };
     let prompt = normalize_skill_search(prompt);
     let haystack = normalize_skill_search(&format!("{} {} {}", entry.skill_id, entry.name, entry.description));
     let words = prompt
@@ -2308,7 +2323,7 @@ fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) 
         "early-years-booklet-planning" | "early-years-activity-layout" if book => 12,
         _ => 0,
     };
-    lexical.saturating_add(purpose)
+    lexical.saturating_add(purpose).saturating_add(exact_id_boost)
 }
 
 /// Search-only normalization; task copy and pinned skill contents stay exact.
@@ -4121,6 +4136,39 @@ mod tests {
             assert_eq!(choose_compatible_skills(prompt, vec![entry.clone()], &supported_commands()), vec![entry.skill_id.clone()]);
         }
         assert!(choose_compatible_skills("Create a business invoice", vec![entry], &supported_commands()).is_empty());
+
+        // Explicitly naming a skill_id in the prompt elevates it into the top-6 selection even alongside 8+ high-priority skills.
+        let mut catalog_entries =
+            runner.registry.catalog("").into_iter().filter(|e| e.revisions[0].manifest.design_profile.is_none()).collect::<Vec<_>>();
+        let seed_entry = catalog_entries[0].clone();
+        for extra_id in [
+            "kg-cognitive-sensory-layout",
+            "kg-international-curriculum-architect",
+            "kg-oxford-skills-time",
+            "kg-oxford-fluency-time",
+            "kg-school-print-prepress",
+        ] {
+            let mut extra = seed_entry.clone();
+            extra.skill_id = extra_id.into();
+            extra.name = extra_id.into();
+            extra.description = "منهج علوم دولي للأطفال للطباعة".into();
+            extra.revisions[0].status = RevisionStatus::Approved;
+            extra.active_revision = Some(extra.revisions[0].revision.clone());
+            catalog_entries.push(extra);
+        }
+        let mut custom = seed_entry;
+        custom.skill_id = "custom-editorial-craft".into();
+        custom.name = "Editorial Craft".into();
+        custom.description = "Bespoke grid polish".into();
+        custom.revisions[0].status = RevisionStatus::Approved;
+        custom.active_revision = Some(custom.revisions[0].revision.clone());
+        catalog_entries.push(custom);
+        let chosen = choose_compatible_skills(
+            "صمم منهج علوم دولي للأطفال لمرحلة KG2 باستخدام مهارة custom-editorial-craft للطباعة",
+            catalog_entries,
+            &supported_commands(),
+        );
+        assert!(chosen.contains(&"custom-editorial-craft".to_owned()), "explicitly named skill_id must be selected, got: {chosen:?}");
     }
 
     #[test]

@@ -759,4 +759,115 @@ mod native_tests {
         assert!(start.elapsed() < std::time::Duration::from_millis(200));
         assert_eq!(server.join().unwrap().len(), 1);
     }
+
+    #[test]
+    fn ai29_gemini_schema_prep_strips_string_lengths_omits_explosive_unions_and_recovers_config_400() {
+        // 1. Compact closed schema with unsupported string constraints strips minLength/maxLength/pattern
+        //    from responseJsonSchema while keeping the full contract in the user prompt.
+        let compact_with_lengths = GenerationRequest {
+            json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["title", "summary"],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 400, "pattern": "^.+$"}
+                }
+            }),
+            ..request()
+        };
+        let sel = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.7-flash".into(), endpoint: None };
+        let compact_body = generation_body(&sel, &compact_with_lengths).unwrap();
+        let attached = &compact_body["generationConfig"]["responseJsonSchema"];
+        assert!(attached.is_object(), "compact sanitized schema should stay attached");
+        assert!(attached["properties"]["title"].get("minLength").is_none());
+        assert!(attached["properties"]["title"].get("maxLength").is_none());
+        assert!(attached["properties"]["summary"].get("pattern").is_none());
+        assert!(compact_body["contents"][0]["parts"][0]["text"].as_str().unwrap().contains("\"maxLength\":120"));
+
+        // 2. Multi-page 9-family union schema (Batch 2 facing spread: minItems=2, maxItems=2)
+        //    omits responseJsonSchema so Gemini's grammar compiler never rejects Page 2+ with HTTP 400.
+        let branches: Vec<Value> = (0..9)
+            .map(|idx| {
+                let mut props = serde_json::Map::new();
+                let mut req_slots = Vec::new();
+                for s in 0..12 {
+                    let key = format!("slot_{s}");
+                    props.insert(key.clone(), json!({"type": "string", "minLength": 1, "maxLength": 96}));
+                    req_slots.push(key);
+                }
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["page", "family", "text"],
+                    "properties": {
+                        "page": {"type": "integer", "minimum": 1, "maximum": 2},
+                        "family": {"type": "string", "enum": [format!("family-{idx}")]},
+                        "text": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": req_slots,
+                            "properties": props
+                        }
+                    }
+                })
+            })
+            .collect();
+        let multipage_req = GenerationRequest {
+            json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["title", "pages"],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "pages": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"anyOf": branches}
+                    }
+                }
+            }),
+            ..request()
+        };
+        let multipage_body = generation_body(&sel, &multipage_req).unwrap();
+        assert_eq!(multipage_body["generationConfig"]["responseMimeType"], "application/json");
+        assert!(
+            multipage_body["generationConfig"].get("responseJsonSchema").is_none(),
+            "explosive 9-branch multi-page union must omit responseJsonSchema and rely on JSON mode + prompt contract"
+        );
+        assert!(multipage_body["contents"][0]["parts"][0]["text"].as_str().unwrap().contains("OUTPUT JSON CONTRACT:"));
+
+        // 3. Pre-inference HTTP 400 fallback strips optional thinkingConfig/responseJsonSchema once for Gemini.
+        let cancel = AtomicBool::new(false);
+        let mut calls: Vec<(Value, bool)> = Vec::new();
+        let ok_payload = json!({
+            "candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "{\"title\":\"ok\",\"summary\":\"ok\"}"}]}}],
+            "usageMetadata": {"promptTokenCount": 42, "candidatesTokenCount": 12}
+        });
+        let recovered = crate::native::generate_with_post(&sel, &compact_with_lengths, &cancel, |_, body, once| {
+            calls.push((body.clone(), once));
+            if calls.len() == 1 { Err("AI provider HTTP 400: invalid request or unsupported model parameter".into()) } else { Ok(ok_payload.clone()) }
+        })
+        .unwrap();
+        assert_eq!(recovered.text, "{\"title\":\"ok\",\"summary\":\"ok\"}");
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[0].1);
+        assert!(calls[0].0["generationConfig"].get("thinkingConfig").is_some());
+        assert!(calls[0].0["generationConfig"].get("responseJsonSchema").is_some());
+        assert!(calls[1].1, "fallback must be single-shot");
+        assert!(calls[1].0["generationConfig"].get("thinkingConfig").is_none());
+        assert!(calls[1].0["generationConfig"].get("responseJsonSchema").is_none());
+        assert_eq!(calls[1].0["generationConfig"]["responseMimeType"], "application/json");
+
+        // Persistent HTTP 400 after stripping optional config returns sanitized error without further retries.
+        let mut fail_calls = 0usize;
+        let still_bad = crate::native::generate_with_post(&sel, &compact_with_lengths, &cancel, |_, _, _| {
+            fail_calls += 1;
+            Err("AI provider HTTP 400: invalid request or unsupported model parameter".into())
+        })
+        .unwrap_err();
+        assert_eq!(still_bad, "AI provider HTTP 400: invalid request or unsupported model parameter");
+        assert_eq!(fail_calls, 2);
+    }
 }
