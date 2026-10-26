@@ -59,7 +59,7 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
                 "message":"Kept the existing mixed Arabic/Latin frame intact; applied the available Arabic print face with checked Latin coverage"}));
         }
         let fonts = designcraft_fonts::FontDb::global().scoped(doc.font_scope);
-        let mut ranges: Vec<(usize, usize, String)> = Vec::new();
+        let mut ranges: Vec<(usize, usize, String, String)> = Vec::new();
         let mut runs = story.runs().peekable();
         for (paragraph_index, mut paragraph_range) in story.para_ranges().into_iter().enumerate() {
             let para = story.paras.get(paragraph_index).ok_or("Missing native paragraph during print font binding")?;
@@ -88,8 +88,8 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
                 let text = story.text.get(start..end).ok_or("Print font run is not on Unicode character boundaries")?;
                 let attrs = doc.styles.resolve_char(&base_chars, format);
                 let (weight, italic) = fonts.traits_of(&attrs.font_family, &attrs.font_style);
-                let style = binding_style(font, &fonts, weight >= 600.0, italic)?;
-                let face = fonts.face(&font.family, &style);
+                let (run_family, style) = binding_style(font, &fonts, weight >= 600.0, italic)?;
+                let face = fonts.face(&run_family, &style);
                 // Symbols and covered Arabic honorific ligatures/signs are left for the separate explicit fallback-font repair pass.
                 if let Some(ch) = text.chars().find(|&ch| {
                     ch != '\u{061c}'
@@ -97,15 +97,17 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
                         && face.glyph_for(ch) == 0
                         && !(crate::native_layout::is_fallback_symbol_or_honorific(ch) && crate::native_layout::has_fallback_glyph(&fonts, ch))
                 }) {
-                    return Err(format!("Requested print font '{} {}' lacks supplied character {ch}; copy was preserved", font.family, style));
+                    return Err(format!("Requested print font '{} {}' lacks supplied character {ch}; copy was preserved", run_family, style));
                 }
-                let merge = ranges.last().is_some_and(|(_, previous_end, previous_style)| *previous_end == start && *previous_style == style);
+                let merge = ranges.last().is_some_and(|(_, previous_end, previous_fam, previous_style)| {
+                    *previous_end == start && *previous_fam == run_family && *previous_style == style
+                });
                 if merge {
-                    if let Some((_, previous_end, _)) = ranges.last_mut() {
+                    if let Some((_, previous_end, _, _)) = ranges.last_mut() {
                         *previous_end = end;
                     }
                 } else {
-                    ranges.push((start, end, style));
+                    ranges.push((start, end, run_family, style));
                 }
                 if ranges.len() > MAX_ACTIONS / 2 {
                     return Err("Print text has too many formatting ranges for the 512-action limit".into());
@@ -116,13 +118,13 @@ pub(crate) fn apply(plan: &mut ProductionPlan, base: &DocState, prefs: &Prefs, c
             }
         }
         let count = ranges.len();
-        for (start, end, style) in ranges {
+        for (start, end, run_family, style) in ranges {
             if candidate.commands.len().checked_add(2).is_none_or(|count| count > MAX_ACTIONS) {
                 return Err("Native print font binding exceeds the 512-action limit".into());
             }
             let actions = [
                 EngineAction { command: "text.select".into(), params: json!({"story":format!("${index}.story"),"anchor":start,"focus":end}) },
-                EngineAction { command: "type.char".into(), params: json!({"attrs":{"fontFamily":font.family,"fontStyle":style}}) },
+                EngineAction { command: "type.char".into(), params: json!({"attrs":{"fontFamily":run_family,"fontStyle":style}}) },
             ];
             scratch.execute("text.select", &json!({"story":story_id.0,"anchor":start,"focus":end})).map_err(|e| e.to_string())?;
             let _ = scratch.execute("type.char", &actions.get(1).ok_or("Missing print font action")?.params).map_err(|e| e.to_string())?;
@@ -147,23 +149,30 @@ fn has_fallback_glyph(fonts: &designcraft_fonts::ScopedFonts<'_>, ch: char) -> b
     crate::native_layout::has_fallback_glyph(fonts, ch)
 }
 
-fn binding_style(font: &AvailablePrintFont, fonts: &designcraft_fonts::ScopedFonts<'_>, bold: bool, italic: bool) -> Result<String, String> {
+fn binding_style(
+    font: &AvailablePrintFont,
+    fonts: &designcraft_fonts::ScopedFonts<'_>,
+    bold: bool,
+    italic: bool,
+) -> Result<(String, String), String> {
+    let target_family = if bold { font.heading_family.as_deref().unwrap_or(&font.family) } else { &font.family };
     let selected = if bold { &font.heading } else { &font.regular };
-    let styles = fonts.styles(&font.family);
+    let styles = fonts.styles(target_family);
     let style = styles
         .iter()
         .find(|style| {
-            let (weight, slanted) = fonts.traits_of(&font.family, style);
+            let (weight, slanted) = fonts.traits_of(target_family, style);
             (weight >= 600.0) == bold && slanted == italic && style.eq_ignore_ascii_case(selected)
         })
         .or_else(|| {
             styles.iter().find(|style| {
-                let (weight, slanted) = fonts.traits_of(&font.family, style);
+                let (weight, slanted) = fonts.traits_of(target_family, style);
                 (weight >= 600.0) == bold && slanted == italic
             })
-        });
-    style.cloned().ok_or_else(|| {
-        format!("Print font '{}' has no installed face preserving bold={bold}, italic={italic}; formatting was preserved", font.family)
+        })
+        .or_else(|| (!italic).then(|| styles.iter().find(|style| style.eq_ignore_ascii_case(selected))).flatten());
+    style.map(|s| (target_family.to_owned(), s.clone())).ok_or_else(|| {
+        format!("Print font '{}' has no installed face preserving bold={bold}, italic={italic}; formatting was preserved", target_family)
     })
 }
 

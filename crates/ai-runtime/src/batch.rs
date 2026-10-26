@@ -62,6 +62,19 @@ pub(crate) fn layout_relevant_prefs_value(prefs: &Prefs) -> Result<Value, String
             "recovery_minutes",
             "showFontNamesInEnglish",
             "show_font_names_in_english",
+            "cjkFeatures",
+            "cjk_features",
+            "documentPresets",
+            "document_presets",
+            "autocorrect",
+            "autocorrectList",
+            "autocorrect_list",
+            "absolutePageNumbers",
+            "absolute_page_numbers",
+            "polygonSides",
+            "polygon_sides",
+            "starInset",
+            "star_inset",
         ] {
             obj.remove(non_layout_key);
         }
@@ -367,6 +380,7 @@ impl ProductionRunner {
         job.ledger = None;
         let id = batch_report_id(&job);
         let expected = job.snapshot.document_uid.zip(job.snapshot.document_revision);
+        let expected_doc = job.publication_base.as_ref().map(|st| st.doc.clone());
         self.pending = Some(Pending {
             roots: job.roots.clone(),
             worker,
@@ -374,9 +388,12 @@ impl ProductionRunner {
             started: Instant::now(),
             task: Some(task),
             expected,
+            expected_doc,
             expected_prefs: None,
             skills: pins,
             settings,
+            deferred_outcome: None,
+            deferred_batch: None,
         });
         job.snapshot.status = "running".into();
         self.snapshot.busy = true;
@@ -1862,9 +1879,12 @@ mod tests {
             started: Instant::now(),
             task: Some(request.clone()),
             expected: continuing.then_some((before.uid, before.revision)),
+            expected_doc: continuing.then(|| before.doc.clone()),
             expected_prefs: None,
             skills: vec![],
             settings: request.settings,
+            deferred_outcome: None,
+            deferred_batch: None,
         });
         let completed = runner.handle(&mut session, AiRequest::Poll);
         assert_eq!(completed.stage, "awaiting_human_proof", "{}", completed.message);
@@ -3777,9 +3797,12 @@ mod tests {
                 started: Instant::now(),
                 task: Some(request.clone()),
                 expected: existing.as_ref().map(|d| (d.uid, d.revision)),
+                expected_doc: existing.as_ref().map(|d| d.doc.clone()),
                 expected_prefs: None,
                 skills: vec![],
                 settings: request.settings,
+                deferred_outcome: None,
+                deferred_batch: None,
             });
             let completed = runner.handle(&mut session, AiRequest::Poll);
             assert_eq!(completed.stage, "awaiting_human_proof", "blank_reuse={blank_reuse}: {}", completed.message);

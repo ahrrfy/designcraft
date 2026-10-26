@@ -1029,6 +1029,50 @@ fn schemas() -> Vec<(&'static str, Value, Value)> {
             json!({"story":"$0.story","table":"$1.table","direction":"rightToLeft","headerRows":1,"repeatHeader":true}),
         ),
         (
+            "font.replace",
+            object(
+                &[
+                    ("family", string()),
+                    ("style", string()),
+                    ("toFamily", string()),
+                    ("toStyle", string()),
+                    ("redefineStyles", boolean()),
+                    ("script", choice(&["arabic", "latin"])),
+                    ("pages", array(integer(1, 10000), 2, 2)),
+                ],
+                &["toFamily"],
+            ),
+            json!({"script":"arabic","toFamily":"Al-Jazeera-Arabic","pages":[1,32]}),
+        ),
+        (
+            "type.diacritics",
+            object(
+                &[
+                    ("mode", choice(&["none", "light"])),
+                    ("pages", array(integer(1, 10000), 2, 2)),
+                    ("story", integer(1, u64::MAX)),
+                    ("excludeLabels", array(string(), 0, 64)),
+                ],
+                &["mode"],
+            ),
+            json!({"mode":"none","pages":[1,32]}),
+        ),
+        (
+            "book.polishArabic",
+            object(
+                &[
+                    ("tashkeel", choice(&["keep", "none", "light"])),
+                    ("arabicFont", string()),
+                    ("fixNumbering", boolean()),
+                    ("fixRtlCells", boolean()),
+                    ("fitOverset", boolean()),
+                    ("pages", array(integer(1, 10000), 2, 2)),
+                ],
+                &[],
+            ),
+            json!({"tashkeel":"none","arabicFont":"Al-Jazeera-Arabic","fixNumbering":true,"fixRtlCells":true,"fitOverset":true,"pages":[1,32]}),
+        ),
+        (
             "file.place",
             object(
                 &[

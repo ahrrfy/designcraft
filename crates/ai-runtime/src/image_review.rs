@@ -67,7 +67,7 @@ pub(crate) fn request(placement: &ImagePlacement, image: &GeneratedImage, settin
              Do not infer a required subject count from those numbers. A number is a count requirement only when it explicitly describes depicted subjects. \
              This image is one illustration, not a complete page: native layout, captions, speech bubbles, labels, fonts and exercise controls are added separately. Their absence is not a failure. \
              Do not demand typography, page layouts, answers, numbers or captions inside the image. \
-             Return fail only for a clearly visible mismatch with an explicit illustration requirement, such as monkeys requested but no monkeys depicted. \
+             Return fail only for a clearly visible mismatch where the primary requested subject or scene is completely absent or replaced by an unrelated subject (such as monkeys requested but cars depicted). When the core requested scene or educational subjects are present, treat minor pose, handedness, finger/hand count, or secondary card details as uncertain rather than fail so the human reviewer can inspect the proof. \
              Return uncertain when requirements are ambiguous, objects cannot be counted reliably, or the image does not provide enough visual evidence. The inspection reference may be reduced; do not infer invisible details or printing resolution from it. \
              Return pass only when the inspected visible requirements appear satisfied; pass remains advisory, not certification or a guarantee of semantic correctness. \
              Never invent unseen objects, hidden actions, curriculum standards, or requirements absent from the illustration request. \

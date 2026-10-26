@@ -24,9 +24,12 @@ struct Pending {
     started: Instant,
     task: Option<TaskRequest>,
     expected: Option<(u64, u64)>,
+    expected_doc: Option<std::sync::Arc<designcraft_engine::doc::Document>>,
     expected_prefs: Option<Prefs>,
     skills: Vec<(String, String)>,
     settings: AiSettings,
+    deferred_outcome: Option<worker::Outcome>,
+    deferred_batch: Option<(worker::Outcome, Box<UsageLedger>)>,
 }
 struct SampleEvidence {
     id: String,
@@ -68,6 +71,7 @@ impl ProductionRunner {
         // Every profile access resolves links against these canonical boundaries.
         let profile_access = file_access::AutomationRoots::new(Some(&root), Some(&root))?.ok_or("Missing AI profile boundary")?;
         let vault = Vault::for_profile(&root)?;
+        import_sibling_managed_profiles(&root, &vault);
         let mut registry = SkillRegistry::open(root.join("skills")).map_err(|e| e.to_string())?;
         registry.install_builtin_drafts().map_err(|e| e.to_string())?;
         let mut settings = read_json(&profile_access, &root.join("settings.json"), 1024 * 1024)?
@@ -606,14 +610,17 @@ impl ProductionRunner {
         self.save_production_draft(session, &task)?;
         require_text_model(&task.settings)?;
         require_generation_models(&task.settings)?;
-        let expected = match task.target {
-            TaskTarget::CurrentDocument => Some((session.doc().map_err(|e| e.to_string())?.uid, session.doc().map_err(|e| e.to_string())?.revision)),
+        let (expected, expected_doc) = match task.target {
+            TaskTarget::CurrentDocument => {
+                let current = session.doc().map_err(|e| e.to_string())?;
+                (Some((current.uid, current.revision)), Some(current.doc.clone()))
+            }
             TaskTarget::ContinueBook => {
                 let current = session.doc().map_err(|e| e.to_string())?;
                 if task.settings.pages_per_batch == 0 {
                     return Err("Continuing a book requires reviewed batches".into());
                 }
-                Some((current.uid, current.revision))
+                (Some((current.uid, current.revision)), Some(current.doc.clone()))
             }
             TaskTarget::NewA4 { pages } => {
                 if !(1..=1000).contains(&pages) {
@@ -622,7 +629,7 @@ impl ProductionRunner {
                 if task.settings.pages_per_batch == 0 && pages > 8 {
                     return Err("Books over eight pages require reviewed batches".into());
                 }
-                None
+                (None, None)
             }
         };
         let ids = if task.auto_select_skills {
@@ -686,7 +693,7 @@ impl ProductionRunner {
             base,
             prefs: session.prefs.clone(),
         };
-        self.launch(work, Some(task), expected, pins, settings)
+        self.launch_with_doc(work, Some(task), expected, expected_doc, pins, settings)
     }
 
     fn preview_production(&mut self, session: &Session, task: TaskRequest) -> Result<(), String> {
@@ -865,6 +872,18 @@ impl ProductionRunner {
         skills: Vec<(String, String)>,
         settings: AiSettings,
     ) -> Result<(), String> {
+        self.launch_with_doc(work, task, expected, None, skills, settings)
+    }
+
+    fn launch_with_doc(
+        &mut self,
+        work: worker::Work,
+        task: Option<TaskRequest>,
+        expected: Option<(u64, u64)>,
+        expected_doc: Option<std::sync::Arc<designcraft_engine::doc::Document>>,
+        skills: Vec<(String, String)>,
+        settings: AiSettings,
+    ) -> Result<(), String> {
         if self.pending.is_some() {
             return Err("Only one AI task can run in this window".into());
         }
@@ -892,7 +911,20 @@ impl ProductionRunner {
             _ => None,
         };
         let worker = worker::spawn(work, keys, roots.clone())?;
-        self.pending = Some(Pending { roots, worker, id, started: Instant::now(), task, expected, expected_prefs, skills, settings });
+        self.pending = Some(Pending {
+            roots,
+            worker,
+            id,
+            started: Instant::now(),
+            task,
+            expected,
+            expected_doc,
+            expected_prefs,
+            skills,
+            settings,
+            deferred_outcome: None,
+            deferred_batch: None,
+        });
         self.snapshot.busy = true;
         self.snapshot.current_usage = Default::default();
         self.snapshot.current_issues.clear();
@@ -964,55 +996,81 @@ impl ProductionRunner {
     }
 
     fn poll(&mut self, session: &mut Session) {
-        let Some(pending) = self.pending.take() else { return };
+        let Some(mut pending) = self.pending.take() else { return };
         if let (Some(job), Some(snapshot)) = (&self.batch, &mut self.snapshot.batch) {
             snapshot.elapsed_ms = job.snapshot_elapsed().saturating_add(pending.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         }
-        let mut completed = None;
+        let target_uid = pending.expected.map(|(uid, _)| uid).or_else(|| self.batch.as_ref().and_then(|job| job.snapshot.document_uid));
+        let mut completed = pending.deferred_outcome.take();
+        let mut completed_batch = pending.deferred_batch.take();
         let mut disconnected = false;
-        for _ in 0..64 {
-            match pending.worker.receiver.try_recv() {
-                Ok(worker::Message::Progress { stage, fraction }) => {
-                    self.snapshot.stage = stage;
-                    self.snapshot.progress = fraction.clamp(0.0, 1.0);
-                }
-                Ok(worker::Message::Usage(usage)) => {
-                    self.snapshot.current_usage = usage.clone();
-                    if let Some(job) = self.batch.as_mut() {
-                        job.snapshot.cumulative_usage = usage.clone();
+        if completed.is_none() && completed_batch.is_none() {
+            for _ in 0..64 {
+                match pending.worker.receiver.try_recv() {
+                    Ok(worker::Message::Progress { stage, fraction }) => {
+                        self.snapshot.stage = stage;
+                        self.snapshot.progress = fraction.clamp(0.0, 1.0);
                     }
-                    if let Some(batch) = self.snapshot.batch.as_mut() {
-                        batch.cumulative_usage = usage;
+                    Ok(worker::Message::Usage(usage)) => {
+                        self.snapshot.current_usage = usage.clone();
+                        if let Some(job) = self.batch.as_mut() {
+                            job.snapshot.cumulative_usage = usage.clone();
+                        }
+                        if let Some(batch) = self.snapshot.batch.as_mut() {
+                            batch.cumulative_usage = usage;
+                        }
                     }
-                }
-                Ok(worker::Message::Diagnostic(issue)) => {
-                    // A long review group may repair many pages. Retain the
-                    // latest bounded planning evidence without growing each
-                    // poll/history response by a plan for every attempt.
-                    if issue.get("kind").and_then(Value::as_str) == Some("nativePlanningValidation")
-                        && let Some(previous) = self.snapshot.current_issues.iter_mut().find(|old| old.get("kind") == issue.get("kind"))
-                    {
-                        *previous = issue;
-                    } else if self.snapshot.current_issues.len() < 1024 {
-                        self.snapshot.current_issues.push(issue);
+                    Ok(worker::Message::Diagnostic(issue)) => {
+                        // A long review group may repair many pages. Retain the
+                        // latest bounded planning evidence without growing each
+                        // poll/history response by a plan for every attempt.
+                        if issue.get("kind").and_then(Value::as_str) == Some("nativePlanningValidation")
+                            && let Some(previous) = self.snapshot.current_issues.iter_mut().find(|old| old.get("kind") == issue.get("kind"))
+                        {
+                            *previous = issue;
+                        } else if self.snapshot.current_issues.len() < 1024 {
+                            self.snapshot.current_issues.push(issue);
+                        }
                     }
-                }
-                Ok(worker::Message::Finished(outcome)) => {
-                    completed = Some(outcome);
-                    break;
-                }
-                Ok(worker::Message::FinishedWithLedger(outcome, ledger)) => {
-                    self.finish_batch(session, pending, outcome, *ledger);
-                    return;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
+                    Ok(worker::Message::Finished(outcome)) => {
+                        completed = Some(outcome);
+                        break;
+                    }
+                    Ok(worker::Message::FinishedWithLedger(outcome, ledger)) => {
+                        completed_batch = Some((outcome, ledger));
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
         }
+        let cancelled = pending.worker.cancel.load(Ordering::Relaxed);
+        if let Some((outcome, ledger)) = completed_batch {
+            if !cancelled && outcome.result.is_ok() && is_publication_temporarily_busy(session, target_uid) {
+                pending.deferred_batch = Some((outcome, ledger));
+                self.snapshot.stage = "waiting_for_idle".into();
+                self.snapshot.message =
+                    "AI batch finished; waiting for your current canvas drag, IME input, or preview to finish before publishing".into();
+                self.pending = Some(pending);
+                return;
+            }
+            self.finish_batch(session, pending, outcome, *ledger);
+            return;
+        }
         if let Some(outcome) = completed {
+            let needs_doc_publish = matches!(&outcome.result, Ok(worker::Product::Plan(_)));
+            if !cancelled && needs_doc_publish && is_publication_temporarily_busy(session, target_uid) {
+                pending.deferred_outcome = Some(outcome);
+                self.snapshot.stage = "waiting_for_idle".into();
+                self.snapshot.message =
+                    "AI result is ready; waiting for your current canvas drag, IME input, or preview to finish before applying".into();
+                self.pending = Some(pending);
+                return;
+            }
             self.finish(session, pending, outcome);
         } else if disconnected {
             self.finish(
@@ -1063,7 +1121,7 @@ impl ProductionRunner {
                             .into(),
                     );
                 }
-                self.publish(session, &pending.task, pending.expected, product, &mut report)
+                self.publish(session, &pending.task, pending.expected, pending.expected_doc.as_ref(), product, &mut report)
             })
         };
         match result {
@@ -1096,6 +1154,7 @@ impl ProductionRunner {
         session: &mut Session,
         task: &Option<TaskRequest>,
         expected: Option<(u64, u64)>,
+        expected_doc: Option<&std::sync::Arc<designcraft_engine::doc::Document>>,
         product: worker::Product,
         report: &mut TaskReport,
     ) -> Result<(), String> {
@@ -1161,7 +1220,11 @@ impl ProductionRunner {
                     if target.interaction.is_some() || target.preview_stash.is_some() {
                         return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
                     }
-                    if target.revision != revision {
+                    let doc_unchanged = match expected_doc {
+                        Some(pinned_doc) => std::sync::Arc::ptr_eq(&target.doc, pinned_doc),
+                        None => target.revision == revision,
+                    };
+                    if !doc_unchanged {
                         return Err(
                             "The document changed during generation; result was not applied. Run the task again against the current document".into(),
                         );
@@ -2560,6 +2623,141 @@ fn ensure_preflight_at(session: &mut Session, min_ppi: f64) -> Result<Value, Str
 }
 /// Check before file.new or evidence writes: normal command prologues can commit IME
 /// composition and restore previews, so the later production.apply guard is insufficient.
+fn is_publication_temporarily_busy(session: &Session, target_uid: Option<u64>) -> bool {
+    if ensure_publication_idle(session).is_err() {
+        return true;
+    }
+    if let Some(uid) = target_uid
+        && let Some(target) = session.documents().iter().find(|doc| doc.uid == uid)
+        && (target.interaction.is_some() || target.preview_stash.is_some())
+    {
+        return true;
+    }
+    false
+}
+
+fn import_sibling_managed_profiles(root: &Path, vault: &Vault) {
+    if root.file_name().and_then(|s| s.to_str()) != Some("AI") {
+        return;
+    }
+    let Some(profile_dir) = root.parent() else { return };
+    let mut outputs_candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p1) = profile_dir.parent() {
+        outputs_candidates.push(p1.to_path_buf());
+        if p1.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.len() >= 16)
+            && let Some(versions_dir) = p1.parent()
+            && versions_dir.file_name().and_then(|s| s.to_str()) == Some("versions")
+            && let Some(mu_dir) = versions_dir.parent()
+            && let Some(out_dir) = mu_dir.parent()
+        {
+            outputs_candidates.push(out_dir.to_path_buf());
+        }
+    }
+    let mut siblings: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let root_canon = root.canonicalize().ok();
+    for out_dir in outputs_candidates {
+        let versions_dir = out_dir.join("managed-updates").join("versions");
+        if let Ok(entries) = std::fs::read_dir(&versions_dir) {
+            for entry in entries.flatten().take(16) {
+                let cand = entry.path().join("DesignCraftData").join("AI");
+                if cand.is_dir() && cand.canonicalize().ok() != root_canon {
+                    let mtime = std::fs::metadata(cand.join("settings.json"))
+                        .or_else(|_| std::fs::metadata(&cand))
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    siblings.push((mtime, cand));
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&out_dir) {
+            for entry in entries.flatten().take(16) {
+                let path = entry.path();
+                if path.file_name().and_then(|s| s.to_str()).is_some_and(|n| n.ends_with("-profile")) {
+                    let cand = path.join("AI");
+                    if cand.is_dir() && cand.canonicalize().ok() != root_canon {
+                        let mtime = std::fs::metadata(cand.join("settings.json"))
+                            .or_else(|_| std::fs::metadata(&cand))
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        siblings.push((mtime, cand));
+                    }
+                }
+            }
+        }
+    }
+    if siblings.is_empty() {
+        return;
+    }
+    siblings.sort_by_key(|b| std::cmp::Reverse(b.0));
+    siblings.truncate(8);
+
+    // 1. Copy missing JSON state files when `root` is freshly initialized (or sync newer version-local draft/settings).
+    for fname in ["settings.json", "production-draft.json", "history.json"] {
+        let dst = root.join(fname);
+        let dst_mtime = std::fs::metadata(&dst).and_then(|m| m.modified()).ok();
+        for (_, sib) in &siblings {
+            let src = sib.join(fname);
+            let Ok(meta) = std::fs::symlink_metadata(&src) else { continue };
+            if !meta.file_type().is_file() || meta.len() > 8 * 1024 * 1024 {
+                continue;
+            }
+            let src_mtime = meta.modified().ok();
+            let should_copy = match (dst_mtime, src_mtime) {
+                (None, _) => true,
+                (Some(d), Some(s)) if s > d && sib.to_string_lossy().contains("DesignCraftData") => true,
+                _ => false,
+            };
+            if should_copy {
+                let _ = std::fs::copy(&src, &dst);
+                break;
+            }
+        }
+    }
+
+    // 2. Merge missing production-cache-v1 artifacts (plans & images) so previously purchased illustrations reuse locally.
+    for sub in ["plans", "images"] {
+        let dst_dir = root.join("production-cache-v1").join(sub);
+        let mut copied = 0usize;
+        for (_, sib) in &siblings {
+            let src_dir = sib.join("production-cache-v1").join(sub);
+            let Ok(entries) = std::fs::read_dir(&src_dir) else { continue };
+            let _ = std::fs::create_dir_all(&dst_dir);
+            for entry in entries.flatten() {
+                if copied >= 256 {
+                    break;
+                }
+                let src_file = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&src_file) else { continue };
+                if !meta.file_type().is_file() || meta.len() > 32 * 1024 * 1024 {
+                    continue;
+                }
+                let Some(name) = src_file.file_name() else { continue };
+                let dst_file = dst_dir.join(name);
+                if !dst_file.exists() && std::fs::copy(&src_file, &dst_file).is_ok() {
+                    copied += 1;
+                }
+            }
+        }
+    }
+
+    // 3. Migrate OS-protected Vault credentials if missing in `vault` and present in a sibling profile's Vault.
+    if Vault::available() {
+        for provider in [ProviderKind::Gemini, ProviderKind::OpenAi] {
+            let probe = designcraft_ai_types::ModelSelection { provider, model: String::new(), endpoint: None };
+            if vault.presence(&probe).unwrap_or(true) {
+                continue;
+            }
+            for (_, sib) in &siblings {
+                let Ok(sib_vault) = Vault::for_profile(sib) else { continue };
+                if let Ok(Some(secret)) = sib_vault.load(&probe) {
+                    let _ = vault.save(&probe, &secret);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn ensure_publication_idle(session: &Session) -> Result<(), String> {
     if session.tool_composing() || session.active().is_some_and(|state| state.interaction.is_some() || state.preview_stash.is_some()) {
         return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
@@ -2596,12 +2794,16 @@ fn compact_context(session: &Session) -> Result<Value, String> {
     let doc = &state.doc;
     // A small, measured font inventory prevents planning from assuming installed glyphs.
     let fonts = designcraft_fonts::FontDb::global().scoped(doc.font_scope);
-    let mut families: Vec<String> = ["Tahoma", "Arial", "Noto Sans", "Noto Naskh Arabic", "DejaVu Sans"]
-        .into_iter()
-        .filter(|family| fonts.has_family(family))
-        .take(3)
-        .map(str::to_owned)
-        .collect();
+    let arabic_families: Vec<String> = fonts.available_arabic_families().into_iter().take(6).collect();
+    let mut families: Vec<String> = arabic_families.iter().take(2).cloned().collect();
+    for fallback in ["Tahoma", "Arial", "Noto Sans", "Noto Naskh Arabic", "DejaVu Sans"] {
+        if families.len() >= 3 {
+            break;
+        }
+        if fonts.has_family(fallback) && !families.iter().any(|f| f.eq_ignore_ascii_case(fallback)) {
+            families.push(fallback.to_owned());
+        }
+    }
     if families.is_empty() {
         families.extend(fonts.families().into_iter().take(3));
     }
@@ -2732,8 +2934,56 @@ fn compact_context(session: &Session) -> Result<Value, String> {
             break;
         }
     }
+    let max_summary_pages = doc.page_count().min(128);
+    let mut page_summaries: Vec<(Option<String>, Option<String>, Option<String>, usize)> = vec![(None, None, None, 0); max_summary_pages];
+    for (spread_index, spread) in doc.spreads.iter().enumerate() {
+        let first_page = doc.first_page_of_spread(spread_index);
+        let mut stack: Vec<(&designcraft_engine::doc::Item, designcraft_geom::Affine, usize)> =
+            spread.items.iter().rev().map(|it| (it.as_ref(), designcraft_geom::Affine::IDENTITY, 0usize)).collect();
+        while let Some((item, parent_xf, depth)) = stack.pop() {
+            let bounds = parent_xf.transform_rect_bbox(item.bounds());
+            let page_offset = spread.page_at_x(bounds.center().x).unwrap_or(0);
+            let p_idx = first_page.saturating_add(page_offset);
+            if let Some(slot) = page_summaries.get_mut(p_idx) {
+                slot.3 = slot.3.saturating_add(1);
+                if let Some(tf) = item.text_frame()
+                    && let Some(st) = doc.stories.get(&tf.story)
+                {
+                    let snippet: String = st.text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(64).collect();
+                    if !snippet.is_empty() {
+                        if item.label == "part.ui.header.unit-num" {
+                            slot.0 = Some(snippet);
+                        } else if item.label == "part.ui.footer.page" {
+                            slot.2 = Some(snippet);
+                        } else if slot.1.is_none() && (item.label.contains("title-main") || bounds.y0 < 160.0) {
+                            slot.1 = Some(snippet);
+                        }
+                    }
+                }
+            }
+            if depth < 6 && !item.children().is_empty() {
+                let child_xf = parent_xf * item.xf;
+                for child in item.children().iter().rev() {
+                    stack.push((child.as_ref(), child_xf, depth + 1));
+                }
+            }
+        }
+    }
+    let page_index: Vec<Value> = page_summaries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (unit_badge, heading, footer_page, items))| {
+            json!({
+                "page": idx + 1,
+                "unitBadge": unit_badge,
+                "heading": heading,
+                "footerPage": footer_page,
+                "itemCount": items,
+            })
+        })
+        .collect();
     Ok(
-        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"selection":state.selection,"objects":objects,"objectsTruncated":objects_truncated,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
+        json!({"documentUid":state.uid,"revision":state.revision,"title":doc.title,"pageCount":doc.page_count(),"pageWidth":doc.settings.page_width,"pageHeight":doc.settings.page_height,"facingPages":doc.settings.facing_pages,"rightToLeftBinding":doc.settings.right_to_left_binding,"selection":state.selection,"pageIndex":page_index,"objects":objects,"objectsTruncated":objects_truncated,"availableArabicFonts":arabic_families,"fontFaces":font_faces,"swatchNames":doc.swatches.iter().take(64).map(|s|s.name.chars().take(160).collect::<String>()).collect::<Vec<_>>(),"units":"points, 72 per inch; rect=[left,top,right,bottom]"}),
     )
 }
 
@@ -3170,7 +3420,7 @@ mod tests {
             }],
             images: vec![],
         };
-        runner.publish(&mut session, &Some(task), None, worker::Product::Plan(plan), &mut report).unwrap();
+        runner.publish(&mut session, &Some(task), None, None, worker::Product::Plan(plan), &mut report).unwrap();
         let published = session.doc().unwrap();
         crate::design::check_geometry(None, published, &profile).unwrap();
         let page = &published.doc.spreads[0].pages[0];
@@ -3504,7 +3754,7 @@ mod tests {
             artifacts: vec![],
             message: String::new(),
         };
-        let error = runner.publish(&mut session, &Some(task), None, worker::Product::Plan(plan), &mut report).unwrap_err();
+        let error = runner.publish(&mut session, &Some(task), None, None, worker::Product::Plan(plan), &mut report).unwrap_err();
         assert!(error.contains("interaction"), "{error}");
         assert!(session.tool_composing(), "Refusal must not commit marked text");
         let after = session.doc().unwrap();
@@ -3596,7 +3846,7 @@ mod tests {
             artifacts: vec![],
             message: String::new(),
         };
-        let error = runner.publish(&mut session, &Some(task), None, worker::Product::Plan(plan), &mut report).unwrap_err();
+        let error = runner.publish(&mut session, &Some(task), None, None, worker::Product::Plan(plan), &mut report).unwrap_err();
         assert!(error.contains("outside the write root"), "{error}");
         assert_eq!(session.documents().len(), 1);
         assert!(std::sync::Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
@@ -4356,10 +4606,13 @@ mod tests {
             id: "live-progress".into(),
             started: Instant::now(),
             expected: None,
+            expected_doc: None,
             expected_prefs: None,
             task: None,
             skills: vec![],
             settings: Default::default(),
+            deferred_outcome: None,
+            deferred_batch: None,
         });
         runner.snapshot.busy = true;
         sender
@@ -4428,7 +4681,7 @@ mod tests {
             message: String::new(),
             design_style: None,
         };
-        let error = runner.publish(&mut session, &Some(task.clone()), None, worker::Product::Plan(plan), &mut report).unwrap_err();
+        let error = runner.publish(&mut session, &Some(task.clone()), None, None, worker::Product::Plan(plan), &mut report).unwrap_err();
         assert!(error.contains("spread"), "{error}");
         assert_eq!(session.documents().len(), 1);
         assert_eq!(session.active_index(), Some(0));
@@ -4440,7 +4693,7 @@ mod tests {
             commands: vec![EngineAction { command: "frame.create".into(), params: json!({"spread":0,"rect":[50,50,100,100]}) }],
             images: vec![],
         };
-        runner.publish(&mut session, &Some(task), None, worker::Product::Plan(valid), &mut report).unwrap();
+        runner.publish(&mut session, &Some(task), None, None, worker::Product::Plan(valid), &mut report).unwrap();
         assert_eq!(session.documents().len(), 2);
         assert!(session.doc().unwrap().doc.settings.facing_pages);
         assert_eq!(session.doc().unwrap().history.undo.len(), 1);
@@ -4488,7 +4741,7 @@ mod tests {
             artifacts: Vec::new(),
             message: String::new(),
         };
-        assert!(runner.publish(&mut session, &Some(task), Some((uid, revision)), worker::Product::Plan(plan), &mut report).is_err());
+        assert!(runner.publish(&mut session, &Some(task), Some((uid, revision)), None, worker::Product::Plan(plan), &mut report).is_err());
         assert_eq!(session.doc().unwrap().doc.spreads[0].items.len(), 1);
     }
     #[test]
@@ -4530,9 +4783,12 @@ mod tests {
                 export_directory: None,
             }),
             expected: Some((before.uid, before.revision)),
+            expected_doc: Some(before.doc.clone()),
             expected_prefs: Some(original_prefs),
             skills: vec![],
             settings,
+            deferred_outcome: None,
+            deferred_batch: None,
         });
         runner.snapshot.busy = true;
         session.prefs.typographers_quotes = true;
@@ -4577,10 +4833,13 @@ mod tests {
             id: "cancel-test".into(),
             started: Instant::now(),
             expected: Some((session.doc().unwrap().uid, session.doc().unwrap().revision)),
+            expected_doc: Some(session.doc().unwrap().doc.clone()),
             expected_prefs: Some(session.prefs.clone()),
             task: Some(task),
             skills: Vec::new(),
             settings: Default::default(),
+            deferred_outcome: None,
+            deferred_batch: None,
         });
         runner.snapshot.busy = true;
         let snapshot = runner.handle(&mut session, AiRequest::Cancel);
@@ -5209,9 +5468,12 @@ mod tests {
             started: std::time::Instant::now(),
             task: Some(request.clone()),
             expected: None,
+            expected_doc: None,
             expected_prefs: None,
             skills: vec![],
             settings: request.settings,
+            deferred_outcome: None,
+            deferred_batch: None,
         });
         let snap = runner.handle(&mut session, AiRequest::Poll);
         assert_eq!(snap.stage, "completed", "msg={}", snap.message);
@@ -5221,5 +5483,75 @@ mod tests {
         let pdf_bytes = std::fs::read(export_dir.path().join("production-oneshot-ar-single.pdf")).unwrap();
         let pdf_raw = String::from_utf8_lossy(&pdf_bytes);
         assert!(pdf_raw.contains("/Direction") && pdf_raw.contains("/R2L"), "expected /Direction /R2L in exported single-page Arabic PDF");
+    }
+
+    #[test]
+    fn ai31_selection_revision_bump_and_transient_interaction_preserve_current_document_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(2)).unwrap();
+        let created = session.execute("frame.create", &json!({"spread":0,"rect":[50,50,200,120]})).unwrap();
+        let item_id = created["id"].as_u64().unwrap();
+        let before = session.doc().unwrap().clone();
+
+        let task = TaskRequest {
+            prompt: "Add second frame".into(),
+            settings: AiSettings::default(),
+            skill_ids: vec![],
+            auto_select_skills: false,
+            target: TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+        let plan = ProductionPlan {
+            title: "Added frame".into(),
+            commands: vec![EngineAction { command: "frame.create".into(), params: json!({"spread":1,"rect":[60,60,220,140]}) }],
+            images: vec![],
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(worker::Message::Finished(worker::Outcome { result: Ok(worker::Product::Plan(plan)), usage: Default::default() })).unwrap();
+        runner.pending = Some(Pending {
+            roots: None,
+            worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+            id: "ai31-ptr-eq".into(),
+            started: Instant::now(),
+            task: Some(task),
+            expected: Some((before.uid, before.revision)),
+            expected_doc: Some(before.doc.clone()),
+            expected_prefs: Some(session.prefs.clone()),
+            skills: vec![],
+            settings: Default::default(),
+            deferred_outcome: None,
+            deferred_batch: None,
+        });
+        runner.snapshot.busy = true;
+
+        // 1. User clicks/selects items while inspecting pages (which bumps `revision` without mutating `Arc<Document>`),
+        // AND starts a transient canvas drag (`interaction = Some(...)`) right when `Finished` arrives:
+        session.execute("selection.set", &json!({"ids":[item_id]})).unwrap();
+        session.execute("selection.set", &json!({"ids":[]})).unwrap();
+        assert_ne!(session.doc().unwrap().revision, before.revision, "selection commands bump revision");
+        assert!(std::sync::Arc::ptr_eq(&session.doc().unwrap().doc, &before.doc));
+        {
+            let st = session.doc_mut().unwrap();
+            st.interaction = Some(designcraft_engine::Interaction {
+                label: "pan-drag".into(),
+                doc: st.doc.clone(),
+                selection: st.selection.clone(),
+                preview: None,
+                revision: st.revision,
+            });
+        }
+
+        // Poll while interaction is active must defer instead of discarding the finished result!
+        let waiting_snap = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(waiting_snap.stage, "waiting_for_idle");
+        assert!(runner.pending.is_some(), "finished outcome must be held until canvas interaction ends");
+
+        // Release interaction -> next Poll publishes cleanly despite bumped revision!
+        session.doc_mut().unwrap().interaction = None;
+        let done_snap = runner.handle(&mut session, AiRequest::Poll);
+        assert_eq!(done_snap.stage, "completed", "msg={}", done_snap.message);
+        assert_eq!(session.doc().unwrap().doc.spreads[1].items.len(), 1);
     }
 }

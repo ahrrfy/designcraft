@@ -564,6 +564,136 @@ pub fn render_svg(bytes: &[u8], max_side: u32) -> Option<(Vec<u8>, u32, u32)> {
     Some((pm.take(), w, h))
 }
 
+/// Reverses horizontal column order (`[0, 1, .., cols - 1]` → `[cols - 1, .., 1, 0]`) across a
+/// multi-card strip or `2×2` grid raster **without** mirroring pixels inside any cell (so hands,
+/// props, and asymmetric details keep their true orientation).
+///
+/// Each internal boundary searches within `±(width / 28)` around the nominal column split for the
+/// cleanest light/white gutter seam closest to the nominal split. When `require_clean_seams` is
+/// `true`, continuous panoramic scenes lacking a clear vertical separator (`mean brightness < 215`)
+/// return `None` instead of cutting through artwork.
+pub fn reverse_raster_columns(bytes: &[u8], cols: usize, require_clean_seams: bool) -> Option<Vec<u8>> {
+    if !(2..=8).contains(&cols) || is_svg(bytes) || is_eps(bytes) || is_pdf(bytes) {
+        return None;
+    }
+    let src = decode_rgba(bytes)?;
+    let (w, h) = src.dimensions();
+    let w_usize = usize::try_from(w).ok()?;
+    let h_usize = usize::try_from(h).ok()?;
+    if w_usize < cols.checked_mul(16)? || h_usize < 8 {
+        return None;
+    }
+    let y_step = (h_usize / 96).max(1);
+    let sample_rows = h_usize.div_ceil(y_step).max(1) as f64;
+    let rad = (w_usize / 28).max(4);
+
+    let mut cuts = Vec::with_capacity(cols + 1);
+    cuts.push(0usize);
+    for k in 1..cols {
+        let nominal = w_usize.checked_mul(k)? / cols;
+        let prev_min = cuts.last().copied().unwrap_or(0).saturating_add(8);
+        let max_allowed = w_usize.saturating_sub((cols - k).saturating_mul(8));
+        let lo = nominal.saturating_sub(rad).max(prev_min);
+        let hi = nominal.saturating_add(rad).min(max_allowed);
+        if lo > hi {
+            return None;
+        }
+        let mut best_x = nominal.clamp(lo, hi);
+        let mut best_brightness = -1.0f64;
+        let mut best_pure_white = false;
+        let mut best_dist = usize::MAX;
+        for x in lo..=hi {
+            let Ok(xu) = u32::try_from(x) else { continue };
+            let mut sum = 0.0f64;
+            let mut y = 0usize;
+            while y < h_usize {
+                if let Ok(yu) = u32::try_from(y) {
+                    let [r, g, b, a] = src.get_pixel(xu, yu).0;
+                    if a < 16 {
+                        sum += 255.0 * 3.0;
+                    } else {
+                        sum += f64::from(r) + f64::from(g) + f64::from(b);
+                    }
+                }
+                y = y.saturating_add(y_step);
+            }
+            let brightness = sum / (sample_rows * 3.0);
+            let pure_white = brightness >= 252.0;
+            let dist = x.abs_diff(nominal);
+            let better = match (pure_white, best_pure_white) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => dist < best_dist || (dist == best_dist && brightness > best_brightness),
+                (false, false) => (brightness - best_brightness) > 1.5 || ((brightness - best_brightness).abs() <= 1.5 && dist < best_dist),
+            };
+            if better {
+                best_x = x;
+                best_brightness = brightness;
+                best_pure_white = pure_white;
+                best_dist = dist;
+            }
+        }
+        if require_clean_seams && best_brightness < 215.0 {
+            return None;
+        }
+        cuts.push(best_x);
+    }
+    cuts.push(w_usize);
+
+    let mut dst = image::RgbaImage::new(w, h);
+    let mut dst_x = 0u32;
+    for cell in (0..cols).rev() {
+        let x0 = *cuts.get(cell)?;
+        let x1 = *cuts.get(cell + 1)?;
+        let cell_w = u32::try_from(x1.checked_sub(x0)?).ok()?;
+        let x0_u32 = u32::try_from(x0).ok()?;
+        for y in 0..h {
+            for dx in 0..cell_w {
+                let px = *src.get_pixel(x0_u32.saturating_add(dx), y);
+                if dst_x.saturating_add(dx) < w {
+                    dst.put_pixel(dst_x.saturating_add(dx), y, px);
+                }
+            }
+        }
+        dst_x = dst_x.saturating_add(cell_w);
+    }
+
+    let mut encoded = Vec::new();
+    if mime(bytes) == "image/jpeg" {
+        let rgb = image::RgbImage::from_fn(w, h, |x, y| {
+            let [r, g, b, a] = dst.get_pixel(x, y).0;
+            if a == 255 {
+                image::Rgb([r, g, b])
+            } else {
+                let af = u16::from(a);
+                let inv = 255u16.saturating_sub(af);
+                image::Rgb([
+                    ((u16::from(r) * af + 255 * inv + 127) / 255) as u8,
+                    ((u16::from(g) * af + 255 * inv + 127) / 255) as u8,
+                    ((u16::from(b) * af + 255 * inv + 127) / 255) as u8,
+                ])
+            }
+        });
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 92);
+        enc.encode(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8).ok()?;
+    } else {
+        dst.write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png).ok()?;
+    }
+    Some(encoded)
+}
+
+/// Encodes raw `width × height` RGBA8 bytes as a PNG image.
+pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let expected = usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)?.checked_mul(4)?;
+    if rgba.len() != expected {
+        return None;
+    }
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,5 +1033,39 @@ mod tests {
                 .faces()
                 .any(|f| { matches!(&f.source, usvg::fontdb::Source::Binary(b) if bundled_ptrs.contains(&b.as_ref().as_ref().as_ptr())) })
         );
+        reverse_raster_columns_smoke();
+    }
+
+    fn reverse_raster_columns_smoke() {}
+
+    #[test]
+    fn reverse_raster_columns_reorders_cells_without_mirroring_pixels() {
+        let img = image::RgbaImage::from_fn(128, 24, |x, _y| {
+            let cell = x / 32;
+            let local_x = x % 32;
+            if !(2..=29).contains(&local_x) {
+                return image::Rgba([255, 255, 255, 255]);
+            }
+            let base = (cell as u8 + 1) * 50;
+            let side_tag = if local_x < 16 { 10 } else { 200 };
+            image::Rgba([base, side_tag, 30, 255])
+        });
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let reversed = reverse_raster_columns(&png, 4, true).expect("clean white seams");
+        assert_eq!(mime(&reversed), "image/png");
+        let out = decode_rgba(&reversed).unwrap();
+        assert_eq!(out.dimensions(), (128, 24));
+        assert_eq!(out.get_pixel(6, 12).0, [200, 10, 30, 255]);
+        assert_eq!(out.get_pixel(24, 12).0, [200, 200, 30, 255]);
+        assert_eq!(out.get_pixel(96 + 6, 12).0, [50, 10, 30, 255]);
+        assert_eq!(out.get_pixel(96 + 24, 12).0, [50, 200, 30, 255]);
+
+        let mut dark_png = Vec::new();
+        image::RgbaImage::from_pixel(128, 24, image::Rgba([40, 60, 80, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut dark_png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(reverse_raster_columns(&dark_png, 2, true).is_none());
+        assert!(reverse_raster_columns(&dark_png, 2, false).is_some());
     }
 }

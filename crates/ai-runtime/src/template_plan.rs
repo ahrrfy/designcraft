@@ -613,17 +613,27 @@ fn template_has_graphic_frame_for_slot(template: &[EngineAction], slot_rect: [f6
 
 #[cfg(test)]
 pub(crate) fn schema(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode) -> Result<Value, String> {
-    schema_inner(skill, scope, mode, false)
+    schema_inner(skill, scope, mode, false, None)
 }
 
 pub(crate) fn schema_for_brief(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, brief: &str) -> Result<Value, String> {
-    schema_inner(skill, scope, mode, detect_curriculum_subject(brief) == CurriculumSubject::Mathematics)
+    let subject = detect_curriculum_subject(brief);
+    schema_inner(skill, scope, mode, subject == CurriculumSubject::Mathematics, Some(subject))
 }
 
-fn schema_inner(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, allow_counting: bool) -> Result<Value, String> {
-    let profile = profile(skill)?;
+fn schema_inner(
+    skill: &SkillSnapshot,
+    scope: BatchScope,
+    mode: OutputMode,
+    allow_counting: bool,
+    subject: Option<CurriculumSubject>,
+) -> Result<Value, String> {
+    let mut profile = profile(skill)?.clone();
+    if let Some(subj) = subject {
+        adapt_profile_families_for_subject(&mut profile, subj);
+    }
     let end = scope_end(scope)?;
-    let image_sources = scope_image_sources(profile, scope, mode)?;
+    let image_sources = scope_image_sources(&profile, scope, mode)?;
     let families: Vec<_> = profile
         .page_families
         .iter()
@@ -701,7 +711,7 @@ fn schema_inner(skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, allo
 
 #[cfg(test)]
 pub(crate) fn system(skill: &SkillSnapshot) -> Result<String, String> {
-    system_inner(skill, false, None, OutputMode::NativeWithImages)
+    system_inner(skill, false, None, OutputMode::NativeWithImages, designcraft_ai_types::ArabicTashkeelMode::Auto, "")
 }
 
 #[cfg(test)]
@@ -709,9 +719,19 @@ pub(crate) fn system_for_brief(skill: &SkillSnapshot, brief: &str) -> Result<Str
     system_for_brief_with_mode(skill, brief, OutputMode::NativeWithImages)
 }
 
+#[cfg(test)]
 pub(crate) fn system_for_brief_with_mode(skill: &SkillSnapshot, brief: &str, mode: OutputMode) -> Result<String, String> {
+    system_for_brief_with_options(skill, brief, mode, designcraft_ai_types::ArabicTashkeelMode::Auto)
+}
+
+pub(crate) fn system_for_brief_with_options(
+    skill: &SkillSnapshot,
+    brief: &str,
+    mode: OutputMode,
+    tashkeel: designcraft_ai_types::ArabicTashkeelMode,
+) -> Result<String, String> {
     let subject = detect_curriculum_subject(brief);
-    system_inner(skill, subject == CurriculumSubject::Mathematics, Some(subject), mode)
+    system_inner(skill, subject == CurriculumSubject::Mathematics, Some(subject), mode, tashkeel, brief)
 }
 
 fn adapt_profile_families_for_subject(profile: &mut designcraft_ai_types::DesignProfile, subject: CurriculumSubject) {
@@ -719,6 +739,41 @@ fn adapt_profile_families_for_subject(profile: &mut designcraft_ai_types::Design
         if family.id == "garnet-computing-systems-lab" && subject != CurriculumSubject::ComputerScience {
             family.purpose =
                 "Structured Step-by-Step Sequence, Concept Classification Cards, Process Flowchart & Guided Practical Application".into();
+            for slot in &mut family.text_slots {
+                match slot.id.as_str() {
+                    "header-tag" => {
+                        slot.purpose = "Short unit or section badge label matching the current lesson's subject".into();
+                    }
+                    "term-1" | "term-2" | "term-3" | "term-4" => {
+                        slot.purpose = "Short concept or step card label matching the corresponding isolated card illustration above".into();
+                    }
+                    "ipo-in-title" => {
+                        slot.purpose = "First stage title in the 3-step sequence for the current lesson".into();
+                    }
+                    "ipo-in-body" => {
+                        slot.purpose = "Short child-friendly explanation of the first stage".into();
+                    }
+                    "ipo-proc-title" => {
+                        slot.purpose = "Second stage title in the 3-step sequence for the current lesson".into();
+                    }
+                    "ipo-proc-body" => {
+                        slot.purpose = "Short child-friendly explanation of the second stage".into();
+                    }
+                    "ipo-out-title" => {
+                        slot.purpose = "Third stage title (outcome or fruit) in the 3-step sequence for the current lesson".into();
+                    }
+                    "ipo-out-body" => {
+                        slot.purpose = "Short child-friendly explanation of the third stage".into();
+                    }
+                    "lab-bubble-1" | "lab-bubble-2" => {
+                        slot.purpose = "Child character dialogue line practicing the current lesson's value or skill".into();
+                    }
+                    "lab-steps" => {
+                        slot.purpose = "Guided practical activity steps for children applying the current lesson".into();
+                    }
+                    _ => {}
+                }
+            }
             for slot in &mut family.image_slots {
                 if matches!(slot.id.as_str(), "computing-terms" | "computing-items") {
                     slot.purpose = "Row of 4 isolated educational illustrations directly representing the current lesson's 4 core items or steps on a clean background, no text".into();
@@ -730,6 +785,20 @@ fn adapt_profile_families_for_subject(profile: &mut designcraft_ai_types::Design
         }
         if family.id == "oxford-phonics-maze" && !matches!(subject, CurriculumSubject::Languages | CurriculumSubject::ArabicLanguage) {
             family.purpose = "Key Term & Concept Card Arch, Guided Practice Writing Lines & Interactive Learning Path Maze".into();
+            for slot in &mut family.text_slots {
+                match slot.id.as_str() {
+                    "header-tag" => {
+                        slot.purpose = "Short unit or section badge label matching the current lesson's subject".into();
+                    }
+                    "phonics-1" | "phonics-2" | "phonics-3" | "phonics-4" => {
+                        slot.purpose = "Short key concept or vocabulary label matching the corresponding card illustration above".into();
+                    }
+                    "trace-line-1" | "trace-line-2" => {
+                        slot.purpose = "Short guided key phrase or practice line for the current lesson".into();
+                    }
+                    _ => {}
+                }
+            }
             for slot in &mut family.image_slots {
                 if matches!(slot.id.as_str(), "phonics-cards" | "phonics-words") {
                     slot.purpose =
@@ -743,7 +812,61 @@ fn adapt_profile_families_for_subject(profile: &mut designcraft_ai_types::Design
     }
 }
 
-fn system_inner(skill: &SkillSnapshot, allow_counting: bool, subject: Option<CurriculumSubject>, mode: OutputMode) -> Result<String, String> {
+fn arabic_diacritics_policy(tashkeel: designcraft_ai_types::ArabicTashkeelMode, brief: &str) -> &'static str {
+    use designcraft_ai_types::ArabicTashkeelMode;
+    let lowered = brief.to_lowercase();
+    let brief_forbids = [
+        "بدون تشكيل",
+        "بلا تشكيل",
+        "ازل التشكيل",
+        "أزل التشكيل",
+        "إزالة التشكيل",
+        "حذف التشكيل",
+        "غير مشكول",
+        "without diacritics",
+        "no tashkeel",
+        "no harakat",
+    ]
+    .iter()
+    .any(|kw| lowered.contains(kw));
+    let brief_demands_full = ["تشكيل كامل", "مشكول بالكامل", "مع التشكيل الكامل", "بالحركات الكاملة", "fully vocalized", "full tashkeel"]
+        .iter()
+        .any(|kw| lowered.contains(kw));
+    let effective = match tashkeel {
+        ArabicTashkeelMode::None => ArabicTashkeelMode::None,
+        ArabicTashkeelMode::Light => ArabicTashkeelMode::Light,
+        ArabicTashkeelMode::Full => ArabicTashkeelMode::Full,
+        ArabicTashkeelMode::Auto => {
+            if brief_forbids {
+                ArabicTashkeelMode::None
+            } else if brief_demands_full {
+                ArabicTashkeelMode::Full
+            } else {
+                ArabicTashkeelMode::Light
+            }
+        }
+    };
+    match effective {
+        ArabicTashkeelMode::None => {
+            "ARABIC DIACRITICS POLICY: When authoring Arabic copy, write clean unvocalized letters WITHOUT harakat/tashkeel marks (no fatha, damma, kasra, sukun, or shadda) so early-years children read clear letter shapes without visual clutter."
+        }
+        ArabicTashkeelMode::Light | ArabicTashkeelMode::Auto => {
+            "ARABIC DIACRITICS POLICY: When authoring Arabic copy, use clean, easy-to-read Arabic with LIGHT minimal tashkeel only where strictly needed to disambiguate a word; never put dense harakat on every letter of titles, badges, or cards."
+        }
+        ArabicTashkeelMode::Full => {
+            "ARABIC DIACRITICS POLICY: When authoring Arabic copy, apply accurate full vocalization (tashkeel/harakat) appropriate for reading instruction."
+        }
+    }
+}
+
+fn system_inner(
+    skill: &SkillSnapshot,
+    allow_counting: bool,
+    subject: Option<CurriculumSubject>,
+    mode: OutputMode,
+    tashkeel: designcraft_ai_types::ArabicTashkeelMode,
+    brief: &str,
+) -> Result<String, String> {
     let mut profile = profile(skill)?.clone();
     profile.page_families.retain(|family| {
         skill
@@ -782,10 +905,11 @@ fn system_inner(skill: &SkillSnapshot, allow_counting: bool, subject: Option<Cur
     } else {
         ""
     };
+    let diacritics_policy = arabic_diacritics_policy(tashkeel, brief);
     let illustration_policy = if mode == OutputMode::NativeOnly {
         "Output mode is native_only: do not emit an illustrations field or request any raster images; native vector and text layout carries the complete page."
     } else {
-        "Illustrations are allowed only in the selected family's declared image_slots; populate every declared image slot of the selected family so pre-authored graphic frames are filled cleanly. At most eight independent illustration sources are allowed across the entire supplied batch scope; additional native views share their source. Each prompt describes one independent illustration following the selected style profile's illustration rules, without text, captions, numbers, speech bubbles, page borders or page-layout instructions. Never request an entire page as an image."
+        "Illustrations are allowed only in the selected family's declared image_slots; populate every declared image slot of the selected family so pre-authored graphic frames are filled cleanly. At most eight independent illustration sources are allowed across the entire supplied batch scope; additional native views share their source. Each prompt describes one independent illustration following the selected style profile's illustration rules, without text, captions, numbers, speech bubbles, page borders or page-layout instructions. For multi-card strips (vocab-strip, phonics-cards, paint-pots, computing-terms) and 2x2 story grids, ensure the prompt describes the exact items authored in the page's text slots so every card picture matches its caption. Never request an entire page as an image."
     };
     let rules = serde_json::to_string(&profile).map_err(|e| e.to_string())?;
     if rules.len() > 32 * 1024 {
@@ -801,6 +925,7 @@ fn system_inner(skill: &SkillSnapshot, allow_counting: bool, subject: Option<Cur
          Fill every declared text slot exactly once, using its purpose and max_chars Unicode base-character target (count spaces and base letters; Arabic combining vowel/tashkeel marks do not count against max_chars). Supply nonempty complete content \
          that fits, with no extra slot IDs. Adapt 100% of text slots—including headers, tags, cards, speech bubbles, diagrams, and tasks—to the user's exact subject and requested language. Never leave placeholder words from an unrelated topic. \
          Keep each field focused on its declared purpose, rather than placing a full bilingual page script into one rule box. Preserve meaningful supplied wording and requested vocalization; do not cut a sentence or omit required content to satisfy a character estimate. Native composition decides actual fit without shrinking the authored typography. \
+         {diacritics_policy} \
          {binding_policy} \
          Native typography, geometry and formatting are already fixed by the approved templates. \
          Adapt educational language, topic, sequence and difficulty to the brief and age range. Do not invent facts or claim live external research, reference coverage, publisher affiliation, endorsement, or standards certification. \
@@ -2149,7 +2274,7 @@ pub(crate) fn capacity(skill: &SkillSnapshot, mode: OutputMode) -> Result<u32, S
         let sample = json!({"title":"Local template validation","pages":[{"page":0,"family":family.id,"text":text,"illustrations":[]}]});
         // Capacity verifies command topology using placeholder copy, without
         // treating a sample's fixed mathematical artwork as bound lesson data.
-        let plan = compile_inner(&sample.to_string(), skill, BatchScope { start: 0, count: 1 }, mode, false)?;
+        let plan = compile_inner(&sample.to_string(), skill, BatchScope { start: 0, count: 1 }, mode, false, None)?;
         largest = largest.max(plan.commands.len());
         let placements = family
             .image_slots
@@ -2257,10 +2382,20 @@ fn authored_center_alignment(template: &[EngineAction], target: usize) -> Option
     alignment.filter(|align| matches!(*align, "center" | "centerJustified"))
 }
 
-pub(crate) fn compile(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode) -> Result<ProductionPlan, String> {
-    compile_inner(text, skill, scope, mode, true)
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TemplateCompileContext<'a> {
+    pub base: Option<&'a designcraft_engine::DocState>,
+    pub facing_pages: bool,
+    pub total_pages: u32,
+    pub subject: Option<CurriculumSubject>,
 }
 
+#[cfg(test)]
+pub(crate) fn compile(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode) -> Result<ProductionPlan, String> {
+    compile_inner(text, skill, scope, mode, true, None)
+}
+
+#[cfg(test)]
 pub(crate) fn compile_for_brief(
     text: &str,
     skill: &SkillSnapshot,
@@ -2268,8 +2403,29 @@ pub(crate) fn compile_for_brief(
     mode: OutputMode,
     brief: &str,
 ) -> Result<ProductionPlan, String> {
-    let mut plan = compile(text, skill, scope, mode)?;
-    if detect_curriculum_subject(brief) != CurriculumSubject::Mathematics
+    let subject = detect_curriculum_subject(brief);
+    compile_for_brief_with_context(
+        text,
+        skill,
+        scope,
+        mode,
+        brief,
+        TemplateCompileContext { base: None, facing_pages: false, total_pages: 0, subject: Some(subject) },
+    )
+}
+
+pub(crate) fn compile_for_brief_with_context(
+    text: &str,
+    skill: &SkillSnapshot,
+    scope: BatchScope,
+    mode: OutputMode,
+    brief: &str,
+    mut ctx: TemplateCompileContext<'_>,
+) -> Result<ProductionPlan, String> {
+    let subject = ctx.subject.unwrap_or_else(|| detect_curriculum_subject(brief));
+    ctx.subject = Some(subject);
+    let mut plan = compile_inner(text, skill, scope, mode, true, Some(ctx))?;
+    if subject != CurriculumSubject::Mathematics
         && plan.commands.iter().any(|action| {
             action.command == "object.label" && action.params.get("label").and_then(Value::as_str) == Some("group.cpa.pictorial-tenframe.bound")
         })
@@ -2281,7 +2437,120 @@ pub(crate) fn compile_for_brief(
     Ok(plan)
 }
 
-fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: OutputMode, verify_math: bool) -> Result<ProductionPlan, String> {
+fn strip_arabic_marks_for_match(input: &str) -> String {
+    input
+        .chars()
+        .filter(|&c| {
+            !(('\u{0610}'..='\u{061A}').contains(&c)
+                || ('\u{064B}'..='\u{065F}').contains(&c)
+                || c == '\u{0670}'
+                || ('\u{06D6}'..='\u{06ED}').contains(&c)
+                || c == '\u{0640}')
+        })
+        .map(|c| match c {
+            'أ' | 'إ' | 'آ' | 'ٱ' => 'ا',
+            _ => c,
+        })
+        .collect()
+}
+
+fn parse_small_unit_int(token: &str) -> Option<u32> {
+    let mut digits = String::new();
+    for ch in token.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if ('\u{0660}'..='\u{0669}').contains(&ch) {
+            digits.push(char::from_u32(u32::from('0') + (u32::from(ch) - 0x0660))?);
+        } else if ('\u{06F0}'..='\u{06F9}').contains(&ch) {
+            digits.push(char::from_u32(u32::from('0') + (u32::from(ch) - 0x06F0))?);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse::<u32>().ok().filter(|&n| (1..=99).contains(&n))
+}
+
+fn extract_unit_number_from_text(raw: &str) -> Option<u32> {
+    let cleaned = strip_arabic_marks_for_match(raw);
+    let lower = cleaned.to_lowercase();
+    for (phrase, num) in [
+        ("الوحدة الثانية عشرة", 12),
+        ("الوحدة الحادية عشرة", 11),
+        ("الوحدة العاشرة", 10),
+        ("الوحدة التاسعة", 9),
+        ("الوحدة الثامنة", 8),
+        ("الوحدة السابعة", 7),
+        ("الوحدة السادسة", 6),
+        ("الوحدة الخامسة", 5),
+        ("الوحدة الرابعة", 4),
+        ("الوحدة الثالثة", 3),
+        ("الوحدة الثانية", 2),
+        ("الوحدة الاولى", 1),
+        ("الوحدة الأولى", 1),
+    ] {
+        if lower.contains(phrase) {
+            return Some(num);
+        }
+    }
+    for marker in ["الوحدة", "وحدة", "unit"] {
+        if let Some(pos) = lower.find(marker)
+            && let Some(after) = lower.get(pos.saturating_add(marker.len())..)
+        {
+            let rest = after.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '-' | '–' | '—' | '#' | '(' | '['));
+            if let Some(n) = parse_small_unit_int(rest) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn seed_unit_from_preceding_pages(base: &designcraft_engine::DocState, upto_page: u32) -> Option<u32> {
+    let doc = &base.doc;
+    let limit = usize::try_from(upto_page).unwrap_or(0);
+    if limit == 0 {
+        return None;
+    }
+    let mut active: Option<u32> = None;
+    for (spread_idx, spread) in doc.spreads.iter().enumerate() {
+        let first_page = doc.first_page_of_spread(spread_idx);
+        let mut stack: Vec<(&designcraft_engine::doc::Item, designcraft_geom::Affine)> =
+            spread.items.iter().rev().map(|it| (it.as_ref(), designcraft_geom::Affine::IDENTITY)).collect();
+        while let Some((item, parent_xf)) = stack.pop() {
+            let bounds = parent_xf.transform_rect_bbox(item.bounds());
+            let page_offset = spread.page_at_x(bounds.center().x).unwrap_or(0);
+            let page_idx = first_page.saturating_add(page_offset);
+            if page_idx < limit
+                && let Some(tf) = item.text_frame()
+                && let Some(story) = doc.stories.get(&tf.story)
+            {
+                if item.label == "part.ui.header.unit-num" {
+                    if let Some(n) = parse_small_unit_int(story.text.trim()) {
+                        active = Some(n);
+                    }
+                } else if let Some(n) = extract_unit_number_from_text(&story.text) {
+                    active = Some(n);
+                }
+            }
+            if !item.children().is_empty() {
+                let child_xf = parent_xf * item.xf;
+                for child in item.children().iter().rev() {
+                    stack.push((child.as_ref(), child_xf));
+                }
+            }
+        }
+    }
+    active
+}
+
+fn compile_inner(
+    text: &str,
+    skill: &SkillSnapshot,
+    scope: BatchScope,
+    mode: OutputMode,
+    verify_math: bool,
+    ctx: Option<TemplateCompileContext<'_>>,
+) -> Result<ProductionPlan, String> {
     if text.len() > MAX_JSON {
         return Err("Template content exceeds 1 MiB".into());
     }
@@ -2309,6 +2578,7 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
         .map(str::to_owned)
         .collect();
     let mut plan = ProductionPlan { title: content.title, commands: Vec::new(), images: Vec::new() };
+    let mut active_unit = ctx.and_then(|c| c.base).and_then(|base| seed_unit_from_preceding_pages(base, scope.start));
     for page_number in scope.start..end {
         let page = pages.remove(&page_number).ok_or("Template content is missing a requested page")?;
         let family = profile.page_families.iter().find(|family| family.id == page.family).ok_or("Unknown content page family")?;
@@ -2362,6 +2632,22 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
             .count();
         let mirror_rtl = has_ui_chrome && arabic_slots.saturating_mul(2) > family.text_slots.len();
         let page_w = profile.page_mm[0] * 72.0 / 25.4;
+        let explicit_page_unit =
+            ["header-tag", "title-main"].into_iter().filter_map(|slot_id| page.text.get(slot_id)).find_map(|txt| extract_unit_number_from_text(txt));
+        if let Some(u) = explicit_page_unit {
+            active_unit = Some(u);
+        }
+        let resolved_unit_badge = active_unit.or_else(|| {
+            ctx.map(|c| {
+                let _ = c.total_pages;
+                if page_number == 0 || family.id == "international-scope-sequence" {
+                    1
+                } else {
+                    page_number.saturating_sub(1).checked_div(8).unwrap_or(0).saturating_add(1)
+                }
+            })
+        });
+        let even_facing_rtl = mirror_rtl && ctx.is_some_and(|c| c.facing_pages) && page_number % 2 == 1;
         let offset = plan.commands.len();
         if offset.checked_add(template.len()).is_none_or(|count| count > MAX_ACTIONS) {
             return Err("Compiled template exceeds 512 commands".into());
@@ -2373,16 +2659,40 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
             let mut budget = 65_536;
             validate_tree(&action.params, 0, &mut budget)?;
             let orig_rect = action_rect_array(action);
+            let frame_label = template
+                .get(index.saturating_add(3))
+                .filter(|next| next.command == "object.label")
+                .and_then(|next| next.params.get("label"))
+                .and_then(Value::as_str);
+            let path_label = template
+                .get(index.saturating_add(2))
+                .filter(|next| next.command == "object.label")
+                .and_then(|next| next.params.get("label"))
+                .and_then(Value::as_str);
             let mut action: EngineAction = action.clone();
             let params = action.params.as_object_mut().ok_or("Native template parameters must be an object")?;
             for (key, value) in params.iter_mut() {
                 if key == "text" && action.command == "frame.create" {
                     let raw = value.as_str().ok_or("Native frame text must be a string")?;
                     let supplied = family.text_slots.iter().find(|slot| slot.command == index).and_then(|slot| page.text.get(&slot.id));
-                    let text = supplied.cloned().unwrap_or_else(|| {
+                    let text = if let Some(supplied) = supplied {
+                        supplied.clone()
+                    } else if frame_label == Some("part.ui.header.unit-num")
+                        && let Some(unit_no) = resolved_unit_badge
+                    {
+                        unit_no.to_string()
+                    } else if frame_label == Some("part.listen.sample-tick") {
+                        " ".to_string()
+                    } else {
                         let resolved = raw.replace("{{page}}", &u64::from(page_number).saturating_add(1).to_string());
-                        if mirror_rtl { resolved.replace("[v]", "✓") } else { resolved }
-                    });
+                        if matches!(frame_label, Some("part.skills.listen-checks" | "part.lab.steps-txt")) {
+                            resolved.replace("[v]", "( )")
+                        } else if mirror_rtl {
+                            resolved.replace("[v]", "✓")
+                        } else {
+                            resolved
+                        }
+                    };
                     // script::resolve consumes $$ into $, preventing text from becoming a native result reference.
                     *value = Value::String(text.replace('$', "$$"));
                 } else {
@@ -2398,7 +2708,11 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
                 params.insert("content".into(), json!("unassigned"));
             }
             if mirror_rtl {
-                mirror_template_action_x(&action.command, params, page_w);
+                let keep_outer_right_footer =
+                    even_facing_rtl && (frame_label == Some("part.ui.footer.page") || path_label == Some("part.ui.footer.bar"));
+                if !keep_outer_right_footer {
+                    mirror_template_action_x(&action.command, params, page_w);
+                }
                 if action.command == "object.stroke"
                     && template.get(index.saturating_add(1)).is_some_and(|next| {
                         next.command == "object.label"
@@ -2415,7 +2729,7 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
                     && let Some(attrs) = params.get_mut("attrs").and_then(Value::as_object_mut)
                 {
                     attrs.insert("direction".into(), json!("rightToLeft"));
-                    attrs.insert("align".into(), json!("left"));
+                    attrs.insert("align".into(), json!(if even_facing_rtl { "right" } else { "left" }));
                 }
             }
             if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") || params.contains_key("spread") {
@@ -2477,7 +2791,25 @@ fn compile_inner(text: &str, skill: &SkillSnapshot, scope: BatchScope, mode: Out
                 plan.commands.push(EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":direction,"align":align}}) });
             }
         }
-        append_images(&mut plan, &page, family, mode, quantities, &profile.illustration, mirror_rtl.then_some(page_w))?;
+        let wb_cap_ids: Vec<String> = template
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, act)| {
+                if act.command != "frame.create" {
+                    return None;
+                }
+                let lbl = template
+                    .get(idx.saturating_add(3))
+                    .filter(|next| next.command == "object.label")
+                    .and_then(|next| next.params.get("label"))
+                    .and_then(Value::as_str)?;
+                matches!(lbl, "part.wb.cap-1" | "part.wb.cap-2").then(|| format!("${}.id", offset.saturating_add(idx)))
+            })
+            .collect();
+        if !wb_cap_ids.is_empty() && plan.commands.len() < MAX_ACTIONS {
+            plan.commands.push(EngineAction { command: "object.fill".into(), params: json!({"ids": wb_cap_ids, "swatch": "[Paper]", "tint": 0.92}) });
+        }
+        append_images(&mut plan, &page, family, mode, quantities, &profile.illustration, mirror_rtl.then_some(page_w), ctx.and_then(|c| c.subject))?;
     }
     crate::worker::validate_batch_plan(&plan, scope)?;
     Ok(plan)
@@ -2598,6 +2930,116 @@ fn contains_image_quantity_claim(prompt: &str) -> bool {
         })
 }
 
+fn compact_slot_snippet(text: Option<&String>, max_chars: usize) -> String {
+    let Some(raw) = text else { return String::new() };
+    raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(max_chars).collect()
+}
+
+fn bind_rtl_and_subject_image_prompt(
+    base_prompt: &str,
+    family_id: &str,
+    slot_id: &str,
+    slot_purpose: &str,
+    page_text: &BTreeMap<String, String>,
+    mirror_rtl: bool,
+    subject: Option<CurriculumSubject>,
+) -> (String, String) {
+    let mut prompt = base_prompt.to_owned();
+    let mut label = slot_purpose.to_owned();
+    if mirror_rtl {
+        if family_id == "oxford-song-colours" && slot_id == "song-scene" {
+            for needle in ["Keep the right 34% lighter", "keep the right 34% lighter", "right 34%"] {
+                if prompt.contains(needle) {
+                    prompt = prompt.replace(needle, "LEFT 34% calm light background space");
+                }
+            }
+            if label.contains("right 34%") {
+                label = label.replace("right 34%", "LEFT 34%");
+            }
+            prompt.push_str(
+                "\nCOMPOSITION FOR RTL OVERLAY: Keep the LEFT 34% of the frame calm, uncluttered light background space for the native Arabic card overlay; place the main characters and action in the RIGHT 66%.",
+            );
+        } else if family_id == "international-curriculum-cover" && slot_id == "cover-hero" {
+            if prompt.contains("top-right") {
+                prompt = prompt.replace("top-right", "top-left");
+            }
+            if label.contains("top-right") {
+                label = label.replace("top-right", "top-left");
+            }
+            prompt.push_str("\nCOMPOSITION FOR RTL COVER: Keep the top-left corner calm light background space.");
+        }
+
+        let four_card_keys: Option<[&str; 4]> = match (family_id, slot_id) {
+            ("oxford-vocab-story", "vocab-strip") => Some(["vocab-1", "vocab-2", "vocab-3", "vocab-4"]),
+            ("oxford-phonics-maze", "phonics-cards") => Some(["phonics-1", "phonics-2", "phonics-3", "phonics-4"]),
+            ("oxford-song-colours", "paint-pots") => Some(["colour-1", "colour-2", "colour-3", "colour-4"]),
+            ("garnet-computing-systems-lab", "computing-terms") => Some(["term-1", "term-2", "term-3", "term-4"]),
+            _ => None,
+        };
+        if let Some([k1, k2, k3, k4]) = four_card_keys {
+            let s1 = compact_slot_snippet(page_text.get(k1), 48);
+            let s2 = compact_slot_snippet(page_text.get(k2), 48);
+            let s3 = compact_slot_snippet(page_text.get(k3), 48);
+            let s4 = compact_slot_snippet(page_text.get(k4), 48);
+            if !s1.is_empty() && !s4.is_empty() {
+                prompt.push_str(&format!(
+                    "\nMANDATORY PHYSICAL LEFT-TO-RIGHT 4-PANEL ORDER (for Arabic RTL layout where card 1 sits on the FAR RIGHT and card 4 sits on the FAR LEFT): Divide this wide horizontal strip into 4 equal, cleanly separated side-by-side cards from physical LEFT to RIGHT: [1st / FAR-LEFT card depicts '{s4}']; [2nd / CENTER-LEFT card depicts '{s3}']; [3rd / CENTER-RIGHT card depicts '{s2}']; [4th / FAR-RIGHT card depicts '{s1}']. Keep crisp white vertical gutters between the 4 cards and draw NO text, letters, or numbers."
+                ));
+                label.push_str(" [rtl-cells]");
+            }
+        } else if family_id == "oxford-vocab-story" && slot_id == "story-grid" {
+            let b1 = compact_slot_snippet(page_text.get("bubble-1"), 64);
+            let b2 = compact_slot_snippet(page_text.get("bubble-2"), 64);
+            let b3 = compact_slot_snippet(page_text.get("bubble-3"), 64);
+            let b4 = compact_slot_snippet(page_text.get("bubble-4"), 64);
+            prompt.push_str(&format!(
+                "\nMANDATORY 2x2 QUADRANT ORDER (for Arabic RTL reading order): Arrange 4 distinct story panels in a 2x2 grid: [TOP-RIGHT panel (scene 1): '{b1}']; [TOP-LEFT panel (scene 2): '{b2}']; [BOTTOM-RIGHT panel (scene 3): '{b3}']; [BOTTOM-LEFT panel (scene 4): '{b4}']. Draw NO speech bubbles, text, or numbers."
+            ));
+            label.push_str(" [rtl-cells]");
+        } else if family_id == "oxford-fluency-project" && slot_id == "everyday-dialogue" {
+            let d1 = compact_slot_snippet(page_text.get("dialogue-1"), 72);
+            let d2 = compact_slot_snippet(page_text.get("dialogue-2"), 72);
+            prompt.push_str(&format!(
+                "\nMANDATORY LEFT-TO-RIGHT 2-PANEL ORDER (for Arabic RTL dialogue): [LEFT half depicts '{d2}']; [RIGHT half depicts '{d1}']. Draw NO speech bubbles, text, or numbers."
+            ));
+            label.push_str(" [rtl-cells]");
+        } else if family_id == "oxford-fluency-project" && slot_id == "craft-project" {
+            let st1 = compact_slot_snippet(page_text.get("step-1"), 48);
+            let st3 = compact_slot_snippet(page_text.get("step-3"), 48);
+            prompt.push_str(&format!(
+                "\nMANDATORY LEFT-TO-RIGHT LAYOUT (for Arabic RTL steps): [RIGHT side shows materials and starting step: '{st1}']; [LEFT side shows completed activity and child presenting: '{st3}']. Draw NO text or numbers."
+            ));
+            label.push_str(" [rtl-cells]");
+        } else if family_id == "oxford-skills-time" && slot_id == "listening-grid" {
+            prompt.push_str(
+                "\nRTL 3-PANEL ORDER: Arrange the 3 distinct scenes from RIGHT (first scene) to CENTER (second scene) to LEFT (third scene) with clean white separation between panels, and draw NO text, letters, numbers, or checkmarks.",
+            );
+            label.push_str(" [rtl-cells]");
+        } else if family_id == "oxford-workbook-print" && slot_id == "workbook-lineart" {
+            let sc1 = compact_slot_snippet(page_text.get("scene-1"), 60);
+            let sc2 = compact_slot_snippet(page_text.get("scene-2"), 60);
+            prompt.push_str(&format!(
+                "\nMANDATORY LEFT-TO-RIGHT COLUMN ORDER (for Arabic RTL workbook): [LEFT column line-art matches '{sc2}']; [RIGHT column line-art matches '{sc1}']. Clean black-and-white line art only, NO text or numbers."
+            ));
+            label.push_str(" [rtl-cells]");
+        }
+    }
+    if subject == Some(CurriculumSubject::IslamicStudies) {
+        prompt.push_str(
+            "\nISLAMIC EDUCATIONAL VISUAL ETIQUETTE: Whenever a character is eating, drinking, giving, receiving, or reaching for food or objects, they MUST clearly use their RIGHT hand (keep the left hand resting down or away from food). For Du'a (supplication), show both hands raised together at chest level with palms open upward. Depict natural anatomy (two hands per child) and modest, warm attire; never depict prophets or divine beings.",
+        );
+    }
+    if prompt.len() > 8000 {
+        let mut end = 8000;
+        while end > 0 && !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        prompt.truncate(end);
+    }
+    (prompt, label)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_images(
     plan: &mut ProductionPlan,
     page: &ContentPage,
@@ -2606,10 +3048,12 @@ fn append_images(
     quantities: Option<NumberTriplet>,
     illustration_style: &[String],
     mirror_page_w: Option<f64>,
+    subject: Option<CurriculumSubject>,
 ) -> Result<(), String> {
     if mode == OutputMode::NativeOnly && !page.illustrations.is_empty() {
         return Err("Native-only template content cannot request images".into());
     }
+    let mirror_rtl = mirror_page_w.is_some();
     let mut slots = BTreeSet::new();
     for image in &page.illustrations {
         let slot = family.image_slots.iter().find(|slot| slot.id == image.slot).ok_or("Unknown illustration slot")?;
@@ -2632,7 +3076,7 @@ fn append_images(
             );
             (prompt, format!("CPA concrete quantities: {} + {} = {}; raster count pending human review", values.left, values.right, values.total))
         } else {
-            (image.prompt.clone(), slot.purpose.clone())
+            bind_rtl_and_subject_image_prompt(&image.prompt, &family.id, &slot.id, &slot.purpose, &page.text, mirror_rtl, subject)
         };
         if prompt.len() > 8192 {
             return Err("Bound CPA illustration prompt exceeds its limit".into());
@@ -3924,5 +4368,99 @@ mod tests {
         let concatenated = format!("{valid_only} {{\"extra\":true}}");
         let trailing_err = compile(&concatenated, &s, BatchScope { start: 0, count: 1 }, OutputMode::NativeOnly).unwrap_err();
         assert!(trailing_err.contains("Invalid template content"), "{trailing_err}");
+    }
+
+    #[test]
+    fn ai31_rtl_card_binding_unit_badges_and_islamic_subject_adaptation() {
+        let manifest: Value = serde_json::from_str(include_str!("../../../skills/kg-oxford-cambridge-style/designcraft.json")).unwrap();
+        let ox_profile: DesignProfile = serde_json::from_value(manifest["design_profile"].clone()).unwrap();
+        let templates = BTreeMap::from([
+            (
+                "templates/oxford-vocab-story.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/oxford-vocab-story.json"
+                ))
+                .unwrap(),
+            ),
+            (
+                "templates/garnet-computing-systems-lab.json".into(),
+                serde_json::from_str::<Vec<EngineAction>>(include_str!(
+                    "../../../skills/kg-oxford-cambridge-style/templates/garnet-computing-systems-lab.json"
+                ))
+                .unwrap(),
+            ),
+        ]);
+        let mut ox_skill = skill();
+        ox_skill.skill_id = "kg-oxford-cambridge-style".into();
+        ox_skill.templates = templates;
+        let mut active_profile = ox_profile;
+        active_profile.page_families.retain(|f| ox_skill.templates.contains_key(&f.template));
+        ox_skill.design_profile = Some(active_profile);
+        let brief = "كتاب التربية الإسلامية لمرحلة الروضة KG1 بدون تشكيل";
+        let sys =
+            system_for_brief_with_options(&ox_skill, brief, OutputMode::NativeWithImages, designcraft_ai_types::ArabicTashkeelMode::Auto).unwrap();
+        assert!(sys.contains("WITHOUT harakat/tashkeel marks"), "expected plain Arabic diacritics policy in system prompt");
+        assert!(!sys.contains("CPU processes"), "garnet-computing-systems-lab text slots should adapt away from Computer Science");
+
+        let fam = ox_skill.design_profile.as_ref().unwrap().page_families.iter().find(|f| f.id == "oxford-vocab-story").unwrap();
+        let mut slots: BTreeMap<String, String> =
+            fam.text_slots.iter().enumerate().map(|(idx, s)| (s.id.clone(), format!("محتوى الدرس {}", idx + 1))).collect();
+        slots.insert("header-tag".into(), "الوحدة الثالثة: الأخلاق".into());
+        slots.insert("vocab-1".into(), "صدق".into());
+        slots.insert("vocab-2".into(), "أمانة".into());
+        slots.insert("vocab-3".into(), "وفاء".into());
+        slots.insert("vocab-4".into(), "رحمة".into());
+        slots.insert("bubble-1".into(), "يقول الصدق".into());
+        slots.insert("bubble-2".into(), "يحفظ الأمانة".into());
+        slots.insert("bubble-3".into(), "يفي بالوعد".into());
+        slots.insert("bubble-4".into(), "يرحم الصغير".into());
+
+        let page_json = json!({
+            "title": "الأخلاق الحميدة",
+            "pages": [{
+                "page": 1,
+                "family": "oxford-vocab-story",
+                "text": slots,
+                "illustrations": [
+                    {"slot": "vocab-strip", "prompt": "Four joyful children practicing good Islamic manners"},
+                    {"slot": "story-grid", "prompt": "A 2x2 story of Adam and Layla sharing fruit"}
+                ]
+            }]
+        });
+        let plan = compile_for_brief_with_context(
+            &page_json.to_string(),
+            &ox_skill,
+            BatchScope { start: 1, count: 1 },
+            OutputMode::NativeWithImages,
+            brief,
+            TemplateCompileContext { base: None, facing_pages: true, total_pages: 32, subject: Some(CurriculumSubject::IslamicStudies) },
+        )
+        .unwrap();
+
+        let unit_badge_cmd = plan
+            .commands
+            .windows(4)
+            .find(|w| w[3].command == "object.label" && w[3].params.get("label").and_then(Value::as_str) == Some("part.ui.header.unit-num"))
+            .expect("unit-num command sequence");
+        assert_eq!(unit_badge_cmd[0].params.get("text").and_then(Value::as_str), Some("3"));
+
+        let footer_cmd = plan
+            .commands
+            .windows(4)
+            .find(|w| w[3].command == "object.label" && w[3].params.get("label").and_then(Value::as_str) == Some("part.ui.footer.page"))
+            .expect("footer.page command sequence");
+        let fx0 = footer_cmd[0].params["rect"][0].as_f64().unwrap();
+        assert!(fx0 > 400.0, "even RTL facing page footer should stay on outer-right margin, got x0={fx0}");
+
+        let strip = plan.images.iter().find(|img| img.slot_id.as_deref() == Some("vocab-strip")).unwrap();
+        assert!(strip.label.contains("[rtl-cells]"));
+        assert!(strip.prompt.contains("FAR-LEFT card depicts 'رحمة'"), "got prompt: {}", strip.prompt);
+        assert!(strip.prompt.contains("FAR-RIGHT card depicts 'صدق'"), "got prompt: {}", strip.prompt);
+        assert!(strip.prompt.contains("RIGHT hand"), "expected Islamic visual etiquette in prompt");
+
+        let grid = plan.images.iter().find(|img| img.slot_id.as_deref() == Some("story-grid")).unwrap();
+        assert!(grid.label.contains("[rtl-cells]"));
+        assert!(grid.prompt.contains("TOP-RIGHT panel (scene 1): 'يقول الصدق'"));
+        assert!(grid.prompt.contains("TOP-LEFT panel (scene 2): 'يحفظ الأمانة'"));
     }
 }

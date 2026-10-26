@@ -32,6 +32,8 @@ pub(crate) struct AvailablePrintFont {
     pub family: String,
     pub regular: String,
     pub heading: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading_family: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -417,7 +419,7 @@ impl PrintContract {
     pub(crate) fn select_fonts(&self, state: &DocState) -> Result<PrintFonts, String> {
         let fonts = designcraft_fonts::FontDb::global().scoped(state.doc.font_scope);
         let mut notices = Vec::new();
-        let mut select = |allowed: &[String], language: &str, probe: &str| -> Result<Option<AvailablePrintFont>, String> {
+        let select = |allowed: &[String], language: &str, probe: &str, notices: &mut Vec<String>| -> Result<Option<AvailablePrintFont>, String> {
             if allowed.is_empty() {
                 return Ok(None);
             }
@@ -460,15 +462,53 @@ impl PrintContract {
                         face.family
                     ));
                 }
-                return Ok(Some(AvailablePrintFont { family: face.family.clone(), regular: regular.clone(), heading: heading.clone() }));
+                return Ok(Some(AvailablePrintFont {
+                    family: face.family.clone(),
+                    regular: regular.clone(),
+                    heading: heading.clone(),
+                    heading_family: None,
+                }));
             }
             Err(format!(
                 "No requested {language} font is available with the required glyphs; install or explicitly allow one of: {}",
                 allowed.join(", ")
             ))
         };
-        let english = select(&self.english_fonts, "English", "AaGg0123456789")?;
-        let arabic = select(&self.arabic_fonts, "Arabic", "العربيةَُِّْ0123456789٠١٢٣٤٥٦٧٨٩")?;
+        let english = select(&self.english_fonts, "English", "AaGg0123456789", &mut notices)?;
+        let arabic = if self.arabic_fonts.is_empty() {
+            None
+        } else {
+            let mut resolved_ar = None;
+            for (index, requested) in self.arabic_fonts.iter().enumerate() {
+                let Some(ar) = fonts.resolve_arabic_font(requested) else {
+                    continue;
+                };
+                if index > 0 {
+                    notices.push(format!(
+                        "Requested first-choice Arabic font '{}' is unavailable/incomplete; using allowed alternative '{}'",
+                        self.arabic_fonts.first().map_or("", String::as_str),
+                        ar.family
+                    ));
+                }
+                if !ar.regular_family.eq_ignore_ascii_case(requested) && !ar.family.eq_ignore_ascii_case(requested) {
+                    notices.push(format!("Resolved requested Arabic font '{}' to installed Unicode family '{}'", requested, ar.family));
+                }
+                let heading_family = (!ar.bold_family.eq_ignore_ascii_case(&ar.regular_family)).then_some(ar.bold_family.clone());
+                if !ar.regular_style.eq_ignore_ascii_case("Regular") || !ar.bold_style.eq_ignore_ascii_case("Bold") || heading_family.is_some() {
+                    notices.push(format!(
+                        "Arabic font '{}' uses available styles '{} {}' / '{} {}'",
+                        ar.family, ar.regular_family, ar.regular_style, ar.bold_family, ar.bold_style
+                    ));
+                }
+                resolved_ar =
+                    Some(AvailablePrintFont { family: ar.regular_family, regular: ar.regular_style, heading: ar.bold_style, heading_family });
+                break;
+            }
+            match resolved_ar {
+                Some(font) => Some(font),
+                None => select(&self.arabic_fonts, "Arabic", "العربيةَُِّْ0123456789٠١٢٣٤٥٦٧٨٩", &mut notices)?,
+            }
+        };
         Ok(PrintFonts { english, arabic, notices })
     }
 }
