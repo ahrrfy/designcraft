@@ -23,6 +23,7 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("ai.providers", "AI Providers and Keys…", None, "{} — configure models and OS-protected credentials"),
     ("ai.local", "Local AI…", None, "{} — connect local inference and configure resource limits"),
     ("ai.request", "AI Host Request", None, "{method, …} — see ai::request_command; all requests use the optional native host"),
+    ("ai.runPrompt", "Run with AI…", None, "{prompt, run?} — hand off natural-language instructions to AI Production"),
     ("app.newDocumentDialog", "New Document…", Some("Cmd+N"), "{}"),
     ("app.openDialog", "Open…", Some("Cmd+O"), "{}"),
     ("app.openRecent", "Open Recent File", None, "{index} — file.openRecent, with an alert when the file can't be opened"),
@@ -1022,6 +1023,7 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
             crate::ai::dispatch(app, designcraft_ai_types::protocol::AiRequest::Poll)
         }
         "ai.request" => crate::ai::request_command(app, p),
+        "ai.runPrompt" => crate::ai::run_prompt_command(app, p),
         "app.checkPreviewUpdate" => app.ui.ai.preview_update.command(p),
         "window.minimize" => {
             app.pending_window_commands.push(egui::ViewportCommand::Minimized(true));
@@ -3228,7 +3230,21 @@ pub fn palette(app: &mut DesignApp, ctx: &egui::Context) {
                 .iter()
                 .any(|e| matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, modifiers, .. } if !modifiers.command))
         });
+        let trimmed_q = q.trim();
+        let show_trailing_ai = !items.is_empty() && trimmed_q.split_whitespace().count() >= 2 && !items.iter().any(|it| it.id == "ai.runPrompt");
         egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+            if items.is_empty() && !trimmed_q.is_empty() {
+                let size = egui::vec2(460.0, 22.0);
+                let label = crate::i18n::tr(&app.ui.language, "Run with AI…");
+                let b = egui::Button::new(crate::rtl::widget(ui, label)).frame(false).shortcut_text("AI").min_size(size);
+                let row =
+                    ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min), |ui| {
+                        ui.add(b)
+                    });
+                if row.inner.clicked() || enter {
+                    run = Some(("ai.runPrompt".into(), json!({"prompt": trimmed_q})));
+                }
+            }
             for (i, it) in items.iter().enumerate() {
                 let mut b = egui::Button::new(it.label.as_str()).frame(false);
                 if let Some(sc) = &it.shortcut {
@@ -3246,14 +3262,29 @@ pub fn palette(app: &mut DesignApp, ctx: &egui::Context) {
                     run = Some((it.id.clone(), it.params.clone()));
                 }
             }
+            if show_trailing_ai {
+                let size = egui::vec2(460.0, 22.0);
+                let label = crate::i18n::tr(&app.ui.language, "Run with AI…");
+                let b = egui::Button::new(crate::rtl::widget(ui, label)).frame(false).shortcut_text("AI").min_size(size);
+                let row =
+                    ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min), |ui| {
+                        ui.add(b)
+                    });
+                if row.inner.clicked() {
+                    run = Some(("ai.runPrompt".into(), json!({"prompt": trimmed_q})));
+                }
+            }
         });
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             close = true;
         }
     });
     app.ui.palette = if close || run.is_some() { None } else { Some(q) };
-    if let Some((id, params)) = run {
-        let _ = app.run(&id, params);
+    if let Some((id, params)) = run
+        && let Err(err) = app.run(&id, params)
+        && id == "ai.runPrompt"
+    {
+        app.status_error("Run with AI…", err);
     }
 }
 
@@ -4541,6 +4572,34 @@ mod tests {
         frame(&mut app, vec![enter(true), enter(false)]);
         assert_eq!(app.ui.palette, None, "Return runs the first entry and closes Quick Apply");
         assert_eq!(app.session.documents().len(), 2);
+    }
+
+    #[test]
+    fn quick_apply_hands_off_unmatched_natural_prompt_to_ai() {
+        let mut app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.session.execute("file.new", &json!({})).unwrap();
+        let prompt = "make all captions 14pt bold and group them with graphics";
+        app.ui.palette = Some(prompt.into());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::DesignApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                app.logic(&ui.ctx().clone());
+                app.ui(ui);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        let enter =
+            |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        frame(&mut app, vec![enter(true), enter(false)]);
+        assert_eq!(app.ui.palette, None, "Return hands off the prompt and closes Quick Apply");
+        assert!(app.ui.ai.open, "AI Production panel opens on Quick Apply natural prompt");
+        assert_eq!(app.ui.ai.prompt_text(), prompt);
     }
 
     #[test]

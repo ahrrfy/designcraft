@@ -219,6 +219,460 @@ pub const UNCHECKED: &[&str] = &[
     "type.para",
 ];
 
+/// Structured metadata for one top-level parameter parsed from `CommandSpec::params`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandParamFieldSpec {
+    /// Parameter key name (without trailing `?`).
+    pub name: String,
+    /// True when marked with `?` or absent in an alternative `{…} or {…}` object variant.
+    pub optional: bool,
+    /// Closed list of string literal values when unambiguously documented as `a|b|…`.
+    pub choices: Vec<String>,
+    /// True when unambiguously documented as a boolean parameter (`bool`, `true|false`, `=true`, `=false`).
+    pub boolean: bool,
+    /// Documented value hint / note (trimmed, without leading `:`).
+    pub hint: String,
+}
+
+const NON_CHOICE_TYPE_WORDS: &[&str] = &[
+    "number", "int", "integer", "float", "u64", "i64", "usize", "f64", "pt", "px", "mm", "cm", "em", "n", "bool", "boolean", "string", "str",
+    "object", "array", "null", "any", "id", "ids", "index", "count", "name", "names", "swatch", "hex", "set", "ssNN",
+];
+
+fn strip_trailing_paren_note(s: &str) -> &str {
+    let trimmed = s.trim();
+    if !trimmed.ends_with(')') {
+        return trimmed;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut open_idx = None;
+    for (i, c) in trimmed.char_indices() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '`') => quote = Some(c),
+            (None, '(') => {
+                if depth == 0 {
+                    open_idx = Some(i);
+                }
+                depth += 1;
+            }
+            (None, ')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && i + c.len_utf8() < trimmed.len() {
+                    open_idx = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    match open_idx {
+        Some(0) | None => trimmed,
+        Some(idx) => trimmed.get(..idx).unwrap_or(trimmed).trim(),
+    }
+}
+
+fn is_choice_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let ok =
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') && !s.is_empty();
+    ok && !NON_CHOICE_TYPE_WORDS.contains(&s) && !matches!(s, "true" | "false")
+}
+
+fn clean_hint_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_colon = trimmed.strip_prefix(':').map_or(trimmed, str::trim);
+    without_colon.to_string()
+}
+
+fn classify_hint(hint: &str) -> (bool, Vec<String>) {
+    let core = strip_trailing_paren_note(hint);
+    let core_no_eq = core.strip_prefix('=').map_or(core, str::trim);
+    if matches!(core_no_eq, "bool" | "boolean" | "true|false" | "false|true" | "true" | "false")
+        || core.starts_with("bool ")
+        || core.starts_with("bool=")
+    {
+        return (true, Vec::new());
+    }
+    let alts = split_top(core_no_eq, '|');
+    if alts.len() >= 2 {
+        let mut choices = Vec::with_capacity(alts.len());
+        for alt in alts {
+            let token = strip_trailing_paren_note(alt);
+            if !is_choice_ident(token) {
+                return (false, Vec::new());
+            }
+            if !choices.iter().any(|existing| existing == token) {
+                choices.push(token.to_string());
+            }
+        }
+        if choices.len() >= 2 {
+            return (false, choices);
+        }
+    }
+    (false, Vec::new())
+}
+
+fn merge_field_spec(existing: &mut CommandParamFieldSpec, incoming: CommandParamFieldSpec) {
+    existing.optional |= incoming.optional;
+    if existing.boolean != incoming.boolean {
+        existing.boolean = false;
+    }
+    let incoming_single = strip_trailing_paren_note(&incoming.hint);
+    if !existing.choices.is_empty() {
+        if !incoming.choices.is_empty() {
+            for choice in incoming.choices {
+                if !existing.choices.contains(&choice) {
+                    existing.choices.push(choice);
+                }
+            }
+        } else if is_choice_ident(incoming_single) {
+            if !existing.choices.iter().any(|c| c == incoming_single) {
+                existing.choices.push(incoming_single.to_string());
+            }
+        } else {
+            existing.choices.clear();
+        }
+    }
+    if existing.hint.is_empty() && !incoming.hint.is_empty() {
+        existing.hint = incoming.hint;
+    }
+}
+
+/// Parse structured parameter field metadata from a `CommandSpec::params` description.
+pub fn parse_params_doc(doc: &str) -> std::result::Result<Vec<CommandParamFieldSpec>, String> {
+    let (mut body, mut rest) = object_body(doc)?;
+    let mut variant_bodies = vec![body];
+    while let Some(next) = rest.trim_start().strip_prefix("or ").or_else(|| rest.trim_start().strip_prefix("| ")).filter(|r| r.starts_with('{')) {
+        (body, rest) = object_body(next)?;
+        variant_bodies.push(body);
+    }
+    let multi_variant = variant_bodies.len() > 1;
+    let mut fields: Vec<CommandParamFieldSpec> = Vec::new();
+    let mut variant_key_sets: Vec<Vec<String>> = Vec::with_capacity(variant_bodies.len());
+
+    for vbody in variant_bodies {
+        let mut variant_keys = Vec::new();
+        for entry in split_top(vbody, ',').into_iter().map(str::trim).filter(|e| !e.is_empty()) {
+            if entry.starts_with('…') {
+                continue;
+            }
+            let mut noted = false;
+            let mut pending: Vec<(String, bool)> = Vec::new();
+            let mut raw_hint = String::new();
+            let flush = |pending: &mut Vec<(String, bool)>,
+                         raw_hint: &mut String,
+                         fields: &mut Vec<CommandParamFieldSpec>,
+                         variant_keys: &mut Vec<String>| {
+                if pending.is_empty() {
+                    return;
+                }
+                let hint = clean_hint_text(raw_hint);
+                let (boolean, choices) = classify_hint(&hint);
+                for (name, optional) in pending.drain(..) {
+                    if !variant_keys.contains(&name) {
+                        variant_keys.push(name.clone());
+                    }
+                    let spec = CommandParamFieldSpec { name, optional, choices: choices.clone(), boolean, hint: hint.clone() };
+                    if let Some(prev) = fields.iter_mut().find(|f| f.name == spec.name) {
+                        merge_field_spec(prev, spec);
+                    } else {
+                        fields.push(spec);
+                    }
+                }
+                raw_hint.clear();
+            };
+
+            for alternative in split_top(entry, '|') {
+                let head = alternative.split([':', '=', '(']).next().unwrap_or_default();
+                let tail = alternative.get(head.len()..).unwrap_or_default();
+                let optional = head.trim_end().ends_with('?');
+                let name = head.trim().trim_end_matches('?').trim_end();
+                if !noted {
+                    if !is_key(name) {
+                        let start: String = entry.chars().take(60).collect();
+                        return Err(format!("`{start}` doesn't start with a parameter name"));
+                    }
+                    pending.push((name.to_string(), optional));
+                    if !tail.is_empty() {
+                        raw_hint.push_str(tail);
+                        noted = true;
+                    }
+                } else if is_key(name) && (optional || tail.starts_with(':')) {
+                    flush(&mut pending, &mut raw_hint, &mut fields, &mut variant_keys);
+                    pending.push((name.to_string(), optional));
+                    if !tail.is_empty() {
+                        raw_hint.push_str(tail);
+                        noted = true;
+                    } else {
+                        noted = false;
+                    }
+                } else {
+                    raw_hint.push('|');
+                    raw_hint.push_str(alternative.trim());
+                }
+            }
+            flush(&mut pending, &mut raw_hint, &mut fields, &mut variant_keys);
+        }
+        variant_key_sets.push(variant_keys);
+    }
+
+    if multi_variant {
+        for field in &mut fields {
+            if !variant_key_sets.iter().all(|vk| vk.contains(&field.name)) {
+                field.optional = true;
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_numeric_range(core: &str) -> Option<(f64, f64)> {
+    let (lhs, rhs) = core.split_once("..").or_else(|| core.split_once('–'))?;
+    let min = lhs.trim().parse::<f64>().ok()?;
+    let max = rhs.trim().parse::<f64>().ok()?;
+    (min.is_finite() && max.is_finite() && min <= max).then_some((min, max))
+}
+
+fn normalize_compact(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn with_description(mut schema: Value, hint: &str) -> Value {
+    if !hint.is_empty()
+        && let Some(obj) = schema.as_object_mut()
+    {
+        obj.insert("description".to_string(), Value::String(hint.to_string()));
+    }
+    schema
+}
+
+fn infer_field_json_schema(field: &CommandParamFieldSpec) -> Value {
+    let hint = field.hint.trim();
+    if field.name == "ids" {
+        return with_description(
+            serde_json::json!({
+                "type": "array",
+                "items": {
+                    "anyOf": [
+                        {"type": "integer", "minimum": 0},
+                        {"type": "string", "minLength": 1}
+                    ]
+                },
+                "maxItems": 1024
+            }),
+            hint,
+        );
+    }
+    if field.boolean {
+        return with_description(serde_json::json!({"type": "boolean"}), hint);
+    }
+    if !field.choices.is_empty() {
+        return with_description(
+            serde_json::json!({
+                "type": "string",
+                "enum": field.choices
+            }),
+            hint,
+        );
+    }
+
+    let core = strip_trailing_paren_note(hint);
+    let compact = normalize_compact(core);
+
+    if matches!(compact.as_str(), "bool|null" | "null|bool" | "boolean|null" | "null|boolean") {
+        return with_description(
+            serde_json::json!({
+                "anyOf": [{"type": "boolean"}, {"type": "null"}]
+            }),
+            hint,
+        );
+    }
+    if matches!(compact.as_str(), "[x,y]" | "[dx,dy]" | "[a,b]" | "[start,end]" | "[h,v]") {
+        return with_description(
+            serde_json::json!({
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 2,
+                "maxItems": 2
+            }),
+            hint,
+        );
+    }
+    if matches!(
+        compact.as_str(),
+        "[x0,y0,x1,y1]" | "[left,top,right,bottom]" | "[top,bottom,inside,outside]" | "[t,l,b,r]" | "[top,left,bottom,right]"
+    ) {
+        return with_description(
+            serde_json::json!({
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 4,
+                "maxItems": 4
+            }),
+            hint,
+        );
+    }
+    if matches!(
+        compact.as_str(),
+        "n|[t,l,b,r]" | "number|[t,l,b,r]" | "number|[top,left,bottom,right]" | "[top,left,bottom,right]|number" | "n|[top,bottom,inside,outside]"
+    ) {
+        return with_description(
+            serde_json::json!({
+                "anyOf": [
+                    {"type": "number"},
+                    {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}
+                ]
+            }),
+            hint,
+        );
+    }
+
+    let alts = split_top(core, '|');
+    if alts.len() >= 2 {
+        let mut choice_tokens = Vec::new();
+        let mut saw_number = false;
+        let mut all_understood = true;
+        for alt in &alts {
+            let tok = strip_trailing_paren_note(alt);
+            if matches!(tok, "number" | "n" | "pt") {
+                saw_number = true;
+            } else if is_choice_ident(tok) {
+                choice_tokens.push(tok.to_string());
+            } else {
+                all_understood = false;
+                break;
+            }
+        }
+        if all_understood && saw_number && !choice_tokens.is_empty() {
+            return with_description(
+                serde_json::json!({
+                    "anyOf": [
+                        {"type": "string", "enum": choice_tokens},
+                        {"type": "number"}
+                    ]
+                }),
+                hint,
+            );
+        }
+    }
+
+    if alts.len() == 1 {
+        if let Some((min, max)) = parse_numeric_range(core) {
+            return with_description(
+                serde_json::json!({
+                    "type": "number",
+                    "minimum": min,
+                    "maximum": max
+                }),
+                hint,
+            );
+        }
+        if core.starts_with('[') && core.ends_with(']') {
+            return with_description(
+                serde_json::json!({
+                    "type": "array",
+                    "items": {},
+                    "maxItems": 1024
+                }),
+                hint,
+            );
+        }
+        if core.starts_with('{') && core.ends_with('}') {
+            return with_description(
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": true
+                }),
+                hint,
+            );
+        }
+    }
+
+    if field.name == "id" && (hint.is_empty() || matches!(core, "id" | "u64")) {
+        return with_description(
+            serde_json::json!({
+                "anyOf": [
+                    {"type": "integer", "minimum": 0},
+                    {"type": "string", "minLength": 1}
+                ]
+            }),
+            hint,
+        );
+    }
+
+    with_description(serde_json::json!({}), hint)
+}
+
+fn collect_fields(doc: &'static str, depth: usize, out: &mut Vec<CommandParamFieldSpec>) -> Option<()> {
+    let parsed_keys = doc_keys(doc).ok()?;
+    let parsed_fields = parse_params_doc(doc).ok()?;
+    for field in parsed_fields {
+        if let Some(existing) = out.iter_mut().find(|f| f.name == field.name) {
+            merge_field_spec(existing, field);
+        } else {
+            out.push(field);
+        }
+    }
+    if out.iter().any(|f| f.name == "ids") && !out.iter().any(|f| f.name == "id") {
+        out.push(CommandParamFieldSpec {
+            name: "id".to_string(),
+            optional: true,
+            choices: Vec::new(),
+            boolean: false,
+            hint: "single target object id".to_string(),
+        });
+    }
+    for more in parsed_keys.more {
+        let mut named = named_commands(more).peekable();
+        if named.peek().is_none() || depth > 4 {
+            return None;
+        }
+        for spec in named {
+            if UNCHECKED.contains(&spec.id) {
+                return None;
+            }
+            collect_fields(spec.params, depth + 1, out)?;
+        }
+    }
+    Some(())
+}
+
+/// Every top-level parameter key `spec` accepts according to its `CommandSpec::params` signature,
+/// or `None` when the command accepts unchecked/open-ended keys.
+pub fn accepted_keys(spec: &super::CommandSpec) -> Option<Vec<&'static str>> {
+    if UNCHECKED.contains(&spec.id) {
+        return None;
+    }
+    accepted(spec.params, 0)
+}
+
+/// Derive a JSON Schema object for `spec`'s accepted parameters directly from its
+/// `CommandSpec::params` signature (including inherited `… as/of <cmd>` parameters).
+pub fn command_params_json_schema(spec: &super::CommandSpec) -> Option<Value> {
+    if UNCHECKED.contains(&spec.id) {
+        return None;
+    }
+    let keys = accepted(spec.params, 0)?;
+    let mut fields = Vec::new();
+    collect_fields(spec.params, 0, &mut fields)?;
+    let mut props = serde_json::Map::new();
+    for key in keys {
+        if props.contains_key(key) {
+            continue;
+        }
+        let prop_schema = fields.iter().find(|f| f.name == key).map_or_else(|| serde_json::json!({}), infer_field_json_schema);
+        props.insert(key.to_string(), prop_schema);
+    }
+    Some(serde_json::json!({
+        "type": "object",
+        "properties": props,
+        "required": [],
+        "additionalProperties": false,
+    }))
+}
+
 /// [`check_keys`] for an engine command. A command the engine doesn't have passes: running it
 /// reports that.
 pub fn check_params(id: &str, params: &Value) -> Result<()> {

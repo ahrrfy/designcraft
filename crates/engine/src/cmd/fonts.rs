@@ -171,30 +171,166 @@ fn replace(s: &mut Session, p: &Value) -> Result<Value> {
     {
         return Err(bad("font.replace", "`script` must be `arabic` or `latin`"));
     }
-    let page_range = super::book_polish::parse_pages_range("font.replace", p, s.doc()?.doc.spreads.iter().map(|sp| sp.pages.len()).sum())?;
+    let page_range = super::diacritics::parse_pages_range("font.replace", p, s.doc()?.doc.spreads.iter().map(|sp| sp.pages.len()).sum())?;
     if script.as_deref() == Some("arabic") {
         let family_opt = str_param(p, "family").map(str::to_string);
         let style = str_param(p, "style").map(str::to_string);
-        let to_family = str_param(p, "toFamily").ok_or_else(|| bad("font.replace", "missing toFamily"))?.to_string();
+        let to_family = str_param(p, "toFamily").ok_or_else(|| bad("font.replace", "missing toFamily"))?.trim().to_string();
+        let styles_too = p.get("redefineStyles").and_then(Value::as_bool).unwrap_or(page_range.is_none());
         let db = designcraft_fonts::FontDb::global().scoped(s.doc()?.doc.font_scope);
-        let matched = db
-            .resolve_arabic_font(&to_family)
-            .ok_or_else(|| bad("font.replace", "Choose an installed replacement Arabic font family with Unicode Arabic glyphs"))?;
+        let matched = if matches!(to_family.to_ascii_lowercase().as_str(), "auto") || to_family == "تلقائي" {
+            db.preferred_arabic_font()
+        } else {
+            db.resolve_arabic_font(&to_family)
+        }
+        .ok_or_else(|| bad("font.replace", "Choose an installed replacement Arabic font family with Unicode Arabic glyphs"))?;
         return s.edit(|d, _| {
-            let targets = super::book_polish::stories_on_pages(d, page_range, &[]);
+            let targets = super::diacritics::stories_on_pages(d, page_range, &[]);
             let original_styles = d.styles.clone();
             let scoped_db = designcraft_fonts::FontDb::global().scoped(d.font_scope);
+
+            let mut arabic_used_families = std::collections::BTreeSet::new();
+            for_each_story(d, &mut |st| {
+                let ranges = st.para_ranges();
+                for (pi, r) in ranges.iter().enumerate() {
+                    let Some(pf) = st.paras.get(pi) else { continue };
+                    let (_, base) = original_styles.resolve_para(pf);
+                    for (rr, cf) in st.runs() {
+                        let s0 = rr.start.max(r.start);
+                        let s1 = rr.end.min(r.end);
+                        if s0 >= s1 {
+                            continue;
+                        }
+                        if st.text.get(s0..s1).is_some_and(|slice| slice.chars().any(super::diacritics::is_arabic_letter)) {
+                            let eff = original_styles.resolve_char(&base, cf);
+                            arabic_used_families.insert(eff.font_family.to_ascii_lowercase());
+                        }
+                    }
+                }
+            });
+
+            let matches_style_family = |fam: &str, st_opt: Option<&str>| -> bool {
+                if let Some(sf) = style.as_deref()
+                    && st_opt.is_none_or(|x| !x.eq_ignore_ascii_case(sf))
+                {
+                    return false;
+                }
+                if let Some(ff) = family_opt.as_deref()
+                    && ff != "*"
+                {
+                    return fam.eq_ignore_ascii_case(ff);
+                }
+                arabic_used_families.contains(&fam.to_ascii_lowercase()) || scoped_db.resolve_arabic_font(fam).is_some()
+            };
+
+            let mut redefined_para_styles = std::collections::BTreeSet::new();
+            let mut redefined_char_styles = std::collections::BTreeSet::new();
+            if styles_too {
+                for ps in &original_styles.paragraph {
+                    if ps.chars.font_family.as_deref().is_some_and(|f| matches_style_family(f, ps.chars.font_style.as_deref())) {
+                        redefined_para_styles.insert(ps.name.clone());
+                    }
+                }
+                // Propagate to derived styles that inherit `font_family` from a redefined base style.
+                for _ in 0..original_styles.paragraph.len() {
+                    let mut grew = false;
+                    for ps in &original_styles.paragraph {
+                        if ps.chars.font_family.is_none()
+                            && ps.based_on.as_deref().is_some_and(|b| redefined_para_styles.contains(b))
+                            && redefined_para_styles.insert(ps.name.clone())
+                        {
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                for cs in &original_styles.character {
+                    if cs.chars.font_family.as_deref().is_some_and(|f| matches_style_family(f, cs.chars.font_style.as_deref())) {
+                        redefined_char_styles.insert(cs.name.clone());
+                    }
+                }
+                for _ in 0..original_styles.character.len() {
+                    let mut grew = false;
+                    for cs in &original_styles.character {
+                        if cs.chars.font_family.is_none()
+                            && cs.based_on.as_deref().is_some_and(|b| redefined_char_styles.contains(b))
+                            && redefined_char_styles.insert(cs.name.clone())
+                        {
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+            }
+
             let mut changed = 0usize;
             for sid in targets {
                 if let Some(st) = d.story_mut(sid) {
-                    changed = changed.saturating_add(super::book_polish::replace_arabic_in_story(
+                    changed = changed.saturating_add(super::diacritics::replace_arabic_in_story(
                         st,
                         &original_styles,
                         &scoped_db,
                         &matched,
                         family_opt.as_deref(),
                         style.as_deref(),
+                        &redefined_para_styles,
+                        &redefined_char_styles,
                     ));
+                }
+            }
+
+            if styles_too {
+                let st = d.styles_mut();
+                for ps in &mut st.paragraph {
+                    if let Some(cur_fam) = ps.chars.font_family.as_deref()
+                        && matches_style_family(cur_fam, ps.chars.font_style.as_deref())
+                    {
+                        let cur_st = ps.chars.font_style.as_deref().unwrap_or("Regular");
+                        let (w, _) = scoped_db.traits_of(cur_fam, cur_st);
+                        let bold = super::diacritics::style_looks_bold(cur_st, w);
+                        let (nf, ns) =
+                            if bold { (&matched.bold_family, &matched.bold_style) } else { (&matched.regular_family, &matched.regular_style) };
+                        if !cur_fam.eq_ignore_ascii_case(nf) || !cur_st.eq_ignore_ascii_case(ns) {
+                            ps.chars.font_family = Some(nf.clone());
+                            ps.chars.font_style = Some(ns.clone());
+                            changed = changed.saturating_add(1);
+                        }
+                    }
+                }
+                for cs in &mut st.character {
+                    if let Some(cur_fam) = cs.chars.font_family.as_deref()
+                        && matches_style_family(cur_fam, cs.chars.font_style.as_deref())
+                    {
+                        let cur_st = cs.chars.font_style.as_deref().unwrap_or("Regular");
+                        let (w, _) = scoped_db.traits_of(cur_fam, cur_st);
+                        let bold = super::diacritics::style_looks_bold(cur_st, w);
+                        let (nf, ns) =
+                            if bold { (&matched.bold_family, &matched.bold_style) } else { (&matched.regular_family, &matched.regular_style) };
+                        if !cur_fam.eq_ignore_ascii_case(nf) || !cur_st.eq_ignore_ascii_case(ns) {
+                            cs.chars.font_family = Some(nf.clone());
+                            cs.chars.font_style = Some(ns.clone());
+                            changed = changed.saturating_add(1);
+                        }
+                    }
+                }
+                for f in &mut st.composite_fonts {
+                    for e in &mut f.entries {
+                        if matches_style_family(&e.family, Some(&e.style)) {
+                            let (w, _) = scoped_db.traits_of(&e.family, &e.style);
+                            let bold = super::diacritics::style_looks_bold(&e.style, w);
+                            let (nf, ns) =
+                                if bold { (&matched.bold_family, &matched.bold_style) } else { (&matched.regular_family, &matched.regular_style) };
+                            if !e.family.eq_ignore_ascii_case(nf) || !e.style.eq_ignore_ascii_case(ns) {
+                                e.family.clone_from(nf);
+                                e.style.clone_from(ns);
+                                changed = changed.saturating_add(1);
+                            }
+                        }
+                    }
                 }
             }
             Ok(json!({"changed": changed, "resolvedFamily": matched.family}))
@@ -225,7 +361,7 @@ fn replace(s: &mut Session, p: &Value) -> Result<Value> {
         // Resolve text against the original styles before redefining them. Font family and
         // style can be inherited independently through paragraph and character formatting.
         let original_styles = d.styles.clone();
-        let ids: Vec<_> = super::book_polish::stories_on_pages(d, page_range, &[]).into_iter().collect();
+        let ids: Vec<_> = super::diacritics::stories_on_pages(d, page_range, &[]).into_iter().collect();
         for sid in ids {
             let Some(st) = d.story_mut(sid) else { continue };
             let mut pending = vec![st];
@@ -498,5 +634,43 @@ mod resolution_tests {
         assert_eq!(after[0]["matchStatus"], "exact");
         s.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(before, s.execute("font.list", &json!({})).unwrap());
+    }
+
+    #[test]
+    fn arabic_script_replacement_redefines_styles_while_preserving_latin_runs() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let db = designcraft_fonts::FontDb::global().scoped(s.doc().unwrap().doc.font_scope);
+        let Some(ar) = db.preferred_arabic_font() else {
+            return;
+        };
+        s.execute(
+            "style.paragraph.create",
+            &json!({"name": "Lesson Body", "chars": {"fontFamily": "Source Sans 3", "fontStyle": "Regular", "size": 13}}),
+        )
+        .unwrap();
+        let mixed = "مرحبا بكم في Lesson One مع الصلاة على النبي ﷺ";
+        let f = s.execute("frame.create", &json!({"rect": [36, 36, 420, 180], "content": "text", "text": mixed})).unwrap();
+        let sid = designcraft_doc::StoryId(f["story"].as_u64().unwrap());
+        let len = s.doc().unwrap().doc.stories[&sid].len();
+        s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": len})).unwrap();
+        s.execute("style.paragraph.apply", &json!({"name": "Lesson Body", "clearOverrides": true})).unwrap();
+
+        let res = s.execute("font.replace", &json!({"script": "arabic", "toFamily": "auto", "redefineStyles": true})).unwrap();
+        assert_eq!(res["resolvedFamily"], ar.family);
+
+        let d = &s.doc().unwrap().doc;
+        let ps = d.styles.para("Lesson Body").unwrap();
+        assert_eq!(ps.chars.font_family.as_deref(), Some(ar.regular_family.as_str()));
+
+        let st = d.story(sid).unwrap();
+        let (_, base) = d.styles.resolve_para(&st.paras[0]);
+        let latin_pos = st.text.find("Lesson").unwrap();
+        let latin_cf = st.char_format_at(latin_pos + 1);
+        let latin_eff = d.styles.resolve_char(&base, latin_cf);
+        assert_eq!(latin_eff.font_family, "Source Sans 3", "Latin sub-run preserved its Latin font");
+
+        let arabic_eff = d.styles.resolve_char(&base, st.char_format_at(2));
+        assert_eq!(arabic_eff.font_family, ar.regular_family, "Arabic sub-run uses resolved Arabic family");
     }
 }

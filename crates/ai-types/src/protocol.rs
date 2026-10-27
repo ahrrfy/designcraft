@@ -348,6 +348,12 @@ pub enum AiRequest {
         token: String,
         path: String,
     },
+    ConfirmImageRegeneration {
+        job_id: String,
+    },
+    DismissImageRegeneration {
+        job_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -479,6 +485,18 @@ pub struct SkillReview {
     pub sample_valid: bool,
     pub files: Vec<String>,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingImageApproval {
+    pub job_id: String,
+    #[serde(default)]
+    pub document_uid: u64,
+    pub count: usize,
+    pub provider: ProviderKind,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    pub summary: String,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AiSnapshot {
     pub available: bool,
@@ -506,6 +524,8 @@ pub struct AiSnapshot {
     pub reports: Vec<TaskReport>,
     #[serde(default)]
     pub batch: Option<BatchSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_image_approval: Option<PendingImageApproval>,
     #[serde(default)]
     pub credentials: Vec<CredentialStatus>,
     #[serde(default)]

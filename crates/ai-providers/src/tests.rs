@@ -984,4 +984,370 @@ mod native_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+
+    #[test]
+    fn gemini_agent_turn_preserves_thought_signatures_and_cleans_tool_schemas() {
+        let cancel = AtomicBool::new(false);
+        let sel = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        let tools = vec![ToolDefinition {
+            name: "inspect_pages".into(),
+            description: "Inspect document pages".into(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "start": {"type": "integer", "minimum": 1},
+                    "end": {"type": "integer", "minimum": 1},
+                    "filter": {"type": "string", "minLength": 1, "pattern": "^[a-z]+$"}
+                },
+                "required": ["start", "end"]
+            }),
+        }];
+        let req_turn1 = AgentTurnRequest {
+            system: "Inspect before editing".into(),
+            messages: vec![AgentMessage::User { text: "Fix Arabic fonts on all pages".into(), images: Vec::new() }],
+            tools: tools.clone(),
+            max_output_tokens: 4096,
+            resources: Default::default(),
+        };
+        let mut seen_bodies = Vec::new();
+        let turn1 = crate::agent::generate_agent_turn_with_post(&sel, &req_turn1, &cancel, |path, body, _| {
+            assert_eq!(path, "models/gemini-3.8-flash:generateContent");
+            seen_bodies.push(body.clone());
+            Ok(json!({
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"thought": true, "text": "Need to inspect pages 1..32 first", "thoughtSignature": "sig-thought-1"},
+                            {"functionCall": {"name": "inspect_pages", "args": {"start": 1, "end": 32}}, "thoughtSignature": "sig-call-1"}
+                        ]
+                    }
+                }],
+                "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 18, "thoughtsTokenCount": 42}
+            }))
+        })
+        .unwrap();
+        assert!(turn1.error.is_none());
+        assert_eq!(turn1.usage.input_tokens, Some(120));
+        assert_eq!(turn1.usage.output_tokens, Some(60));
+        assert_eq!(turn1.tool_calls.len(), 1);
+        assert_eq!(turn1.tool_calls[0].name, "inspect_pages");
+        assert_eq!(turn1.tool_calls[0].arguments, json!({"start": 1, "end": 32}));
+        // Schema unsupported keywords were stripped for Gemini functionDeclarations:
+        let decl_params = &seen_bodies[0]["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(decl_params.get("additionalProperties").is_none());
+        assert!(decl_params["properties"]["filter"].get("minLength").is_none());
+        // responseMimeType must NOT be set alongside tools:
+        assert!(seen_bodies[0]["generationConfig"].get("responseMimeType").is_none());
+
+        // Turn 2 replays raw_provider_turn so Gemini 3 thoughtSignature is preserved verbatim!
+        let req_turn2 = AgentTurnRequest {
+            system: "Inspect before editing".into(),
+            messages: vec![
+                AgentMessage::User { text: "Fix Arabic fonts on all pages".into(), images: Vec::new() },
+                AgentMessage::Assistant {
+                    text: turn1.text.clone(),
+                    tool_calls: turn1.tool_calls.clone(),
+                    raw_provider_turn: turn1.raw_provider_turn.clone(),
+                },
+                AgentMessage::ToolResults {
+                    results: vec![ToolResultMessage {
+                        call_id: turn1.tool_calls[0].id.clone(),
+                        name: "inspect_pages".into(),
+                        output: json!({"pageCount": 32}),
+                        images: Vec::new(),
+                    }],
+                },
+            ],
+            tools,
+            max_output_tokens: 4096,
+            resources: Default::default(),
+        };
+        let turn2 = crate::agent::generate_agent_turn_with_post(&sel, &req_turn2, &cancel, |_, body, _| {
+            assert_eq!(body["contents"][1]["parts"][1]["thoughtSignature"], "sig-call-1");
+            assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["name"], "inspect_pages");
+            assert_eq!(body["contents"][2]["parts"][0]["functionResponse"]["response"]["pageCount"], 32);
+            Ok(json!({
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "content": {"role": "model", "parts": [{"text": "Completed font replacement across all 32 pages."}]}
+                }],
+                "usageMetadata": {"promptTokenCount": 300, "candidatesTokenCount": 14}
+            }))
+        })
+        .unwrap();
+        assert!(turn2.error.is_none());
+        assert!(turn2.tool_calls.is_empty());
+        assert_eq!(turn2.text, "Completed font replacement across all 32 pages.");
+    }
+
+    #[test]
+    fn openai_agent_turn_replays_reasoning_and_function_calls() {
+        let cancel = AtomicBool::new(false);
+        let sel = ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-5.4".into(), endpoint: None };
+        let tools = vec![ToolDefinition {
+            name: "apply_engine_commands".into(),
+            description: "Execute engine commands".into(),
+            parameters: json!({"type": "object", "properties": {"commands": {"type": "array", "items": {"type": "object"}}}}),
+        }];
+        let req1 = AgentTurnRequest {
+            system: "Use native commands".into(),
+            messages: vec![AgentMessage::User { text: "Replace Amiri with Sakkal Majalla".into(), images: Vec::new() }],
+            tools: tools.clone(),
+            max_output_tokens: 2048,
+            resources: Default::default(),
+        };
+        let turn1 = crate::agent::generate_agent_turn_with_post(&sel, &req1, &cancel, |path, body, _| {
+            assert_eq!(path, "responses");
+            assert_eq!(body["tools"][0]["name"], "apply_engine_commands");
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+            Ok(json!({
+                "status": "completed",
+                "output": [
+                    {"type": "reasoning", "id": "rs_unencrypted", "summary": []},
+                    {"type": "reasoning", "id": "rs_enc", "summary": [], "encrypted_content": "enc_blob_123"},
+                    {"type": "function_call", "id": "fc_1", "status": "completed", "call_id": "call_abc", "name": "apply_engine_commands", "arguments": "{\"commands\":[{\"command\":\"font.replace\"}]}"}
+                ],
+                "usage": {"input_tokens": 90, "output_tokens": 25}
+            }))
+        })
+        .unwrap();
+        assert_eq!(turn1.tool_calls.len(), 1);
+        assert_eq!(turn1.tool_calls[0].id, "call_abc");
+        assert_eq!(turn1.tool_calls[0].arguments["commands"][0]["command"], "font.replace");
+
+        let req2 = AgentTurnRequest {
+            system: "Use native commands".into(),
+            messages: vec![
+                AgentMessage::User { text: "Replace Amiri with Sakkal Majalla".into(), images: Vec::new() },
+                AgentMessage::Assistant { text: turn1.text, tool_calls: turn1.tool_calls, raw_provider_turn: turn1.raw_provider_turn },
+                AgentMessage::ToolResults {
+                    results: vec![ToolResultMessage {
+                        call_id: "call_abc".into(),
+                        name: "apply_engine_commands".into(),
+                        output: json!({"ok": true, "replaced": 48}),
+                        images: Vec::new(),
+                    }],
+                },
+            ],
+            tools,
+            max_output_tokens: 2048,
+            resources: Default::default(),
+        };
+        let turn2 = crate::agent::generate_agent_turn_with_post(&sel, &req2, &cancel, |_, body, _| {
+            // Unencrypted reasoning item `rs_unencrypted` must be stripped under store=false, while encrypted reasoning is kept!
+            assert_eq!(body["input"][1]["type"], "reasoning");
+            assert_eq!(body["input"][1]["encrypted_content"], "enc_blob_123");
+            assert!(body["input"][1].get("id").is_none());
+            assert_eq!(body["input"][2]["type"], "function_call");
+            assert!(body["input"][2].get("id").is_none() && body["input"][2].get("status").is_none());
+            assert_eq!(body["input"][3]["type"], "function_call_output");
+            assert_eq!(body["input"][3]["call_id"], "call_abc");
+            Ok(json!({
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "Replaced 48 runs."}]}],
+                "usage": {"input_tokens": 130, "output_tokens": 10}
+            }))
+        })
+        .unwrap();
+        assert!(turn2.error.is_none());
+        assert_eq!(turn2.text, "Replaced 48 runs.");
+    }
+
+    #[test]
+    fn ollama_agent_turn_supports_native_tools_and_automatic_json_fallback_over_socket() {
+        let tool = ToolDefinition {
+            name: "inspect_document_overview".into(),
+            description: "Inspect open document".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        };
+        // Turn 1: local Ollama model rejects `tools` with HTTP 400 and falls back to JSON envelope mode.
+        // Turn 2: sticky fallback goes straight to JSON envelope mode in 1 HTTP call (no second HTTP 400!).
+        let (endpoint, handle) = mock(vec![
+            (400, r#"{"error":"model does not support tools"}"#.into()),
+            (
+                200,
+                r#"{"done":true,"prompt_eval_count":64,"eval_count":22,"message":{"role":"assistant","content":"{\"tool_calls\":[{\"name\":\"inspect_document_overview\",\"arguments\":{}}]}"}}"#
+                    .into(),
+            ),
+            (
+                200,
+                r#"{"done":true,"prompt_eval_count":88,"eval_count":14,"message":{"role":"assistant","content":"{\"final_response\":\"All 32 pages inspected.\"}"}}"#
+                    .into(),
+            ),
+        ]);
+        let sel = ModelSelection { provider: ProviderKind::Ollama, model: "qwen2.5:7b".into(), endpoint: Some(endpoint) };
+        let req1 = AgentTurnRequest {
+            system: "Inspect document".into(),
+            messages: vec![AgentMessage::User { text: "Check pages".into(), images: Vec::new() }],
+            tools: vec![tool.clone()],
+            max_output_tokens: 512,
+            resources: Default::default(),
+        };
+        let resp1 = generate_agent_turn(&sel, None, &req1, &AtomicBool::new(false)).unwrap();
+        assert!(resp1.error.is_none());
+        assert_eq!(resp1.tool_calls.len(), 1);
+        assert_eq!(resp1.tool_calls[0].name, "inspect_document_overview");
+
+        let req2 = AgentTurnRequest {
+            system: "Inspect document".into(),
+            messages: vec![
+                AgentMessage::User { text: "Check pages".into(), images: Vec::new() },
+                AgentMessage::Assistant { text: resp1.text, tool_calls: resp1.tool_calls, raw_provider_turn: resp1.raw_provider_turn },
+                AgentMessage::ToolResults {
+                    results: vec![ToolResultMessage {
+                        call_id: "ollama_json_call_0".into(),
+                        name: "inspect_document_overview".into(),
+                        output: json!({"ok": true, "pageCount": 32}),
+                        images: Vec::new(),
+                    }],
+                },
+            ],
+            tools: vec![tool],
+            max_output_tokens: 512,
+            resources: Default::default(),
+        };
+        let resp2 = generate_agent_turn(&sel, None, &req2, &AtomicBool::new(false)).unwrap();
+        let captured = handle.join().unwrap();
+        assert_eq!(captured.len(), 3, "Turn 2 must skip native tools and succeed in 1 request");
+        assert!(captured[0].contains("\"tools\""));
+        assert!(captured[1].contains("\"format\":\"json\"") && !captured[1].contains("\"tools\":[{\"type\":\"function\""));
+        assert!(captured[2].contains("\"format\":\"json\"") && !captured[2].contains("\"role\":\"tool\""));
+        assert!(resp2.error.is_none());
+        assert_eq!(resp2.text, "All 32 pages inspected.");
+    }
+
+    #[test]
+    fn multimodal_tool_results_serialize_for_vision_models_and_degrade_for_text_only_models() {
+        let req = AgentTurnRequest {
+            system: "Visually verify layout".into(),
+            messages: vec![
+                AgentMessage::User { text: "Verify page 1".into(), images: Vec::new() },
+                AgentMessage::Assistant {
+                    text: String::new(),
+                    tool_calls: vec![
+                        ToolCall { id: "call_vis_1".into(), name: "render_visual_check".into(), arguments: json!({"page": 1}) },
+                        ToolCall { id: "call_pages_2".into(), name: "inspect_pages".into(), arguments: json!({"pages": [1]}) },
+                    ],
+                    raw_provider_turn: None,
+                },
+                AgentMessage::ToolResults {
+                    results: vec![
+                        ToolResultMessage {
+                            call_id: "call_vis_1".into(),
+                            name: "render_visual_check".into(),
+                            output: json!({"ok": true, "page": 1, "width": 680, "height": 960}),
+                            images: vec![ImageInput { mime_type: "image/png".into(), bytes: vec![1, 2, 3] }],
+                        },
+                        ToolResultMessage {
+                            call_id: "call_pages_2".into(),
+                            name: "inspect_pages".into(),
+                            output: json!({"ok": true, "pages": [{"page": 1}]}),
+                            images: Vec::new(),
+                        },
+                    ],
+                },
+            ],
+            tools: vec![
+                ToolDefinition {
+                    name: "render_visual_check".into(),
+                    description: "Render page".into(),
+                    parameters: json!({"type": "object", "properties": {"page": {"type": "integer"}}}),
+                },
+                ToolDefinition {
+                    name: "inspect_pages".into(),
+                    description: "Inspect pages".into(),
+                    parameters: json!({"type": "object", "properties": {"pages": {"type": "array", "items": {"type": "integer"}}}}),
+                },
+            ],
+            max_output_tokens: 512,
+            resources: Default::default(),
+        };
+
+        // Gemini 3 nests inlineData inside functionResponse.parts and keeps parallel functionResponse entries contiguous:
+        let gemini3_sel = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+        assert!(supports_agent_vision(&gemini3_sel));
+        let gemini3_body = crate::agent::agent_turn_body(&gemini3_sel, &req, false).unwrap();
+        let g3_parts = gemini3_body["contents"][2]["parts"].as_array().unwrap();
+        assert_eq!(g3_parts.len(), 2, "Gemini 3 must emit 2 contiguous functionResponse parts with media nested inside functionResponse.parts");
+        assert_eq!(g3_parts[0]["functionResponse"]["name"], "render_visual_check");
+        assert_eq!(g3_parts[0]["functionResponse"]["parts"][0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(g3_parts[0]["functionResponse"]["parts"][0]["inlineData"]["data"], "AQID");
+        assert_eq!(g3_parts[1]["functionResponse"]["name"], "inspect_pages");
+        assert!(g3_parts[1]["functionResponse"].get("parts").is_none());
+
+        // Gemini 3 HTTP 400 fallback demotes nested functionResponse.parts into trailing sibling inlineData parts:
+        let mut g3_posts = Vec::new();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let fallback_resp = crate::agent::generate_agent_turn_with_post(&gemini3_sel, &req, &cancel, |_path, body, once| {
+            g3_posts.push((once, body.clone()));
+            if !once {
+                Err("AI provider HTTP 400: Unknown name \"parts\" at 'contents[2].parts[0].function_response'".into())
+            } else {
+                Ok(json!({
+                    "candidates": [{"content": {"role": "model", "parts": [{"text": "Verified visually"}]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 5}
+                }))
+            }
+        })
+        .unwrap();
+        assert_eq!(fallback_resp.text, "Verified visually");
+        assert_eq!(g3_posts.len(), 2);
+        let demoted_parts = g3_posts[1].1["contents"][2]["parts"].as_array().unwrap();
+        assert_eq!(demoted_parts.len(), 3);
+        assert!(demoted_parts[0]["functionResponse"].get("parts").is_none());
+        assert_eq!(demoted_parts[0]["functionResponse"]["name"], "render_visual_check");
+        assert_eq!(demoted_parts[1]["functionResponse"]["name"], "inspect_pages");
+        assert_eq!(demoted_parts[2]["inlineData"]["data"], "AQID");
+
+        // Gemini 2.5 emits all functionResponse parts contiguously first, then trailing inlineData parts:
+        let gemini25_sel = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None };
+        assert!(supports_agent_vision(&gemini25_sel));
+        let gemini25_body = crate::agent::agent_turn_body(&gemini25_sel, &req, false).unwrap();
+        let g25_parts = gemini25_body["contents"][2]["parts"].as_array().unwrap();
+        assert_eq!(g25_parts.len(), 3, "Gemini 2.5 must keep functionResponses contiguous before inlineData");
+        assert_eq!(g25_parts[0]["functionResponse"]["name"], "render_visual_check");
+        assert!(g25_parts[0]["functionResponse"].get("parts").is_none());
+        assert_eq!(g25_parts[1]["functionResponse"]["name"], "inspect_pages");
+        assert_eq!(g25_parts[2]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(g25_parts[2]["inlineData"]["data"], "AQID");
+
+        // OpenAI attaches input_image on multimodal models and omits it on text-only o3-mini:
+        let openai_vis = ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-5.4".into(), endpoint: None };
+        assert!(supports_agent_vision(&openai_vis));
+        let openai_body = crate::agent::agent_turn_body(&openai_vis, &req, false).unwrap();
+        assert_eq!(openai_body["input"][3]["type"], "function_call_output");
+        assert_eq!(openai_body["input"][4]["type"], "function_call_output");
+        assert_eq!(openai_body["input"][5]["role"], "user");
+        assert_eq!(openai_body["input"][5]["content"][1]["type"], "input_image");
+        assert_eq!(openai_body["input"][5]["content"][1]["image_url"], "data:image/png;base64,AQID");
+
+        let openai_txt = ModelSelection { provider: ProviderKind::OpenAi, model: "o3-mini".into(), endpoint: None };
+        assert!(!supports_agent_vision(&openai_txt));
+        let openai_txt_body = crate::agent::agent_turn_body(&openai_txt, &req, false).unwrap();
+        assert_eq!(openai_txt_body["input"].as_array().unwrap().len(), 5, "text-only model must omit input_image");
+
+        // Ollama attaches images on vision-capable models and omits them on text-only models:
+        let ollama_vis = ModelSelection { provider: ProviderKind::Ollama, model: "qwen2.5vl:7b".into(), endpoint: None };
+        assert!(supports_agent_vision(&ollama_vis));
+        let ollama_vis_body = crate::agent::agent_turn_body(&ollama_vis, &req, false).unwrap();
+        let msgs = ollama_vis_body["messages"].as_array().unwrap();
+        assert_eq!(msgs.last().unwrap()["images"], json!(["AQID"]));
+
+        let ollama_txt = ModelSelection { provider: ProviderKind::Ollama, model: "qwen2.5:7b".into(), endpoint: None };
+        assert!(!supports_agent_vision(&ollama_txt));
+        let ollama_txt_body = crate::agent::agent_turn_body(&ollama_txt, &req, false).unwrap();
+        for m in ollama_txt_body["messages"].as_array().unwrap() {
+            assert!(m.get("images").is_none(), "text-only Ollama model must omit images");
+        }
+
+        // Invalid MIME or empty bytes on ToolResultMessage.images are always rejected:
+        let mut bad_req = req.clone();
+        if let AgentMessage::ToolResults { results } = &mut bad_req.messages[2] {
+            results[0].images[0].mime_type = "image/svg+xml".into();
+        }
+        assert!(crate::agent::agent_turn_body(&ollama_txt, &bad_req, false).is_err());
+    }
 }

@@ -95,6 +95,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({
                     "filter": string("Case-insensitive substring matched against id, label and menu path (e.g. \"frame\", \"style\", \"Layout\")"),
                     "enabledOnly": boolean("Only commands that can run right now"),
+                    "includeSchema": boolean("Include structured JSON paramsSchema derived from CommandSpec"),
                 }),
                 &[],
             ),
@@ -464,6 +465,7 @@ fn command_params(v: Option<&Value>) -> Result<Value, String> {
 fn filter_commands(all: Value, a: &Args) -> Value {
     let needle = a.get("filter").and_then(Value::as_str).map(str::to_lowercase).filter(|s| !s.is_empty());
     let enabled_only = a.get("enabledOnly").and_then(Value::as_bool).unwrap_or(false);
+    let include_schema = a.get("includeSchema").and_then(Value::as_bool).unwrap_or(false);
     let Value::Array(list) = all else { return all };
     let hit = |c: &Value| {
         if enabled_only && c.get("enabled").and_then(Value::as_bool) == Some(false) {
@@ -479,7 +481,21 @@ fn filter_commands(all: Value, a: &Args) -> Value {
             .to_lowercase();
         field("id").contains(n) || field("label").contains(n) || menu.contains(n)
     };
-    Value::Array(list.into_iter().filter(hit).collect())
+    Value::Array(
+        list.into_iter()
+            .filter(hit)
+            .map(|mut c| {
+                if include_schema
+                    && let Some(id) = c.get("id").and_then(Value::as_str).map(str::to_string)
+                    && let Some(schema) = designcraft_engine::cmd::production::command_schema(&id)
+                    && let Some(obj) = c.as_object_mut()
+                {
+                    obj.insert("paramsSchema".into(), schema);
+                }
+                c
+            })
+            .collect(),
+    )
 }
 
 fn batch(b: &mut dyn Backend, a: &Args) -> Result<ToolResult, String> {

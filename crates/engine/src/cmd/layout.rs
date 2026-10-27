@@ -316,7 +316,7 @@ pub fn specs() -> Vec<CommandSpec> {
                         }
                     }
                 }
-                Ok(json!({"id": id.0, "prefix": prefix}))
+                Ok(json!({"id": id.0, "prefix": prefix, "index": d.parent_index(id)}))
             })
         }),
         cmd!(
@@ -1192,11 +1192,17 @@ impl SectionEdit {
 
     fn apply(&self, d: &mut designcraft_doc::Document) {
         let start = self.start;
+        let parity_before: Vec<bool> = (0..d.page_count()).map(|i| d.page_number(i) % 2 == 1).collect();
+        let parity_changed = |doc: &designcraft_doc::Document| {
+            (0..doc.page_count()).any(|i| (doc.page_number(i) % 2 == 1) != parity_before.get(i).copied().unwrap_or(false))
+        };
         // Page 1 always starts a section.
         if self.remove && start != 0 {
             d.sections.retain(|x| x.start != start);
             // The pages after it follow the previous section's numbers again.
-            d.repaginate();
+            if parity_changed(d) {
+                d.repaginate();
+            }
             return;
         }
         let mut sec = d.sections.iter().find(|x| x.start == start).cloned().unwrap_or(designcraft_doc::Section {
@@ -1226,7 +1232,9 @@ impl SectionEdit {
         d.sections.push(sec);
         d.sections.sort_by_key(|x| x.start);
         // Facing pages take their sides from their numbers: odd on the right.
-        d.repaginate();
+        if parity_changed(d) {
+            d.repaginate();
+        }
     }
 }
 

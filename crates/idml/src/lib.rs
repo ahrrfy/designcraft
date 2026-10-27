@@ -1,4 +1,6 @@
 //! IDML (InDesign Markup Language) interchange: [`export_idml`] and [`import_idml`].
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 //!
 //! Implemented clean-room from the public IDML File Format Specification and from inspecting
 //! IDML packages exported from synthetic documents. An IDML package is a ZIP whose first entry is
@@ -44,7 +46,6 @@
 //!   (`CropContentVisibleLayers`, `CropContentAllLayers`) are the bounds of what the page draws:
 //!   its paths, text and images, each cut to the clip in force.
 //! - Unknown elements are ignored; nothing is preserved opaquely for round-trip yet.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod arabic;
 mod cjk;
