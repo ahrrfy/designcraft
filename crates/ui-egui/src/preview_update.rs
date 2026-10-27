@@ -41,11 +41,40 @@ fn short_commit(value: &str) -> &str {
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn read_source_commit_file(dir: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(dir.join("SOURCE-COMMIT.txt")).ok()?;
+    if bytes.len() > 128 {
+        return None;
+    }
+    let trimmed = std::str::from_utf8(&bytes).ok()?.trim_start_matches('\u{feff}').trim();
+    valid_commit(trimmed).then(|| trimmed.to_ascii_lowercase())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cleanup_previous_canonical_binaries(exe_dir: &std::path::Path) {
+    if !exe_dir.join("install-manifest.json").is_file() {
+        return;
+    }
+    for old_name in ["designcraft.exe.old", "designcraft-cli.exe.old", "SOURCE-COMMIT.txt.old", "BUILD-IDENTITY.txt.old"] {
+        let _ = std::fs::remove_file(exe_dir.join(old_name));
+    }
+    for old_dir in [".skills.old", ".font-licenses.old"] {
+        let _ = std::fs::remove_dir_all(exe_dir.join(old_dir));
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn discover_adjacent_launcher_layout(exe_path: &std::path::Path) -> (Option<String>, Option<PathBuf>) {
     if !exe_path.is_absolute() {
         return (None, None);
     }
     let Some(commit_dir) = exe_path.parent() else { return (None, None) };
+    let canonical_manifest = commit_dir.join("install-manifest.json");
+    if canonical_manifest.is_file() {
+        let commit_sha = read_source_commit_file(commit_dir)
+            .or_else(|| option_env!("DESIGNCRAFT_BUILD_SHA").filter(|s| valid_commit(s)).map(str::to_ascii_lowercase));
+        return (commit_sha, Some(canonical_manifest));
+    }
     let Some(versions_dir) = commit_dir.parent() else { return (None, None) };
     let Some(managed_dir) = versions_dir.parent() else { return (None, None) };
     let Some(outputs_dir) = managed_dir.parent() else { return (None, None) };
@@ -246,7 +275,8 @@ impl PreviewUpdate {
             return;
         }
         self.last_poll = Some(Instant::now());
-        if !self.initialized {
+        let first_init = !self.initialized;
+        if first_init {
             self.initialized = true;
             #[cfg(target_os = "windows")]
             {
@@ -254,6 +284,9 @@ impl PreviewUpdate {
                 if designcraft_engine::file_access::current().is_none()
                     && let Ok(exe_path) = std::env::current_exe()
                 {
+                    if let Some(exe_dir) = exe_path.parent() {
+                        cleanup_previous_canonical_binaries(exe_dir);
+                    }
                     let (discovered_commit, discovered_manifest) = discover_adjacent_launcher_layout(&exe_path);
                     self.exe_commit = discovered_commit;
                     if self.manifest_path.is_none() {
@@ -263,9 +296,9 @@ impl PreviewUpdate {
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(path) = &self.manifest_path {
+        if let Some(path) = self.manifest_path.clone() {
             let loaded = (|| -> Result<Option<Manifest>, String> {
-                let metadata = designcraft_engine::io::metadata(path).map_err(|error| format!("Cannot inspect launcher manifest: {error}"))?;
+                let metadata = designcraft_engine::io::metadata(&path).map_err(|error| format!("Cannot inspect launcher manifest: {error}"))?;
                 if metadata.len() > MAX_MANIFEST {
                     return Err("Launcher manifest exceeds 64 KiB.".into());
                 }
@@ -274,7 +307,7 @@ impl PreviewUpdate {
                     return Ok(None);
                 }
                 let bytes =
-                    designcraft_engine::io::read_capped(path, MAX_MANIFEST).map_err(|error| format!("Cannot read launcher manifest: {error}"))?;
+                    designcraft_engine::io::read_capped(&path, MAX_MANIFEST).map_err(|error| format!("Cannot read launcher manifest: {error}"))?;
                 let source = String::from_utf8(bytes).map_err(|error| format!("Launcher manifest is not UTF-8: {error}"))?;
                 let manifest = Manifest::parse(&source)?;
                 self.fingerprint = Some(fingerprint);
@@ -282,8 +315,27 @@ impl PreviewUpdate {
             })();
             match loaded {
                 Ok(Some(manifest)) => {
+                    let should_auto_promote = first_init
+                        && designcraft_engine::file_access::current().is_none()
+                        && manifest.staged()
+                        && path.file_name().and_then(|n| n.to_str()) == Some("install-manifest.json")
+                        && path.parent().is_some_and(|d| d.join(".staged-update").join("designcraft.exe").is_file());
+                    let script_path = manifest.script.clone();
                     self.manifest = Some(manifest);
                     self.manifest_error = None;
+                    if should_auto_promote && self.reserve().is_ok() {
+                        let completion = self.completion.clone();
+                        if std::thread::Builder::new()
+                            .name("preview-update-promote".into())
+                            .spawn(move || {
+                                let result = execute_updater(&path, &script_path);
+                                *completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                            })
+                            .is_err()
+                        {
+                            self.running.store(false, Ordering::Release);
+                        }
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -391,8 +443,8 @@ impl PreviewUpdate {
                     crate::rtl::label(
                         ui,
                         text(
-                            "Last successful check; launch through the Windows launcher to enable checks. Errors leave version status unconfirmed.",
-                            "نتيجة آخر فحص ناجح؛ افتح عبر مشغّل ويندوز لتفعيل الفحص. عند الخطأ تبقى حالة الإصدار غير مؤكدة.",
+                            "Checks verified GitHub releases from ahrrfy/designcraft and updates the installed application in place.",
+                            "يفحص الإصدارات الموثقة من ahrrfy/designcraft ويحدّث النسخة المثبتة مباشرة في موضعها.",
                         ),
                     );
                 });
@@ -400,7 +452,25 @@ impl PreviewUpdate {
                     .add_enabled(self.enabled(), egui::Button::new(crate::rtl::widget(ui, text("Check & Stage Update", "فحص وتجهيز التحديث"))))
                     .clicked();
             });
-            if self.manifest.as_ref().is_some_and(Manifest::staged) || status == "staged_waiting_for_app_close" {
+            if status == "installed_for_next_launch" {
+                let commit = self
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.commit.as_deref())
+                    .or_else(|| self.manifest.as_ref().map(|m| m.active_commit.as_str()))
+                    .map_or("unknown", short_commit);
+                crate::rtl::label(
+                    ui,
+                    egui::RichText::new(format!("{} ({commit})", text("Verified update installed", "تم تثبيت التحديث الموثق"))).color(tokens.accent),
+                );
+                crate::rtl::label(
+                    ui,
+                    text(
+                        "Save your work, close DesignCraft and reopen it to run the updated version.",
+                        "احفظ عملك ثم أغلق البرنامج وأعد فتحه لتشغيل النسخة المحدثة.",
+                    ),
+                );
+            } else if self.manifest.as_ref().is_some_and(Manifest::staged) || status == "staged_waiting_for_app_close" {
                 let commit = self.staged_commit().map_or("unknown", short_commit);
                 crate::rtl::label(
                     ui,
@@ -409,8 +479,8 @@ impl PreviewUpdate {
                 crate::rtl::label(
                     ui,
                     text(
-                        "Save your work, close DesignCraft and relaunch via Launcher to activate.",
-                        "احفظ جميع أعمالك، ثم أغلق البرنامج وأعد فتحه عبر المشغّل لتفعيل التحديث.",
+                        "Save your work, close DesignCraft and relaunch to activate.",
+                        "احفظ جميع أعمالك، ثم أغلق البرنامج وأعد فتحه لتفعيل التحديث.",
                     ),
                 );
             }
@@ -701,6 +771,21 @@ mod tests {
         let manifest_file = outputs_dir.join("current-gemini-integrated-trial.json");
         std::fs::write(&manifest_file, "{}").unwrap();
         assert_eq!(super::discover_adjacent_launcher_layout(&exe_path), (Some(ACTIVE.to_string()), Some(manifest_file)));
+
+        // Canonical single-slot layout in Programs/DesignCraft with install-manifest.json + SOURCE-COMMIT.txt:
+        let canonical_dir = temp.path().join("Programs").join("DesignCraft");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        let canonical_exe = canonical_dir.join("designcraft.exe");
+        let canonical_manifest = canonical_dir.join("install-manifest.json");
+        std::fs::write(&canonical_exe, b"stub").unwrap();
+        std::fs::write(&canonical_manifest, "{}").unwrap();
+        std::fs::write(canonical_dir.join("SOURCE-COMMIT.txt"), format!("{upper_sha}\n")).unwrap();
+        std::fs::write(canonical_dir.join("designcraft.exe.old"), b"old").unwrap();
+        std::fs::write(canonical_dir.join("designcraft-cli.exe.old"), b"old").unwrap();
+        assert_eq!(super::discover_adjacent_launcher_layout(&canonical_exe), (Some(ACTIVE.to_string()), Some(canonical_manifest)));
+        super::cleanup_previous_canonical_binaries(&canonical_dir);
+        assert!(!canonical_dir.join("designcraft.exe.old").exists());
+        assert!(!canonical_dir.join("designcraft-cli.exe.old").exists());
     }
 
     #[cfg(target_os = "windows")]

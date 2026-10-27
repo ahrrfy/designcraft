@@ -109,7 +109,12 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
         st.open = true;
     }
     let items = if st.open { crate::menus::command_search(app, &st.query) } else { Vec::new() };
-    let last = items.len().saturating_sub(1);
+    let trimmed_query = st.query.trim().to_owned();
+    let show_ai_row = st.open
+        && !trimmed_query.is_empty()
+        && (items.is_empty() || (trimmed_query.split_whitespace().count() >= 2 && !items.iter().any(|it| it.id == "ai.runPrompt")));
+    let total_rows = items.len() + usize::from(show_ai_row);
+    let last = total_rows.saturating_sub(1);
     if down {
         st.highlight = st.highlight.saturating_add(1);
     }
@@ -118,11 +123,16 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
     }
     st.highlight = st.highlight.min(last);
     let mut run = None;
-    if enter && let Some(it) = items.get(st.highlight).filter(|it| crate::menus::menu_enabled(app, &it.id)) {
-        run = Some(it.id.clone());
+    let mut run_ai_prompt = None;
+    if enter {
+        if let Some(it) = items.get(st.highlight).filter(|it| crate::menus::menu_enabled(app, &it.id)) {
+            run = Some(it.id.clone());
+        } else if show_ai_row && st.highlight == items.len() {
+            run_ai_prompt = Some(trimmed_query.clone());
+        }
     }
     let mut over_matches = false;
-    if st.open && !st.query.trim().is_empty() {
+    if st.open && !trimmed_query.is_empty() {
         let shown = egui::Area::new(id.with("matches"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::RIGHT_TOP)
@@ -153,11 +163,28 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
                             run = Some(it.id.clone());
                         }
                     }
+                    if show_ai_row {
+                        let ai_btn = egui::Button::new(crate::rtl::widget(ui, crate::i18n::tr(&lang, "Run with AI…")))
+                            .frame(false)
+                            .min_size(size)
+                            .shortcut_text("AI");
+                        if st.highlight == items.len() {
+                            ui.painter().rect_filled(egui::Rect::from_min_size(ui.cursor().min, size), 2.0, t.hover);
+                        }
+                        let ai_row = ui.allocate_ui_with_layout(
+                            size,
+                            egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min),
+                            |ui| ui.add(ai_btn),
+                        );
+                        if ai_row.inner.clicked() {
+                            run_ai_prompt = Some(trimmed_query.clone());
+                        }
+                    }
                 });
             });
         over_matches = shown.response.contains_pointer();
     }
-    if escape || run.is_some() {
+    if escape || run.is_some() || run_ai_prompt.is_some() {
         st.query.clear();
         st.open = false;
         let previous = st.previous_focus.take();
@@ -172,6 +199,10 @@ fn search_field(app: &mut DesignApp, ui: &mut egui::Ui) {
     ui.data_mut(|d| d.insert_temp(state_id, st));
     if let Some(cmd) = run {
         crate::menus::activate(app, &cmd, &serde_json::Value::Null);
+    } else if let Some(prompt) = run_ai_prompt
+        && let Err(err) = app.run("ai.runPrompt", serde_json::json!({"prompt": prompt}))
+    {
+        app.status_error("Run with AI…", err);
     }
 }
 
@@ -1249,6 +1280,22 @@ mod tests {
         assert_eq!(items(&h), (2, 2));
         let field = search_node(&h);
         assert_eq!(field.value().unwrap_or_default(), "", "the query is cleared");
+    }
+
+    #[test]
+    fn unmatched_search_query_hands_off_to_ai_run_prompt_on_enter() {
+        let mut h = searching();
+        let prompt = "أزل التشكيل من جميع الإطارات واضبط الخط العربي";
+        h.event(egui::Event::Text(prompt.into()));
+        h.run_steps(4);
+        assert!(h.query_by_label(crate::i18n::tr("de", "No matching commands")).is_some());
+        assert!(row(&h, crate::i18n::tr("de", "Run with AI…")).is_some());
+        h.key_press(egui::Key::Enter);
+        h.run_steps(4);
+        assert!(h.state().app.ui.ai.open, "AI Production panel opens on natural-language search Enter");
+        assert_eq!(h.state().app.ui.ai.prompt_text(), prompt);
+        let field = search_node(&h);
+        assert_eq!(field.value().unwrap_or_default(), "", "the search field clears after handoff");
     }
 
     /// The status bar's preflight count is a menu; its Preflight Panel entry shows the panel.

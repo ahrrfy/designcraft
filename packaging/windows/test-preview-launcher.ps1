@@ -2,9 +2,8 @@ $ErrorActionPreference = 'Stop'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
-$taskRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $taskArabic = [string][char]0x0628 + [char]0x0631 + [char]0x0646 + [char]0x0627 + [char]0x0645 + [char]0x062C
-$taskFixture = Join-Path (Join-Path $taskRoot 'outputs/preview-launcher-tests') ($taskArabic + '-' + [guid]::NewGuid().ToString('N'))
+$taskFixture = Join-Path ([System.IO.Path]::GetTempPath()) ('dc-preview-launcher-test-' + $taskArabic + '-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $taskFixture -Force | Out-Null
 try {
     $taskProfile = Join-Path $taskFixture 'profile'

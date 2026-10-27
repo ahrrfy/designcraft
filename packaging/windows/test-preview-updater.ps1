@@ -150,5 +150,29 @@ Check (Test-Path -LiteralPath ($manifest + '.before-update')) 'Rollback pointer 
     function Get-Process { param($Name, $ErrorAction) return @($throwingProc) }
     Check (Test-PreviewProcessRunning $recWithPid $manifest) 'Inaccessible process Path did not fail closed safely.'
 }
-Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
+$canonicalDir = Join-Path $testRoot 'canonical-install'
+[IO.Directory]::CreateDirectory($canonicalDir) | Out-Null
+[IO.File]::WriteAllText((Join-Path $canonicalDir 'designcraft.exe'), 'old-exe-bytes')
+[IO.File]::WriteAllText((Join-Path $canonicalDir 'designcraft-cli.exe'), 'old-cli-bytes')
+$canonicalManifest = Join-Path $canonicalDir 'install-manifest.json'
+JsonFile $canonicalManifest ([pscustomobject]@{
+    install_mode = 'canonical_inplace'
+    profile = $profile
+    executable = (Join-Path $canonicalDir 'designcraft.exe')
+    published_source_commit = ('b' * 40)
+    update_script_path = (Join-Path $canonicalDir 'update-native-preview.ps1')
+    update_status = 'up_to_date'
+})
+$canonicalStaged = Join-Path $canonicalDir '.staged-update'
+Expand-VerifiedUpdate $archive $canonicalStaged $meta
+[IO.File]::WriteAllText((Join-Path $canonicalStaged 'portable.txt'), 'must-be-stripped-for-canonical')
+Check ((Install-CanonicalSlotUpdate $canonicalManifest $canonicalStaged $meta) -eq 'installed_for_next_launch') 'Canonical slot update did not promote in-place.'
+Check (-not (Test-Path -LiteralPath $canonicalStaged)) 'Canonical .staged-update directory remained after promotion.'
+Check (-not (Test-Path -LiteralPath (Join-Path $canonicalDir 'portable.txt'))) 'portable.txt was not stripped during canonical promotion.'
+Check (-not (Test-Path -LiteralPath (Join-Path $canonicalDir 'designcraft.exe.old'))) 'Unlocked .old binary was not cleaned after canonical promotion.'
+Check (-not (Test-Path -LiteralPath (Join-Path $canonicalDir 'managed-updates'))) 'Canonical update unexpectedly created managed-updates folder.'
+Check ((Get-FileHash -LiteralPath (Join-Path $canonicalDir 'designcraft.exe') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $meta.binaries.'designcraft.exe') 'Canonical designcraft.exe hash mismatch.'
+Check ((Get-Content -LiteralPath (Join-Path $canonicalDir 'SOURCE-COMMIT.txt') -Raw).Trim() -eq $sha) 'Canonical SOURCE-COMMIT.txt mismatch.'
+Check (Test-Path -LiteralPath (Join-Path $canonicalDir 'skills/catalog.json') -PathType Leaf) 'Canonical skills catalog missing after update.'
+Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, canonical in-place single-slot promotion, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

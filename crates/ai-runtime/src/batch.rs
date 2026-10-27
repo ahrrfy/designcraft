@@ -860,6 +860,7 @@ impl ProductionRunner {
                 .execute("file.new", &production_document_params(profile, job.snapshot.total_pages, &job.task.settings, &job.task.prompt)?)
                 .map_err(|e| e.to_string())?;
             initialize_print_document(session, &job.task.prompt)?;
+            crate::template_plan::initialize_relational_book_master(session, profile, &job.task.settings, &job.task.prompt)?;
             // Print preferences define the new document's creation baseline. Facing setup
             // and reviewed artwork are published together by applyGroup below, so undoing
             // this batch restores its complete pre-publication state in one step.
@@ -1539,6 +1540,18 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
+    fn complete_http_body(bytes: &[u8]) -> Result<Option<&[u8]>, &'static str> {
+        let Some(sep) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return Ok(None);
+        };
+        let headers = std::str::from_utf8(&bytes[..sep]).map_err(|_| "Invalid mock HTTP header UTF-8")?;
+        let length = headers
+            .lines()
+            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
+            .ok_or("Missing mock Content-Length")?;
+        Ok(bytes.get(sep + 4..sep + 4 + length))
+    }
+
     fn task(endpoint: String, max_requests: u32) -> TaskRequest {
         TaskRequest {
             prompt: "Make one editable native rectangle per page, with exact 15 mm margins.".into(),
@@ -2019,17 +2032,7 @@ mod tests {
                         return Err("Mock content request ended early".into());
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n").map(|(h, b)| (h.to_owned(), b.to_owned()))
-                    else {
-                        continue;
-                    };
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .ok_or("Missing mock Content-Length")?;
-                    if let Some(body) = body.as_bytes().get(..length) {
+                    if let Some(body) = complete_http_body(&bytes)? {
                         break serde_json::from_slice::<Value>(body).map_err(|e| e.to_string())?;
                     }
                 };
@@ -2176,14 +2179,8 @@ mod tests {
                         return Err("Mock request ended early".into());
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    if let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n") {
-                        let length = headers
-                            .lines()
-                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
-                            .ok_or("Missing mock Content-Length")?;
-                        if body.len() >= length {
-                            break;
-                        }
+                    if complete_http_body(&bytes)?.is_some() {
+                        break;
                     }
                 }
                 let request_index = server_calls.fetch_add(1, Ordering::Relaxed);
@@ -2985,14 +2982,8 @@ mod tests {
                         return Err("Mock request ended early".into());
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    if let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n").map(|(h, b)| (h.to_owned(), b.to_owned())) {
-                        let length = headers
-                            .lines()
-                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
-                            .ok_or("Missing mock Content-Length")?;
-                        if let Some(slice) = body.as_bytes().get(..length) {
-                            break serde_json::from_slice::<Value>(slice).map_err(|e| e.to_string())?;
-                        }
+                    if let Some(slice) = complete_http_body(&bytes)? {
+                        break serde_json::from_slice::<Value>(slice).map_err(|e| e.to_string())?;
                     }
                 };
                 let index = server_calls.fetch_add(1, Ordering::Relaxed);
@@ -3451,14 +3442,8 @@ mod tests {
                             break;
                         }
                         bytes.extend_from_slice(&chunk[..n]);
-                        if let Some((headers, req_body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n") {
-                            let len = headers
-                                .lines()
-                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
-                                .unwrap_or(0);
-                            if req_body.len() >= len {
-                                break;
-                            }
+                        if complete_http_body(&bytes).ok().flatten().is_some() {
+                            break;
                         }
                     }
                     let commands: Vec<Value> = spreads

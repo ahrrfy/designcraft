@@ -2,7 +2,8 @@
 
 use serde_json::json;
 
-use crate::cmd::params::{UNCHECKED, check_keys, check_params, doc_keys};
+use crate::cmd::params::{UNCHECKED, accepted_keys, check_keys, check_params, command_params_json_schema, doc_keys, parse_params_doc};
+use crate::cmd::production::command_schema;
 use crate::{EngineError, Session, command_specs, find_command};
 
 fn keys(doc: &str) -> Vec<&str> {
@@ -112,4 +113,64 @@ fn convert_rows_takes_the_table_target() {
         check_params(id, &json!({"story": 1, "table": 0, "rows": [0, 1], "cols": [0, 0]})).unwrap();
         check_params(id, &json!({"row": 0, "col": 0})).unwrap();
     }
+}
+
+#[test]
+fn structured_params_schema_derives_types_enums_and_validates_in_production() {
+    let mut rich_derived_count = 0usize;
+    for spec in command_specs() {
+        let fields = parse_params_doc(spec.params).unwrap_or_else(|e| panic!("{}: {e}", spec.id));
+        if let Some(accepted) = accepted_keys(spec) {
+            let schema = command_params_json_schema(spec).unwrap_or_else(|| panic!("{} accepted_keys succeeded but schema was None", spec.id));
+            let props = schema["properties"].as_object().expect("properties object");
+            for key in &accepted {
+                assert!(props.contains_key(*key), "{} schema missing accepted key `{key}`", spec.id);
+            }
+            if props.values().any(|v| v.get("type").is_some() || v.get("anyOf").is_some() || v.get("description").is_some()) {
+                rich_derived_count += 1;
+            }
+        } else {
+            let _ = fields;
+        }
+    }
+    assert!(rich_derived_count >= 150, "expected >= 150 commands with structured derived schemas, got {rich_derived_count}");
+
+    // Union `{…} or {…}` merges enum choices cleanly (`guide.add` orientation: horizontal|vertical|both):
+    let guide_spec = find_command("guide.add").expect("guide.add exists");
+    let guide_schema = command_params_json_schema(guide_spec).unwrap();
+    assert_eq!(guide_schema["properties"]["orientation"]["enum"], json!(["horizontal", "vertical", "both"]));
+    assert_eq!(guide_schema["properties"]["point"]["minItems"], json!(2));
+    assert_eq!(guide_schema["properties"]["spreadGuide"]["type"], json!("boolean"));
+
+    // Derived schema in `command_schema` / `production.validate` enforces real enums & booleans while allowing open hints:
+    let caption_schema = command_schema("object.caption").unwrap();
+    assert!(caption_schema["properties"].as_object().unwrap().contains_key("group"));
+    let rulers_schema = command_schema("view.zeroPoint").unwrap();
+    assert_eq!(rulers_schema["properties"]["reset"]["type"], json!("boolean"));
+    assert_eq!(rulers_schema["properties"]["at"]["minItems"], json!(2));
+
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    // Derived command in production.validate rejects invalid enum / boolean type on derived schema:
+    let bad_guide = s.execute(
+        "production.validate",
+        &json!({
+            "outputMode": "native_only",
+            "commands": [{"command": "guide.add", "params": {"orientation": "diagonal", "position": 72}}]
+        }),
+    );
+    assert!(bad_guide.is_err(), "derived enum schema should reject invalid orientation `diagonal`");
+    let ok_guide = s
+        .execute(
+            "production.validate",
+            &json!({
+                "outputMode": "native_only",
+                "commands": [
+                    {"command": "guide.add", "params": {"orientation": "horizontal", "position": 72}},
+                    {"command": "guide.add", "params": {"orientation": "both", "point": [72, 72], "spreadGuide": true}}
+                ]
+            }),
+        )
+        .unwrap();
+    assert_eq!(ok_guide["valid"], json!(true));
 }
