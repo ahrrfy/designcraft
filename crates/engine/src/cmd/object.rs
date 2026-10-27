@@ -1826,7 +1826,7 @@ fn opt_u64(p: &Value, cmd: &str, key: &str) -> Result<Option<u64>> {
 }
 
 /// The sibling list under the group at `parent` (the spread's top level when empty).
-fn siblings_mut<'a>(d: &'a mut Document, r: SpreadRef, parent: &[usize]) -> Option<&'a mut Vec<Arc<Item>>> {
+pub(super) fn siblings_mut<'a>(d: &'a mut Document, r: SpreadRef, parent: &[usize]) -> Option<&'a mut Vec<Arc<Item>>> {
     let mut items = &mut d.spread_mut(r)?.items;
     for &i in parent {
         items = Arc::make_mut(items.get_mut(i)?).children_mut()?;
@@ -2031,29 +2031,34 @@ fn can_group(s: &Session) -> std::result::Result<(), String> {
     group_plan(&st.doc, &st.selection.items).map(|_| ()).map_err(|_| super::CANT_GROUP_SELECTION.into())
 }
 
+pub(super) fn group_items_in_doc(d: &mut Document, cmd_id: &str, ids: &[ItemId]) -> Result<ItemId> {
+    let plan = group_plan(d, ids).map_err(|e| bad(cmd_id, e))?;
+    let missing = || bad(cmd_id, "the objects to group are gone");
+    let siblings = siblings_mut(d, plan.spread, &plan.parent).ok_or_else(missing)?;
+    let (Some(&back), Some(&front)) = (plan.indices.first(), plan.indices.last()) else { return Err(missing()) };
+    let layer = siblings.get(back).ok_or_else(missing)?.layer;
+    // Keep stacking order: remove front to back, then restore back-to-front order.
+    let mut kids = Vec::with_capacity(plan.indices.len());
+    for &i in plan.indices.iter().rev() {
+        if i >= siblings.len() {
+            return Err(missing());
+        }
+        kids.push(siblings.remove(i));
+    }
+    kids.reverse();
+    let gid = ItemId(d.alloc());
+    let mut g = Item::new(gid, layer, Shape::Group, designcraft_geom::PathData::default());
+    let at = (front + 1).saturating_sub(kids.len());
+    g.content = Content::Group { items: kids };
+    let siblings = siblings_mut(d, plan.spread, &plan.parent).ok_or_else(missing)?;
+    siblings.insert(at.min(siblings.len()), Arc::new(g));
+    Ok(gid)
+}
+
 fn group(s: &mut Session, p: &Value) -> Result<Value> {
     let ids = targets(s, p)?;
     s.edit(|d, sel| {
-        let plan = group_plan(d, &ids).map_err(|e| bad("object.group", e))?;
-        let missing = || bad("object.group", "the objects to group are gone");
-        let siblings = siblings_mut(d, plan.spread, &plan.parent).ok_or_else(missing)?;
-        let (Some(&back), Some(&front)) = (plan.indices.first(), plan.indices.last()) else { return Err(missing()) };
-        let layer = siblings.get(back).ok_or_else(missing)?.layer;
-        // Keep stacking order: remove front to back, then restore back-to-front order.
-        let mut kids = Vec::with_capacity(plan.indices.len());
-        for &i in plan.indices.iter().rev() {
-            if i >= siblings.len() {
-                return Err(missing());
-            }
-            kids.push(siblings.remove(i));
-        }
-        kids.reverse();
-        let gid = ItemId(d.alloc());
-        let mut g = Item::new(gid, layer, Shape::Group, designcraft_geom::PathData::default());
-        let at = (front + 1).saturating_sub(kids.len());
-        g.content = Content::Group { items: kids };
-        let siblings = siblings_mut(d, plan.spread, &plan.parent).ok_or_else(missing)?;
-        siblings.insert(at.min(siblings.len()), Arc::new(g));
+        let gid = group_items_in_doc(d, "object.group", &ids)?;
         *sel = Selection::items(vec![gid]);
         Ok(json!({"id": gid.0}))
     })

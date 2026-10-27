@@ -48,7 +48,7 @@ pub(crate) fn place(doc: &Document, cs: &ComposedStory, pos: usize) -> Option<(u
     let ft = cs.frames.get(fi)?;
     let loc = doc.find(ft.frame)?;
     let SpreadRef::Doc(si) = loc.spread else { return None };
-    let b = doc.item(ft.frame)?.bounds();
+    let b = doc.parent_xf(&loc).transform_rect_bbox(doc.item(ft.frame)?.bounds());
     let pi = doc.spreads.get(si)?.page_at_x(b.center().x).unwrap_or(0);
     Some((doc.first_page_of_spread(si) + pi, ((b.y0 + baseline) * 10.0) as i64, ((b.x0 + x) * 10.0) as i64))
 }

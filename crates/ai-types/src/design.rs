@@ -124,8 +124,8 @@ impl DesignProfile {
             {
                 return Err("Design profile page family or template path is invalid".into());
             }
-            if family.text_slots.len() > 24 || family.image_slots.len() > 4 {
-                return Err("A design page family supports at most 24 text slots and 4 image slots".into());
+            if family.text_slots.len() > 24 || family.image_slots.len() > 6 {
+                return Err("A design page family supports at most 24 text slots and 6 image slots".into());
             }
             let mut names = BTreeSet::new();
             let mut commands = BTreeSet::new();
@@ -183,8 +183,8 @@ impl DesignProfile {
         if self.corrections.iter().any(|c| !text(&c.before, 512) || !text(&c.after, 512) || !text(&c.reason, 512)) {
             return Err("Design correction requires bounded before, after and reason".into());
         }
-        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > 24 * 1024 {
-            return Err("Design profile exceeds 24 KiB".into());
+        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > 32 * 1024 {
+            return Err("Design profile exceeds 32 KiB".into());
         }
         Ok(())
     }

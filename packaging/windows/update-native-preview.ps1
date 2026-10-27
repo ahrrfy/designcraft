@@ -232,21 +232,189 @@ function Test-PreviewProcessRunning($Record, [string]$Path) {
     return $false
 }
 
+function Test-IsCanonicalManifest($Record, [string]$ManifestPath) {
+    $modeProp = if ($null -ne $Record) { $Record.PSObject.Properties['install_mode'] } else { $null }
+    if ($null -ne $modeProp -and [string]$modeProp.Value -ceq 'canonical_inplace') { return $true }
+    return ([IO.Path]::GetFileName($ManifestPath) -ieq 'install-manifest.json')
+}
+
+function Install-CanonicalSlotUpdate([string]$Path, [string]$StagedDir, $Metadata) {
+    $record = Read-UpdateJson $Path
+    Assert-PreviewProtectedPaths $record
+    Assert-UpdateMetadata $Metadata
+    $stagedExe = Join-Path $StagedDir 'designcraft.exe'
+    Assert-StagedUpdateFiles $stagedExe $Metadata.binaries.'designcraft.exe' $Metadata.binaries.'designcraft-cli.exe' $Metadata.sourceCommit $Metadata.ciUrl
+    $installDir = Split-Path ([IO.Path]::GetFullPath($Path)) -Parent
+    $stagedPortable = Join-Path $StagedDir 'portable.txt'
+    if (Test-Path -LiteralPath $stagedPortable -PathType Leaf) {
+        Remove-Item -LiteralPath $stagedPortable -Force
+    }
+    # Verify binaries, subdirectories, and extra files can be replaced in-place atomically; roll back cleanly on any lock/IO failure.
+    $movedOld = @()
+    $movedSubDirs = @()
+    $movedExtraFiles = @()
+    try {
+        foreach ($bin in @('designcraft.exe', 'designcraft-cli.exe')) {
+            $target = Join-Path $installDir $bin
+            $old = $target + '.old'
+            $stagedBin = Join-Path $StagedDir $bin
+            if (Test-Path -LiteralPath $old -PathType Leaf) {
+                Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $target -PathType Leaf) {
+                Move-Item -LiteralPath $target -Destination $old -Force
+                $movedOld += @{ target = $target; old = $old; staged = $stagedBin }
+            } else {
+                $movedOld += @{ target = $target; old = $null; staged = $stagedBin }
+            }
+            Move-Item -LiteralPath $stagedBin -Destination $target -Force
+        }
+        foreach ($subDir in @('skills', 'font-licenses')) {
+            $srcSub = Join-Path $StagedDir $subDir
+            if (Test-Path -LiteralPath $srcSub -PathType Container) {
+                $dstSub = Join-Path $installDir $subDir
+                $oldSub = Join-Path $installDir ('.' + $subDir + '.old')
+                if (Test-Path -LiteralPath $oldSub) { Remove-Item -LiteralPath $oldSub -Recurse -Force }
+                if (Test-Path -LiteralPath $dstSub) {
+                    Move-Item -LiteralPath $dstSub -Destination $oldSub -Force
+                    $movedSubDirs += @{ dst = $dstSub; old = $oldSub; staged = $srcSub }
+                } else {
+                    $movedSubDirs += @{ dst = $dstSub; old = $null; staged = $srcSub }
+                }
+                Move-Item -LiteralPath $srcSub -Destination $dstSub -Force
+            }
+        }
+        foreach ($entry in @(Get-ChildItem -LiteralPath $StagedDir -Force)) {
+            if ($entry.Name -ieq 'portable.txt') { continue }
+            if ($entry.PSIsContainer) { continue }
+            $dstEntry = Join-Path $installDir $entry.Name
+            $oldEntry = $dstEntry + '.old'
+            if (Test-Path -LiteralPath $oldEntry -PathType Leaf) {
+                Remove-Item -LiteralPath $oldEntry -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $dstEntry -PathType Leaf) {
+                Move-Item -LiteralPath $dstEntry -Destination $oldEntry -Force
+                $movedExtraFiles += @{ dst = $dstEntry; old = $oldEntry; staged = $entry.FullName }
+            } else {
+                $movedExtraFiles += @{ dst = $dstEntry; old = $null; staged = $entry.FullName }
+            }
+            Move-Item -LiteralPath $entry.FullName -Destination $dstEntry -Force
+        }
+    } catch {
+        foreach ($item in $movedExtraFiles) {
+            if ((Test-Path -LiteralPath $item.dst -PathType Leaf) -and -not (Test-Path -LiteralPath $item.staged -PathType Leaf)) {
+                Move-Item -LiteralPath $item.dst -Destination $item.staged -Force -ErrorAction SilentlyContinue
+            }
+            if ($item.old -and -not (Test-Path -LiteralPath $item.dst -PathType Leaf) -and (Test-Path -LiteralPath $item.old -PathType Leaf)) {
+                Move-Item -LiteralPath $item.old -Destination $item.dst -Force -ErrorAction SilentlyContinue
+            }
+        }
+        foreach ($sub in $movedSubDirs) {
+            if ((Test-Path -LiteralPath $sub.dst -PathType Container) -and -not (Test-Path -LiteralPath $sub.staged -PathType Container)) {
+                Move-Item -LiteralPath $sub.dst -Destination $sub.staged -Force -ErrorAction SilentlyContinue
+            }
+            if ($sub.old -and -not (Test-Path -LiteralPath $sub.dst -PathType Container) -and (Test-Path -LiteralPath $sub.old -PathType Container)) {
+                Move-Item -LiteralPath $sub.old -Destination $sub.dst -Force -ErrorAction SilentlyContinue
+            }
+        }
+        foreach ($pair in $movedOld) {
+            if ((Test-Path -LiteralPath $pair.target -PathType Leaf) -and -not (Test-Path -LiteralPath $pair.staged -PathType Leaf)) {
+                Move-Item -LiteralPath $pair.target -Destination $pair.staged -Force -ErrorAction SilentlyContinue
+            }
+            if ($pair.old -and -not (Test-Path -LiteralPath $pair.target -PathType Leaf) -and (Test-Path -LiteralPath $pair.old -PathType Leaf)) {
+                Move-Item -LiteralPath $pair.old -Destination $pair.target -Force -ErrorAction SilentlyContinue
+            }
+        }
+        # Fall back to staged_waiting_for_app_close in .staged-update (still zero versions/ folders).
+        $fields = @{
+            install_mode = 'canonical_inplace'
+            update_status = 'staged_waiting_for_app_close'
+            staged_executable = $stagedExe
+            staged_executable_sha256 = $Metadata.binaries.'designcraft.exe'
+            staged_cli_sha256 = $Metadata.binaries.'designcraft-cli.exe'
+            staged_source_commit = $Metadata.sourceCommit
+            staged_ci_url = $Metadata.ciUrl
+            staged_updated_utc = [DateTime]::UtcNow.ToString('o')
+        }
+        foreach ($item in $fields.GetEnumerator()) { $record | Add-Member -NotePropertyName $item.Key -NotePropertyValue $item.Value -Force }
+        Write-UpdateManifest $Path $record
+        Remove-Item -LiteralPath ($Path + '.before-update') -Force -ErrorAction SilentlyContinue
+        return 'staged_waiting_for_app_close'
+    }
+
+    foreach ($sub in $movedSubDirs) {
+        if ($sub.old -and (Test-Path -LiteralPath $sub.old)) {
+            Remove-Item -LiteralPath $sub.old -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($item in $movedExtraFiles) {
+        if ($item.old -and (Test-Path -LiteralPath $item.old -PathType Leaf)) {
+            Remove-Item -LiteralPath $item.old -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -LiteralPath $StagedDir -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($oldName in @('designcraft.exe.old', 'designcraft-cli.exe.old')) {
+        Remove-Item -LiteralPath (Join-Path $installDir $oldName) -Force -ErrorAction SilentlyContinue
+    }
+    $canonicalExe = Join-Path $installDir 'designcraft.exe'
+    $fields = @{
+        install_mode = 'canonical_inplace'
+        executable = $canonicalExe
+        executable_sha256 = $Metadata.binaries.'designcraft.exe'
+        cli_sha256 = $Metadata.binaries.'designcraft-cli.exe'
+        published_source_commit = $Metadata.sourceCommit
+        update_ci_url = $Metadata.ciUrl
+        update_status = 'installed_for_next_launch'
+    }
+    foreach ($item in $fields.GetEnumerator()) { $record | Add-Member -NotePropertyName $item.Key -NotePropertyValue $item.Value -Force }
+    foreach ($name in @($record.PSObject.Properties.Name | Where-Object { $_ -like 'staged_*' -or $_ -eq 'previous_executable' })) {
+        $record.PSObject.Properties.Remove($name)
+    }
+    Write-UpdateManifest $Path $record
+    Remove-Item -LiteralPath ($Path + '.before-update') -Force -ErrorAction SilentlyContinue
+    return 'installed_for_next_launch'
+}
+
 if ($LibraryOnly) { return }
 try {
 if (-not [IO.Path]::IsPathRooted($ManifestPath) -or -not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw 'An existing absolute launcher manifest is required.' }
 $record = Read-UpdateJson $ManifestPath
 if (-not [IO.Path]::IsPathRooted($record.profile) -or -not (Test-Path -LiteralPath $record.profile -PathType Container)) { throw 'Existing protected profile is missing.' }
-$root = Join-Path (Split-Path $ManifestPath -Parent) 'managed-updates'
+$canonicalMode = Test-IsCanonicalManifest $record $ManifestPath
+$installDir = Split-Path ([IO.Path]::GetFullPath($ManifestPath)) -Parent
+$root = if ($canonicalMode) { $installDir } else { Join-Path $installDir 'managed-updates' }
 [IO.Directory]::CreateDirectory($root) | Out-Null
+$lockPath = if ($canonicalMode) { Join-Path $installDir '.update.lock' } else { Join-Path $root 'update.lock' }
 $lock = $null
 try {
-    $lock = [IO.File]::Open((Join-Path $root 'update.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     $record = Read-UpdateJson $ManifestPath
     Assert-PreviewProtectedPaths $record
-    # A verified pending update remains actionable until the launcher activates
-    # it. Rechecking must not replace its notification with an up-to-date result.
+    if ($canonicalMode) {
+        foreach ($oldName in @('designcraft.exe.old', 'designcraft-cli.exe.old')) {
+            Remove-Item -LiteralPath (Join-Path $installDir $oldName) -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # A verified pending update remains actionable until activated.
     if ($record.update_status -eq 'staged_waiting_for_app_close') {
+        if ($canonicalMode -and $record.staged_executable -and (Test-Path -LiteralPath $record.staged_executable -PathType Leaf)) {
+            $stagedDir = Split-Path ([string]$record.staged_executable) -Parent
+            $stagedMeta = [pscustomobject]@{
+                schemaVersion = 1
+                repository = 'ahrrfy/designcraft'
+                sourceCommit = [string]$record.staged_source_commit
+                ciUrl = [string]$record.staged_ci_url
+                archive = [pscustomobject]@{ name = 'smart-design-v0.0.0-windows-x64-unsigned-portable.zip'; sha256 = ('0' * 64); size = 1 }
+                binaries = [pscustomobject]@{
+                    'designcraft.exe' = [string]$record.staged_executable_sha256
+                    'designcraft-cli.exe' = [string]$record.staged_cli_sha256
+                }
+            }
+            $promoted = Install-CanonicalSlotUpdate $ManifestPath $stagedDir $stagedMeta
+            $targetOut = if ($promoted -eq 'installed_for_next_launch') { Join-Path $installDir 'designcraft.exe' } else { $record.staged_executable }
+            Write-PreviewUpdateResult $promoted $record.staged_source_commit $targetOut $record.staged_ci_url
+            return
+        }
         Promote-StagedUpdate $ManifestPath -ValidateOnly | Out-Null
         Write-PreviewUpdateResult 'staged_waiting_for_app_close' $record.staged_source_commit $record.staged_executable $record.staged_ci_url
         return
@@ -260,9 +428,15 @@ try {
     if ($null -eq $release) { Write-PreviewUpdateResult 'no_published_update' $null $null $null; return }
     $asset = @($release.assets | Where-Object name -eq 'update.json')[0]
     if ($asset.size -gt 1048576 -or $asset.browser_download_url -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/v[0-9A-Za-z.-]+/update\.json$') { throw 'Invalid update metadata asset.' }
-    $metaPath = Join-Path $root 'downloaded-update.json'
-    Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $metaPath -TimeoutSec 45
-    $meta = Read-UpdateJson $metaPath
+    $metaPath = Join-Path $root $(if ($canonicalMode) { '.downloaded-update.json' } else { 'downloaded-update.json' })
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $metaPath -TimeoutSec 45
+        $meta = Read-UpdateJson $metaPath
+    } finally {
+        if ($canonicalMode -and (Test-Path -LiteralPath $metaPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $metaPath -Force -ErrorAction SilentlyContinue
+        }
+    }
     Assert-UpdateMetadata $meta
     if ($meta.sourceCommit -ceq $record.published_source_commit) { Write-PreviewUpdateResult 'up_to_date' $meta.sourceCommit $record.executable $meta.ciUrl; return }
     if ($record.published_source_commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Current source commit is unknown; automatic replacement is disabled.' }
@@ -293,18 +467,38 @@ try {
     }
     $archiveAsset = @($release.assets | Where-Object name -CEQ $meta.archive.name)
     if ($archiveAsset.Count -ne 1 -or $archiveAsset[0].size -ne $meta.archive.size -or $archiveAsset[0].browser_download_url -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/v[0-9A-Za-z.-]+/smart-design-[0-9A-Za-z.-]+-windows-x64-unsigned-portable\.zip$') { throw 'Invalid archive asset.' }
-    $destination = Join-Path $root ('versions/' + $meta.sourceCommit)
-    if (-not (Test-Path -LiteralPath $destination)) {
-        $archivePath = Join-Path $root $meta.archive.name
-        Invoke-WebRequest -UseBasicParsing -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 300
-        Expand-VerifiedUpdate $archivePath $destination $meta
-        Remove-Item -LiteralPath $archivePath
+    if ($canonicalMode) {
+        $stagedDir = Join-Path $installDir '.staged-update'
+        if (Test-Path -LiteralPath $stagedDir) { Remove-Item -LiteralPath $stagedDir -Recurse -Force }
+        $archivePath = Join-Path $installDir ('.' + $meta.archive.name)
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 300
+            Expand-VerifiedUpdate $archivePath $stagedDir $meta
+        } finally {
+            if (Test-Path -LiteralPath $archivePath -PathType Leaf) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
+        }
+        $status = Install-CanonicalSlotUpdate $ManifestPath $stagedDir $meta
+        $targetExe = if ($status -eq 'installed_for_next_launch') { Join-Path $installDir 'designcraft.exe' } else { Join-Path $stagedDir 'designcraft.exe' }
+        Write-PreviewUpdateResult $status $meta.sourceCommit $targetExe $meta.ciUrl
+    } else {
+        $destination = Join-Path $root ('versions/' + $meta.sourceCommit)
+        if (-not (Test-Path -LiteralPath $destination)) {
+            $archivePath = Join-Path $root $meta.archive.name
+            Invoke-WebRequest -UseBasicParsing -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 300
+            Expand-VerifiedUpdate $archivePath $destination $meta
+            Remove-Item -LiteralPath $archivePath
+        }
+        # Never terminate a live app, discard unsaved work, or resume an AI job.
+        $running = Test-PreviewProcessRunning $record $ManifestPath
+        $status = Install-UpdatePointer $ManifestPath $destination $meta $running
+        Write-PreviewUpdateResult $status $meta.sourceCommit (Join-Path $destination 'designcraft.exe') $meta.ciUrl
     }
-    # Never terminate a live app, discard unsaved work, or resume an AI job.
-    $running = Test-PreviewProcessRunning $record $ManifestPath
-    $status = Install-UpdatePointer $ManifestPath $destination $meta $running
-    Write-PreviewUpdateResult $status $meta.sourceCommit (Join-Path $destination 'designcraft.exe') $meta.ciUrl
-} finally { if ($null -ne $lock) { $lock.Dispose() } }
+} finally {
+    if ($null -ne $lock) { $lock.Dispose() }
+    if ($canonicalMode -and (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    }
+}
 } catch {
     # One concise stderr line and a nonzero exit; never emit success-shaped JSON.
     $message = 'Update failed: ' + ($_.Exception.Message -replace '[\r\n]+', ' ')

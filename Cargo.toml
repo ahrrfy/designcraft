@@ -35,7 +35,6 @@ designcraft-ai-types = { path = "crates/ai-types" }
 designcraft-ai-skills = { path = "crates/ai-skills" }
 designcraft-ai-providers = { path = "crates/ai-providers" }
 designcraft-ai-runtime = { path = "crates/ai-runtime" }
-designcraft-testkit = { path = "crates/testkit" }
 
 # foundation
 kurbo = { version = "0.13", features = ["serde"] }

@@ -14,6 +14,7 @@ pub enum Class {
     Standalone,
     /// Test tooling: may depend on anything up to L5 (it sits at L6 for rule
     /// purposes); other crates may use it only as a dev-dependency.
+    #[cfg_attr(not(test), allow(dead_code))]
     Testkit,
     /// Binaries and build tooling: exempt from the rules.
     Exempt,
@@ -54,7 +55,6 @@ pub const TABLE: &[(&str, Class)] = &[
     ("ui-egui", Class::Layer(6)),
     ("mcp", Class::Layer(6)),
     ("ai-runtime", Class::Layer(6)),
-    ("testkit", Class::Testkit),
     // L7 apps and tooling
     ("designcraft", Class::Exempt),
     ("cli", Class::Exempt),
@@ -87,9 +87,13 @@ pub fn short_name(pkg: &str) -> &str {
     pkg.strip_prefix("designcraft-").unwrap_or(pkg)
 }
 
-pub fn classify(pkg: &str) -> Option<Class> {
+fn classify_in(pkg: &str, table: &[(&str, Class)]) -> Option<Class> {
     let s = short_name(pkg);
-    TABLE.iter().find(|(n, _)| *n == s).map(|(_, c)| *c)
+    table.iter().find(|(n, _)| *n == s).map(|(_, c)| *c)
+}
+
+pub fn classify(pkg: &str) -> Option<Class> {
+    classify_in(pkg, TABLE)
 }
 
 fn is_ui_crate(name: &str) -> bool {
@@ -151,11 +155,15 @@ impl std::fmt::Display for Violation {
     }
 }
 
-/// Check all rules. Returns violations sorted for stable output.
+/// Check all rules against the live workspace table. Returns violations sorted for stable output.
 pub fn check(crates: &[Crate]) -> Vec<Violation> {
+    check_with_table(crates, TABLE)
+}
+
+fn check_with_table(crates: &[Crate], table: &[(&str, Class)]) -> Vec<Violation> {
     let mut out = Vec::new();
     for c in crates {
-        let Some(class) = classify(&c.name) else {
+        let Some(class) = classify_in(&c.name, table) else {
             out.push(Violation::Unregistered { krate: c.name.clone() });
             continue;
         };
@@ -173,7 +181,7 @@ pub fn check(crates: &[Crate]) -> Vec<Violation> {
                     out.push(Violation::StandaloneHasWorkspaceDep { krate: c.name.clone(), dep: d.name.clone() });
                     continue;
                 }
-                match classify(&d.name) {
+                match classify_in(&d.name, table) {
                     // Unregistered deps are reported on their own entry.
                     None => {}
                     Some(Class::Testkit) if d.kind != DepKind::Dev => {
@@ -251,7 +259,7 @@ mod tests {
         let g = [
             c("designcraft-geom", &[("kurbo", Normal, false)]),
             c("designcraft-doc", &[("designcraft-geom", Normal, true)]),
-            c("designcraft-engine", &[("designcraft-doc", Normal, true), ("designcraft-testkit", Dev, true)]),
+            c("designcraft-engine", &[("designcraft-doc", Normal, true)]),
             c("designcraft-ui-egui", &[("designcraft-engine", Normal, true), ("egui", Normal, false)]),
             c("designcraft-cli", &[("designcraft-ui-egui", Normal, true)]),
         ];
@@ -307,12 +315,15 @@ mod tests {
 
     #[test]
     fn testkit_only_as_dev_dependency() {
-        let v = check(&[c("designcraft-render", &[("designcraft-testkit", Normal, true)])]);
+        assert_eq!(classify("designcraft-testkit"), None, "TABLE must only list real workspace crates");
+        let mut t = TABLE.to_vec();
+        t.push(("testkit", Class::Testkit));
+        let v = check_with_table(&[c("designcraft-render", &[("designcraft-testkit", Normal, true)])], &t);
         assert!(matches!(v[..], [Violation::TestkitAsNormalDep { .. }]));
-        assert!(check(&[c("designcraft-render", &[("designcraft-testkit", Dev, true)])]).is_empty());
+        assert!(check_with_table(&[c("designcraft-render", &[("designcraft-testkit", Dev, true)])], &t).is_empty());
         // testkit itself may use anything up to L5 but not L6 crates.
-        assert!(check(&[c("designcraft-testkit", &[("designcraft-engine", Normal, true)])]).is_empty());
-        assert!(!check(&[c("designcraft-testkit", &[("designcraft-ui-egui", Normal, true)])]).is_empty());
+        assert!(check_with_table(&[c("designcraft-testkit", &[("designcraft-engine", Normal, true)])], &t).is_empty());
+        assert!(!check_with_table(&[c("designcraft-testkit", &[("designcraft-ui-egui", Normal, true)])], &t).is_empty());
     }
 
     #[test]

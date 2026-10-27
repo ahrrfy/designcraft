@@ -168,7 +168,7 @@ fn define(s: &mut Session, p: &Value) -> Result<Value> {
                 d.text_variables.len() - 1
             }
         };
-        Ok(json!({"index": i}))
+        Ok(json!({"index": i, "char": var_char(i).map(|c| c.to_string())}))
     })
 }
 
@@ -355,5 +355,56 @@ mod tests {
         // Deleting a variable flattens its instances to text.
         s.execute("variables.delete", &json!({"name": "Last Page Number"})).unwrap();
         assert!(s.doc().unwrap().doc.story(sid).unwrap().text.ends_with(" · 3"));
+    }
+
+    #[test]
+    fn running_header_resolves_grouped_translated_frames_on_facing_spreads() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": true, "width": 600.0, "height": 800.0})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Heading"})).ok();
+        s.execute("variables.define", &json!({"name": "Chapter Head", "type": "runningHeader", "style": "Heading"})).unwrap();
+
+        // Spread 1 holds facing pages 1 (x = 0..600) and 2 (x = 600..1200).
+        // Create both heading groups in local left-page coordinates, then translate the second group onto the right page.
+        for (text, dx) in [("Left Unit", 0.0), ("Right Unit", 600.0)] {
+            let f1 = s.execute("frame.create", &json!({"spread": 1, "rect": [60, 80, 420, 130], "content": "text", "text": text})).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+            let sid = s.doc().unwrap().doc.item(designcraft_doc::ItemId(f1)).unwrap().text_frame().unwrap().story;
+            s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 1})).unwrap();
+            s.execute("style.paragraph.apply", &json!({"name": "Heading"})).unwrap();
+            let badge = s.execute("frame.create", &json!({"spread": 1, "rect": [24, 80, 52, 112]})).unwrap()["id"].as_u64().unwrap();
+            let grp = s.execute("object.group", &json!({"ids": [badge, f1]})).unwrap()["id"].as_u64().unwrap();
+            if dx != 0.0 {
+                s.execute("transform.move", &json!({"ids": [grp], "dx": dx, "dy": 0.0})).unwrap();
+            }
+        }
+
+        let d = s.doc().unwrap().doc.clone();
+        let idx = s.cache.running_index(&d);
+        assert_eq!(idx.value("Heading", false, designcraft_doc::vars::Use::FirstOnPage, 1), "Left Unit");
+        assert_eq!(idx.value("Heading", false, designcraft_doc::vars::Use::FirstOnPage, 2), "Right Unit");
+    }
+
+    #[test]
+    fn running_header_resolves_rtl_facing_spread_pages_near_spine() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": true, "binding": "rightToLeft", "width": 600.0, "height": 800.0})).unwrap();
+        s.execute("style.paragraph.create", &json!({"name": "Heading"})).ok();
+        s.execute("variables.define", &json!({"name": "Chapter Head", "type": "runningHeader", "style": "Heading"})).unwrap();
+
+        // On an RTL facing spread (spread 1), page index 1 (page "2") sits on the RIGHT (x = 600..1200)
+        // and page index 2 (page "3") sits on the LEFT (x = 0..600), meeting at the spine x = 600.
+        for (text, rect) in [("الوحدة اليمنى", [604.0, 80.0, 920.0, 130.0]), ("الوحدة اليسرى", [280.0, 80.0, 596.0, 130.0])] {
+            let f = s.execute("frame.create", &json!({"spread": 1, "rect": rect, "content": "text", "text": text})).unwrap()["id"].as_u64().unwrap();
+            let sid = s.doc().unwrap().doc.item(designcraft_doc::ItemId(f)).unwrap().text_frame().unwrap().story;
+            s.execute("text.select", &json!({"story": sid.0, "anchor": 0, "focus": 1})).unwrap();
+            s.execute("style.paragraph.apply", &json!({"name": "Heading"})).unwrap();
+        }
+
+        let d = s.doc().unwrap().doc.clone();
+        let idx = s.cache.running_index(&d);
+        assert_eq!(idx.value("Heading", false, designcraft_doc::vars::Use::FirstOnPage, 1), "الوحدة اليمنى");
+        assert_eq!(idx.value("Heading", false, designcraft_doc::vars::Use::FirstOnPage, 2), "الوحدة اليسرى");
     }
 }

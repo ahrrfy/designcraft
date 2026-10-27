@@ -310,7 +310,7 @@ impl Session {
                 self.smart_reflow();
             }
             if let Some(st) = self.active_mut()
-                && st.doc.spreads.iter().any(|sp| sp.items.iter().any(|i| i.live_caption.is_some()))
+                && crate::cmd::captions::has_live_captions(&st.doc)
             {
                 let mut d = (*st.doc).clone();
                 if crate::cmd::captions::refresh_live(&mut d) {

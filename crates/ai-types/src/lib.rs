@@ -233,6 +233,74 @@ pub fn supports_gemini_image_review(provider: ProviderKind, model: &str) -> bool
     })
 }
 
+/// Returns `true` when a free-form prompt explicitly asks to generate, regenerate, redraw, or
+/// re-illustrate raster artwork (as opposed to mentioning images in a caption-matching or layout audit).
+pub fn prompt_explicitly_requests_image_generation(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    const NEGATIONS: &[&str] = &[
+        "بدون توليد صور",
+        "دون توليد صور",
+        "لا تولد صور",
+        "لا تولّد صور",
+        "بدون رسم صور",
+        "without generating images",
+        "do not generate images",
+        "don't generate images",
+        "do not regenerate images",
+        "don't regenerate images",
+        "no image generation",
+    ];
+    if NEGATIONS.iter().any(|neg| lower.contains(neg)) {
+        return false;
+    }
+    const EXPLICIT_PATTERNS: &[&str] = &[
+        "أعد توليد الصور",
+        "اعد توليد الصور",
+        "إعادة توليد الصور",
+        "اعادة توليد الصور",
+        "أعد توليد الصورة",
+        "اعد توليد الصورة",
+        "إعادة توليد الصورة",
+        "اعادة توليد الصورة",
+        "ولّد صور",
+        "ولد صور",
+        "توليد صور",
+        "توليد الصور",
+        "أعد رسم الصور",
+        "اعد رسم الصور",
+        "إعادة رسم الصور",
+        "اعادة رسم الصور",
+        "ارسم صور",
+        "ارسم رسوم",
+        "توليد رسوم",
+        "استبدل الصور بصور جديدة",
+        "صمم صوراً جديدة",
+        "صمم صورا جديدة",
+        "regenerate image",
+        "regenerate images",
+        "regenerate the image",
+        "regenerate the images",
+        "regenerate illustration",
+        "regenerate illustrations",
+        "redraw image",
+        "redraw images",
+        "redraw illustration",
+        "redraw illustrations",
+        "re-illustrate",
+        "generate new image",
+        "generate new images",
+        "generate image",
+        "generate images",
+        "generate illustration",
+        "generate illustrations",
+        "create new illustration",
+        "create new illustrations",
+        "draw new image",
+        "draw new images",
+    ];
+    EXPLICIT_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +390,18 @@ mod tests {
         assert!(!supports_gemini_image_review(ProviderKind::OpenAi, "gpt-4o"));
         assert!(!supports_gemini_image_review(ProviderKind::Ollama, "llava"));
         assert!(!supports_gemini_image_review(ProviderKind::Gemini, "gemini-3.1-flash-image"));
+    }
+
+    #[test]
+    fn explicit_image_generation_prompt_classifier_distinguishes_audit_from_redraw() {
+        assert!(!prompt_explicitly_requests_image_generation(
+            "ازل التشكيل من الحروف ونريد تبديل الخط العربي وايضا لاحظنا الكلمات وبين الصور ليس متطابقة فمثلا الصورة وتحتها الكلمة ليست متطابقة ارجو المراجعة والتدقيق"
+        ));
+        assert!(!prompt_explicitly_requests_image_generation(
+            "Review all pages 1-32, fix page numbers, and check caption-to-image alignment without generating images."
+        ));
+        assert!(prompt_explicitly_requests_image_generation("أعد توليد الصور التالفة في الصفحات 3 و 7"));
+        assert!(prompt_explicitly_requests_image_generation("Fix captions and regenerate images for the mismatched cards"));
+        assert!(!prompt_explicitly_requests_image_generation("أعد توليد الصور بدون توليد صور مدفوعة"));
     }
 }

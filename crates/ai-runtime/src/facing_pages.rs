@@ -225,6 +225,45 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
             }
             selected = pages.clone();
             step_pages.ids = pages.first().copied();
+        } else if action.command == "object.altText" {
+            let pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if pages.is_empty() {
+                return Err("Projected object.altText requires a target object".into());
+            }
+        } else if action.command == "object.caption" {
+            let mut pages = match params.get("ids") {
+                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
+                None => selected.clone(),
+            };
+            if let Some(cf) = params.get("captionFrame").filter(|v| !v.is_null()) {
+                let cf_page = single_target_page(cf, &result_pages, index, actual)?;
+                if !pages.contains(&cf_page) {
+                    pages.push(cf_page);
+                }
+            }
+            if pages.len() != 1 {
+                return Err("Projected captions must remain on one absolute page".into());
+            }
+            selected = pages.clone();
+            step_pages.ids = pages.first().copied();
+            if params.get("group").and_then(Value::as_bool) == Some(true) {
+                step_pages.groups = pages.first().copied();
+            }
+        } else if action.command == "layout.section" {
+            let page_1 = params.get("page").and_then(Value::as_u64).ok_or("Projected layout.section requires a 1-based page")?;
+            let abs = usize::try_from(page_1).ok().and_then(|n| n.checked_sub(1)).ok_or("Projected layout.section page is out of range")?;
+            page_location(actual, abs)?;
+        } else if action.command == "layout.pages.applyParent" {
+            let arr =
+                params.get("pages").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or("Projected layout.pages.applyParent requires pages")?;
+            for v in arr {
+                let page_0 = v.as_u64().ok_or("Projected layout.pages.applyParent page must be a 0-based integer")?;
+                let abs = usize::try_from(page_0).map_err(|_| "Projected layout.pages.applyParent page is out of range")?;
+                page_location(actual, abs)?;
+            }
         } else if action.command == "object.qrCode" {
             params.remove("spread");
             let page = *selected.first().ok_or("Projected object.qrCode without rect requires a selected target")?;
@@ -456,6 +495,7 @@ struct StepPages {
     from: Option<usize>,
     to: Option<usize>,
     ids: Option<usize>,
+    groups: Option<usize>,
 }
 
 fn page_location(actual: &DocState, absolute: usize) -> Result<(usize, &doc::Page), String> {
@@ -481,6 +521,7 @@ fn single_target_page(id: &Value, results: &[StepPages], current: usize, actual:
         let resolved = match root_field {
             "id" => step_pages.id,
             "ids" => step_pages.ids,
+            "groups" => step_pages.groups,
             "from" => step_pages.from,
             "to" => step_pages.to,
             _ => return Err("Projected object targets must reference an earlier object ID".into()),
@@ -559,7 +600,11 @@ pub(crate) fn validate_mapped_result(before: &DocState, after: &DocState, scope:
     validate_item_trees(after)?;
     let mut absolute = 0usize;
     for (old, new) in before.doc.spreads.iter().zip(&after.doc.spreads) {
-        if old.id != new.id || old.pages != new.pages || old.parent != new.parent || old.allow_shuffle != new.allow_shuffle {
+        if old.id != new.id
+            || !pages_equal_allowing_scoped_parent(&old.pages, &new.pages, absolute, start, end)
+            || old.parent != new.parent
+            || old.allow_shuffle != new.allow_shuffle
+        {
             return Err("Facing batch changed page geometry, order or spread metadata".into());
         }
         let old_ids: std::collections::BTreeSet<_> = old.items.iter().map(|item| item.id).collect();
@@ -612,6 +657,9 @@ pub(crate) fn validate_mapped_result(before: &DocState, after: &DocState, scope:
     normalized.assets = before.doc.assets.clone();
     normalized.next_id = before.doc.next_id;
     normalized.modified = before.doc.modified;
+    if crate::worker::marker_only_sections_within_scope(&before.doc.sections, &normalized.sections, start, end) {
+        normalized.sections = before.doc.sections.clone();
+    }
     if normalized.swatches.len() >= before.doc.swatches.len()
         && normalized.swatches.get(..before.doc.swatches.len()) == Some(before.doc.swatches.as_slice())
         && normalized.swatches.get(before.doc.swatches.len()..).is_some_and(|extra| {
@@ -624,6 +672,21 @@ pub(crate) fn validate_mapped_result(before: &DocState, after: &DocState, scope:
         return Err("Facing batch changed global styles, swatches, layers or document settings".into());
     }
     Ok(())
+}
+
+pub(crate) fn pages_equal_allowing_scoped_parent(old: &[doc::Page], new: &[doc::Page], spread_abs: usize, start: usize, end: usize) -> bool {
+    if old.len() != new.len() {
+        return false;
+    }
+    old.iter().zip(new).enumerate().all(|(offset, (a, b))| {
+        if spread_abs.checked_add(offset).is_some_and(|abs| (start..end).contains(&abs)) {
+            let mut normalized = b.clone();
+            normalized.parent = a.parent;
+            &normalized == a
+        } else {
+            a == b
+        }
+    })
 }
 
 fn validate_item_trees(state: &DocState) -> Result<(), String> {

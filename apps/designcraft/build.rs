@@ -13,8 +13,9 @@ fn main() {
         return;
     }
     let src_icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/app-icon/designcraft.ico");
-    let icon_path = std::env::var_os("OUT_DIR")
-        .map(std::path::PathBuf::from)
+    let out_dir = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+    let icon_path = out_dir
+        .as_ref()
         .and_then(|out| {
             let dst = out.join("designcraft.ico");
             std::fs::copy(&src_icon, &dst).ok().map(|_| dst)
@@ -30,10 +31,33 @@ fn main() {
         .set("OriginalFilename", "designcraft.exe")
         .set("InternalName", "designcraft");
     if let Err(e) = res.compile() {
-        if std::env::var_os("DESIGNCRAFT_REQUIRE_WINRES").is_some() {
-            eprintln!("embedding Windows resources failed: {e}");
-            std::process::exit(1);
+        let gnu_ok =
+            std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") && out_dir.as_deref().is_some_and(compile_gnu_rc_without_manifest_include);
+        if !gnu_ok {
+            if std::env::var_os("DESIGNCRAFT_REQUIRE_WINRES").is_some() {
+                eprintln!("embedding Windows resources failed: {e}");
+                std::process::exit(1);
+            }
+            println!("cargo:warning=designcraft.exe built without icon/version resources: {e}");
         }
-        println!("cargo:warning=designcraft.exe built without icon/version resources: {e}");
     }
+}
+
+fn compile_gnu_rc_without_manifest_include(out_dir: &std::path::Path) -> bool {
+    let rc_path = out_dir.join("resource.rc");
+    if !rc_path.is_file() {
+        return false;
+    }
+    let obj_path = out_dir.join("designcraft_res.o");
+    for tool in ["x86_64-w64-mingw32-windres", "windres"] {
+        let status = std::process::Command::new(tool)
+            .current_dir(out_dir)
+            .args(["--use-temp-file", "--input", "resource.rc", "--output", "designcraft_res.o"])
+            .status();
+        if status.is_ok_and(|s| s.success()) && obj_path.is_file() {
+            println!("cargo:rustc-link-arg-bins={}", obj_path.display());
+            return true;
+        }
+    }
+    false
 }

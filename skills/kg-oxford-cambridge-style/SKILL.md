@@ -7,11 +7,11 @@ Use the structured `design_profile` and its 10 declared `page_families` as the p
 1. **10 Executable International Page Families**:
    - `international-curriculum-cover`: Publisher ribbon, course title/subtitle, hero illustration slot (`cover-hero`), 4 curriculum pillar cards, and student registration box.
    - `international-scope-sequence`: Panoramic syllabus header + 4 structured unit rows detailing Unit Topic, Core Vocabulary, Systems/Logic, and Practical Lab/Project.
-   - `garnet-computing-systems-lab`: 4 technical concept flashcards (`computing-terms`) + decomposable vector `Input -> Process -> Output` (`IPO`) flowchart + computer lab scene (`computing-lab-scene`) with overlaid speech bubbles + step-by-step lab task.
-   - `oxford-vocab-story`: 4-item vocabulary flashcard strip + 4-panel narrative/scenario grid with overlaid speech bubbles + term consolidation bar.
-   - `oxford-phonics-maze`: 4 sound/symbol/code cards + 4-line guided writing staves + interactive sequence/algorithm maze.
+   - `garnet-computing-systems-lab`: 3 atomic 1:1 technical concept card + live-caption groups (`computing-card-1..3`) + decomposable vector `Input -> Process -> Output` (`IPO`) flowchart + computer lab scene (`computing-lab-scene`) with overlaid speech bubbles + step-by-step lab task.
+   - `oxford-vocab-story`: 3 atomic 1:1 vocabulary flashcard + live-caption groups (`vocab-card-1..3`) + 4-panel narrative/scenario grid with overlaid speech bubbles + term consolidation bar.
+   - `oxford-phonics-maze`: 3 atomic 1:1 sound/symbol/code card + live-caption groups (`phonics-card-1..3`) + 4-line guided writing staves + interactive sequence/algorithm maze.
    - `cambridge-cpa-grammar`: Concept/rule dialogue & synthesis card + 3-stage Concrete-Pictorial-Abstract ten-frame & part-whole diagram.
-   - `oxford-song-colours`: 4 visual concept swatches + wide hero scene with overlaid chant/summary card + vector shape classification.
+   - `oxford-song-colours`: 3 atomic 1:1 visual concept swatch + live-caption groups (`colour-card-1..3`) + wide hero scene with overlaid chant/summary card + vector shape classification.
    - `oxford-workbook-print`: High-contrast print-safe workbook line-art + word bank + decomposable crossword grid + guided sentence writing.
    - `oxford-skills-time`: Spiral-notebook reading passage + listening identification grid + pair speaking dialogue & word pool.
    - `oxford-fluency-project`: Collaborative functional dialogue + 3-step hands-on project & presentation + *I can!* self-assessment bar.

@@ -2,7 +2,9 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod agent_loop;
 mod design;
+mod doc_tools;
 mod facing_pages;
 mod image_repetition;
 mod image_review;

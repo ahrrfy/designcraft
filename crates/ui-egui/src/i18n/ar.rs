@@ -6,6 +6,7 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("AI Providers and Keys…", "مزودو الذكاء الاصطناعي والمفاتيح…"),
     ("Local AI…", "الذكاء الاصطناعي المحلي…"),
     ("AI Host Request", "طلب خدمة الذكاء الاصطناعي"),
+    ("Run with AI…", "التنفيذ بالذكاء الاصطناعي…"),
     ("File", "ملف"),
     ("Edit", "تحرير"),
     ("Layout", "تخطيط"),
@@ -2030,7 +2031,7 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("a, b, c, d...", "أ، ب، ج، د..."),
     ("i, ii, iii, iv...", "أ، ب، ج، د..."),
     ("Arabic Diacritics…", "التشكيل العربي…"),
-    ("Polish Arabic Book…", "تحسين الكتاب العربي بالكامل…"),
+    ("Fit Overset Text", "احتواء النص الفائض"),
     ("lowercase", "صغير"),
 ];
 
