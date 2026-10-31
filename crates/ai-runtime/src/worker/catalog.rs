@@ -177,7 +177,7 @@ pub(super) fn native_result_contract(command: &str) -> Option<Value> {
         | "path.convertPoints"
         | "layout.overrideParentItems"
         | "layout.detachAll" => json!({"ids":"ItemId[]"}),
-        "object.caption" => json!({"ids":"ItemId[]","groups":"ItemId[] only when group=true"}),
+        "object.caption" => json!({"ids":"ItemId[]","groups":"ItemId[]"}),
         "states.create" => json!({"id":"ItemId","states":"array"}),
         "edit.stepAndRepeat" => json!({"created":"integer","ids":"ItemId[]"}),
         "file.place" => json!({"id":"ItemId","asset":"AssetId"}),
@@ -482,6 +482,9 @@ pub(super) fn native_result_shape(action: &EngineAction) -> Value {
                 if field == "story" && action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) != Some("text") {
                     return None;
                 }
+                if field == "groups" && action.command == "object.caption" && action.params.get("group").and_then(Value::as_bool) != Some(true) {
+                    return None;
+                }
                 let value = match kind.as_str().unwrap_or("") {
                     // Whole-array references have unknown cardinality here. Use
                     // the vetted 1024-ID maximum, leaving exact length to the engine.
@@ -784,4 +787,28 @@ pub(super) fn batch_command(id: &str) -> bool {
             | "table.options"
             | "file.place"
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod caption_ref_tests {
+    use super::*;
+
+    #[test]
+    fn caption_group_references_resolve_when_grouped_and_fail_when_ungrouped() {
+        let grouped = vec![
+            EngineAction { command: "frame.create".into(), params: json!({"rect": [72, 72, 240, 200], "content": "graphic"}) },
+            EngineAction { command: "object.caption".into(), params: json!({"ids": ["$0.id"], "text": "{altText}", "group": true}) },
+            EngineAction { command: "transform.move".into(), params: json!({"ids": ["$1.groups.0"], "dx": 12.0, "dy": 0.0}) },
+            EngineAction { command: "object.opacity".into(), params: json!({"ids": "$1.groups", "opacity": 0.95}) },
+        ];
+        validate_identifier_references(&grouped).expect("grouped caption must expose ItemId[] groups");
+
+        let ungrouped = vec![
+            EngineAction { command: "frame.create".into(), params: json!({"rect": [72, 72, 240, 200], "content": "graphic"}) },
+            EngineAction { command: "object.caption".into(), params: json!({"ids": ["$0.id"], "text": "{altText}", "group": false}) },
+            EngineAction { command: "transform.move".into(), params: json!({"ids": ["$1.groups.0"], "dx": 12.0, "dy": 0.0}) },
+        ];
+        assert!(validate_identifier_references(&ungrouped).is_err(), "ungrouped caption must not expose groups");
+    }
 }

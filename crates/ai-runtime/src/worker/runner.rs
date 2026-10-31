@@ -359,8 +359,9 @@ impl Runner<'_> {
                 Ok(Product::Resources(crate::resources::probe_host()))
             }
             Work::Production { request, context, catalog, skills, base, prefs } => self.production(request, context, catalog, skills, base, prefs),
-            Work::DeferredImages { title, batches, settings, style_profile, cache_root, min_ppi, base, prefs } => {
+            Work::DeferredImages { title, batches, settings, style_profile, cache_root, min_ppi, print_contract, base, prefs } => {
                 self.cache_root = cache_root;
+                self.print = print_contract;
                 let total_imgs: usize = batches.iter().map(|b| b.images.len()).sum();
                 self.progress(&format!("Generating {total_imgs} confirmed single-subject illustration(s)"), 0.15)?;
                 let mut scratch = Session::new();

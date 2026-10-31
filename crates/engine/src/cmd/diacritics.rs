@@ -247,32 +247,26 @@ pub(super) fn replace_arabic_in_story(
                 }
                 let Some(slice) = cur.text.get(start..end) else { continue };
                 let has_arabic = slice.chars().any(is_arabic_letter);
-                let has_latin = slice.chars().any(is_latin_letter);
+                let has_non_arabic_visible = slice.chars().any(|c| !c.is_whitespace() && !is_arabic_letter(c));
                 let inherited_style_redefined =
                     char_fmt.over.font_family.is_none() && (para_style_redefined || redefined_char_styles.contains(&char_fmt.style));
-                if !(has_arabic || has_latin && inherited_style_redefined) {
+                if !(has_arabic || has_non_arabic_visible && inherited_style_redefined) {
                     continue;
                 }
                 let effective = original_styles.resolve_char(&base, char_fmt);
 
                 if !has_arabic {
-                    // Pure-Latin run whose inherited style is being redefined to an Arabic font:
-                    // pin its original Latin font so English words do not switch to the Arabic face.
-                    for (rel_idx, ch) in slice.char_indices() {
-                        if !is_latin_letter(ch) {
-                            continue;
-                        }
-                        let abs_start = start.saturating_add(rel_idx);
-                        let abs_end = start.saturating_add(rel_idx.saturating_add(ch.len_utf8()));
-                        if let Some(last) = updates.last_mut()
-                            && last.0.end == abs_start
-                            && last.1 == effective.font_family
-                            && last.2 == effective.font_style
-                        {
-                            last.0.end = abs_end;
-                        } else {
-                            updates.push((abs_start..abs_end, effective.font_family.clone(), effective.font_style.clone()));
-                        }
+                    // Non-Arabic run (Latin, Greek, math symbols, digits, etc.) whose inherited style is
+                    // being redefined to an Arabic font: pin its original effective font so non-Arabic runs
+                    // retain their layout and glyph coverage.
+                    if let Some(last) = updates.last_mut()
+                        && last.0.end == start
+                        && last.1 == effective.font_family
+                        && last.2 == effective.font_style
+                    {
+                        last.0.end = end;
+                    } else {
+                        updates.push((start..end, effective.font_family.clone(), effective.font_style.clone()));
                     }
                     continue;
                 }
@@ -654,5 +648,22 @@ mod tests {
         let fitted_size = fmt.over.size.unwrap();
         assert!((7.5..14.0).contains(&fitted_size), "expected binary-searched size above floor, got {fitted_size}");
         assert!(matches!(fmt.over.leading, Some(designcraft_doc::Leading::Points(l)) if l < 20.0));
+    }
+
+    #[test]
+    fn font_replace_arabic_preserves_greek_math_runs_in_redefined_shared_style() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let orig_family = s.doc().unwrap().doc.styles.resolve_para(&designcraft_doc::ParaFormat::default()).1.font_family.clone();
+        let _ar_frame = s.execute("frame.create", &json!({"rect": [36, 36, 300, 120], "content": "text", "text": "معادلة فيزيائية أساسية"})).unwrap();
+        let math_frame = s.execute("frame.create", &json!({"rect": [36, 140, 300, 200], "content": "text", "text": "α + β = 2"})).unwrap();
+        let math_sid = StoryId(math_frame["story"].as_u64().unwrap());
+
+        s.execute("font.replace", &json!({"script": "arabic", "toFamily": "Tahoma", "redefineStyles": true})).unwrap();
+        let doc = &s.doc().unwrap().doc;
+        let math_story = &doc.stories[&math_sid];
+        let (_, base_char) = doc.styles.resolve_para(&math_story.paras[0]);
+        let resolved = doc.styles.resolve_char(&base_char, math_story.char_format_at(0));
+        assert_eq!(resolved.font_family, orig_family, "Greek/math run must retain original font after Arabic style redefinition");
     }
 }

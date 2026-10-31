@@ -2610,6 +2610,8 @@ fn agentic_publish_applies_multiple_chunks_in_single_undo_and_gates_deferred_ima
 
 #[test]
 fn confirm_image_regeneration_promotes_native_only_non_gemini_and_sizes_request_budget() {
+    let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
     let dir = tempfile::tempdir().unwrap();
     let mut runner = ProductionRunner::open(dir.path()).unwrap();
     let mut session = Session::new();
@@ -2679,4 +2681,9 @@ fn confirm_image_regeneration_promotes_native_only_non_gemini_and_sizes_request_
     assert!(!launched_settings.verify_generated_images, "OpenAI text model cannot run Gemini image review");
     assert_eq!(launched_settings.budget.max_requests, 6, "max_requests raised from 4 to cover all 6 confirmed images");
     let _ = runner.handle(&mut session, AiRequest::Cancel);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runner.snapshot.busy && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = runner.handle(&mut session, AiRequest::Poll);
+    }
 }

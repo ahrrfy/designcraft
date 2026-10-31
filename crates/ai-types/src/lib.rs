@@ -242,13 +242,41 @@ pub fn prompt_explicitly_requests_image_generation(prompt: &str) -> bool {
         "دون توليد صور",
         "لا تولد صور",
         "لا تولّد صور",
+        "لا تعيد توليد",
+        "لا تعد توليد",
+        "لا تعيد رسم",
+        "لا تعد رسم",
+        "بدون إعادة توليد",
+        "بدون اعادة توليد",
+        "دون إعادة توليد",
         "بدون رسم صور",
-        "without generating images",
-        "do not generate images",
-        "don't generate images",
-        "do not regenerate images",
-        "don't regenerate images",
+        "without generating",
+        "without regenerating",
+        "without redrawing",
+        "do not generate",
+        "don't generate",
+        "dont generate",
+        "do not regenerate",
+        "don't regenerate",
+        "dont regenerate",
+        "do not redraw",
+        "don't redraw",
+        "dont redraw",
+        "do not re-illustrate",
+        "don't re-illustrate",
+        "do not create new image",
+        "don't create new image",
+        "do not create new illustration",
+        "don't create new illustration",
+        "do not draw new",
+        "don't draw new",
+        "never generate",
+        "never regenerate",
+        "avoid generating",
+        "avoid regenerating",
         "no image generation",
+        "no new images",
+        "no new illustrations",
     ];
     if NEGATIONS.iter().any(|neg| lower.contains(neg)) {
         return false;
@@ -435,6 +463,8 @@ mod tests {
         assert!(prompt_explicitly_requests_image_generation("أعد توليد الصور التالفة في الصفحات 3 و 7"));
         assert!(prompt_explicitly_requests_image_generation("Fix captions and regenerate images for the mismatched cards"));
         assert!(!prompt_explicitly_requests_image_generation("أعد توليد الصور بدون توليد صور مدفوعة"));
+        assert!(!prompt_explicitly_requests_image_generation("Review captions, but do not regenerate the images."));
+        assert!(!prompt_explicitly_requests_image_generation("Please don't generate the illustrations; only align labels."));
     }
 
     #[test]

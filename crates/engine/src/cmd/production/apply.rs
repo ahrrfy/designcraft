@@ -484,6 +484,12 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
             return Err(bad(GROUP_ID, "documentSetup cannot add or remove existing document pages"));
         }
     }
+    let require_preflight = env.require_preflight.unwrap_or(false);
+    let min_ppi = match env.min_ppi {
+        None => 150.0,
+        Some(n) if n.is_finite() && (1.0..=2400.0).contains(&n) => n,
+        Some(_) => return Err(bad(GROUP_ID, "minPpi must be a finite number from 1 to 2400")),
+    };
     let chunks = p.get("chunks").and_then(Value::as_array).ok_or_else(|| bad(GROUP_ID, "chunks must contain 1 to 1000 plans"))?;
     let mut results = Vec::with_capacity(chunks.len());
     let mut steps = 0usize;
@@ -494,12 +500,15 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
         bounded(chunk)?;
         let chunk = chunk.as_object().ok_or_else(|| bad(GROUP_ID, format!("chunks[{index}]: expected an object")))?;
         let mut chunk_params = serde_json::Map::new();
-        for key in ["outputMode", "requirePreflight", "minPpi"] {
+        for key in ["outputMode", "minPpi"] {
             if let Some(value) = p.get(key) {
                 chunk_params.insert(key.into(), value.clone());
             }
         }
         chunk_params.extend(chunk.clone());
+        // Replay intermediate chunks without rejecting transient errors that a later chunk repairs
+        // (e.g. `font.replace` followed by `story.fitOverset`), then preflight the complete combined draft below.
+        chunk_params.insert("requirePreflight".into(), Value::Bool(false));
         let (finished, chunk_results) = draft(&work, &Value::Object(chunk_params), &mut cancelled).map_err(|e| match e {
             crate::EngineError::BadParams { msg, .. } if msg.starts_with("commands[") => {
                 crate::EngineError::BadParams { cmd: GROUP_ID.into(), msg: format!("chunks[{index}].{msg}") }
@@ -509,6 +518,15 @@ pub fn apply_action_groups(s: &mut Session, p: &Value, mut cancelled: impl FnMut
         *work.doc_mut()? = finished;
         steps = steps.saturating_add(chunk_results.len());
         results.push(chunk_results);
+    }
+    if require_preflight {
+        check_text_layout(s, &work)?;
+        let issues = super::super::preflight::check(&work, min_ppi);
+        let errors: Vec<_> = issues.iter().filter(|issue| issue.severity == "error").collect();
+        if !errors.is_empty() {
+            let summary = errors.iter().take(8).map(|issue| format!("{}: {}", issue.kind, issue.message)).collect::<Vec<_>>().join("; ");
+            return Err(bad(GROUP_ID, format!("preflight rejected draft ({} errors): {summary}", errors.len())));
+        }
     }
     if cancelled() {
         return Err(bad(GROUP_ID, "production cancelled"));

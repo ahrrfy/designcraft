@@ -384,6 +384,8 @@ impl ProductionRunner {
         let mut task = pending_regen.task.clone();
         task.settings = effective_settings.clone();
         let skills = pending_regen.skills.clone();
+        let print_contract =
+            crate::print_contract::PrintContract::from_prompt(&task.prompt)?.or_else(|| self.print_contracts.get(&target_uid).cloned());
         let work = worker::Work::DeferredImages {
             title: "Regenerate Document Illustrations".into(),
             batches: pending_regen.batches.clone(),
@@ -391,6 +393,7 @@ impl ProductionRunner {
             style_profile: pending_regen.style_profile.clone(),
             cache_root: Some(self.root.join("production-cache-v1")),
             min_ppi: pending_regen.min_ppi,
+            print_contract,
             base,
             prefs: session.prefs.clone(),
         };
@@ -1100,7 +1103,7 @@ impl ProductionRunner {
                 let min_ppi =
                     crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
                 let total_actions: usize = chunks.iter().map(Vec::len).sum();
-                let has_placed_images = chunks.iter().flatten().any(|a| a.command == "frame.placeImage");
+                let has_placed_images = chunks.iter().flatten().any(|a| matches!(a.command.as_str(), "frame.placeImage" | "file.place"));
                 let apply_mode = if has_placed_images { designcraft_ai_types::OutputMode::NativeWithImages } else { task.settings.output_mode };
                 let non_empty_chunks: Vec<&Vec<EngineAction>> = chunks.iter().filter(|c| !c.is_empty()).collect();
                 let published = (|| {

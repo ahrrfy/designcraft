@@ -387,8 +387,10 @@ impl DocToolWorkspace {
         let state = self.session.doc().map_err(|e| e.to_string())?;
         let doc = &state.doc;
 
-        // Map StoryId -> (1-based page, 0-based spread, optional 0-based parent spread, frame ItemId)
+        // Map frame ItemId and fallback StoryId -> (1-based page, 0-based spread, optional 0-based parent spread, frame ItemId)
+        let mut frame_locations = std::collections::BTreeMap::new();
         let mut story_locations = std::collections::BTreeMap::new();
+        let mut story_last_locations = std::collections::BTreeMap::new();
         let mut page_cursor = 0usize;
         for (spread_idx, spread) in doc.spreads.iter().enumerate() {
             let spread_first_page = page_cursor;
@@ -399,7 +401,10 @@ impl DocToolWorkspace {
                     let mid_x = 0.5 * (b.x0 + b.x1);
                     let rel_page = spread.pages.iter().position(|p| mid_x >= p.x && mid_x <= p.x + p.width).unwrap_or(0);
                     let page_1based = spread_first_page.saturating_add(rel_page).saturating_add(1);
-                    story_locations.entry(tf.story.0).or_insert((page_1based, spread_idx, None, it.id.0));
+                    let loc = (page_1based, spread_idx, None, it.id.0);
+                    frame_locations.insert(it.id.0, loc);
+                    story_locations.entry(tf.story.0).or_insert(loc);
+                    story_last_locations.insert(tf.story.0, loc);
                 }
             }
             page_cursor = page_cursor.saturating_add(spread.pages.len());
@@ -409,7 +414,10 @@ impl DocToolWorkspace {
             flatten_spread_items(&parent.items, designcraft_geom::Affine::IDENTITY, 0, &mut flat);
             for (it, _b) in flat {
                 if let Some(tf) = it.text_frame() {
-                    story_locations.entry(tf.story.0).or_insert((0, 0, Some(parent_idx), it.id.0));
+                    let loc = (0, 0, Some(parent_idx), it.id.0);
+                    frame_locations.insert(it.id.0, loc);
+                    story_locations.entry(tf.story.0).or_insert(loc);
+                    story_last_locations.entry(tf.story.0).or_insert(loc);
                 }
             }
         }
@@ -421,7 +429,22 @@ impl DocToolWorkspace {
             let sid = m.get("story").and_then(Value::as_u64).unwrap_or(0);
             let start = m.get("start").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(0);
             let end = m.get("end").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(start);
-            let (page, spread, parent_spread, frame_id) = story_locations.get(&sid).copied().unwrap_or((0, 0, None, 0));
+            let composed = self.session.cache.get(doc, StoryId(sid), None);
+            let frame_hit = composed
+                .frames
+                .iter()
+                .find(|f| start >= f.range.start && (start < f.range.end || (f.range.start == f.range.end && start == f.range.start)))
+                .and_then(|f| frame_locations.get(&f.frame.0).copied())
+                .or_else(|| {
+                    composed
+                        .overset_at
+                        .filter(|&ov| start >= ov)
+                        .and_then(|_| composed.frames.last().and_then(|f| frame_locations.get(&f.frame.0).copied()))
+                });
+            let (page, spread, parent_spread, frame_id) = frame_hit
+                .or_else(|| story_locations.get(&sid).copied())
+                .or_else(|| story_last_locations.get(&sid).copied())
+                .unwrap_or((0, 0, None, 0));
             let context_snippet = doc.story(StoryId(sid)).map(|st| slice_context(&st.text, start, end, 64)).unwrap_or_default();
             matches_out.push(json!({
                 "page": page,
@@ -505,18 +528,9 @@ impl DocToolWorkspace {
                     continue;
                 }
 
-                // Sort graphics in reading order (RTL: rightmost center-X first; LTR: leftmost center-X first)
-                graphics.sort_by(|(_, a), (_, b)| {
-                    let ay = a.y0;
-                    let by = b.y0;
-                    if (ay - by).abs() > 24.0 {
-                        ay.total_cmp(&by)
-                    } else if rtl {
-                        (0.5 * (b.x0 + b.x1)).total_cmp(&(0.5 * (a.x0 + a.x1)))
-                    } else {
-                        (0.5 * (a.x0 + a.x1)).total_cmp(&(0.5 * (b.x0 + b.x1)))
-                    }
-                });
+                // Sort graphics in deterministic reading order without non-transitive tolerance cycles:
+                // 1) Total-order vertical sort by y0, 2) cluster contiguous rows within 24pt, 3) total-order horizontal sort per row.
+                sort_graphics_reading_order(&mut graphics, rtl);
 
                 let mut graphic_entries = Vec::new();
                 for (g_item, gb) in &graphics {
@@ -1497,6 +1511,29 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     s.get(..end).unwrap_or("").to_string()
 }
 
+fn sort_graphics_reading_order(graphics: &mut [(&Item, designcraft_geom::Rect)], rtl: bool) {
+    graphics.sort_by(|(ia, a), (ib, b)| {
+        a.y0.total_cmp(&b.y0).then_with(|| (0.5 * (a.x0 + a.x1)).total_cmp(&(0.5 * (b.x0 + b.x1)))).then_with(|| ia.id.0.cmp(&ib.id.0))
+    });
+    let mut row_start = 0usize;
+    while row_start < graphics.len() {
+        let anchor_y = graphics[row_start].1.y0;
+        let mut row_end = row_start.saturating_add(1);
+        while row_end < graphics.len() && (graphics[row_end].1.y0 - anchor_y) <= 24.0 {
+            row_end = row_end.saturating_add(1);
+        }
+        if let Some(row) = graphics.get_mut(row_start..row_end) {
+            row.sort_by(|(ia, a), (ib, b)| {
+                let ax = 0.5 * (a.x0 + a.x1);
+                let bx = 0.5 * (b.x0 + b.x1);
+                let horiz = if rtl { bx.total_cmp(&ax) } else { ax.total_cmp(&bx) };
+                horiz.then_with(|| a.y0.total_cmp(&b.y0)).then_with(|| ia.id.0.cmp(&ib.id.0))
+            });
+        }
+        row_start = row_end;
+    }
+}
+
 fn slice_context(s: &str, start: usize, end: usize, radius: usize) -> String {
     let len = s.len();
     let mut c0 = start.min(len).saturating_sub(radius);
@@ -1619,5 +1656,48 @@ mod tests {
             multi_imgs.len(),
             "visionAttachedCount must exactly match delivered image count under byte budget"
         );
+    }
+
+    #[test]
+    fn inspect_graphics_staggered_coordinates_never_panic_and_threaded_search_resolves_frame_pages() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 3, "facingPages": false, "width": 612, "height": 2400})).unwrap();
+        // 100 staggered graphics whose 20pt vertical steps previously formed a non-transitive comparator cycle `(200-2i, 20i)` that panicked `sort_by`.
+        for i in 0..100usize {
+            let x0 = 500.0 - (i as f64) * 4.0;
+            let y0 = 20.0 + (i as f64) * 20.0;
+            s.execute("frame.create", &json!({"spread": 0, "rect": [x0, y0, x0 + 24.0, y0 + 18.0], "content": "graphic"})).unwrap();
+        }
+        // Threaded story spanning Page 1 (spread 0) -> Page 3 (spread 2):
+        let f1 = s
+            .execute(
+                "frame.create",
+                &json!({"spread": 0, "rect": [40, 2100, 200, 2132], "content": "text", "text": "Opening line on page one.\nOverflowing paragraph pushed to page three target_marker_omega."}),
+            )
+            .unwrap();
+        let f3 = s.execute("frame.create", &json!({"spread": 2, "rect": [40, 40, 360, 220], "content": "text", "text": ""})).unwrap();
+        s.execute("text.thread", &json!({"from": f1["id"], "to": f3["id"]})).unwrap();
+
+        let base = s.doc().unwrap().clone();
+        let mut ws = DocToolWorkspace::new(&base, &s.prefs, designcraft_engine::cmd::production::catalog(), 150.0);
+        let req = TaskRequest {
+            prompt: "audit".into(),
+            settings: AiSettings::default(),
+            skill_ids: Vec::new(),
+            auto_select_skills: false,
+            target: TaskTarget::CurrentDocument,
+            export_directory: None,
+        };
+
+        let (gfx_res, _, gfx_err) = ws.execute_tool_multimodal("inspect_graphics_and_captions", &json!({"start_page": 1, "end_page": 1}), &req, 5);
+        assert!(!gfx_err, "{gfx_res}");
+        assert_eq!(gfx_res["pages"][0]["graphics"].as_array().unwrap().len(), 100);
+
+        let (search_res, _, search_err) = ws.execute_tool_multimodal("search_document", &json!({"query": "target_marker_omega"}), &req, 5);
+        assert!(!search_err, "{search_res}");
+        let hit = &search_res["matches"][0];
+        assert_eq!(hit["page"], 3, "threaded match displayed in frame on page 3 must report page 3, got {hit}");
+        assert_eq!(hit["spread"], 2);
+        assert_eq!(hit["frameId"], f3["id"]);
     }
 }

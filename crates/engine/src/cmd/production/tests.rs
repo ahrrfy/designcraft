@@ -1088,3 +1088,34 @@ fn unified_command_surface_matches_params_source_of_truth_and_executes_derived_c
     s.execute("edit.undo", &json!({})).unwrap();
     assert!(Arc::ptr_eq(&before, &s.doc().unwrap().doc));
 }
+
+#[test]
+fn apply_group_defers_preflight_until_all_repair_chunks_complete() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({})).unwrap();
+    let f = s.execute("frame.create", &json!({"rect": [72, 72, 180, 102], "content": "text", "text": "Short", "caret": false})).unwrap();
+    let sid = f["story"].as_u64().unwrap();
+
+    // Chunk 0 creates temporary overset; Chunk 1 fits the overset story. Final draft passes preflight.
+    let repaired = json!({
+        "outputMode": "native_only",
+        "requirePreflight": true,
+        "chunks": [
+            {"commands": [{"command": "story.setText", "params": {"story": sid, "text": "Long overflowing sentence that does not fit at default 12pt inside a narrow 30pt-tall box."}}]},
+            {"commands": [{"command": "story.fitOverset", "params": {"story": sid, "minSize": 6.5}}]}
+        ]
+    });
+    let res = s.execute("production.applyGroup", &repaired).unwrap();
+    assert_eq!(res["groups"], 2);
+
+    // Unrepaired overset at the end of the group is still rejected by final preflight.
+    let unrepaired = json!({
+        "outputMode": "native_only",
+        "requirePreflight": true,
+        "chunks": [
+            {"commands": [{"command": "story.setText", "params": {"story": sid, "text": "Overflowing words ".repeat(60)}}]}
+        ]
+    });
+    let err = s.execute("production.applyGroup", &unrepaired).unwrap_err().to_string();
+    assert!(err.contains("preflight rejected draft"), "got {err}");
+}

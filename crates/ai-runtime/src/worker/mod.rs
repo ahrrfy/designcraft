@@ -118,6 +118,7 @@ pub(crate) enum Work {
         style_profile: Option<designcraft_ai_types::DesignProfile>,
         cache_root: Option<PathBuf>,
         min_ppi: f64,
+        print_contract: Option<crate::print_contract::PrintContract>,
         base: DocState,
         prefs: Prefs,
     },

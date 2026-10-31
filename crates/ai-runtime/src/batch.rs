@@ -3607,8 +3607,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 8192];
-            let _ = stream.read(&mut buf);
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+                if complete_http_body(&bytes).ok().flatten().is_some() {
+                    break;
+                }
+            }
             let plan = json!({
                 "title": "Page 2",
                 "commands": [
@@ -3626,6 +3638,7 @@ mod tests {
             let resp =
                 format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             stream.write_all(resp.as_bytes()).unwrap();
+            let _ = stream.flush();
         });
 
         waiting(&mut runner, &mut session, format!("http://{addr}"));
