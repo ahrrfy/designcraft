@@ -52,7 +52,7 @@ impl std::io::Write for LimitedJson {
     }
 }
 
-fn validate_value(value: &Value, depth: usize, count: &mut usize) -> Result<(), String> {
+pub(super) fn validate_value(value: &Value, depth: usize, count: &mut usize) -> Result<(), String> {
     *count = count.saturating_add(1);
     if depth > 64 || *count > 100_000 {
         return Err("AI JSON nesting or item count exceeds limit".into());
@@ -73,22 +73,22 @@ fn validate_value(value: &Value, depth: usize, count: &mut usize) -> Result<(), 
     Ok(())
 }
 
-fn encode_json(value: &Value) -> Result<Vec<u8>, String> {
+pub(super) fn encode_json(value: &Value) -> Result<Vec<u8>, String> {
     validate_value(value, 0, &mut 0)?;
     let mut writer = LimitedJson(Vec::new());
     serde_json::to_writer(&mut writer, value).map_err(|_| "AI JSON request exceeds limits or cannot be encoded")?;
     Ok(writer.0)
 }
 
-struct Transport<'a> {
-    client: Client,
-    base: Url,
-    provider: ProviderKind,
+pub(super) struct Transport<'a> {
+    pub(super) client: Client,
+    pub(super) base: Url,
+    pub(super) provider: ProviderKind,
     key: Option<&'a str>,
 }
 
 impl<'a> Transport<'a> {
-    fn new(selection: &ModelSelection, key: Option<&'a str>) -> Result<Self, String> {
+    pub(super) fn new(selection: &ModelSelection, key: Option<&'a str>) -> Result<Self, String> {
         let base = validate_endpoint(selection)?;
         if key.is_some_and(|key| !key.is_empty() && base.as_str().contains(key)) {
             return Err("API key must not occur in the endpoint URL".into());
@@ -148,11 +148,11 @@ impl<'a> Transport<'a> {
         serde_json::from_slice(&bytes).map_err(|_| "Provider returned malformed or truncated JSON".into())
     }
 
-    fn post(&self, path: &str, body: &Value, cancel: &AtomicBool, limit: usize) -> Result<Value, String> {
+    pub(super) fn post(&self, path: &str, body: &Value, cancel: &AtomicBool, limit: usize) -> Result<Value, String> {
         self.json(reqwest::Method::POST, self.url(path)?, Some(body), cancel, limit)
     }
 
-    fn post_once(&self, path: &str, body: &Value, cancel: &AtomicBool, limit: usize) -> Result<Value, String> {
+    pub(super) fn post_once(&self, path: &str, body: &Value, cancel: &AtomicBool, limit: usize) -> Result<Value, String> {
         let encoded = encode_json(body)?;
         let request = self.request(reqwest::Method::POST, self.url(path)?)?.header("content-type", "application/json").body(encoded);
         let response = send_once(request, cancel)?;
@@ -206,12 +206,12 @@ thread_local! {
         const { std::cell::RefCell::new(std::sync::Weak::new()) };
 }
 
-struct LocalOriginLease {
+pub(super) struct LocalOriginLease {
     token: Option<std::sync::Arc<LocalOriginRelease>>,
 }
 
 impl LocalOriginLease {
-    fn acquire(provider: ProviderKind, base: &Url) -> Result<Self, String> {
+    pub(super) fn acquire(provider: ProviderKind, base: &Url) -> Result<Self, String> {
         let tag = match provider {
             ProviderKind::Ollama => 1_u8,
             ProviderKind::ComfyUi => 2_u8,
@@ -375,7 +375,7 @@ fn send(mut request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, St
         let response = send_raw(request, cancel)?;
         check_cancel(cancel)?;
         let code = response.status().as_u16();
-        if matches!(code, 429 | 503)
+        if matches!(code, 429 | 502..=504)
             && let Some(next_request) = retry_clone
         {
             let delay_ms = retry_after_delay_ms(&response).unwrap_or(if attempt == 0 { 250 } else { 750 });
@@ -434,7 +434,7 @@ fn response_read_error(error: &std::io::Error) -> &'static str {
     }
 }
 
-fn model_id(selection: &ModelSelection) -> Result<&str, String> {
+pub(super) fn model_id(selection: &ModelSelection) -> Result<&str, String> {
     let model = selection.model.strip_prefix("models/").unwrap_or(&selection.model);
     if model.is_empty() || model.len() > 256 || !model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.:/".contains(&c)) {
         return Err("Invalid model identifier".into());
@@ -613,7 +613,7 @@ pub(super) fn gemini_prepare_json_schema(schema: &Value) -> Option<Value> {
     prepare_node(schema, 0, &mut weight)
 }
 
-fn sanitize_reason_token(raw: Option<&str>) -> Option<String> {
+pub(super) fn sanitize_reason_token(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() || trimmed.len() > 32 {
         return None;
@@ -621,7 +621,7 @@ fn sanitize_reason_token(raw: Option<&str>) -> Option<String> {
     trimmed.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_').then(|| trimmed.to_string())
 }
 
-fn gemini_thinking_config(model: &str, max_output_tokens: u32) -> Option<Value> {
+pub(super) fn gemini_thinking_config(model: &str, max_output_tokens: u32) -> Option<Value> {
     let model = model.trim().to_ascii_lowercase();
     let model = model.strip_prefix("models/").unwrap_or(&model);
     if model.contains("-image")
@@ -820,7 +820,7 @@ pub(super) fn parse_usage(provider: ProviderKind, value: &Value) -> Usage {
     }
 }
 
-fn gemini_candidate_text(candidate: &Value) -> String {
+pub(super) fn gemini_candidate_text(candidate: &Value) -> String {
     candidate
         .pointer("/content/parts")
         .and_then(Value::as_array)

@@ -4,6 +4,8 @@
   "required_commands": [
     "frame.create",
     "line.create",
+    "object.altText",
+    "object.caption",
     "object.fill",
     "object.group",
     "object.label",
@@ -83,7 +85,7 @@
     ],
     "typography": [
       "All typography uses native editable Tahoma Regular/Bold frames with explicit leading and automatic paragraph direction (RTL for Arabic, LTR for English). Never rasterize text into images.",
-      "Adapt 100% of the 12 declared text slots on every page to the exact requested curriculum subject (e.g. Computer Science / ICT, Science, Math, Languages) and target language."
+      "Adapt 100% of the declared text slots on every page to the exact requested curriculum subject (e.g. Computer Science / ICT, Science, Math, Languages) and target language."
     ],
     "layout": [
       "A4 portrait (210x297 mm) with strict 15 mm safe margins. Every page family uses single-level decomposable vector groups (object.group <-> object.ungroup) with 3-10 labeled part.* atomic objects.",
@@ -284,7 +286,7 @@
       },
       {
         "id": "garnet-computing-systems-lab",
-        "purpose": "Garnet Education, Oxford & Cambridge International Computing & Systems Lab Spread: top 4 technical concept flashcards, middle decomposable vector Input-Process-Output (IPO) system flowchart, computer lab scene with callout bubbles, and bottom step-by-step practical lab task.",
+        "purpose": "Garnet Education, Oxford & Cambridge International Computing & Systems Lab Spread: top 3 atomic 1:1 technical concept flashcard + live-caption groups, middle decomposable vector Input-Process-Output (IPO) system flowchart, computer lab scene with callout bubbles, and bottom step-by-step practical lab task.",
         "template": "templates/garnet-computing-systems-lab.json",
         "text_slots": [
           {
@@ -301,71 +303,85 @@
           },
           {
             "id": "term-1",
-            "purpose": "Technical concept or hardware card 1 label.",
+            "purpose": "Technical concept or hardware card 1 label (live caption bound to computing-card-1).",
             "command": 47,
-            "max_chars": 22
+            "max_chars": 26
           },
           {
             "id": "term-2",
-            "purpose": "Technical concept or hardware card 2 label.",
-            "command": 55,
-            "max_chars": 19
+            "purpose": "Technical concept or hardware card 2 label (live caption bound to computing-card-2).",
+            "command": 63,
+            "max_chars": 26
           },
           {
             "id": "term-3",
-            "purpose": "Technical concept or hardware card 3 label.",
-            "command": 63,
-            "max_chars": 19
-          },
-          {
-            "id": "term-4",
-            "purpose": "Technical concept or hardware card 4 label.",
-            "command": 71,
-            "max_chars": 22
+            "purpose": "Technical concept or hardware card 3 label (live caption bound to computing-card-3).",
+            "command": 79,
+            "max_chars": 26
           },
           {
             "id": "ipo-input",
             "purpose": "Stage 1 Input node in the system flowchart.",
-            "command": 85,
+            "command": 95,
             "max_chars": 56
           },
           {
             "id": "ipo-process",
             "purpose": "Stage 2 Process node in the system flowchart.",
-            "command": 96,
+            "command": 106,
             "max_chars": 56
           },
           {
             "id": "ipo-output",
             "purpose": "Stage 3 Output node in the system flowchart.",
-            "command": 107,
+            "command": 117,
             "max_chars": 58
           },
           {
             "id": "lab-bubble-1",
             "purpose": "Left student callout in the lab scene.",
-            "command": 125,
+            "command": 135,
             "max_chars": 42
           },
           {
             "id": "lab-bubble-2",
             "purpose": "Right student callout in the lab scene.",
-            "command": 139,
+            "command": 149,
             "max_chars": 46
           },
           {
             "id": "lab-steps",
             "purpose": "Hands-on computer lab step-by-step activity and verification task.",
-            "command": 157,
+            "command": 167,
             "max_chars": 105
           }
         ],
         "image_slots": [
           {
-            "id": "computing-terms",
-            "purpose": "Row of 4 isolated educational computing/technical illustrations on a pure white (#FFFFFF) background in clean modern textbook illustration style (e.g. keyboard, mouse, CPU chip, monitor). No text or borders.",
+            "id": "computing-card-1",
+            "purpose": "Single isolated educational computing/technical flashcard illustration for card 1 on a pure solid white (#FFFFFF) background in clean modern textbook illustration style. No text or borders.",
             "rect": [
               48.0,
+              118.0,
+              205.0,
+              214.0
+            ]
+          },
+          {
+            "id": "computing-card-2",
+            "purpose": "Single isolated educational computing/technical flashcard illustration for card 2 on a pure solid white (#FFFFFF) background in clean modern textbook illustration style. No text or borders.",
+            "rect": [
+              219.0,
+              118.0,
+              376.0,
+              214.0
+            ]
+          },
+          {
+            "id": "computing-card-3",
+            "purpose": "Single isolated educational computing/technical flashcard illustration for card 3 on a pure solid white (#FFFFFF) background in clean modern textbook illustration style. No text or borders.",
+            "rect": [
+              390.0,
               118.0,
               547.0,
               214.0
@@ -373,7 +389,7 @@
           },
           {
             "id": "computing-lab-scene",
-            "purpose": "Bright modern school computer lab illustration in warm Oxford/Cambridge/Garnet textbook style showing two students working at a desktop computer and tablet, pointing at the screen and keyboard. Leave. No text.",
+            "purpose": "Bright modern school computer lab illustration in warm textbook style showing two students at a desktop computer and tablet pointing at the screen and keyboard. Leave top 28% calm light background for speech bubbles. No text.",
             "rect": [
               48.0,
               406.0,
@@ -385,7 +401,7 @@
       },
       {
         "id": "oxford-vocab-story",
-        "purpose": "Oxford First Friends & Family and Friends Vocabulary & 4-Panel Story/Scenario Spread: top 4-item flashcard strip, 2x2 story/scenario grid with native overlaid speech bubbles, and bottom consolidation bar.",
+        "purpose": "Oxford First Friends & Family and Friends Vocabulary & 4-Panel Story/Scenario Spread: top 3 atomic 1:1 flashcard + live-caption groups, 2x2 story/scenario grid with native overlaid speech bubbles, and bottom consolidation bar.",
         "template": "templates/oxford-vocab-story.json",
         "text_slots": [
           {
@@ -402,71 +418,85 @@
           },
           {
             "id": "vocab-1",
-            "purpose": "Flashcard 1 vocabulary term.",
+            "purpose": "Flashcard 1 vocabulary term (live caption bound to vocab-card-1).",
             "command": 47,
-            "max_chars": 16
+            "max_chars": 20
           },
           {
             "id": "vocab-2",
-            "purpose": "Flashcard 2 vocabulary term.",
-            "command": 55,
-            "max_chars": 16
+            "purpose": "Flashcard 2 vocabulary term (live caption bound to vocab-card-2).",
+            "command": 63,
+            "max_chars": 20
           },
           {
             "id": "vocab-3",
-            "purpose": "Flashcard 3 vocabulary term.",
-            "command": 63,
-            "max_chars": 16
-          },
-          {
-            "id": "vocab-4",
-            "purpose": "Flashcard 4 vocabulary term.",
-            "command": 71,
-            "max_chars": 16
+            "purpose": "Flashcard 3 vocabulary term (live caption bound to vocab-card-3).",
+            "command": 79,
+            "max_chars": 20
           },
           {
             "id": "story-prompt",
             "purpose": "Section heading for the 4-panel visual story or scenario.",
-            "command": 77,
+            "command": 87,
             "max_chars": 56
           },
           {
             "id": "bubble-1",
             "purpose": "Panel 1 speech bubble.",
-            "command": 129,
+            "command": 139,
             "max_chars": 40
           },
           {
             "id": "bubble-2",
             "purpose": "Panel 2 speech bubble.",
-            "command": 143,
+            "command": 153,
             "max_chars": 40
           },
           {
             "id": "bubble-3",
             "purpose": "Panel 3 speech bubble.",
-            "command": 157,
+            "command": 167,
             "max_chars": 40
           },
           {
             "id": "bubble-4",
             "purpose": "Panel 4 speech bubble.",
-            "command": 171,
+            "command": 181,
             "max_chars": 40
           },
           {
             "id": "trace-words",
-            "purpose": "Bottom consolidation task instruction and 4 key terms.",
-            "command": 188,
+            "purpose": "Bottom consolidation task instruction and key terms.",
+            "command": 198,
             "max_chars": 92
           }
         ],
         "image_slots": [
           {
-            "id": "vocab-strip",
-            "purpose": "Horizontal row of 4 isolated educational flashcard illustrations on a pure solid white (#FFFFFF) background in warm textbook watercolor-and-ink style, evenly spaced. No text or borders.",
+            "id": "vocab-card-1",
+            "purpose": "Single isolated educational flashcard illustration for vocabulary card 1 on a pure solid white (#FFFFFF) background in warm textbook watercolor-and-ink style. No text or borders.",
             "rect": [
               48.0,
+              118.0,
+              205.0,
+              224.0
+            ]
+          },
+          {
+            "id": "vocab-card-2",
+            "purpose": "Single isolated educational flashcard illustration for vocabulary card 2 on a pure solid white (#FFFFFF) background in warm textbook watercolor-and-ink style. No text or borders.",
+            "rect": [
+              219.0,
+              118.0,
+              376.0,
+              224.0
+            ]
+          },
+          {
+            "id": "vocab-card-3",
+            "purpose": "Single isolated educational flashcard illustration for vocabulary card 3 on a pure solid white (#FFFFFF) background in warm textbook watercolor-and-ink style. No text or borders.",
+            "rect": [
+              390.0,
               118.0,
               547.0,
               224.0
@@ -486,7 +516,7 @@
       },
       {
         "id": "oxford-phonics-maze",
-        "purpose": "Oxford Phonics, Symbols & Sequence Maze Spread: top 4-card sound/symbol strip, middle red/blue 4-line guided writing staves, and bottom path/algorithm maze puzzle with goal illustration.",
+        "purpose": "Oxford Phonics, Symbols & Sequence Maze Spread: top 3 atomic 1:1 sound/symbol card + live-caption groups, middle red/blue 4-line guided writing staves, and bottom path/algorithm maze puzzle with goal illustration.",
         "template": "templates/oxford-phonics-maze.json",
         "text_slots": [
           {
@@ -503,71 +533,85 @@
           },
           {
             "id": "phonics-prompt",
-            "purpose": "Instruction for the 4-card symbol/phonics strip.",
+            "purpose": "Instruction for the 3-card symbol/phonics row.",
             "command": 39,
             "max_chars": 60
           },
           {
             "id": "phonics-1",
-            "purpose": "Card 1 symbol/letter and example word.",
+            "purpose": "Card 1 symbol/letter and example word (live caption bound to phonics-card-1).",
             "command": 51,
-            "max_chars": 16
+            "max_chars": 20
           },
           {
             "id": "phonics-2",
-            "purpose": "Card 2 symbol/letter and example word.",
-            "command": 59,
-            "max_chars": 16
+            "purpose": "Card 2 symbol/letter and example word (live caption bound to phonics-card-2).",
+            "command": 67,
+            "max_chars": 20
           },
           {
             "id": "phonics-3",
-            "purpose": "Card 3 symbol/letter and example word.",
-            "command": 67,
-            "max_chars": 16
-          },
-          {
-            "id": "phonics-4",
-            "purpose": "Card 4 symbol/letter and example word.",
-            "command": 75,
-            "max_chars": 16
+            "purpose": "Card 3 symbol/letter and example word (live caption bound to phonics-card-3).",
+            "command": 83,
+            "max_chars": 20
           },
           {
             "id": "writing-prompt",
             "purpose": "Guided writing/tracing instruction.",
-            "command": 81,
+            "command": 91,
             "max_chars": 58
           },
           {
             "id": "trace-row-1",
             "purpose": "Guided writing stave row 1 target letters, symbols or terms.",
-            "command": 107,
+            "command": 117,
             "max_chars": 44
           },
           {
             "id": "trace-row-2",
             "purpose": "Guided writing stave row 2 target letters, symbols or terms.",
-            "command": 135,
+            "command": 145,
             "max_chars": 44
           },
           {
             "id": "maze-prompt",
             "purpose": "Instruction for the bottom sequence/path maze activity.",
-            "command": 141,
+            "command": 151,
             "max_chars": 58
           },
           {
             "id": "maze-row-1",
             "purpose": "Maze sequence steps and completion instruction (3 lines showing path from start to goal).",
-            "command": 160,
+            "command": 170,
             "max_chars": 110
           }
         ],
         "image_slots": [
           {
-            "id": "phonics-cards",
-            "purpose": "Row of 4 isolated educational flashcard illustrations on a pure white (#FFFFFF) background in warm textbook style, evenly spaced across 4 columns. No text or borders.",
+            "id": "phonics-card-1",
+            "purpose": "Single isolated educational flashcard illustration for symbol/concept card 1 on a pure solid white (#FFFFFF) background in warm textbook style. No text or borders.",
             "rect": [
               48.0,
+              138.0,
+              205.0,
+              236.0
+            ]
+          },
+          {
+            "id": "phonics-card-2",
+            "purpose": "Single isolated educational flashcard illustration for symbol/concept card 2 on a pure solid white (#FFFFFF) background in warm textbook style. No text or borders.",
+            "rect": [
+              219.0,
+              138.0,
+              376.0,
+              236.0
+            ]
+          },
+          {
+            "id": "phonics-card-3",
+            "purpose": "Single isolated educational flashcard illustration for symbol/concept card 3 on a pure solid white (#FFFFFF) background in warm textbook style. No text or borders.",
+            "rect": [
+              390.0,
               138.0,
               547.0,
               236.0
@@ -688,7 +732,7 @@
       },
       {
         "id": "oxford-song-colours",
-        "purpose": "Oxford Visual Swatches, Wide Hero Scene & Classification Spread: top 4 visual concept swatches, middle wide hero illustration with overlaid summary/chant card, and bottom vector shape classification activity.",
+        "purpose": "Oxford Visual Swatches, Wide Hero Scene & Classification Spread: top 3 atomic 1:1 visual concept swatch + live-caption groups, middle wide hero illustration with overlaid summary/chant card, and bottom vector shape classification activity.",
         "template": "templates/oxford-song-colours.json",
         "text_slots": [
           {
@@ -705,71 +749,85 @@
           },
           {
             "id": "colours-prompt",
-            "purpose": "Instruction for the top 4 visual concept items.",
+            "purpose": "Instruction for the top 3 visual concept items.",
             "command": 39,
             "max_chars": 52
           },
           {
             "id": "colour-1",
-            "purpose": "Concept item 1 short label.",
+            "purpose": "Concept item 1 short label (live caption bound to colour-card-1).",
             "command": 51,
-            "max_chars": 16
+            "max_chars": 20
           },
           {
             "id": "colour-2",
-            "purpose": "Concept item 2 short label.",
-            "command": 59,
-            "max_chars": 16
+            "purpose": "Concept item 2 short label (live caption bound to colour-card-2).",
+            "command": 67,
+            "max_chars": 20
           },
           {
             "id": "colour-3",
-            "purpose": "Concept item 3 short label.",
-            "command": 67,
-            "max_chars": 16
-          },
-          {
-            "id": "colour-4",
-            "purpose": "Concept item 4 short label.",
-            "command": 75,
-            "max_chars": 16
+            "purpose": "Concept item 3 short label (live caption bound to colour-card-3).",
+            "command": 83,
+            "max_chars": 20
           },
           {
             "id": "song-prompt",
             "purpose": "Instruction for the wide hero scene and summary card.",
-            "command": 81,
+            "command": 91,
             "max_chars": 60
           },
           {
             "id": "song-title",
             "purpose": "Title of the classroom chant or concept summary card.",
-            "command": 96,
+            "command": 106,
             "max_chars": 26
           },
           {
             "id": "song-verse-1",
             "purpose": "First stanza or key points (3-4 short lines).",
-            "command": 100,
+            "command": 110,
             "max_chars": 84
           },
           {
             "id": "song-verse-2",
             "purpose": "Second stanza or closing summary (3-4 short lines).",
-            "command": 104,
+            "command": 114,
             "max_chars": 84
           },
           {
             "id": "colour-key",
-            "purpose": "Bottom classification instruction and 1-4 coding key.",
-            "command": 118,
+            "purpose": "Bottom classification instruction and 1-3 coding key.",
+            "command": 128,
             "max_chars": 92
           }
         ],
         "image_slots": [
           {
-            "id": "paint-pots",
-            "purpose": "Row of 4 colourful isolated educational concept icons/illustrations on a pure white (#FFFFFF) background. No text or letters.",
+            "id": "colour-card-1",
+            "purpose": "Single isolated colourful educational concept icon/illustration for swatch 1 on a pure solid white (#FFFFFF) background. No text or letters.",
             "rect": [
               48.0,
+              138.0,
+              205.0,
+              232.0
+            ]
+          },
+          {
+            "id": "colour-card-2",
+            "purpose": "Single isolated colourful educational concept icon/illustration for swatch 2 on a pure solid white (#FFFFFF) background. No text or letters.",
+            "rect": [
+              219.0,
+              138.0,
+              376.0,
+              232.0
+            ]
+          },
+          {
+            "id": "colour-card-3",
+            "purpose": "Single isolated colourful educational concept icon/illustration for swatch 3 on a pure solid white (#FFFFFF) background. No text or letters.",
+            "rect": [
+              390.0,
               138.0,
               547.0,
               232.0

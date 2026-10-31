@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub mod design;
 pub mod protocol;
 pub use design::{DesignCorrection, DesignImageSlot, DesignProfile, DesignStyleUse, DesignTextSlot, PageFamily};
-pub use protocol::ArabicTashkeelMode;
+pub use protocol::{ArabicTashkeelMode, ExecutionPacing, VisualDensityMode};
 pub mod resources;
 pub use resources::{GpuSnapshot, LocalResourcePolicy, ResourceSnapshot};
 
@@ -233,6 +233,134 @@ pub fn supports_gemini_image_review(provider: ProviderKind, model: &str) -> bool
     })
 }
 
+/// Returns `true` when a free-form prompt explicitly asks to generate, regenerate, redraw, or
+/// re-illustrate raster artwork (as opposed to mentioning images in a caption-matching or layout audit).
+pub fn prompt_explicitly_requests_image_generation(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    const NEGATIONS: &[&str] = &[
+        "بدون توليد صور",
+        "دون توليد صور",
+        "لا تولد صور",
+        "لا تولّد صور",
+        "لا تعيد توليد",
+        "لا تعد توليد",
+        "لا تعيد رسم",
+        "لا تعد رسم",
+        "بدون إعادة توليد",
+        "بدون اعادة توليد",
+        "دون إعادة توليد",
+        "بدون رسم صور",
+        "without generating",
+        "without regenerating",
+        "without redrawing",
+        "do not generate",
+        "don't generate",
+        "dont generate",
+        "do not regenerate",
+        "don't regenerate",
+        "dont regenerate",
+        "do not redraw",
+        "don't redraw",
+        "dont redraw",
+        "do not re-illustrate",
+        "don't re-illustrate",
+        "do not create new image",
+        "don't create new image",
+        "do not create new illustration",
+        "don't create new illustration",
+        "do not draw new",
+        "don't draw new",
+        "never generate",
+        "never regenerate",
+        "avoid generating",
+        "avoid regenerating",
+        "no image generation",
+        "no new images",
+        "no new illustrations",
+    ];
+    if NEGATIONS.iter().any(|neg| lower.contains(neg)) {
+        return false;
+    }
+    const EXPLICIT_PATTERNS: &[&str] = &[
+        "أعد توليد الصور",
+        "اعد توليد الصور",
+        "إعادة توليد الصور",
+        "اعادة توليد الصور",
+        "أعد توليد الصورة",
+        "اعد توليد الصورة",
+        "إعادة توليد الصورة",
+        "اعادة توليد الصورة",
+        "ولّد صور",
+        "ولد صور",
+        "توليد صور",
+        "توليد الصور",
+        "أعد رسم الصور",
+        "اعد رسم الصور",
+        "إعادة رسم الصور",
+        "اعادة رسم الصور",
+        "ارسم صور",
+        "ارسم رسوم",
+        "توليد رسوم",
+        "استبدل الصور بصور جديدة",
+        "صمم صوراً جديدة",
+        "صمم صورا جديدة",
+        "regenerate image",
+        "regenerate images",
+        "regenerate the image",
+        "regenerate the images",
+        "regenerate illustration",
+        "regenerate illustrations",
+        "redraw image",
+        "redraw images",
+        "redraw illustration",
+        "redraw illustrations",
+        "re-illustrate",
+        "generate new image",
+        "generate new images",
+        "generate image",
+        "generate images",
+        "generate illustration",
+        "generate illustrations",
+        "create new illustration",
+        "create new illustrations",
+        "draw new image",
+        "draw new images",
+    ];
+    EXPLICIT_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+/// Normalizes user-entered or pasted file/folder paths (such as Windows "Copy as path" strings)
+/// by removing Unicode BiDi/invisible formatting marks, trimming whitespace/control characters,
+/// and unwrapping surrounding quotes so `std::fs` never fails with `os error 123`.
+pub fn sanitize_user_path(raw: &str) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\0' | '\r' | '\n' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+            )
+        })
+        .collect();
+    let mut trimmed = filtered.trim();
+    for _ in 0..4 {
+        let prev = trimmed;
+        if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            trimmed = inner.trim();
+        } else if let Some(inner) = trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            trimmed = inner.trim();
+        } else if let Some(inner) = trimmed.strip_prefix('\u{201C}').and_then(|s| s.strip_suffix('\u{201D}')) {
+            trimmed = inner.trim();
+        } else {
+            trimmed = trimmed.trim_matches(|c| matches!(c, '"' | '\u{201C}' | '\u{201D}')).trim();
+        }
+        if trimmed == prev {
+            break;
+        }
+    }
+    trimmed.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +450,48 @@ mod tests {
         assert!(!supports_gemini_image_review(ProviderKind::OpenAi, "gpt-4o"));
         assert!(!supports_gemini_image_review(ProviderKind::Ollama, "llava"));
         assert!(!supports_gemini_image_review(ProviderKind::Gemini, "gemini-3.1-flash-image"));
+    }
+
+    #[test]
+    fn explicit_image_generation_prompt_classifier_distinguishes_audit_from_redraw() {
+        assert!(!prompt_explicitly_requests_image_generation(
+            "ازل التشكيل من الحروف ونريد تبديل الخط العربي وايضا لاحظنا الكلمات وبين الصور ليس متطابقة فمثلا الصورة وتحتها الكلمة ليست متطابقة ارجو المراجعة والتدقيق"
+        ));
+        assert!(!prompt_explicitly_requests_image_generation(
+            "Review all pages 1-32, fix page numbers, and check caption-to-image alignment without generating images."
+        ));
+        assert!(prompt_explicitly_requests_image_generation("أعد توليد الصور التالفة في الصفحات 3 و 7"));
+        assert!(prompt_explicitly_requests_image_generation("Fix captions and regenerate images for the mismatched cards"));
+        assert!(!prompt_explicitly_requests_image_generation("أعد توليد الصور بدون توليد صور مدفوعة"));
+        assert!(!prompt_explicitly_requests_image_generation("Review captions, but do not regenerate the images."));
+        assert!(!prompt_explicitly_requests_image_generation("Please don't generate the illustrations; only align labels."));
+    }
+
+    #[test]
+    fn sanitize_user_path_strips_windows_quotes_and_bidi_marks() {
+        assert_eq!(
+            sanitize_user_path(
+                r#"  "C:\Users\alara\Desktop\Starlight_Blossom_365_Planner_Skill_And_Script_Package\planners-journals-notebooks-studio"  "#
+            ),
+            r"C:\Users\alara\Desktop\Starlight_Blossom_365_Planner_Skill_And_Script_Package\planners-journals-notebooks-studio"
+        );
+        assert_eq!(sanitize_user_path("\u{202A}\"C:\\Users\\alara\\Downloads\\pkg\"\u{202C}"), r"C:\Users\alara\Downloads\pkg");
+        assert_eq!(sanitize_user_path("'\u{200F}/tmp/my skill/SKILL.md\u{200E}'"), "/tmp/my skill/SKILL.md");
+        assert_eq!(sanitize_user_path("“D:\\كتاب\\بلانر.designcraft”\r\n"), r"D:\كتاب\بلانر.designcraft");
+    }
+
+    #[test]
+    fn execution_pacing_and_visual_density_round_trip_with_backward_compatible_defaults() {
+        let legacy: crate::protocol::AiSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.execution_pacing, ExecutionPacing::ReviewEveryBatch);
+        assert_eq!(legacy.visual_density, VisualDensityMode::SmartHybrid);
+
+        let mut updated = legacy;
+        updated.execution_pacing = ExecutionPacing::AutoContinue;
+        updated.visual_density = VisualDensityMode::PureNativeVector;
+        let encoded = serde_json::to_string(&updated).unwrap();
+        let decoded: crate::protocol::AiSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.execution_pacing, ExecutionPacing::AutoContinue);
+        assert_eq!(decoded.visual_density, VisualDensityMode::PureNativeVector);
     }
 }

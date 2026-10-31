@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use url::Url;
 
 #[cfg(not(target_arch = "wasm32"))]
+mod agent;
+#[cfg(not(target_arch = "wasm32"))]
 mod native;
 
 /// Runtime-only secret. Intentionally neither serializable nor printable.
@@ -52,8 +54,69 @@ pub struct GenerationRequest {
     pub resources: designcraft_ai_types::LocalResourcePolicy,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolResultMessage {
+    pub call_id: String,
+    pub name: String,
+    pub output: Value,
+    /// Runtime-only visual renders produced by inspection tools (e.g. `render_visual_check`);
+    /// never persisted into JSON configuration or logs.
+    #[serde(skip, default)]
+    pub images: Vec<ImageInput>,
+}
+
+#[derive(Clone, Debug)]
+pub enum AgentMessage {
+    User {
+        text: String,
+        images: Vec<ImageInput>,
+    },
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCall>,
+        /// Provider-opaque turn payload (such as Gemini thoughtSignature parts or OpenAI output items)
+        /// replayed verbatim on subsequent turns to preserve multi-turn reasoning signatures.
+        raw_provider_turn: Option<Value>,
+    },
+    ToolResults {
+        results: Vec<ToolResultMessage>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentTurnRequest {
+    pub system: String,
+    pub messages: Vec<AgentMessage>,
+    pub tools: Vec<ToolDefinition>,
+    pub max_output_tokens: u32,
+    pub resources: designcraft_ai_types::LocalResourcePolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentTurnResponse {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub raw_provider_turn: Option<Value>,
+    pub usage: Usage,
+    pub error: Option<String>,
+}
+
 /// Runtime-only reference image; not stored in configuration or skill files.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ImageInput {
     pub mime_type: String,
     pub bytes: Vec<u8>,
@@ -62,6 +125,40 @@ pub struct ImageInput {
 impl std::fmt::Debug for ImageInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageInput").field("mime_type", &self.mime_type).field("byte_length", &self.bytes.len()).finish()
+    }
+}
+
+/// Whether `selection` accepts multimodal image inputs on agent tool-result turns.
+/// Text-only models degrade gracefully to structured JSON tool metadata without image payloads.
+pub fn supports_agent_vision(selection: &ModelSelection) -> bool {
+    let lower = selection.model.trim().to_ascii_lowercase();
+    let leaf = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if leaf.is_empty() {
+        return false;
+    }
+    match selection.provider {
+        ProviderKind::Gemini => !(leaf.starts_with("gemma-2") || leaf.starts_with("gemma-3-1b") || leaf.starts_with("gemma-3n-e2b")),
+        ProviderKind::OpenAi => {
+            !(leaf.starts_with("gpt-3.5") || leaf.starts_with("o1-mini") || leaf.starts_with("o1-preview") || leaf.starts_with("o3-mini"))
+        }
+        ProviderKind::Ollama => {
+            let base = leaf.split(':').next().unwrap_or(leaf);
+            let tag = leaf.split_once(':').map_or("", |(_, t)| t);
+            if base == "gemma3" && (tag.starts_with("1b") || tag.contains("-1b")) {
+                return false;
+            }
+            base.contains("vision")
+                || base.contains("llava")
+                || base.contains("moondream")
+                || base.contains("pixtral")
+                || base.contains("minicpm-v")
+                || base.contains("internvl")
+                || base.contains("smolvlm")
+                || base.ends_with("-vl")
+                || base.ends_with("vl")
+                || matches!(base, "gemma3" | "gemma4" | "llama4" | "qwen3.5" | "mistral-small3.1" | "mistral-small3.2")
+        }
+        ProviderKind::ComfyUi => false,
     }
 }
 
@@ -361,6 +458,25 @@ pub fn generate(
     #[cfg(not(target_arch = "wasm32"))]
     {
         native::generate(selection, key, request, cancel)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (key, request);
+        Err("AI HTTP transport is available only in the native application".into())
+    }
+}
+
+pub fn generate_agent_turn(
+    selection: &ModelSelection,
+    key: Option<&str>,
+    request: &AgentTurnRequest,
+    cancel: &AtomicBool,
+) -> Result<AgentTurnResponse, String> {
+    check_cancel(cancel)?;
+    validate_endpoint(selection)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        agent::generate_agent_turn(selection, key, request, cancel)
     }
     #[cfg(target_arch = "wasm32")]
     {

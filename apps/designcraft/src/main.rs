@@ -352,6 +352,10 @@ fn open_filters(purpose: &str) -> &'static [OpenFilter] {
             OpenFilter { name: "Text (Word, RTF, plain, Excel)", extensions: &["docx", "rtf", "txt", "md", "xlsx"] },
             OpenFilter { name: "Video and sound", extensions: &["mp4", "m4v", "mov", "webm", "mp3", "m4a", "wav", "ogg"] },
         ],
+        "ai_script" => &[
+            OpenFilter { name: "Production Script (Markdown, Text)", extensions: &["md", "txt", "markdown"] },
+            OpenFilter { name: "All files", extensions: &[ALL_FILES] },
+        ],
         "ai_target_document" => &[
             OpenFilter {
                 name: "Editable & Importable Documents",
@@ -464,6 +468,7 @@ fn ai_service() -> Option<designcraft_ui_egui::AiFn> {
         let root = profile::config_dir()?.join("AI");
         match designcraft_ai_runtime::ProductionRunner::open(root) {
             Ok(mut runner) => {
+                runner.enable_desktop_defaults();
                 // `ProductionRunner::open` already imports `DESIGNCRAFT_SKILLS_DIR` when set; only
                 // fall back to probing bundled/adjacent portable catalogs when that env var is unset.
                 if std::env::var_os("DESIGNCRAFT_SKILLS_DIR").is_none_or(|v| v.is_empty())

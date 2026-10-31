@@ -88,7 +88,7 @@ fn approve(registry: &mut SkillRegistry, temp: &Path, record: &SkillRevision) {
 fn drafts_require_review_and_preserve_active_revision_on_edit() {
     let (temp, mut registry) = registry();
     let records = registry.install_builtin_drafts().unwrap();
-    assert_eq!(records.len(), 9);
+    assert_eq!(records.len(), 11);
     let first = records.first().unwrap();
     assert_eq!(first.status, RevisionStatus::Draft);
     assert!(registry.snapshot(&first.skill_id, &[]).is_err());
@@ -390,4 +390,66 @@ fn folder_symlink_is_rejected() {
     fs::create_dir(&root).unwrap();
     std::os::unix::fs::symlink(temp.path(), root.join("references")).unwrap();
     assert!(registry.import_folder(root, Provenance::default()).is_err());
+}
+
+#[test]
+fn planner_studio_packages_validate_and_external_nested_skill_folder_adapts_cleanly() {
+    let (temp, mut registry) = registry();
+    let records = registry.install_builtin_drafts().unwrap();
+    let style = records.iter().find(|r| r.skill_id == "planner-journal-studio-style").unwrap();
+    let profile = style.manifest.design_profile.as_ref().unwrap();
+    assert_eq!(profile.page_mm, [148.0, 210.0]);
+    assert_eq!(profile.page_families.len(), 8);
+    let templates = registry.review_templates(&style.skill_id, &style.revision).unwrap();
+    assert_eq!(templates.len(), 8);
+    assert!(templates.values().all(|actions| actions.len() <= 90));
+
+    // External nested folder with quotes, BiDi marks, scripts/helper.py, and visual_mockups/card.png
+    let outer = temp.path().join("full-package-wrapper");
+    let inner = outer.join("external-stationery-studio");
+    fs::create_dir_all(inner.join("references")).unwrap();
+    fs::create_dir_all(inner.join("scripts")).unwrap();
+    fs::create_dir_all(inner.join("visual_mockups")).unwrap();
+    fs::write(
+        inner.join("SKILL.md"),
+        b"---\nname: external-stationery-studio\ndescription: Luxury bilingual planner and journal architecture.\n---\nDesign 365-page planners.\n",
+    )
+    .unwrap();
+    fs::write(inner.join("references").join("guide.md"), b"# Blueprint\nA5 layout rules.\n").unwrap();
+    fs::write(inner.join("scripts").join("generate_script.py"), b"print('ignored helper')\n").unwrap();
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, 2, 2);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.write_header().unwrap().write_image_data(&[240u8; 12]).unwrap();
+    }
+    fs::write(inner.join("visual_mockups").join("Page01.png"), &png_bytes).unwrap();
+
+    let quoted_with_bidi = format!("  \u{202A}\"{}\"\u{202C}  ", outer.display());
+    let imported = registry.import_folder(&quoted_with_bidi, Provenance::default()).unwrap();
+    assert_eq!(imported.skill_id, "external-stationery-studio");
+    assert!(imported.manifest.external_tools.is_empty());
+    assert_eq!(imported.manifest.references, ["references/guide.md"]);
+    let files = registry.review_files(&imported.skill_id, &imported.revision).unwrap();
+    assert!(files.contains_key("assets/Page01.png"));
+    assert!(!files.keys().any(|k| k.contains("generate_script")));
+    approve(&mut registry, temp.path(), &imported);
+    let snap = registry.snapshot(&imported.skill_id, &["references/guide.md".into()]).unwrap();
+    assert!(snap.references.get("references/guide.md").unwrap().contains("A5 layout rules"));
+
+    // Optional local dev-machine smoke check against real user-supplied folders (if present on disk):
+    for raw_local_folder in [
+        r#""C:\Users\alara\Desktop\Starlight_Blossom_365_Planner_Skill_And_Script_Package\planners-journals-notebooks-studio""#,
+        r#""C:\Users\alara\OneDrive\Documents\Downloads\planners-journals-notebooks-studio-full-package""#,
+    ] {
+        let unquoted = designcraft_ai_types::sanitize_user_path(raw_local_folder);
+        if std::path::Path::new(&unquoted).exists() {
+            let (_local_tmp, mut local_reg) = self::registry();
+            let rev = local_reg
+                .import_folder(raw_local_folder, Provenance::default())
+                .unwrap_or_else(|e| panic!("failed importing {raw_local_folder}: {e}"));
+            assert!(rev.manifest.external_tools.is_empty());
+            assert!(rev.manifest.sample_template.is_some());
+        }
+    }
 }

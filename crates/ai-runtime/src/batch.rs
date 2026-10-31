@@ -130,10 +130,28 @@ fn page_ranges_summary(spreads: &[Arc<designcraft_engine::doc::Spread>], filled:
 
 /// A continuation starts only from a deliberately selected current book. Never
 /// infer permission or a page offset from stale, editable checkpoint metadata.
+#[cfg(test)]
 pub(super) fn continuation_progress(
     base: &DocState,
     profile: Option<&designcraft_ai_types::DesignProfile>,
     brief: &str,
+) -> Result<(u32, u32), String> {
+    continuation_progress_inner(base, profile, brief, false)
+}
+
+pub(super) fn continuation_or_blank_progress(
+    base: &DocState,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    brief: &str,
+) -> Result<(u32, u32), String> {
+    continuation_progress_inner(base, profile, brief, !brief.trim().is_empty())
+}
+
+fn continuation_progress_inner(
+    base: &DocState,
+    profile: Option<&designcraft_ai_types::DesignProfile>,
+    brief: &str,
+    allow_all_blank: bool,
 ) -> Result<(u32, u32), String> {
     if let Some(profile) = profile {
         profile.validate()?;
@@ -171,7 +189,8 @@ pub(super) fn continuation_progress(
         ));
     }
     let start = base.doc.spreads.iter().position(|spread| spread.items.is_empty()).ok_or("No blank pages remain in this book")?;
-    if start == 0 || base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty()) {
+    let has_trailing_items = base.doc.spreads.iter().skip(start).any(|spread| !spread.items.is_empty());
+    if has_trailing_items || (start == 0 && !allow_all_blank) {
         let completed = page_ranges_summary(&base.doc.spreads, true);
         let blank = page_ranges_summary(&base.doc.spreads, false);
         return Err(format!(
@@ -179,6 +198,48 @@ pub(super) fn continuation_progress(
         ));
     }
     Ok((pages, u32::try_from(start).map_err(|_| "Invalid continuation page")?))
+}
+
+pub(crate) fn extract_requested_page_count(brief: &str) -> Result<Option<u32>, String> {
+    if let Some(contract) = crate::script_contract::parse(brief)? {
+        let count = u32::try_from(contract.pages.len()).map_err(|_| "Explicit page-script count exceeds limit")?;
+        return Ok((1..=1000).contains(&count).then_some(count));
+    }
+    let normalized: String = brief
+        .chars()
+        .map(|c| match c {
+            '\u{0660}'..='\u{0669}' => char::from(b'0' + (u32::from(c) - 0x0660) as u8),
+            '\u{06F0}'..='\u{06F9}' => char::from(b'0' + (u32::from(c) - 0x06F0) as u8),
+            _ => c.to_ascii_lowercase(),
+        })
+        .collect();
+    let tokens: Vec<&str> =
+        normalized.split(|c: char| !c.is_alphanumeric() && !('\u{0600}'..='\u{06FF}').contains(&c)).filter(|tok| !tok.is_empty()).collect();
+    for window in tokens.windows(2) {
+        if let [num_tok, unit_tok] = window
+            && let Ok(n) = num_tok.parse::<u32>()
+            && (1..=1000).contains(&n)
+            && matches!(*unit_tok, "pages" | "page" | "صفحة" | "صفحه" | "صفحات")
+        {
+            return Ok(Some(n));
+        }
+    }
+    if crate::template_plan::is_stationery_or_planner_prompt(brief)
+        && ["365", "سنوي", "سنوية", "annual", "yearly", "year-round"].iter().any(|kw| normalized.contains(kw))
+    {
+        return Ok(Some(365));
+    }
+    Ok(None)
+}
+
+pub(super) fn desired_continuation_pages(
+    brief: &str,
+    draft: Option<&designcraft_ai_types::protocol::ProductionDraft>,
+) -> Result<Option<u32>, String> {
+    if let Some(explicit) = extract_requested_page_count(brief)? {
+        return Ok(Some(explicit));
+    }
+    Ok(draft.and_then(|d| d.progress.target_total_pages).filter(|p| (1..=1000).contains(p)))
 }
 
 impl ProductionRunner {
@@ -227,6 +288,8 @@ impl ProductionRunner {
         job.task.settings.text_model = settings.text_model.clone();
         job.task.settings.image_model = settings.image_model.clone();
         job.task.settings.output_mode = settings.output_mode;
+        job.task.settings.visual_density = settings.visual_density;
+        job.task.settings.execution_pacing = settings.execution_pacing;
         job.task.settings.verify_generated_images = settings.verify_generated_images;
         job.task.settings.allow_paid_repairs = settings.allow_paid_repairs;
         job.task.settings.image_rates = settings.image_rates.clone();
@@ -234,6 +297,107 @@ impl ProductionRunner {
         job.task.settings.resources = settings.resources.clone();
         self.snapshot.batch = Some(job.snapshot.clone());
         Ok(())
+    }
+
+    pub(super) fn prepare_continuable_book(
+        &mut self,
+        session: &mut Session,
+        task: &TaskRequest,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+    ) -> Result<(), String> {
+        let (current_pages, all_blank, has_holes, requested_trim_conflicts, current_facing) = {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            let first_blank = current.doc.spreads.iter().position(|s| s.items.is_empty());
+            let has_holes = first_blank.is_some_and(|first| current.doc.spreads.iter().skip(first).any(|s| !s.items.is_empty()));
+            let all_blank = current.doc.spreads.iter().all(|s| s.items.is_empty());
+            let current_pages = u32::try_from(current.doc.page_count()).map_err(|_| "Invalid existing book page count")?;
+            let requested_trim = crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|c| c.page_mm);
+            let requested_trim_conflicts = requested_trim.is_some_and(|[w, h]| {
+                current
+                    .doc
+                    .spreads
+                    .iter()
+                    .any(|sp| sp.pages.iter().any(|pg| (pg.width - w * 72.0 / 25.4).abs() > 0.1 || (pg.height - h * 72.0 / 25.4).abs() > 0.1))
+            });
+            (current_pages, all_blank, has_holes, requested_trim_conflicts, current.doc.settings.facing_pages)
+        };
+        if has_holes {
+            return Ok(());
+        }
+        let desired_pages = desired_continuation_pages(&task.prompt, self.snapshot.production_draft.as_ref())?;
+        if all_blank {
+            let target_pages = desired_pages.unwrap_or(current_pages).clamp(1, 1000);
+            let needs_setup = profile.is_some() || requested_trim_conflicts || target_pages != current_pages;
+            if needs_setup {
+                ensure_publication_idle(session)?;
+                let mut setup = production_document_params(profile, target_pages, &task.settings, &task.prompt)?;
+                if setup.get("width").is_none() && setup.get("preset").and_then(Value::as_str) == Some("A4") {
+                    setup["width"] = json!(210.0 * 72.0 / 25.4);
+                    setup["height"] = json!(297.0 * 72.0 / 25.4);
+                }
+                setup["facingPages"] = json!(current_facing);
+                session.execute("layout.documentSetup", &setup).map_err(|e| e.to_string())?;
+                let after_setup_pages = session.doc().map_err(|e| e.to_string())?.doc.page_count();
+                if after_setup_pages < target_pages as usize {
+                    session
+                        .execute("layout.pages.insert", &json!({"count": (target_pages as usize).saturating_sub(after_setup_pages)}))
+                        .map_err(|e| e.to_string())?;
+                }
+                initialize_print_document(session, &task.prompt)?;
+                crate::template_plan::initialize_relational_book_master(session, profile, &task.settings, &task.prompt)?;
+            }
+        } else if !requested_trim_conflicts && let Some(want) = desired_pages.filter(|want| *want > current_pages && *want <= 1000) {
+            ensure_publication_idle(session)?;
+            session.execute("layout.pages.insert", &json!({"count": want - current_pages})).map_err(|e| e.to_string())?;
+        }
+        let updated_total = u32::try_from(session.doc().map_err(|e| e.to_string())?.doc.page_count()).ok();
+        if let Some(mut draft) = self.snapshot.production_draft.clone()
+            && draft.progress.target_total_pages != updated_total
+        {
+            draft.progress.target_total_pages = updated_total;
+            let _ = self.persist_production_draft(&draft);
+            self.snapshot.production_draft = Some(draft);
+        }
+        Ok(())
+    }
+
+    pub(super) fn project_continuable_preview_base(
+        &self,
+        base: &DocState,
+        prefs: &Prefs,
+        task: &TaskRequest,
+        profile: Option<&designcraft_ai_types::DesignProfile>,
+    ) -> Result<DocState, String> {
+        let first_blank = base.doc.spreads.iter().position(|s| s.items.is_empty());
+        let has_holes = first_blank.is_some_and(|first| base.doc.spreads.iter().skip(first).any(|s| !s.items.is_empty()));
+        if has_holes {
+            return Ok(base.clone());
+        }
+        let all_blank = base.doc.spreads.iter().all(|s| s.items.is_empty());
+        let current_pages = u32::try_from(base.doc.page_count()).map_err(|_| "Invalid existing book page count")?;
+        let desired_pages = desired_continuation_pages(&task.prompt, self.snapshot.production_draft.as_ref())?;
+        let mut scratch = Session::new();
+        scratch.prefs = prefs.clone();
+        scratch.add_document(base.clone());
+        if all_blank {
+            let target_pages = desired_pages.unwrap_or(current_pages).clamp(1, 1000);
+            let mut setup = production_document_params(profile, target_pages, &task.settings, &task.prompt)?;
+            if setup.get("width").is_none() && setup.get("preset").and_then(Value::as_str) == Some("A4") {
+                setup["width"] = json!(210.0 * 72.0 / 25.4);
+                setup["height"] = json!(297.0 * 72.0 / 25.4);
+            }
+            setup["facingPages"] = json!(false);
+            scratch.execute("layout.documentSetup", &setup).map_err(|e| e.to_string())?;
+            let after_setup_pages = scratch.doc().map_err(|e| e.to_string())?.doc.page_count();
+            if after_setup_pages < target_pages as usize {
+                scratch
+                    .execute("layout.pages.insert", &json!({"count": (target_pages as usize).saturating_sub(after_setup_pages)}))
+                    .map_err(|e| e.to_string())?;
+            }
+        } else if let Some(want) = desired_pages.filter(|want| *want > current_pages && *want <= 1000) {
+            scratch.execute("layout.pages.insert", &json!({"count": want - current_pages})).map_err(|e| e.to_string())?;
+        }
+        Ok(scratch.doc().map_err(|e| e.to_string())?.clone())
     }
 
     pub(super) fn start_batches(
@@ -247,7 +411,8 @@ impl ProductionRunner {
         let (pages, completed, existing) = match task.target {
             TaskTarget::NewA4 { pages } => (pages, 0, None),
             TaskTarget::ContinueBook => {
-                let (pages, completed) = continuation_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()), &task.prompt)?;
+                let (pages, completed) =
+                    continuation_or_blank_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()), &task.prompt)?;
                 (pages, completed, Some((base.uid, base.revision)))
             }
             TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
@@ -423,7 +588,7 @@ impl ProductionRunner {
                 return Err("Select this failed task's book before Retry; another open document will not be modified".into());
             }
             let (base, context) = task_document_context(session, &TaskTarget::ContinueBook, profile, &job.task.prompt, &job.task.settings)?;
-            let (total, completed) = continuation_progress(&base, profile, &job.task.prompt)?;
+            let (total, completed) = continuation_or_blank_progress(&base, profile, &job.task.prompt)?;
             if total != job.snapshot.total_pages || completed != job.snapshot.completed_pages {
                 return Err("The target pages or book page count changed; prepare a fresh continuation instead of overwriting content".into());
             }
@@ -609,6 +774,46 @@ impl ProductionRunner {
         self.launch_batch(job, base, context)
     }
 
+    pub(super) fn pause_batch(&mut self, id: &str) -> Result<(), String> {
+        let job = self.batch.as_mut().ok_or("No active production batch job to pause")?;
+        if job.snapshot.job_id != id {
+            return Err("Pause request does not match the active production batch job".into());
+        }
+        job.snapshot.paused = true;
+        let snap = job.snapshot.clone();
+        self.persist_batch(&snap)?;
+        self.snapshot.batch = Some(snap);
+        self.snapshot.message = if self.pending.is_some() {
+            "Pausing cleanly after the current batch finishes; in-flight work will be published and saved.".into()
+        } else {
+            "Production batch job paused; click Resume to continue.".into()
+        };
+        Ok(())
+    }
+
+    pub(super) fn resume_batch(&mut self, session: &mut Session, id: &str) -> Result<(), String> {
+        let (checkpoint, is_waiting) = {
+            let job = self.batch.as_mut().ok_or("No active production batch job to resume")?;
+            if job.snapshot.job_id != id {
+                return Err("Resume request does not match the active production batch job".into());
+            }
+            job.snapshot.paused = false;
+            let snap = job.snapshot.clone();
+            let waiting = snap.status == "awaiting_human_proof" && self.pending.is_none();
+            let cp = snap.checkpoint;
+            let _ = job;
+            self.persist_batch(&snap)?;
+            self.snapshot.batch = Some(snap);
+            (cp, waiting)
+        };
+        if is_waiting {
+            self.approve_batch(session, id, checkpoint)
+        } else {
+            self.snapshot.message = "Autonomous continuation resumed; the next batch will launch automatically.".into();
+            Ok(())
+        }
+    }
+
     pub(super) fn refresh_batch_proofs(&mut self, session: &mut Session, id: &str) -> Result<(), String> {
         if self.pending.is_some() {
             return Err("A provider request is already active".into());
@@ -788,16 +993,90 @@ impl ProductionRunner {
                 })
             })
         };
+        let mut auto_next_launch: Option<(DocState, Value, u32)> = None;
         match result {
             Ok(()) => {
                 job.snapshot.completed_pages = job.snapshot.completed_pages.saturating_add(batch_report.page_count);
                 job.snapshot.checkpoint = job.snapshot.checkpoint.saturating_add(1);
-                job.snapshot.status = "awaiting_human_proof".into();
-                batch_report.status = "awaiting_human_proof".into();
-                report.status = "awaiting_human_proof".into();
-                report.message =
-                    "Batch published with native/PDF/PNG proofs. Human approval is required before any subsequent provider request".into();
-                if let Err(error) = self.bind_production_draft(session, &job.snapshot.job_id) {
+                let draft_note = self.bind_production_draft(session, &job.snapshot.job_id).err();
+                let pacing_continues = job.task.settings.execution_pacing == ExecutionPacing::AutoContinue
+                    || (job.task.settings.execution_pacing == ExecutionPacing::StopAfterFirstBatch && job.snapshot.current_batch > 1);
+                if !job.snapshot.paused && pacing_continues && job.snapshot.completed_pages >= job.snapshot.total_pages {
+                    match file_access::confine(job.roots.as_ref(), || self.export_finished_batch(session, &job.task, &job.snapshot.job_id)) {
+                        Ok(paths) => {
+                            report.artifacts.extend(paths);
+                            job.snapshot.status = "completed".into();
+                            batch_report.status = "approved".into();
+                            report.status = "completed".into();
+                            report.message = format!(
+                                "Autonomous production completed all {} pages across {} batches.",
+                                job.snapshot.total_pages, job.snapshot.current_batch
+                            );
+                        }
+                        Err(export_err) => {
+                            job.snapshot.status = "awaiting_human_proof".into();
+                            batch_report.status = "awaiting_human_proof".into();
+                            report.status = "awaiting_human_proof".into();
+                            report.message = format!(
+                                "All {} pages were published, but automatic export failed ({export_err}); review and approve to finish.",
+                                job.snapshot.total_pages
+                            );
+                        }
+                    }
+                } else if !job.snapshot.paused && pacing_continues && job.snapshot.completed_pages < job.snapshot.total_pages {
+                    let prep = (|| -> Result<(DocState, Value, u32), String> {
+                        let target_doc = session
+                            .documents()
+                            .iter()
+                            .find(|doc| Some(doc.uid) == job.snapshot.document_uid)
+                            .ok_or_else(|| "Published book disappeared before continuing to the next batch".to_string())?;
+                        let mut next_base = crate::facing_pages::canonicalize(target_doc, &session.prefs)?;
+                        next_base.selection = Default::default();
+                        let mut projected = Session::new();
+                        projected.prefs = session.prefs.clone();
+                        projected.add_document(next_base.clone());
+                        let mut next_job_view = job.clone();
+                        let mut approved_entry = batch_report.clone();
+                        approved_entry.status = "approved".into();
+                        next_job_view.snapshot.batches.push(approved_entry);
+                        let next_context = batch_context(&projected, &next_job_view, &self.root)?;
+                        let next_batch = job.snapshot.current_batch.checked_add(1).ok_or_else(|| "Batch index overflow".to_string())?;
+                        Ok((next_base, next_context, next_batch))
+                    })();
+                    match prep {
+                        Ok(next_tuple) => {
+                            job.snapshot.status = "running".into();
+                            batch_report.status = "approved".into();
+                            report.status = "approved".into();
+                            report.message = format!(
+                                "Batch {} of {} published ({}/{} pages); continuing automatically…",
+                                job.snapshot.current_batch, job.snapshot.total_batches, job.snapshot.completed_pages, job.snapshot.total_pages
+                            );
+                            auto_next_launch = Some(next_tuple);
+                        }
+                        Err(prep_err) => {
+                            job.snapshot.status = "awaiting_human_proof".into();
+                            batch_report.status = "awaiting_human_proof".into();
+                            report.status = "awaiting_human_proof".into();
+                            report.message = format!("Batch published; automatic continuation paused ({prep_err})");
+                        }
+                    }
+                } else {
+                    job.snapshot.status = "awaiting_human_proof".into();
+                    batch_report.status = "awaiting_human_proof".into();
+                    report.status = "awaiting_human_proof".into();
+                    report.message = if job.snapshot.paused {
+                        format!(
+                            "Paused cleanly after batch {} ({}/{} pages). Click Resume to continue autonomous generation.",
+                            job.snapshot.current_batch, job.snapshot.completed_pages, job.snapshot.total_pages
+                        )
+                    } else if job.task.settings.execution_pacing == ExecutionPacing::StopAfterFirstBatch && job.snapshot.current_batch == 1 {
+                        "First batch published for style check. Approve once to continue the remaining book automatically.".into()
+                    } else {
+                        "Batch published with native/PDF/PNG proofs. Human approval is required before any subsequent provider request".into()
+                    };
+                }
+                if let Some(error) = draft_note {
                     report.message.push_str(&format!("; saved continuation instructions could not be updated: {error}"));
                 }
             }
@@ -822,10 +1101,20 @@ impl ProductionRunner {
             .persist_batch(&job.snapshot)
             .and_then(|()| write_json(&self.profile_access, &self.root.join("history.json"), &self.snapshot.reports));
         if let Err(error) = persisted {
+            auto_next_launch = None;
             job.snapshot.status = "failed".into();
             self.snapshot.stage = "failed".into();
             self.snapshot.message = format!("Batch evidence could not be persisted; continuation is disabled: {error}");
             self.snapshot.batch = Some(job.snapshot.clone());
+        }
+        if let Some((next_base, next_context, next_batch)) = auto_next_launch {
+            job.snapshot.current_batch = next_batch;
+            job.snapshot.status = "running".into();
+            if let Err(launch_err) = self.launch_batch(job, next_base, next_context) {
+                self.snapshot.stage = "failed".into();
+                self.snapshot.message = launch_err;
+            }
+            return;
         }
         if matches!(job.snapshot.status.as_str(), "awaiting_human_proof" | "failed") {
             self.batch = Some(job);
@@ -860,6 +1149,7 @@ impl ProductionRunner {
                 .execute("file.new", &production_document_params(profile, job.snapshot.total_pages, &job.task.settings, &job.task.prompt)?)
                 .map_err(|e| e.to_string())?;
             initialize_print_document(session, &job.task.prompt)?;
+            crate::template_plan::initialize_relational_book_master(session, profile, &job.task.settings, &job.task.prompt)?;
             // Print preferences define the new document's creation baseline. Facing setup
             // and reviewed artwork are published together by applyGroup below, so undoing
             // this batch restores its complete pre-publication state in one step.
@@ -943,10 +1233,23 @@ impl ProductionRunner {
             } else {
                 format!("batch-{}-retry-{}", job.snapshot.current_batch, job.retry_sequence)
             };
-            let directory = self.root.join("runs").join(&job.snapshot.job_id).join(directory_name);
+            let run_root = self.root.join("runs").join(&job.snapshot.job_id);
+            let directory = run_root.join(directory_name);
             self.profile_access.check(&directory, file_access::Access::Write)?;
             std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+            let next_completed = job.snapshot.completed_pages.saturating_add(batch_report.page_count);
+            let pacing_continues = job.task.settings.execution_pacing == ExecutionPacing::AutoContinue
+                || (job.task.settings.execution_pacing == ExecutionPacing::StopAfterFirstBatch && job.snapshot.current_batch > 1);
+            let will_auto_continue = !job.snapshot.paused && pacing_continues && next_completed < job.snapshot.total_pages;
             for proof in proofs {
+                if will_auto_continue && proof.name == "proof.pdf" {
+                    continue;
+                }
+                if will_auto_continue && proof.name == "document.designcraft" {
+                    let rolling = run_root.join("latest-checkpoint.designcraft");
+                    write_profile(&self.profile_access, &rolling, &proof.bytes)?;
+                    continue;
+                }
                 let path = directory.join(proof.name);
                 write_profile(&self.profile_access, &path, &proof.bytes)?;
                 batch_report.proof_sha256.push(hash(&proof.bytes));
@@ -1539,6 +1842,18 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
+    fn complete_http_body(bytes: &[u8]) -> Result<Option<&[u8]>, &'static str> {
+        let Some(sep) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return Ok(None);
+        };
+        let headers = std::str::from_utf8(&bytes[..sep]).map_err(|_| "Invalid mock HTTP header UTF-8")?;
+        let length = headers
+            .lines()
+            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
+            .ok_or("Missing mock Content-Length")?;
+        Ok(bytes.get(sep + 4..sep + 4 + length))
+    }
+
     fn task(endpoint: String, max_requests: u32) -> TaskRequest {
         TaskRequest {
             prompt: "Make one editable native rectangle per page, with exact 15 mm margins.".into(),
@@ -2019,17 +2334,7 @@ mod tests {
                         return Err("Mock content request ended early".into());
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n").map(|(h, b)| (h.to_owned(), b.to_owned()))
-                    else {
-                        continue;
-                    };
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .ok_or("Missing mock Content-Length")?;
-                    if let Some(body) = body.as_bytes().get(..length) {
+                    if let Some(body) = complete_http_body(&bytes)? {
                         break serde_json::from_slice::<Value>(body).map_err(|e| e.to_string())?;
                     }
                 };
@@ -2176,14 +2481,8 @@ mod tests {
                         return Err("Mock request ended early".into());
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    if let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n") {
-                        let length = headers
-                            .lines()
-                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
-                            .ok_or("Missing mock Content-Length")?;
-                        if body.len() >= length {
-                            break;
-                        }
+                    if complete_http_body(&bytes)?.is_some() {
+                        break;
                     }
                 }
                 let request_index = server_calls.fetch_add(1, Ordering::Relaxed);
@@ -2985,14 +3284,8 @@ mod tests {
                         return Err("Mock request ended early".into());
                     }
                     bytes.extend_from_slice(&chunk[..count]);
-                    if let Some((headers, body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n").map(|(h, b)| (h.to_owned(), b.to_owned())) {
-                        let length = headers
-                            .lines()
-                            .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
-                            .ok_or("Missing mock Content-Length")?;
-                        if let Some(slice) = body.as_bytes().get(..length) {
-                            break serde_json::from_slice::<Value>(slice).map_err(|e| e.to_string())?;
-                        }
+                    if let Some(slice) = complete_http_body(&bytes)? {
+                        break serde_json::from_slice::<Value>(slice).map_err(|e| e.to_string())?;
                     }
                 };
                 let index = server_calls.fetch_add(1, Ordering::Relaxed);
@@ -3177,6 +3470,7 @@ mod tests {
             total_batches: 2,
             completed_pages: 1,
             status: "failed".into(),
+            paused: false,
             retryable: true,
             checkpoint: 1,
             document_uid: Some(doc.uid),
@@ -3313,8 +3607,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 8192];
-            let _ = stream.read(&mut buf);
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+                if complete_http_body(&bytes).ok().flatten().is_some() {
+                    break;
+                }
+            }
             let plan = json!({
                 "title": "Page 2",
                 "commands": [
@@ -3332,6 +3638,7 @@ mod tests {
             let resp =
                 format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             stream.write_all(resp.as_bytes()).unwrap();
+            let _ = stream.flush();
         });
 
         waiting(&mut runner, &mut session, format!("http://{addr}"));
@@ -3451,14 +3758,8 @@ mod tests {
                             break;
                         }
                         bytes.extend_from_slice(&chunk[..n]);
-                        if let Some((headers, req_body)) = String::from_utf8_lossy(&bytes).split_once("\r\n\r\n") {
-                            let len = headers
-                                .lines()
-                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|s| s.trim().parse::<usize>().ok()))
-                                .unwrap_or(0);
-                            if req_body.len() >= len {
-                                break;
-                            }
+                        if complete_http_body(&bytes).ok().flatten().is_some() {
+                            break;
                         }
                     }
                     let commands: Vec<Value> = spreads
@@ -3893,5 +4194,148 @@ mod tests {
         let polled = runner.handle(&mut session, AiRequest::Poll);
         assert_eq!(polled.batch.as_ref().unwrap().document_revision, Some(bumped_rev));
         assert_eq!(std::fs::read_to_string(&checkpoint_file).unwrap(), saved_before, "selection-only bump must not rewrite batch-checkpoint.json");
+    }
+
+    #[test]
+    fn ai33_auto_continue_pause_resume_and_blank_planner_continuation() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicU32::new(0));
+        let server_calls = calls.clone();
+        let slow_first = Arc::new(AtomicBool::new(false));
+        let server_slow = slow_first.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                socket.set_nonblocking(false).map_err(|e| e.to_string())?;
+                socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+                socket.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let request = loop {
+                    if bytes.len() > 1024 * 1024 || Instant::now() >= deadline {
+                        return Err("Mock request exceeded bounds".into());
+                    }
+                    let count = socket.read(&mut chunk).map_err(|e| e.to_string())?;
+                    if count == 0 {
+                        return Err("Mock request ended early".into());
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(body) = complete_http_body(&bytes)? {
+                        break serde_json::from_slice::<Value>(body).map_err(|e| e.to_string())?;
+                    }
+                };
+                if server_slow.swap(false, Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(120));
+                }
+                let page = server_calls.fetch_add(1, Ordering::Relaxed);
+                let _ = request;
+                let plan = json!({
+                    "title": format!("Auto page {}", page + 1),
+                    "commands": [
+                        {"command": "frame.create", "params": {"spread": page, "rect": [48, 56, 200, 160], "content": "unassigned"}},
+                        {"command": "object.label", "params": {"ids": ["$0.id"], "label": format!("auto-page-{}", page + 1)}}
+                    ],
+                    "images": []
+                });
+                let reply = json!({
+                    "done": true,
+                    "message": {"content": plan.to_string()},
+                    "prompt_eval_count": 40,
+                    "eval_count": 20
+                })
+                .to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+
+        // 1. ExecutionPacing::AutoContinue completes all 3 batches without manual ApproveBatch,
+        //    saving rolling latest-checkpoint.designcraft on batches 1 & 2 and full PDF+native proofs on batch 3.
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(dir.path()).unwrap();
+        let mut session = Session::new();
+        let mut auto_req = task(endpoint.clone(), 6);
+        auto_req.target = TaskTarget::NewA4 { pages: 3 };
+        auto_req.settings.execution_pacing = designcraft_ai_types::ExecutionPacing::AutoContinue;
+        let started = runner.handle(&mut session, AiRequest::Start(auto_req));
+        assert!(started.busy, "{}", started.message);
+        let completed = wait(&mut runner, &mut session);
+        assert_eq!(completed.stage, "completed", "{}", completed.message);
+        let batch = completed.batch.as_ref().unwrap();
+        assert_eq!(batch.status, "completed");
+        assert_eq!(batch.completed_pages, 3);
+        assert_eq!(batch.batches.len(), 3);
+        assert!(dir.path().join("runs").join(&batch.job_id).join("latest-checkpoint.designcraft").is_file());
+        assert_eq!(batch.batches[0].proof_paths.len(), 1);
+        assert!(!batch.batches[0].proof_paths.iter().any(|p| p.ends_with("proof.pdf")));
+        assert!(batch.batches[2].proof_paths.iter().any(|p| p.ends_with("proof.pdf")));
+        assert!(batch.batches[2].proof_paths.iter().any(|p| p.ends_with("document.designcraft")));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // 2. PauseBatch stops cleanly after the in-flight batch, and ResumeBatch finishes the remaining batches.
+        calls.store(0, Ordering::Relaxed);
+        slow_first.store(true, Ordering::Relaxed);
+        let mut pause_req = task(endpoint.clone(), 6);
+        pause_req.prompt = "Make one distinct native rectangle per page for pause-resume test, with exact 15 mm margins.".into();
+        pause_req.target = TaskTarget::NewA4 { pages: 3 };
+        pause_req.settings.execution_pacing = designcraft_ai_types::ExecutionPacing::AutoContinue;
+        let started_pause = runner.handle(&mut session, AiRequest::Start(pause_req));
+        assert!(started_pause.busy, "{}", started_pause.message);
+        let job_id = started_pause.batch.as_ref().unwrap().job_id.clone();
+        let paused_snap = runner.handle(&mut session, AiRequest::PauseBatch { job_id: job_id.clone() });
+        assert!(paused_snap.batch.as_ref().unwrap().paused);
+        let stopped_after_one = wait(&mut runner, &mut session);
+        assert_eq!(stopped_after_one.stage, "awaiting_human_proof", "{}", stopped_after_one.message);
+        assert_eq!(stopped_after_one.batch.as_ref().unwrap().completed_pages, 1);
+        assert!(stopped_after_one.batch.as_ref().unwrap().paused);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let resumed = runner.handle(&mut session, AiRequest::ResumeBatch { job_id });
+        assert!(resumed.busy, "{}", resumed.message);
+        let finished_after_resume = wait(&mut runner, &mut session);
+        assert_eq!(finished_after_resume.stage, "completed", "{}", finished_after_resume.message);
+        assert_eq!(finished_after_resume.batch.as_ref().unwrap().completed_pages, 3);
+        assert!(!finished_after_resume.batch.as_ref().unwrap().paused);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // 3. ContinueBook on a 1-page blank A4 open document ("بلانر") auto-expands to 4 pages and A5 trim.
+        calls.store(0, Ordering::Relaxed);
+        session.execute("file.new", &new_a4(1)).unwrap();
+        assert_eq!(session.doc().unwrap().doc.page_count(), 1);
+        let mut cont_req = task(endpoint, 6);
+        cont_req.target = TaskTarget::ContinueBook;
+        cont_req.prompt = "انشاء بلانر متكامل وشامل من 4 صفحات\nTrim Size: 148 x 210 mm".into();
+        cont_req.settings.execution_pacing = designcraft_ai_types::ExecutionPacing::AutoContinue;
+        let started_cont = runner.handle(&mut session, AiRequest::Start(cont_req));
+        assert!(started_cont.busy, "{}", started_cont.message);
+        let finished_cont = wait(&mut runner, &mut session);
+        assert_eq!(finished_cont.stage, "completed", "{}", finished_cont.message);
+        let final_doc = &session.doc().unwrap().doc;
+        assert_eq!(final_doc.page_count(), 4);
+        assert!((final_doc.settings.page_width - 148.0 * 72.0 / 25.4).abs() < 1.0, "width={}", final_doc.settings.page_width);
+        assert!((final_doc.settings.page_height - 210.0 * 72.0 / 25.4).abs() < 1.0, "height={}", final_doc.settings.page_height);
+        assert!(final_doc.spreads.iter().all(|s| !s.items.is_empty()));
+
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
     }
 }

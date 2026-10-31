@@ -44,8 +44,20 @@ const ALLOWED: &[(&str, &str)] = &[
         "The host's fixed print-proofs directory and bounded hash-token filenames are checked against pinned private profile authority before creation and engine writes. Proof reads use capped engine I/O under that same authority and verify the frozen PDF hash before review or submission. Requested external saves retain caller automation roots and use the engine's checked frozen-PDF save command; durable attempt records precede submission of the existing immutable engine artifact.",
     ),
     (
-        "ai-runtime/src/runtime.rs",
-        "The desktop host chooses the private profile root; direct profile I/O uses only fixed or validated descendants. Every command-named import/export/output path is checked against the effective automation roots before probing or creating it, and asynchronous publication retains the originating roots.",
+        "ai-runtime/src/runtime/state.rs",
+        "The desktop host chooses the private profile root; direct profile initialization, mtime checks, and portable skills catalog/member link validation read only fixed or validated descendants.",
+    ),
+    (
+        "ai-runtime/src/runtime/dispatch.rs",
+        "Every command-named skill import/export or run output path is checked against the effective automation roots before probing or creating it, and asynchronous publication retains the originating roots.",
+    ),
+    (
+        "ai-runtime/src/runtime/proofs.rs",
+        "Batch proof refresh directories live under the pinned private profile root and are checked against profile authority before creation.",
+    ),
+    (
+        "ai-runtime/src/runtime/persistence.rs",
+        "Settings, ledger, and draft persistence write atomically only to fixed descendants inside the host's pinned private profile root.",
     ),
     (
         "ai-runtime/src/references.rs",
