@@ -478,9 +478,12 @@ pub(crate) fn skill_tool_mastermind_brief(
             })
         })
         .collect();
+    let is_planner =
+        super::planner_blueprint::is_stationery_or_planner_prompt(prompt) || skills.iter().any(|s| s.skill_id == "planner-journal-studio-style");
+    let inferred_domain = if is_planner { "StationeryPlannerAndJournalStudio".to_owned() } else { format!("{subject:?}") };
     json!({
         "engine_role": "Universal Skill & Native Tool Mastermind",
-        "inferred_subject": format!("{subject:?}"),
+        "inferred_subject": inferred_domain,
         "prompt_topic_focus": topic_focus,
         "inferred_learner_stage": stage,
         "inferred_direction": if rtl_primary { "Right-to-Left (RTL) primary with bidirectional support" } else { "Left-to-Right (LTR) primary" },
@@ -564,6 +567,9 @@ pub(crate) fn curriculum_blueprint(prompt: &str, skill: &SkillSnapshot, scope: B
     }
     if let Some(contract) = crate::script_contract::parse(prompt)? {
         return contract.context(scope, total_pages);
+    }
+    if super::planner_blueprint::is_planner_blueprint_target(prompt, skill) {
+        return super::planner_blueprint::planner_blueprint(prompt, skill, scope, total_pages);
     }
 
     let norm = normalize_curriculum_query(prompt);

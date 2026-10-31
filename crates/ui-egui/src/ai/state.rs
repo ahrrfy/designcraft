@@ -99,6 +99,82 @@ impl OpenDocument {
         }
     }
 
+    pub(super) fn has_interior_gaps(&self) -> bool {
+        let filled = self.effective_filled_ranges();
+        let blank = self.effective_blank_ranges();
+        if filled.is_empty() || blank.is_empty() {
+            return false;
+        }
+        if filled.len() != 1 || blank.len() != 1 {
+            return true;
+        }
+        let [f_start, f_end] = filled[0];
+        let [b_start, b_end] = blank[0];
+        f_start != 1 || b_start != f_end.saturating_add(1) || b_end != self.pages
+    }
+
+    pub(super) fn can_continue_with_target(&self, requested_pages: Option<u32>, has_prompt: bool) -> bool {
+        if self.continuable {
+            return true;
+        }
+        if self.has_interior_gaps() || !has_prompt {
+            return false;
+        }
+        let filled = self.effective_filled_ranges();
+        let blank = self.effective_blank_ranges();
+        if filled.is_empty() {
+            return true;
+        }
+        if blank.is_empty() {
+            return requested_pages.is_some_and(|req| u32::try_from(self.pages).ok().is_some_and(|cur| req > cur));
+        }
+        false
+    }
+
+    pub(super) fn effective_remaining_pages(&self, requested_pages: Option<u32>) -> Option<u32> {
+        let cur_pages = u32::try_from(self.pages).ok()?;
+        let completed = self.pages.saturating_sub(self.remaining_pages);
+        let completed_u32 = u32::try_from(completed).ok()?;
+        let total = match requested_pages {
+            Some(req) if req < cur_pages => return None,
+            Some(req) => req.max(cur_pages),
+            None => cur_pages,
+        };
+        let rem = total.saturating_sub(completed_u32);
+        (rem > 0).then_some(rem)
+    }
+
+    pub(super) fn continuation_guidance(&self, arabic: bool, requested_pages: Option<u32>, has_prompt: bool) -> Option<String> {
+        if self.can_continue_with_target(requested_pages, has_prompt) {
+            let cur_pages = u32::try_from(self.pages).ok()?;
+            let filled = self.effective_filled_ranges();
+            if filled.is_empty() {
+                let target = requested_pages.unwrap_or(cur_pages).max(cur_pages);
+                if target > cur_pages {
+                    return Some(if arabic {
+                        format!("سيُوسَّع المستند الفارغ تلقائياً من {} إلى {target} صفحة ويبدأ الإنتاج من الصفحة 1.", self.pages)
+                    } else {
+                        format!("Blank document will automatically expand from {} to {target} pages and start at page 1.", self.pages)
+                    });
+                }
+                return Some(
+                    text(arabic, "Blank document is ready; production will start at page 1.", "المستند الفارغ جاهز؛ سيبدأ الإنتاج من الصفحة 1.")
+                        .to_string(),
+                );
+            }
+            if let Some(target) = requested_pages.filter(|req| *req > cur_pages) {
+                let next_page = self.pages.saturating_sub(self.remaining_pages).saturating_add(1);
+                return Some(if arabic {
+                    format!("سيُوسَّع الكتاب تلقائياً من {} إلى {target} صفحة ويُستكمل من الصفحة {next_page}.", self.pages)
+                } else {
+                    format!("Book will automatically expand from {} to {target} pages and continue from page {next_page}.", self.pages)
+                });
+            }
+            return None;
+        }
+        self.non_continuable_reason(arabic)
+    }
+
     pub(super) fn non_continuable_reason(&self, arabic: bool) -> Option<String> {
         if self.continuable {
             return None;
@@ -109,8 +185,8 @@ impl OpenDocument {
             Some(
                 text(
                     arabic,
-                    "All pages are blank; use New document or Edit current document to start from page 1.",
-                    "جميع الصفحات فارغة؛ اختر مستنداً جديداً أو تحرير المستند الحالي للبدء من الصفحة 1.",
+                    "All pages are blank; enter instructions above to expand and produce from page 1, or choose New document.",
+                    "جميع الصفحات فارغة؛ أدخل تعليمات الإنتاج أعلاه لتوسيع الصفحات والبدء من الصفحة 1، أو اختر مستنداً جديداً.",
                 )
                 .to_string(),
             )
@@ -118,8 +194,8 @@ impl OpenDocument {
             Some(
                 text(
                     arabic,
-                    "All pages already contain items; there are no trailing blank pages to continue.",
-                    "جميع الصفحات تحتوي على عناصر؛ لا توجد صفحات فارغة متبقية للاستكمال.",
+                    "All pages already contain items; specify a larger total page count in the prompt to append and continue.",
+                    "جميع الصفحات تحتوي على عناصر؛ حدد إجمالي صفحات أكبر في الوصف لإضافة صفحات جديدة واستكمالها.",
                 )
                 .to_string(),
             )
@@ -236,6 +312,113 @@ impl RequestEstimate {
     }
 }
 
+fn script_digit_ui(ch: char) -> Option<u32> {
+    match ch {
+        '0'..='9' => Some(u32::from(ch) - u32::from('0')),
+        '\u{0660}'..='\u{0669}' => Some(u32::from(ch) - 0x0660),
+        '\u{06F0}'..='\u{06F9}' => Some(u32::from(ch) - 0x06F0),
+        _ => None,
+    }
+}
+
+fn parse_script_number_ui(digits: &str) -> Option<u32> {
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
+    let mut value = 0u32;
+    for ch in digits.chars() {
+        value = value.checked_mul(10)?.checked_add(script_digit_ui(ch)?)?;
+    }
+    (1..=1000).contains(&value).then_some(value)
+}
+
+fn strip_title_sep_ui(s: &str) -> Option<&str> {
+    s.strip_prefix('—').or_else(|| s.strip_prefix('–')).or_else(|| s.strip_prefix('-')).or_else(|| s.strip_prefix(':'))
+}
+
+fn parse_script_heading_ui(line: &str) -> Result<Option<(u32, u32)>, ()> {
+    let line = line.trim();
+    let (heading, is_markdown) = if line.starts_with('#') { (line.trim_start_matches('#').trim_start(), true) } else { (line, false) };
+    let (rest, is_arabic_kw) = if is_markdown && heading.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("pages")) {
+        let tail = heading.get(5..).ok_or(())?;
+        if tail.is_empty() {
+            return Err(());
+        }
+        if !tail.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        (tail, false)
+    } else if is_markdown && heading.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("page")) {
+        let tail = heading.get(4..).ok_or(())?;
+        if tail.is_empty() {
+            return Err(());
+        }
+        if !tail.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        (tail, false)
+    } else if let Some(rest) = heading
+        .strip_prefix("الصفحات")
+        .or_else(|| heading.strip_prefix("صفحات"))
+        .or_else(|| heading.strip_prefix("الصفحة"))
+        .or_else(|| heading.strip_prefix("صفحة"))
+    {
+        if !rest.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        (rest, true)
+    } else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    let boundary = rest.find(|c: char| script_digit_ui(c).is_none()).unwrap_or(rest.len());
+    let digits_str = rest.get(..boundary).ok_or(())?;
+    if digits_str.is_empty() {
+        return if is_markdown { Err(()) } else { Ok(None) };
+    }
+    let start_number = parse_script_number_ui(digits_str).ok_or(())?;
+    let after_first = rest.get(boundary..).ok_or(())?;
+    let mut end_number = start_number;
+    let mut suffix = after_first.trim_start();
+
+    let attached_range = after_first.starts_with('-') || after_first.starts_with('–');
+    if let Some(after_dash) = suffix.strip_prefix('-').or_else(|| suffix.strip_prefix('–')) {
+        let trimmed_dash = after_dash.trim_start();
+        let end_boundary = trimmed_dash.find(|c: char| script_digit_ui(c).is_none()).unwrap_or(trimmed_dash.len());
+        if let Some(end_digits) = trimmed_dash.get(..end_boundary).filter(|s| !s.is_empty()) {
+            let trailing = trimmed_dash.get(end_boundary..).unwrap_or("").trim_start();
+            let has_trailing_sep = strip_title_sep_ui(trailing).is_some() || (is_arabic_kw && is_markdown && trailing.is_empty());
+            if attached_range && after_dash.starts_with(|c| script_digit_ui(c).is_some()) {
+                let parsed_end = parse_script_number_ui(end_digits).ok_or(())?;
+                if parsed_end < start_number || parsed_end.saturating_sub(start_number) > 31 {
+                    return Err(());
+                }
+                end_number = parsed_end;
+                suffix = trailing;
+            } else if has_trailing_sep
+                && let Some(parsed_end) = parse_script_number_ui(end_digits)
+                && parsed_end >= start_number
+                && parsed_end.saturating_sub(start_number) <= 31
+            {
+                end_number = parsed_end;
+                suffix = trailing;
+            }
+        }
+    }
+
+    if is_arabic_kw && is_markdown && suffix.is_empty() {
+        return Ok(Some((start_number, end_number)));
+    }
+    let Some(raw_title) = strip_title_sep_ui(suffix) else {
+        return if is_markdown { Err(()) } else { Ok(None) };
+    };
+    let title = raw_title.trim();
+    if title.is_empty() || title.chars().count() > 1536 {
+        return Err(());
+    }
+    Ok(Some((start_number, end_number)))
+}
+
 /// A display estimate only: runtime still validates all authored PAGE blocks and fields.
 pub(super) fn explicit_script_pages(brief: &str) -> Option<u32> {
     if brief.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES || brief.contains('\0') {
@@ -244,45 +427,124 @@ pub(super) fn explicit_script_pages(brief: &str) -> Option<u32> {
     let mut pages = 0u32;
     let mut fenced = false;
     for line in brief.lines() {
-        let line = line.trim();
-        if line.starts_with("```") {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
             fenced = !fenced;
             continue;
         }
-        if fenced || !line.starts_with('#') {
+        if fenced {
             continue;
         }
-        let heading = line.trim_start_matches('#').trim_start();
-        if heading.get(..4).is_none_or(|prefix| !prefix.eq_ignore_ascii_case("page")) {
-            continue;
+        match parse_script_heading_ui(trimmed) {
+            Ok(Some((start_number, end_number))) => {
+                if start_number != pages.checked_add(1)? || end_number > 1000 {
+                    return None;
+                }
+                pages = end_number;
+            }
+            Ok(None) => {}
+            Err(()) => return None,
         }
-        let rest = heading.get(4..)?;
-        if !rest.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let rest = rest.trim_start();
-        let boundary = rest.find(|character: char| !character.is_ascii_digit()).unwrap_or(rest.len());
-        let number = rest.get(..boundary)?.parse::<u32>().ok()?;
-        if number != pages.checked_add(1)? || number > 1000 {
-            return None;
-        }
-        let suffix = rest.get(boundary..)?.trim_start();
-        let title = suffix
-            .strip_prefix('—')
-            .or_else(|| suffix.strip_prefix('–'))
-            .or_else(|| suffix.strip_prefix('-'))
-            .or_else(|| suffix.strip_prefix(':'))?
-            .trim();
-        if title.is_empty() || title.chars().count() > 512 {
-            return None;
-        }
-        pages = number;
     }
     (pages > 0).then_some(pages)
 }
 
 pub(crate) fn is_retired_gemini_text_model(provider: ProviderKind, model: &str) -> bool {
     designcraft_ai_types::is_retired_gemini_model(provider, model)
+}
+
+pub(super) fn is_planner_prompt_ui(lower: &str) -> bool {
+    [
+        "planner",
+        "journal",
+        "notebook",
+        "diary",
+        "agenda",
+        "habit tracker",
+        "gratitude",
+        "cornell",
+        "daily productivity",
+        "bullet journal",
+        "بلانر",
+        "مفكرة",
+        "مفكره",
+        "أجندة",
+        "اجندة",
+        "دفتر يوميات",
+        "دفتر تخطيط",
+        "منظم يومي",
+        "منظم سنوي",
+        "تتبع العادات",
+    ]
+    .iter()
+    .any(|kw| lower.contains(kw))
+}
+
+#[derive(Clone)]
+pub(super) struct PromptAnalysisCache {
+    pub(super) len: usize,
+    pub(super) hash: u64,
+    pub(super) explicit_pages: Option<u32>,
+    pub(super) natural_pages: Option<u32>,
+    pub(super) has_rtl: bool,
+    pub(super) auto_binding_false: bool,
+    pub(super) normalized_search: String,
+    pub(super) is_planner: bool,
+    pub(super) preview_head: String,
+}
+
+pub(super) static EMPTY_PROMPT_CACHE: PromptAnalysisCache = PromptAnalysisCache {
+    len: 0,
+    hash: 0,
+    explicit_pages: None,
+    natural_pages: None,
+    has_rtl: false,
+    auto_binding_false: false,
+    normalized_search: String::new(),
+    is_planner: false,
+    preview_head: String::new(),
+};
+
+impl PromptAnalysisCache {
+    pub(super) fn fingerprint(prompt: &str) -> (usize, u64) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        prompt.hash(&mut hasher);
+        (prompt.len(), hasher.finish())
+    }
+
+    pub(super) fn build(prompt: &str, len: usize, hash: u64) -> Self {
+        let explicit_pages = explicit_script_pages(prompt);
+        let natural_pages = if explicit_pages.is_none() { natural_prompt_pages(prompt) } else { None };
+        let sample = if prompt.len() > 8_192 {
+            let mut end = 8_192;
+            while end > 0 && !prompt.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.get(..end).unwrap_or(prompt)
+        } else {
+            prompt
+        };
+        let has_rtl = rtl::has_rtl(sample);
+        let auto_binding_false = automatic_proof_binding(sample, false);
+        let normalized_search = normalize_skill_search_ui(sample);
+        let is_planner = is_planner_prompt_ui(&normalized_search);
+        let preview_head = prompt
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(3)
+            .map(|line| {
+                let mut out: String = line.chars().take(120).collect();
+                if line.chars().count() > 120 {
+                    out.push('…');
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self { len, hash, explicit_pages, natural_pages, has_rtl, auto_binding_false, normalized_search, is_planner, preview_head }
+    }
 }
 
 /// Search-only normalization matching runtime style keyword matching; prompt text stays exact.
@@ -428,6 +690,13 @@ pub(super) fn natural_prompt_pages(prompt: &str) -> Option<u32> {
             if inline_candidate.is_some() {
                 break;
             }
+        }
+    }
+    if inline_candidate.is_none() {
+        let lower_all = normalized.to_lowercase();
+        if is_planner_prompt_ui(&lower_all) && ["365", "سنوي", "سنوية", "annual", "yearly", "year-round"].iter().any(|kw| lower_all.contains(kw))
+        {
+            return Some(365);
         }
     }
     inline_candidate
@@ -603,6 +872,9 @@ pub struct AiUiState {
     pub(super) open_document_path: String,
     pub(super) pick_target_document: bool,
     pub(super) open_target_document_requested: bool,
+    pub(super) pick_script_file: bool,
+    pub(super) edit_large_script_inline: bool,
+    pub(super) prompt_cache: std::cell::RefCell<Option<PromptAnalysisCache>>,
     pub(super) expand_advanced_settings: Option<bool>,
 }
 impl std::fmt::Debug for AiUiState {
@@ -630,7 +902,7 @@ impl Default for AiUiState {
             preview_update: crate::preview_update::PreviewUpdate::default(),
             tab: 0,
             snapshot: AiSnapshot::default(),
-            settings: AiSettings::default(),
+            settings: AiSettings { execution_pacing: ExecutionPacing::AutoContinue, ..Default::default() },
             initialized: false,
             last_poll: None,
             api_key: Secret::default(),
@@ -697,6 +969,9 @@ impl Default for AiUiState {
             open_document_path: String::new(),
             pick_target_document: false,
             open_target_document_requested: false,
+            pick_script_file: false,
+            edit_large_script_inline: false,
+            prompt_cache: std::cell::RefCell::new(None),
             expand_advanced_settings: None,
         }
     }
@@ -711,7 +986,7 @@ pub(super) fn rate_table_configured(rates: &TokenRates) -> bool {
 
 pub(super) fn has_configured_rates(settings: &AiSettings) -> bool {
     let text_ok = settings.budget.rates.as_ref().is_some_and(|rates| rates.input_per_million > 0.0 || rates.output_per_million > 0.0);
-    if settings.output_mode == OutputMode::NativeWithImages {
+    if settings.output_mode == OutputMode::NativeWithImages && settings.visual_density != VisualDensityMode::PureNativeVector {
         let image_rates = settings.image_rates.as_ref().or(settings.budget.rates.as_ref());
         text_ok && image_rates.is_some_and(rate_table_configured)
     } else {
@@ -719,9 +994,38 @@ pub(super) fn has_configured_rates(settings: &AiSettings) -> bool {
     }
 }
 
+pub(super) fn is_skill_scoped_error(msg: &str) -> bool {
+    let trimmed = msg.trim();
+    trimmed.starts_with("skill ")
+        || trimmed.starts_with("Skill ")
+        || trimmed.starts_with("Unsupported skill")
+        || trimmed.starts_with("Run and visually review")
+}
+
 impl AiUiState {
+    pub(super) fn analyzed_prompt(&self) -> std::cell::Ref<'_, PromptAnalysisCache> {
+        let (len, hash) = PromptAnalysisCache::fingerprint(&self.prompt);
+        let needs_rebuild = self.prompt_cache.borrow().as_ref().is_none_or(|cached| cached.len != len || cached.hash != hash);
+        if needs_rebuild {
+            let built = PromptAnalysisCache::build(&self.prompt, len, hash);
+            *self.prompt_cache.borrow_mut() = Some(built);
+        }
+        std::cell::Ref::map(self.prompt_cache.borrow(), |opt| match opt {
+            Some(cached) => cached,
+            None => &EMPTY_PROMPT_CACHE,
+        })
+    }
+
+    pub(super) fn requested_target_pages(&self) -> Option<u32> {
+        let analysis = self.analyzed_prompt();
+        analysis.explicit_pages.or(analysis.natural_pages).or_else(|| {
+            self.snapshot.production_draft.as_ref().and_then(|draft| draft.progress.target_total_pages).filter(|pages| (1..=1000).contains(pages))
+        })
+    }
+
     pub(super) fn load_production_request(&mut self, request: &TaskRequest) {
         self.prompt = request.prompt.clone();
+        self.edit_large_script_inline = false;
         self.settings = request.settings.clone();
         self.automatic_skills = request.auto_select_skills;
         self.selected_skills = request.skill_ids.iter().cloned().collect();
@@ -767,6 +1071,8 @@ impl AiUiState {
                     merged.image_rates = snapshot.settings.image_rates.clone();
                     merged.resources = snapshot.settings.resources.clone();
                     merged.comfy_workflow = snapshot.settings.comfy_workflow.clone();
+                    merged.execution_pacing = snapshot.settings.execution_pacing;
+                    merged.visual_density = snapshot.settings.visual_density;
                     if snapshot.settings.arabic_tashkeel != ArabicTashkeelMode::Auto {
                         merged.arabic_tashkeel = snapshot.settings.arabic_tashkeel;
                     }
@@ -898,7 +1204,7 @@ impl AiUiState {
         let key = self.proof_display.as_ref()?;
         let selected = key.pages().position(|(path, _)| self.proof_path.as_deref() == Some(path.as_str()))?;
         let page = key.page_range.0.checked_add(u32::try_from(selected).ok()?)?;
-        let rtl = self.proof_binding.or(self.settings.right_to_left_binding).unwrap_or_else(|| automatic_proof_binding(&self.prompt, false));
+        let rtl = self.proof_binding.or(self.settings.right_to_left_binding).unwrap_or_else(|| self.analyzed_prompt().auto_binding_false);
         let pair = facing_proof_pair(page, rtl)?;
         let companion = pair.into_iter().find(|candidate| *candidate != page)?;
         let index = companion.checked_sub(key.page_range.0)?;
@@ -1020,11 +1326,14 @@ impl AiUiState {
 
     pub(super) fn workflow_ready(&self) -> bool {
         self.settings.output_mode != OutputMode::NativeWithImages
+            || self.settings.visual_density == VisualDensityMode::PureNativeVector
             || self.settings.image_model.provider != ProviderKind::ComfyUi
             || (self.workflow_error.is_empty() && self.settings.comfy_workflow.is_some())
     }
 
     pub(super) fn production_issue(&self, available: bool, document: bool, arabic: bool) -> Option<&'static str> {
+        let uses_images =
+            self.settings.output_mode == OutputMode::NativeWithImages && self.settings.visual_density != VisualDensityMode::PureNativeVector;
         let (en, ar) = if !available {
             ("Native AI host is unavailable. Open the desktop application.", "خدمة الذكاء غير متاحة. افتح تطبيق سطح المكتب.")
         } else if self.snapshot.busy {
@@ -1055,17 +1364,14 @@ impl AiUiState {
                 "Choose the target book or prepare its remaining pages before producing the saved request.",
                 "اختر الكتاب المستهدف أو جهّز صفحاته المتبقية قبل إنتاج التعليمات المحفوظة.",
             )
-        } else if self.settings.output_mode == OutputMode::NativeWithImages && self.settings.image_model.provider == ProviderKind::Ollama {
+        } else if uses_images && self.settings.image_model.provider == ProviderKind::Ollama {
             (
                 "Ollama does not generate raster images here. Choose Gemini, OpenAI, or ComfyUI for the image model, or switch to Editable elements.",
                 "مزود Ollama لا يولّد صوراً نقطية هنا. اختر Gemini أو OpenAI أو ComfyUI لنموذج الصور، أو حوّل الوضع إلى عناصر قابلة للتحرير.",
             )
-        } else if self.settings.output_mode == OutputMode::NativeWithImages
-            && self.settings.image_model.provider != ProviderKind::ComfyUi
-            && self.settings.image_model.model.trim().is_empty()
-        {
+        } else if uses_images && self.settings.image_model.provider != ProviderKind::ComfyUi && self.settings.image_model.model.trim().is_empty() {
             ("Choose an image model in Providers and keys.", "اختر نموذج الصور من تبويب المزودين والمفاتيح.")
-        } else if self.settings.output_mode == OutputMode::NativeWithImages
+        } else if uses_images
             && !self.settings.image_model.model.trim().is_empty()
             && is_non_image_model(self.settings.image_model.provider, &self.settings.image_model.model)
         {
@@ -1073,7 +1379,7 @@ impl AiUiState {
                 "The selected image model is a text/non-image or unsupported endpoint model. Choose a supported image generation model (such as gemini-3.1-flash-image or gpt-image-1) or switch to Editable elements.",
                 "نموذج الصور المختار مخصص للنصوص أو غير مدعوم على مسار التوليد الحالي. اختر نموذج توليد صور مدعوماً (مثل gemini-3.1-flash-image أو gpt-image-1) أو حوّل الوضع إلى عناصر قابلة للتحرير.",
             )
-        } else if self.settings.output_mode == OutputMode::NativeWithImages
+        } else if uses_images
             && self.settings.verify_generated_images
             && !supports_gemini_image_review(self.settings.text_model.provider, &self.settings.text_model.model)
         {
@@ -1092,6 +1398,10 @@ impl AiUiState {
     }
 
     pub(super) fn effective_design_profile(&self) -> Option<&designcraft_ai_types::DesignProfile> {
+        self.effective_design_profile_with_id().map(|(_, profile)| profile)
+    }
+
+    pub(super) fn effective_design_profile_with_id(&self) -> Option<(&str, &designcraft_ai_types::DesignProfile)> {
         if let Some(id) = &self.settings.design_style {
             return self
                 .snapshot
@@ -1100,7 +1410,7 @@ impl AiUiState {
                 .rev()
                 .filter(|card| &card.id == id && card.design_profile.is_some())
                 .max_by_key(|card| u8::from(card.enabled && card.compatible) * 2 + u8::from(card.active))
-                .and_then(|card| card.design_profile.as_ref());
+                .and_then(|card| Some((card.id.as_str(), card.design_profile.as_ref()?)));
         }
         if !self.automatic_skills {
             return self
@@ -1114,9 +1424,9 @@ impl AiUiState {
                         .filter(|card| &card.id == id && card.enabled && card.compatible && card.design_profile.is_some())
                         .max_by_key(|card| u8::from(card.active))
                 })
-                .find_map(|card| card.design_profile.as_ref());
+                .find_map(|card| Some((card.id.as_str(), card.design_profile.as_ref()?)));
         }
-        if let Some(profile) = self
+        if let Some(entry) = self
             .selected_skills
             .iter()
             .filter_map(|id| {
@@ -1126,14 +1436,16 @@ impl AiUiState {
                     .rev()
                     .find(|card| &card.id == id && card.enabled && card.compatible && card.active && card.design_profile.is_some())
             })
-            .find_map(|card| card.design_profile.as_ref())
+            .find_map(|card| Some((card.id.as_str(), card.design_profile.as_ref()?)))
         {
-            return Some(profile);
+            return Some(entry);
         }
-        let lower = normalize_skill_search_ui(&self.prompt);
+        let analysis = self.analyzed_prompt();
+        let lower = analysis.normalized_search.as_str();
         if lower.trim().is_empty() {
             return None;
         }
+        let planner_domain = analysis.is_planner;
         selectable_skill_cards(&self.snapshot.skills, true, false)
             .into_iter()
             .filter_map(|card| {
@@ -1144,18 +1456,24 @@ impl AiUiState {
                     .map(|word| normalize_skill_search_ui(word))
                     .filter(|word| !word.is_empty() && lower.contains(word.as_str()))
                     .count();
-                let bonus = usize::from(hits > 0 && card.id == "kg-oxford-cambridge-style") * 16;
-                (hits > 0).then_some((hits.saturating_add(bonus), card.id.as_str(), profile))
+                let kg_bonus = usize::from(hits > 0 && !planner_domain && card.id == "kg-oxford-cambridge-style") * 16;
+                let planner_bonus = usize::from(planner_domain && card.id == "planner-journal-studio-style") * 24;
+                let score = hits.saturating_add(kg_bonus).saturating_add(planner_bonus);
+                (score > 0).then_some((score, card.id.as_str(), profile))
             })
             .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
-            .map(|(_, _, profile)| profile)
+            .map(|(_, id, profile)| (id, profile))
     }
 
     pub(super) fn request_estimate(&self, documents: &[OpenDocument], active: Option<usize>) -> Option<RequestEstimate> {
         if (!self.new_document && !self.continue_book) || self.settings.pages_per_batch == 0 || self.prompt.trim().is_empty() {
             return None;
         }
-        let scripted_pages = explicit_script_pages(&self.prompt);
+        let (scripted_pages, is_planner) = {
+            let analysis = self.analyzed_prompt();
+            (analysis.explicit_pages, analysis.is_planner)
+        };
+        let requested_pages = self.requested_target_pages();
         let remaining = if self.new_document {
             if scripted_pages.is_some_and(|pages| pages != self.pages) {
                 return None;
@@ -1163,24 +1481,40 @@ impl AiUiState {
             self.pages
         } else {
             let document = documents.iter().find(|document| Some(document.index) == active)?;
-            if scripted_pages.is_some_and(|pages| u32::try_from(document.pages).ok() != Some(pages)) || (self.continue_book && !document.continuable)
-            {
+            if !document.can_continue_with_target(requested_pages, !self.prompt.trim().is_empty()) {
                 return None;
             }
-            u32::try_from(if self.continue_book { document.remaining_pages } else { document.pages }).ok()?
+            if scripted_pages.is_some_and(|pages| {
+                u32::try_from(document.pages).ok().is_none_or(|cur| cur > pages || (cur < pages && document.has_interior_gaps()))
+            }) {
+                return None;
+            }
+            document.effective_remaining_pages(requested_pages)?
         };
         let spread_aligned_new = self.new_document && self.settings.facing_pages && self.settings.pages_per_batch == 2 && remaining > 1;
         let review_pages = if spread_aligned_new { 1 } else { remaining.min(self.settings.pages_per_batch) };
-        let sources_per_page = if self.settings.output_mode == OutputMode::NativeOnly {
-            0
+        let profile_entry = self.effective_design_profile_with_id();
+        let profile = profile_entry.map(|(_, p)| p);
+        let effective_no_images =
+            self.settings.output_mode == OutputMode::NativeOnly || self.settings.visual_density == VisualDensityMode::PureNativeVector;
+        let is_planner_hybrid = !effective_no_images
+            && self.settings.visual_density == VisualDensityMode::SmartHybrid
+            && (profile_entry.is_some_and(|(id, _)| id == "planner-journal-studio-style") || (profile.is_none() && is_planner));
+        let (image_allowance, book_images) = if effective_no_images {
+            (0, 0)
+        } else if is_planner_hybrid {
+            let rev_imgs = review_pages.div_ceil(6).max(1);
+            let bk_imgs = remaining.div_ceil(24).max(rev_imgs);
+            (rev_imgs, bk_imgs)
         } else {
-            self.effective_design_profile()
-                .map(|profile| profile.page_families.iter().map(|family| family.image_slots.len()).max().unwrap_or(0))
-                .map_or(1, |sources| u32::try_from(sources.clamp(1, 8)).unwrap_or(8))
+            let sources_per_page = profile
+                .map(|p| p.page_families.iter().map(|family| family.image_slots.len()).max().unwrap_or(0))
+                .map_or(1, |sources| u32::try_from(sources.clamp(1, 8)).unwrap_or(8));
+            (review_pages.saturating_mul(sources_per_page), remaining.saturating_mul(sources_per_page))
         };
-        let image_allowance = review_pages.saturating_mul(sources_per_page);
-        let vision_allowance = if self.settings.verify_generated_images { image_allowance } else { 0 };
-        let per_page = 1u32.saturating_add(sources_per_page).saturating_add(if self.settings.verify_generated_images { sources_per_page } else { 0 });
+        let vision_allowance = if !effective_no_images && self.settings.verify_generated_images { image_allowance } else { 0 };
+        let book_vision = if !effective_no_images && self.settings.verify_generated_images { book_images } else { 0 };
+        let book_allowance = remaining.saturating_add(book_images).saturating_add(book_vision);
         (review_pages > 0).then_some(RequestEstimate {
             review_pages,
             remaining_pages: remaining,
@@ -1189,7 +1523,7 @@ impl AiUiState {
             } else {
                 remaining.div_ceil(self.settings.pages_per_batch)
             },
-            book_allowance: remaining.saturating_mul(per_page),
+            book_allowance,
             scripted: scripted_pages.is_some(),
             image_allowance,
             vision_allowance,
@@ -1199,21 +1533,31 @@ impl AiUiState {
     pub(super) fn token_estimate(&self, documents: &[OpenDocument], active: Option<usize>) -> Option<TokenEstimate> {
         let estimate = self.request_estimate(documents, active)?;
         let profile = self.effective_design_profile();
-        let overhead_bytes: u64 = if profile.is_some() {
+        let overhead_bytes: u64 = if estimate.scripted {
+            let batch_share = u64::from(estimate.review_pages.clamp(1, 6));
+            (if profile.is_some() { 48_000u64 } else { 56 * 1024 }) / batch_share
+        } else if profile.is_some() {
             96_000
         } else if self.automatic_skills || !self.selected_skills.is_empty() {
             176 * 1024
         } else {
             48_000
         };
-        let prompt_bytes = u64::try_from(self.prompt.len()).unwrap_or(u64::MAX);
+        let raw_prompt_bytes = u64::try_from(self.prompt.len()).unwrap_or(u64::MAX);
+        let prompt_bytes = if estimate.scripted {
+            (raw_prompt_bytes / u64::from(estimate.remaining_pages.max(1))).saturating_add(6_144).min(raw_prompt_bytes)
+        } else {
+            raw_prompt_bytes
+        };
         let text_per_page = prompt_bytes
             .saturating_add(overhead_bytes)
             .div_ceil(3)
             .saturating_add(1024)
             .saturating_add(u64::from(self.settings.budget.max_output_tokens));
-        let sources_per_page = estimate.image_allowance.checked_div(estimate.review_pages).map_or(0, u64::from);
-        let vision_per_page = if self.settings.output_mode == OutputMode::NativeWithImages {
+        let vision_per_page = if self.settings.output_mode == OutputMode::NativeWithImages
+            && self.settings.visual_density != VisualDensityMode::PureNativeVector
+            && estimate.image_allowance > 0
+        {
             let workflow_tokens = self.settings.comfy_workflow.as_ref().map_or(0, |v| u64::try_from(v.to_string().len()).unwrap_or(0).div_ceil(3));
             let image_call_tokens = 2_048u64.saturating_add(1_024).saturating_add(workflow_tokens);
             let review_call_tokens = if self.settings.verify_generated_images {
@@ -1221,7 +1565,8 @@ impl AiUiState {
             } else {
                 0
             };
-            sources_per_page.saturating_mul(image_call_tokens.saturating_add(review_call_tokens))
+            let per_image_tokens = image_call_tokens.saturating_add(review_call_tokens);
+            u64::from(estimate.image_allowance).saturating_mul(per_image_tokens).div_ceil(u64::from(estimate.review_pages.max(1)))
         } else {
             0
         };
@@ -1347,7 +1692,7 @@ impl AiUiState {
         } else {
             return None;
         };
-        if raw_error.is_empty() {
+        if raw_error.is_empty() || is_skill_scoped_error(raw_error) {
             return None;
         }
         Some(classify_diagnostic_alert(raw_error))

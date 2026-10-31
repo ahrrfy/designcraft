@@ -10,6 +10,7 @@
 mod builtin;
 mod educational_style;
 mod package;
+mod planner_studio;
 
 use designcraft_ai_types::EngineAction;
 use serde::{Deserialize, Serialize};
@@ -254,11 +255,11 @@ impl SkillRegistry {
     }
 
     pub fn import_folder(&mut self, path: impl AsRef<Path>, provenance: Provenance) -> Result<SkillRevision> {
-        self.import_files(package::read_folder(path.as_ref())?, provenance)
+        self.import_files(package::read_external_folder(path.as_ref())?, provenance)
     }
 
     pub fn import_zip(&mut self, path: impl AsRef<Path>, provenance: Provenance) -> Result<SkillRevision> {
-        self.import_files(package::read_zip(path.as_ref())?, provenance)
+        self.import_files(package::read_external_zip(path.as_ref())?, provenance)
     }
 
     /// Also the edit/generate API: provide a complete replacement package; it is
@@ -477,12 +478,14 @@ impl SkillRegistry {
 
     pub fn export_folder(&self, skill_id: &str, revision: &str, destination: impl AsRef<Path>) -> Result<()> {
         let files = self.verified_files(self.revision(skill_id, revision)?)?;
-        package::write_folder(destination.as_ref(), &files)
+        let clean = package::sanitize_fs_path(destination.as_ref());
+        package::write_folder(&clean, &files)
     }
 
     pub fn export_zip(&self, skill_id: &str, revision: &str, destination: impl AsRef<Path>) -> Result<()> {
         let files = self.verified_files(self.revision(skill_id, revision)?)?;
-        package::write_zip(destination.as_ref(), &files)
+        let clean = package::sanitize_fs_path(destination.as_ref());
+        package::write_zip(&clean, &files)
     }
 
     pub fn install_builtin_drafts(&mut self) -> Result<Vec<SkillRevision>> {

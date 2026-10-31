@@ -94,6 +94,9 @@ pub(crate) struct TemplateCompileContext<'a> {
     pub facing_pages: bool,
     pub total_pages: u32,
     pub subject: Option<CurriculumSubject>,
+    pub visual_density: designcraft_ai_types::VisualDensityMode,
+    pub soft_fit_slots: bool,
+    pub explicit_script: bool,
 }
 
 #[cfg(test)]
@@ -116,7 +119,7 @@ pub(crate) fn compile_for_brief(
         scope,
         mode,
         brief,
-        TemplateCompileContext { base: None, facing_pages: false, total_pages: 0, subject: Some(subject) },
+        TemplateCompileContext { base: None, facing_pages: false, total_pages: 0, subject: Some(subject), ..Default::default() },
     )
 }
 
@@ -130,7 +133,9 @@ pub(crate) fn compile_for_brief_with_context(
 ) -> Result<ProductionPlan, String> {
     let subject = ctx.subject.unwrap_or_else(|| detect_curriculum_subject(brief));
     ctx.subject = Some(subject);
-    let mut plan = compile_inner(text, skill, scope, mode, true, Some(ctx))?;
+    ctx.explicit_script = crate::script_contract::parse(brief)?.is_some();
+    let effective_mode = if ctx.visual_density == designcraft_ai_types::VisualDensityMode::PureNativeVector { OutputMode::NativeOnly } else { mode };
+    let mut plan = compile_inner(text, skill, scope, effective_mode, true, Some(ctx))?;
     if subject != CurriculumSubject::Mathematics
         && plan.commands.iter().any(|action| {
             action.command == "object.label" && action.params.get("label").and_then(Value::as_str) == Some("group.cpa.pictorial-tenframe.bound")
@@ -181,9 +186,36 @@ pub(super) fn compile_inner(
     let mut active_unit = ctx.and_then(|c| c.base).and_then(|base| seed_unit_from_preceding_pages(base, scope.start));
     let use_relational_master = ctx.and_then(|c| c.base).is_some_and(super::relational::has_relational_master_footer);
     let has_unit_heading_style = ctx.and_then(|c| c.base).is_some_and(super::relational::base_has_unit_heading_style);
+    let soft_fit = ctx.is_some_and(|c| c.soft_fit_slots && !c.explicit_script);
     for page_number in scope.start..end {
-        let page = pages.remove(&page_number).ok_or("Template content is missing a requested page")?;
+        let mut page = pages.remove(&page_number).ok_or("Template content is missing a requested page")?;
         let family = profile.page_families.iter().find(|family| family.id == page.family).ok_or("Unknown content page family")?;
+        let raw_template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
+        if soft_fit {
+            page.text.retain(|key, _| family.text_slots.iter().any(|slot| &slot.id == key));
+            let authored_non_empty =
+                family.text_slots.iter().filter(|slot| page.text.get(&slot.id).is_some_and(|val| !val.trim().is_empty())).count();
+            if authored_non_empty > 0 && family.text_slots.len() > 1 {
+                for slot in &family.text_slots {
+                    if !page.text.contains_key(&slot.id) {
+                        let fallback = raw_template
+                            .get(slot.command)
+                            .and_then(|act| act.params.get("text"))
+                            .and_then(Value::as_str)
+                            .map(|t| t.replace("{{page}}", &u64::from(page_number).saturating_add(1).to_string()))
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| "—".to_owned());
+                        page.text.insert(slot.id.clone(), fallback);
+                    }
+                }
+            }
+            if mode == OutputMode::NativeOnly {
+                page.illustrations.clear();
+            }
+        } else if ctx.is_some_and(|c| c.visual_density == designcraft_ai_types::VisualDensityMode::PureNativeVector) && mode == OutputMode::NativeOnly
+        {
+            page.illustrations.clear();
+        }
         for slot in &family.text_slots {
             let location = format!("Page {} ({}) / text slot {}", u64::from(page_number) + 1, family.id, slot.id);
             let value = page.text.get(&slot.id).ok_or_else(|| format!("{location} is missing"))?;
@@ -202,7 +234,7 @@ pub(super) fn compile_inner(
         if page.text.len() != family.text_slots.len() {
             return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
         }
-        let template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
+        let template = raw_template;
         let bindable = counting_family(family, template) && bindable_counting_family(family, template);
         let quantities = if bindable {
             Some(if verify_math {
@@ -453,7 +485,7 @@ pub(super) fn compile_inner(
                     .push(EngineAction { command: "style.paragraph.apply".into(), params: json!({"name": super::relational::UNIT_HEADING_STYLE}) });
             }
         }
-        append_images(&mut plan, &page, family, mode, quantities, &profile.illustration, mirror_rtl.then_some(page_w), ctx.and_then(|c| c.subject))?;
+        append_images(&mut plan, &skill.skill_id, &page, family, mode, quantities, &profile.illustration, mirror_rtl.then_some(page_w), ctx)?;
     }
     crate::worker::validate_batch_plan(&plan, scope)?;
     Ok(plan)
@@ -641,17 +673,21 @@ fn bind_rtl_and_subject_image_prompt(
 #[allow(clippy::too_many_arguments)]
 fn append_images(
     plan: &mut ProductionPlan,
+    skill_id: &str,
     page: &ContentPage,
     family: &PageFamily,
     mode: OutputMode,
     quantities: Option<NumberTriplet>,
     illustration_style: &[String],
     mirror_page_w: Option<f64>,
-    subject: Option<CurriculumSubject>,
+    ctx: Option<TemplateCompileContext<'_>>,
 ) -> Result<(), String> {
     if mode == OutputMode::NativeOnly && !page.illustrations.is_empty() {
         return Err("Native-only template content cannot request images".into());
     }
+    let subject = ctx.and_then(|c| c.subject);
+    let smart_hybrid = ctx.is_some_and(|c| c.visual_density == designcraft_ai_types::VisualDensityMode::SmartHybrid && !c.explicit_script);
+    let total_pages = ctx.map(|c| c.total_pages).unwrap_or(0).max(page.page.saturating_add(1));
     let mirror_rtl = mirror_page_w.is_some();
     let mut slots = BTreeSet::new();
     for image in &page.illustrations {
@@ -674,6 +710,11 @@ fn append_images(
                 illustration_style.join("; ")
             );
             (prompt, format!("CPA concrete quantities: {} + {} = {}; raster count pending human review", values.left, values.right, values.total))
+        } else if smart_hybrid
+            && let Some(seasonal_prompt) =
+                super::planner_blueprint::smart_hybrid_seasonal_motif_prompt(skill_id, &family.id, &slot.id, page.page, total_pages)
+        {
+            (seasonal_prompt, slot.purpose.clone())
         } else {
             bind_rtl_and_subject_image_prompt(&image.prompt, &family.id, &slot.id, &slot.purpose, &page.text, mirror_rtl, subject)
         };

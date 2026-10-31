@@ -375,7 +375,7 @@ fn send(mut request: RequestBuilder, cancel: &AtomicBool) -> Result<Response, St
         let response = send_raw(request, cancel)?;
         check_cancel(cancel)?;
         let code = response.status().as_u16();
-        if matches!(code, 429 | 503)
+        if matches!(code, 429 | 502..=504)
             && let Some(next_request) = retry_clone
         {
             let delay_ms = retry_after_delay_ms(&response).unwrap_or(if attempt == 0 { 250 } else { 750 });

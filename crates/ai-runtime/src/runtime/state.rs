@@ -40,11 +40,13 @@ impl ProductionRunner {
         let vault = Vault::for_profile(&root)?;
         let mut registry = SkillRegistry::open(root.join("skills")).map_err(|e| e.to_string())?;
         registry.install_builtin_drafts().map_err(|e| e.to_string())?;
-        let mut settings = read_json(&profile_access, &root.join("settings.json"), 1024 * 1024)?
-            .map(serde_json::from_value::<AiSettings>)
-            .transpose()
-            .map_err(|e| format!("AI settings: {e}"))?
-            .unwrap_or_default();
+        let raw_settings = read_json(&profile_access, &root.join("settings.json"), 1024 * 1024)?;
+        let legacy_settings_without_pacing = raw_settings.as_ref().is_some_and(|val| val.get("execution_pacing").is_none());
+        let mut settings =
+            raw_settings.map(serde_json::from_value::<AiSettings>).transpose().map_err(|e| format!("AI settings: {e}"))?.unwrap_or_default();
+        if legacy_settings_without_pacing {
+            settings.execution_pacing = designcraft_ai_types::ExecutionPacing::AutoContinue;
+        }
         let mut startup_warning = String::new();
         if !settings.text_model.model.trim().is_empty() && designcraft_ai_types::is_non_text_model(&settings.text_model.model) {
             startup_warning = format!(
@@ -151,6 +153,14 @@ impl ProductionRunner {
         host.refresh_catalog();
         host.refresh_credentials();
         Ok(host)
+    }
+
+    /// Apply desktop-first defaults (`ExecutionPacing::AutoContinue`) when no saved `settings.json`
+    /// existed yet in the user's profile, without altering programmatic test defaults.
+    pub fn enable_desktop_defaults(&mut self) {
+        if !self.root.join("settings.json").exists() {
+            self.snapshot.settings.execution_pacing = designcraft_ai_types::ExecutionPacing::AutoContinue;
+        }
     }
 
     /// Install verified portable skill packages from the first discovered `skills/catalog.json`

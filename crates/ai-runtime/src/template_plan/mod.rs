@@ -2,6 +2,7 @@
 mod compile;
 mod counting;
 mod curriculum;
+mod planner_blueprint;
 mod relational;
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,7 @@ use curriculum::infer_learner_stage;
 pub(crate) use curriculum::{
     CurriculumSubject, curriculum_blueprint, detect_curriculum_subject, normalize_curriculum_query, skill_tool_mastermind_brief,
 };
+pub(crate) use planner_blueprint::is_stationery_or_planner_prompt;
 pub(crate) use relational::{has_relational_master_footer, initialize_relational_book_master};
 
 pub(super) const MAX_JSON: usize = 1024 * 1024;

@@ -22,6 +22,8 @@ impl ProductionRunner {
                     | AiRequest::Cancel
                     | AiRequest::ApproveBatch { .. }
                     | AiRequest::RefreshBatchProofs { .. }
+                    | AiRequest::PauseBatch { .. }
+                    | AiRequest::ResumeBatch { .. }
                     | AiRequest::InspectSkill { .. }
                     | AiRequest::RefreshCredentials
                     | AiRequest::RefreshResources
@@ -31,7 +33,12 @@ impl ProductionRunner {
             self.snapshot.message = "Finish reviewing or cancel the current production batch before another operation".into();
             return self.snapshot.clone();
         }
-        if self.snapshot.busy && !matches!(request, AiRequest::Poll | AiRequest::Cancel | AiRequest::InspectSkill { .. }) {
+        if self.snapshot.busy
+            && !matches!(
+                request,
+                AiRequest::Poll | AiRequest::Cancel | AiRequest::PauseBatch { .. } | AiRequest::ResumeBatch { .. } | AiRequest::InspectSkill { .. }
+            )
+        {
             self.snapshot.message = "An AI task is running; cancel or wait before starting another operation".into();
             return self.snapshot.clone();
         }
@@ -62,6 +69,8 @@ impl ProductionRunner {
             AiRequest::ApproveBatch { job_id, checkpoint } => self.approve_batch(session, &job_id, checkpoint)?,
             AiRequest::RefreshBatchProofs { job_id } => self.refresh_batch_proofs(session, &job_id)?,
             AiRequest::RetryBatch { job_id } => self.retry_batch(session, &job_id)?,
+            AiRequest::PauseBatch { job_id } => self.pause_batch(&job_id)?,
+            AiRequest::ResumeBatch { job_id } => self.resume_batch(session, &job_id)?,
             AiRequest::UpdateSettings(settings) => {
                 validate_settings(&settings)?;
                 let mut next_draft = self.snapshot.production_draft.clone();
@@ -133,6 +142,7 @@ impl ProductionRunner {
                 self.refresh_local_server();
             }
             AiRequest::StartLocalOllama { executable } => {
+                let executable = designcraft_ai_types::sanitize_user_path(&executable);
                 self.snapshot.settings.resources.validate()?;
                 self.local_server.start(Path::new(&executable), &self.snapshot.settings.resources)?;
                 self.refresh_local_server();
@@ -144,6 +154,7 @@ impl ProductionRunner {
                 self.snapshot.message = "Stopped only the Ollama server started by this window".into();
             }
             AiRequest::ImportSkill { path } => {
+                let path = designcraft_ai_types::sanitize_user_path(&path);
                 let source = Path::new(&path);
                 file_access::check_read(source)?;
                 let provenance = Provenance {
@@ -205,6 +216,7 @@ impl ProductionRunner {
                 self.snapshot.message = "Draft saved; the previous approved revision remains active".into();
             }
             AiRequest::GenerateSkill { prompt, reference_paths, settings, design_style } => {
+                let reference_paths = reference_paths.iter().map(|p| designcraft_ai_types::sanitize_user_path(p)).filter(|p| !p.is_empty()).collect();
                 self.start_skill(prompt, reference_paths, None, settings, design_style)?
             }
             AiRequest::GenerateSkillFromDocument { prompt, settings, design_style } => {
@@ -239,6 +251,7 @@ impl ProductionRunner {
             AiRequest::SetSkillEnabled { id, enabled } => self.registry.set_enabled(&id, enabled).map_err(|e| e.to_string())?,
             AiRequest::RollbackSkill { id, revision } => self.registry.rollback(&id, &revision).map_err(|e| e.to_string())?,
             AiRequest::ExportSkill { id, revision, path } => {
+                let path = designcraft_ai_types::sanitize_user_path(&path);
                 file_access::check_write(&path)?;
                 if Path::new(&path).extension().is_some_and(|x| x.eq_ignore_ascii_case("zip")) {
                     self.registry.export_zip(&id, &revision, &path)
@@ -249,10 +262,12 @@ impl ProductionRunner {
                 self.snapshot.message = "Skill package exported".into();
             }
             AiRequest::CreateScienceSample { directory } => {
+                let directory = designcraft_ai_types::sanitize_user_path(&directory);
                 let artifacts = science::build_science_sample(session, Path::new(&directory))?;
                 self.snapshot.message = format!("Original editable science sample exported: {}", artifacts.join("; "));
             }
             AiRequest::ExportDocument { path, pdf } => {
+                let path = designcraft_ai_types::sanitize_user_path(&path);
                 file_access::check_write(&path)?;
                 let contract = self.print_contracts.get(&session.doc().map_err(|e| e.to_string())?.uid).cloned();
                 if pdf {
@@ -276,12 +291,14 @@ impl ProductionRunner {
                 }
             }
             AiRequest::ExportIdml { path } => {
+                let path = designcraft_ai_types::sanitize_user_path(&path);
                 file_access::check_write(&path)?;
                 ensure_preflight(session)?;
                 session.execute("file.exportIdml", &json!({"path":path,"embedImages":true})).map_err(|e| e.to_string())?;
                 self.snapshot.message = format!("Exported editable IDML: {path}");
             }
             AiRequest::ExportIndd { path } => {
+                let path = designcraft_ai_types::sanitize_user_path(&path);
                 let prepared = crate::indesign::prepare(session, Path::new(&path))?;
                 self.launch(worker::Work::Indesign(prepared), None, None, Vec::new(), self.snapshot.settings.clone())?;
                 self.snapshot.stage = "exporting_indd".into();
@@ -289,7 +306,10 @@ impl ProductionRunner {
             }
             AiRequest::PreparePrint { printer, grayscale, duplex } => self.prepare_print(session, printer, grayscale, duplex)?,
             AiRequest::SubmitPreparedPrint { token, request_id } => self.submit_prepared_print(session, &token, request_id)?,
-            AiRequest::SavePreparedPrint { token, path } => self.save_prepared_print(session, &token, &path)?,
+            AiRequest::SavePreparedPrint { token, path } => {
+                let path = designcraft_ai_types::sanitize_user_path(&path);
+                self.save_prepared_print(session, &token, &path)?;
+            }
             AiRequest::OpenPrintProof { token } => self.open_print_proof(session, &token)?,
             AiRequest::PrintDocument { request_id, .. } => {
                 if self.print_attempts.contains(&request_id) {
@@ -382,6 +402,10 @@ impl ProductionRunner {
     }
 
     pub(super) fn start(&mut self, session: &mut Session, mut task: TaskRequest) -> Result<(), String> {
+        task.export_directory = task.export_directory.as_deref().map(designcraft_ai_types::sanitize_user_path).filter(|s| !s.is_empty());
+        if task.settings.visual_density == VisualDensityMode::PureNativeVector {
+            task.settings.output_mode = designcraft_ai_types::OutputMode::NativeOnly;
+        }
         if matches!(task.target, TaskTarget::ContinueBook | TaskTarget::CurrentDocument) {
             let current = session.doc().map_err(|e| e.to_string())?;
             task.settings.facing_pages |= current.doc.settings.facing_pages;
@@ -399,7 +423,7 @@ impl ProductionRunner {
         self.save_production_draft(session, &task)?;
         require_text_model(&task.settings)?;
         require_generation_models(&task.settings)?;
-        let (expected, expected_doc) = match task.target {
+        let (mut expected, mut expected_doc) = match task.target {
             TaskTarget::CurrentDocument => {
                 let current = session.doc().map_err(|e| e.to_string())?;
                 (Some((current.uid, current.revision)), Some(current.doc.clone()))
@@ -456,6 +480,12 @@ impl ProductionRunner {
             return Err("Choose one design style per task to avoid conflicting identities".into());
         }
         let profile = snapshots.iter().find_map(|s| s.design_profile.as_ref());
+        if matches!(task.target, TaskTarget::ContinueBook) {
+            self.prepare_continuable_book(session, &task, profile)?;
+            let current = session.doc().map_err(|e| e.to_string())?;
+            expected = Some((current.uid, current.revision));
+            expected_doc = Some(current.doc.clone());
+        }
         let (base, mut context) = task_document_context(session, &task.target, profile, &task.prompt, &task.settings)?;
         enrich_production_context(&mut context, &self.root, &base, &task)?;
         let print_contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
@@ -463,7 +493,7 @@ impl ProductionRunner {
             return Err("Too many document print contracts in this application session; save open work and restart before creating another".into());
         }
         if let TaskTarget::ContinueBook = task.target {
-            batch::continuation_progress(&base, profile, &task.prompt)?;
+            batch::continuation_or_blank_progress(&base, profile, &task.prompt)?;
         }
         if matches!(task.target, TaskTarget::NewA4 { .. })
             && print_contract.is_none()
@@ -541,10 +571,16 @@ impl ProductionRunner {
         }
         let style = styles.first().ok_or("Missing preview style")?;
         let profile = style.design_profile.as_ref().ok_or("Missing preview profile")?;
-        let (base, _) = task_document_context(session, &task.target, Some(profile), &task.prompt, &task.settings)?;
+        let (mut base, _) = task_document_context(session, &task.target, Some(profile), &task.prompt, &task.settings)?;
+        if matches!(task.target, TaskTarget::ContinueBook) {
+            base = self.project_continuable_preview_base(&base, &session.prefs, &task, Some(profile))?;
+        }
         let total = u32::try_from(base.doc.page_count()).map_err(|_| "Preview page count exceeds its limit")?;
-        let start =
-            if matches!(task.target, TaskTarget::ContinueBook) { batch::continuation_progress(&base, Some(profile), &task.prompt)?.1 } else { 0 };
+        let start = if matches!(task.target, TaskTarget::ContinueBook) {
+            batch::continuation_or_blank_progress(&base, Some(profile), &task.prompt)?.1
+        } else {
+            0
+        };
         let remaining = total.checked_sub(start).ok_or("Invalid preview range")?;
         let count = remaining.min(task.settings.pages_per_batch.max(1)).min(32);
         let blueprint = crate::template_plan::curriculum_blueprint(&task.prompt, style, worker::BatchScope { start, count }, total)?;

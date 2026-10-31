@@ -1295,7 +1295,13 @@ fn ai31_rtl_card_binding_unit_badges_and_islamic_subject_adaptation() {
         BatchScope { start: 1, count: 1 },
         OutputMode::NativeWithImages,
         brief,
-        TemplateCompileContext { base: None, facing_pages: true, total_pages: 32, subject: Some(CurriculumSubject::IslamicStudies) },
+        TemplateCompileContext {
+            base: None,
+            facing_pages: true,
+            total_pages: 32,
+            subject: Some(CurriculumSubject::IslamicStudies),
+            ..Default::default()
+        },
     )
     .unwrap();
 
@@ -1374,7 +1380,13 @@ fn ai31_rtl_card_binding_unit_badges_and_islamic_subject_adaptation() {
             BatchScope { start: 2, count: 1 },
             OutputMode::NativeWithImages,
             brief,
-            TemplateCompileContext { base: None, facing_pages: true, total_pages: 32, subject: Some(CurriculumSubject::IslamicStudies) },
+            TemplateCompileContext {
+                base: None,
+                facing_pages: true,
+                total_pages: 32,
+                subject: Some(CurriculumSubject::IslamicStudies),
+                ..Default::default()
+            },
         )
         .unwrap();
         let calts: Vec<&str> = cplan
@@ -1455,7 +1467,13 @@ fn relational_book_master_running_header_sections_and_live_captions_end_to_end()
         BatchScope { start: 0, count: 1 },
         OutputMode::NativeOnly,
         brief,
-        TemplateCompileContext { base: Some(&canonical_b1), facing_pages: true, total_pages: 3, subject: Some(CurriculumSubject::IslamicStudies) },
+        TemplateCompileContext {
+            base: Some(&canonical_b1),
+            facing_pages: true,
+            total_pages: 3,
+            subject: Some(CurriculumSubject::IslamicStudies),
+            ..Default::default()
+        },
     )
     .unwrap();
     crate::native_layout::prepare(&mut b1, &canonical_b1, &session.prefs, &cancel).unwrap();
@@ -1499,7 +1517,13 @@ fn relational_book_master_running_header_sections_and_live_captions_end_to_end()
         BatchScope { start: 1, count: 2 },
         OutputMode::NativeOnly,
         brief,
-        TemplateCompileContext { base: Some(&canonical_b2), facing_pages: true, total_pages: 3, subject: Some(CurriculumSubject::IslamicStudies) },
+        TemplateCompileContext {
+            base: Some(&canonical_b2),
+            facing_pages: true,
+            total_pages: 3,
+            subject: Some(CurriculumSubject::IslamicStudies),
+            ..Default::default()
+        },
     )
     .unwrap();
     crate::native_layout::prepare(&mut b2, &canonical_b2, &session.prefs, &cancel).unwrap();

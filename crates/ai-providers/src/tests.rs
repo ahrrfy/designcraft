@@ -767,7 +767,7 @@ mod native_tests {
             (400, "AI provider HTTP 400: invalid request or unsupported model parameter"),
             (404, "AI provider HTTP 404: model or endpoint not found"),
             (422, "AI provider HTTP 422: request schema or parameters rejected"),
-            (502, "AI provider HTTP 502: provider temporarily unavailable"),
+            (500, "AI provider HTTP 500: provider returned an error"),
         ] {
             let (endpoint, server) = mock(vec![(status, "{\"error\":\"secret-detail\"}".into())]);
             let err = list_models(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &cancel).unwrap_err();
@@ -786,18 +786,20 @@ mod native_tests {
             crate::native::parse_images(ProviderKind::Gemini, &json!({"candidates": [{"finishReason": "IMAGE_SAFETY"}]}), &cancel).unwrap();
         assert_eq!(img_safety.error.as_deref(), Some("Gemini image response did not finish normally (IMAGE_SAFETY)"));
 
-        // Bounded HTTP 429 + 503 retry succeeds on attempt 3.
+        // Bounded HTTP 429 + 502/503/504 retry succeeds on attempt 3.
         let ok_body = json!({"done":true,"message":{"content":"{}"},"prompt_eval_count":5,"eval_count":2}).to_string();
-        let (endpoint, server) = mock(vec![(429, "{}".into()), (503, "{}".into()), (200, ok_body)]);
+        let (endpoint, server) = mock(vec![(429, "{}".into()), (502, "{}".into()), (200, ok_body)]);
         let recovered = generate(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &request(), &cancel).unwrap();
         assert_eq!(recovered.text, "{}");
         assert_eq!(server.join().unwrap().len(), 3);
 
-        // Exhausting 2 retries (3 total attempts) surfaces distinct 503 diagnostic.
-        let (endpoint, server) = mock(vec![(503, "{}".into()), (503, "{}".into()), (503, "{}".into())]);
-        let exhausted = generate(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &request(), &cancel).unwrap_err();
-        assert_eq!(exhausted, "AI provider HTTP 503: provider temporarily unavailable");
-        assert_eq!(server.join().unwrap().len(), 3);
+        // Exhausting 2 retries (3 total attempts) surfaces distinct 502 / 503 / 504 diagnostics.
+        for status in [502, 503, 504] {
+            let (endpoint, server) = mock(vec![(status, "{\"error\":\"secret-detail\"}".into()), (status, "{}".into()), (status, "{}".into())]);
+            let exhausted = generate(&selection(ProviderKind::Ollama, Some(&endpoint)), None, &request(), &cancel).unwrap_err();
+            assert_eq!(exhausted, format!("AI provider HTTP {status}: provider temporarily unavailable"));
+            assert_eq!(server.join().unwrap().len(), 3);
+        }
 
         // Cancellation aborts immediately without waiting for retry attempts.
         let cancel_mid = std::sync::Arc::new(AtomicBool::new(false));

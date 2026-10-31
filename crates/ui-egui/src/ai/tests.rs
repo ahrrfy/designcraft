@@ -3037,3 +3037,105 @@ fn ai_run_prompt_auto_dispatches_when_ready_and_opens_panel_when_unconfigured() 
     assert_eq!(started.borrow().len(), 2);
     assert_eq!(started.borrow()[1].prompt, "new document");
 }
+
+#[test]
+fn ai33_ui_large_script_card_slicing_scoped_skill_errors_and_blank_planner_continuation() {
+    use egui_kittest::kittest::Queryable;
+
+    // 1. Flexible explicit script headings: PAGES, zero-padded numbers, ascending ranges, numeric titles, and Arabic ranges.
+    let mixed_script = "\
+### PAGES 001 - 2026 Starlight Cover\n\
+### PAGE 002 - Yearly Vision\n\
+### PAGES 003-004 - January Spread\n\
+### الصفحات ٥-٦ - تخطيط الأسبوع\n";
+    assert_eq!(explicit_script_pages(mixed_script), Some(6));
+    assert_eq!(natural_prompt_pages("صمم بلانر سنوي متكامل وشامل وإبداعي"), Some(365));
+
+    // 2. 739 KB 365-page Starlight & Blossom script: sliced token estimate, SmartHybrid/PureNativeVector allowances, and zero-lag Large Script Card.
+    let mut big_script = String::with_capacity(750_000);
+    big_script.push_str("# COMPLETE 365-PAGE STARLIGHT & BLOSSOM WONDERLAND PLANNER\n");
+    for p in 1..=365u32 {
+        big_script.push_str(&format!(
+            "### PAGES {p:03} - Starlight Daily Page {p}\n* **Grid & Layout Architecture:** A5 148x210mm, 12mm margin.\n* **Visual & Editorial Styling Prompt:** Watercolor botanical border.\n* **Exact Verbatim Copy:** {}\n\n",
+            "Focus & Gratitude Schedule · ".repeat(65)
+        ));
+    }
+    assert!(big_script.len() > 730_000 && big_script.len() < designcraft_ai_types::protocol::MAX_BRIEF_BYTES);
+
+    let mut state = AiUiState { prompt: big_script, new_document: true, pages: 365, ..Default::default() };
+    state.settings.text_model.model = "gemini-3.8-flash".into();
+    state.settings.image_model.provider = ProviderKind::Gemini;
+    state.settings.image_model.model = "gemini-3.1-flash-image".into();
+    state.settings.output_mode = OutputMode::NativeWithImages;
+    state.settings.visual_density = VisualDensityMode::SmartHybrid;
+    state.settings.verify_generated_images = true;
+    state.settings.pages_per_batch = 6;
+
+    let hybrid_est = state.request_estimate(&[], None).expect("365-page planner estimate");
+    assert!(hybrid_est.scripted);
+    assert_eq!(hybrid_est.remaining_pages, 365);
+    assert!(hybrid_est.book_allowance < 450, "SmartHybrid reuses seasonal motifs instead of 3,285 calls: {}", hybrid_est.book_allowance);
+    let hybrid_tok = state.token_estimate(&[], None).expect("365-page token estimate");
+    assert!(
+        hybrid_tok.per_page_tokens < 60_000,
+        "Per-page tokens must reflect sliced batch script, not 247k full-script per page: {}",
+        hybrid_tok.per_page_tokens
+    );
+
+    state.settings.visual_density = VisualDensityMode::PureNativeVector;
+    state.settings.image_model.model.clear();
+    assert_eq!(state.production_issue(true, false, false), None, "PureNativeVector requires no image model");
+    let vector_est = state.request_estimate(&[], None).expect("pure vector estimate");
+    assert_eq!(vector_est.image_allowance, 0);
+    assert_eq!(vector_est.vision_allowance, 0);
+    assert_eq!(vector_est.book_allowance, 365);
+
+    // 3. Skill-scoped import error never triggers Production tab diagnostic alert, and Skills tab sanitizes quoted paths.
+    state.snapshot.stage = "failed".into();
+    state.snapshot.message = "skill I/O: The filename, directory name, or volume label syntax is incorrect. (os error 123)".into();
+    assert!(state.active_diagnostic_alert().is_none(), "Skill-tab I/O errors must not lock an AI Production Alert onto Tab 0");
+
+    let mut prod_panel = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1280.0, 960.0))
+        .build_ui_state(|ui, (st, reqs)| production(ui, st, false, true, &[], &mut None, reqs), (state, Vec::<AiRequest>::new()));
+    prod_panel.run_steps(3);
+    assert!(prod_panel.query_by_label_contains("Large production script loaded").is_some(), "739 KB script renders fast card");
+    assert!(prod_panel.query_by_label_contains("Explicit PAGE script is sliced automatically per batch").is_some());
+    assert!(!prod_panel.get_by_label("Produce").accesskit_node().is_disabled());
+
+    // Verify quoted Windows Copy-as-path is sanitized before ImportSkill is dispatched:
+    let mut skill_state =
+        AiUiState { import_path: "  \"C:\\Users\\alara\\Desktop\\planners-journals-notebooks-studio\"  ".into(), ..Default::default() };
+    skill_state.snapshot.stage = "failed".into();
+    skill_state.snapshot.message = "skill I/O: quoted path failed".into();
+    let mut skill_panel = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1100.0, 800.0))
+        .build_ui_state(|ui, (st, reqs)| skills(ui, st, false, true, true, reqs), (skill_state, Vec::<AiRequest>::new()));
+    skill_panel.run_steps(2);
+    assert!(skill_panel.query_by_label_contains("skill I/O: quoted path failed").is_some());
+    skill_panel.get_by_label("Import draft").click();
+    skill_panel.run_steps(2);
+    assert!(matches!(
+        skill_panel.state().1.last(),
+        Some(AiRequest::ImportSkill { path }) if path == "C:\\Users\\alara\\Desktop\\planners-journals-notebooks-studio"
+    ));
+
+    // 4. 1-page blank document (`بلانر`) supports Continue remaining book pages and auto-expands to 365 pages!
+    let mut blank_planner_doc = Session::new();
+    blank_planner_doc.execute("file.new", &json!({"pages": 1, "title": "بلانر"})).unwrap();
+    let open_docs = vec![OpenDocument::from_document(0, blank_planner_doc.active().unwrap())];
+    let mut cont_state = AiUiState {
+        prompt: "Create a complete 365-page creative planner and journal".into(),
+        new_document: false,
+        continue_book: true,
+        ..Default::default()
+    };
+    cont_state.settings.text_model.model = "gemini-3.8-flash".into();
+    let mut cont_panel = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 960.0)).build_ui_state(
+        move |ui, (st, reqs, sel)| production(ui, st, false, true, &open_docs, sel, reqs),
+        (cont_state, Vec::<AiRequest>::new(), Some(0usize)),
+    );
+    cont_panel.run_steps(3);
+    assert!(cont_panel.query_by_label("Blank document will automatically expand from 1 to 365 pages and start at page 1.").is_some());
+    assert!(!cont_panel.get_by_label("Produce").accesskit_node().is_disabled());
+}

@@ -857,7 +857,7 @@ fn confined_requests_reject_external_paths_before_side_effects_or_workers() {
         assert!(runner.pending.is_none());
         assert!(session.documents().is_empty());
         assert!(!Path::new(&outside_path).exists());
-        assert_eq!(snapshot.skills.len(), 9);
+        assert_eq!(snapshot.skills.len(), 11);
     }
 }
 
@@ -1090,7 +1090,7 @@ fn builtins_remain_drafts_and_cannot_be_approved_without_sample() {
     let mut runner = ProductionRunner::open(dir.path()).unwrap();
     let mut session = Session::new();
     let snapshot = runner.handle(&mut session, AiRequest::Poll);
-    assert_eq!(snapshot.skills.len(), 9);
+    assert_eq!(snapshot.skills.len(), 11);
     assert!(snapshot.skills.iter().all(|s| !s.approved));
     let skill = &snapshot.skills[0];
     let denied = runner.handle(&mut session, AiRequest::ApproveSkill { id: skill.id.clone(), revision: skill.revision.clone() });

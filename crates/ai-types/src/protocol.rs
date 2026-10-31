@@ -46,6 +46,26 @@ pub enum ArabicTashkeelMode {
     Full,
 }
 
+/// Controls whether multi-batch book production stops for human review or continues autonomously.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPacing {
+    #[default]
+    ReviewEveryBatch,
+    StopAfterFirstBatch,
+    AutoContinue,
+}
+
+/// Controls decorative/editorial artwork density and caching across multi-page production.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualDensityMode {
+    #[default]
+    SmartHybrid,
+    PureNativeVector,
+    RichPerPageImages,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
@@ -74,6 +94,12 @@ pub struct AiSettings {
     /// Optional preferred Arabic font family (e.g. "Al-Jazeera-Arabic", "Cairo"); None picks best installed face.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arabic_font: Option<String>,
+    /// Controls whether multi-batch book production stops for human review or continues autonomously.
+    #[serde(default)]
+    pub execution_pacing: ExecutionPacing,
+    /// Controls decorative illustration reuse vs pure native vector vs per-page images.
+    #[serde(default)]
+    pub visual_density: VisualDensityMode,
 }
 impl Default for AiSettings {
     fn default() -> Self {
@@ -93,6 +119,8 @@ impl Default for AiSettings {
             resources: crate::LocalResourcePolicy::default(),
             arabic_tashkeel: ArabicTashkeelMode::Auto,
             arabic_font: None,
+            execution_pacing: ExecutionPacing::ReviewEveryBatch,
+            visual_density: VisualDensityMode::SmartHybrid,
         }
     }
 }
@@ -231,6 +259,14 @@ pub enum AiRequest {
     },
     /// Re-run preflight and proof rendering for an edited checkpoint document without paid calls.
     RefreshBatchProofs {
+        job_id: String,
+    },
+    /// Pause autonomous batch continuation cleanly after the active batch completes.
+    PauseBatch {
+        job_id: String,
+    },
+    /// Resume a paused batch job from the next pending batch.
+    ResumeBatch {
         job_id: String,
     },
     UpdateSettings(AiSettings),
@@ -432,6 +468,9 @@ pub struct BatchSnapshot {
     /// Live failed-job authority only; always false for recovered checkpoints.
     #[serde(default)]
     pub retryable: bool,
+    /// True when an autonomous batch job has been paused between batches and can be resumed.
+    #[serde(default)]
+    pub paused: bool,
     pub checkpoint: u32,
     pub document_uid: Option<u64>,
     pub document_revision: Option<u64>,

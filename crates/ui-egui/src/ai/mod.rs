@@ -7,7 +7,10 @@ use crate::{DesignApp, rtl};
 use designcraft_ai_types::protocol::{
     AiRequest, AiSettings, AiSnapshot, BatchSnapshot, ProductionDraft, SkillCard, TaskRequest, TaskTarget, TokenRates,
 };
-use designcraft_ai_types::{ArabicTashkeelMode, ModelSelection, OutputMode, ProviderKind, is_non_image_model, supports_gemini_image_review};
+use designcraft_ai_types::{
+    ArabicTashkeelMode, ExecutionPacing, ModelSelection, OutputMode, ProviderKind, VisualDensityMode, is_non_image_model, sanitize_user_path,
+    supports_gemini_image_review,
+};
 use serde_json::Value;
 
 mod panel_local;
@@ -132,6 +135,9 @@ pub(super) fn clamp_control_settings(ceiling: &AiSettings, settings: &mut AiSett
     if !ceiling.verify_generated_images {
         settings.verify_generated_images = false;
     }
+    if ceiling.execution_pacing == ExecutionPacing::ReviewEveryBatch {
+        settings.execution_pacing = ExecutionPacing::ReviewEveryBatch;
+    }
 }
 
 pub(super) fn clamped_settings(ceiling: &AiSettings, raw: Value) -> Result<AiSettings, String> {
@@ -193,6 +199,14 @@ pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> 
         "run_skill_sample" => AiRequest::RunSkillSample { id: field("id")?, revision: field("revision")? },
         "run_design_template" => AiRequest::RunDesignTemplate { id: field("id")?, revision: field("revision")?, template: field("template")? },
         "refresh_batch_proofs" => AiRequest::RefreshBatchProofs { job_id: field("job_id")? },
+        "pause_batch" => AiRequest::PauseBatch { job_id: field("job_id")? },
+        "resume_batch" => {
+            ensure_ceiling_initialized(app);
+            if app.ui.ai.settings.execution_pacing == ExecutionPacing::ReviewEveryBatch {
+                return Err("Approval requires the human review button in the desktop panel.".into());
+            }
+            AiRequest::ResumeBatch { job_id: field("job_id")? }
+        }
         "dismiss_image_regeneration" => AiRequest::DismissImageRegeneration { job_id: field("job_id")? },
         "approve_skill" | "approve_batch" | "confirm_image_regeneration" => {
             return Err("Approval requires the human review button in the desktop panel.".into());
@@ -425,16 +439,31 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         }
                     ),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if button(ui, a, "Cancel task — keep produced pages", "إلغاء المهمة مع الاحتفاظ بالصفحات المنتجة")
                     {
                         requests.push(AiRequest::Cancel);
+                    }
+                    if let Some(batch) = &state.snapshot.batch
+                        && !batch.job_id.is_empty()
+                        && batch.completed_pages < batch.total_pages
+                    {
+                        if batch.paused || batch.status == "awaiting_human_proof" {
+                            if button(ui, a, "Resume continuous generation", "استئناف التوليد المستمر") {
+                                requests.push(AiRequest::ResumeBatch { job_id: batch.job_id.clone() });
+                            }
+                        } else if state.snapshot.busy
+                            && state.settings.execution_pacing != ExecutionPacing::ReviewEveryBatch
+                            && button(ui, a, "Pause after current batch", "إيقاف مؤقت بعد هذه الدفعة")
+                        {
+                            requests.push(AiRequest::PauseBatch { job_id: batch.job_id.clone() });
+                        }
                     }
                     rtl::label(ui, state.live_status_line(a));
                 });
             }
             let status_message = if state.error.is_empty() { &state.snapshot.message } else { &state.error };
-            if !status_message.is_empty() {
+            if !(status_message.is_empty() || state.tab == 0 && is_skill_scoped_error(status_message)) {
                 let summary: String = status_message.lines().next().unwrap_or("").chars().take(140).collect();
                 rtl::label(ui, summary);
             }
@@ -534,6 +563,50 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         app.ui.ai.ollama_executable = path;
         ctx.request_repaint();
     }
+    if std::mem::take(&mut app.ui.ai.pick_script_file) {
+        if let Some(picked) = app.services.pick_open.as_mut().and_then(|pick| pick("ai_script")) {
+            let clean = sanitize_user_path(&picked);
+            let max_bytes = designcraft_ai_types::protocol::MAX_BRIEF_BYTES as u64;
+            let loaded = if let Some(read) = app.services.read.as_mut() {
+                read(&clean)
+            } else {
+                designcraft_engine::io::read_capped(&clean, max_bytes).map_err(|e| format!("{clean}: {e}"))
+            };
+            match loaded {
+                Ok(bytes) if bytes.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES => {
+                    app.ui.ai.error = text(
+                        a,
+                        "Script file exceeds 1 MiB. Split or move static reference text into a skill package.",
+                        "يتجاوز ملف السكربت 1 ميبيبايت. قسّم الملف أو انقل المراجع الثابتة إلى مهارة.",
+                    )
+                    .into();
+                }
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(script) if !script.contains('\0') => {
+                        if let Some(detected) = explicit_script_pages(&script).or_else(|| natural_prompt_pages(&script))
+                            && app.ui.ai.new_document
+                        {
+                            app.ui.ai.pages = detected;
+                        }
+                        app.ui.ai.prompt = script;
+                        app.ui.ai.edit_large_script_inline = false;
+                        app.ui.ai.clear_failure_alert();
+                        ctx.request_repaint();
+                    }
+                    _ => {
+                        app.ui.ai.error = text(
+                            a,
+                            "Script file must be valid UTF-8 plain text or Markdown (.md / .txt).",
+                            "يجب أن يكون ملف السكربت نصاً صالحاً بترميز UTF-8 (.md أو .txt).",
+                        )
+                        .into();
+                    }
+                },
+                Err(error) => app.ui.ai.error = error,
+            }
+        }
+        requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
+    }
     if std::mem::take(&mut app.ui.ai.pick_target_document) {
         if app.services.pick_open.is_some() {
             if let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ai_target_document")) {
@@ -595,7 +668,9 @@ pub(super) fn sanitize_pdf_page_size(size: Option<(f64, f64)>) -> (f64, f64) {
     }
 }
 
-pub(super) fn open_target_document_path(app: &mut DesignApp, path: &str) -> Result<serde_json::Value, String> {
+pub(super) fn open_target_document_path(app: &mut DesignApp, raw_path: &str) -> Result<serde_json::Value, String> {
+    let cleaned = sanitize_user_path(raw_path);
+    let path = cleaned.as_str();
     let lower = path.to_ascii_lowercase();
     let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("Imported");
     if [".docx", ".rtf", ".txt", ".md", ".xlsx"].iter().any(|ext| lower.ends_with(ext)) {

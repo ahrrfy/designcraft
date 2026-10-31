@@ -55,9 +55,21 @@ pub(super) fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: b
                 }
             }
         });
+        if s.snapshot.stage == "failed" && is_skill_scoped_error(&s.snapshot.message) {
+            egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0, ui.visuals().error_fg_color)).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    rtl::label(ui, egui::RichText::new(&s.snapshot.message).color(ui.visuals().error_fg_color));
+                    if button(ui, a, "Dismiss", "إخفاء") {
+                        s.clear_failure_alert();
+                    }
+                });
+            });
+        }
         field(ui, a, "Import skill folder or ZIP path", "مسار مجلد المهارة أو ملف ZIP", &mut s.import_path);
         if ui.add_enabled(!s.import_path.trim().is_empty(), egui::Button::new(rtl::widget(ui, text(a, "Import draft", "استيراد مسودة")))).clicked()
         {
+            s.import_path = sanitize_user_path(&s.import_path);
+            s.clear_failure_alert();
             requests.push(AiRequest::ImportSkill { path: s.import_path.clone() });
         }
         ui.separator();

@@ -110,7 +110,12 @@ impl ProductionRunner {
                     let profile = revision.manifest.design_profile.as_ref()?;
                     let lower = normalize_skill_search(prompt);
                     let hits = profile.keywords.iter().filter(|word| lower.contains(&normalize_skill_search(word))).count();
-                    let bonus = usize::from(hits > 0 && entry.skill_id == "kg-oxford-cambridge-style") * 16;
+                    let is_planner = crate::template_plan::is_stationery_or_planner_prompt(prompt);
+                    let bonus = if is_planner {
+                        usize::from(hits > 0 && entry.skill_id == "planner-journal-studio-style") * 24
+                    } else {
+                        usize::from(hits > 0 && entry.skill_id == "kg-oxford-cambridge-style") * 16
+                    };
                     (hits > 0).then_some((hits.saturating_add(bonus), entry.skill_id))
                 })
                 .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))

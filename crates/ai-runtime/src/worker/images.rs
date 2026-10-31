@@ -358,7 +358,11 @@ pub(super) fn image_memory_key(
     style: &str,
     settings: &AiSettings,
 ) -> Result<String, String> {
-    crate::production_cache::digest(&json!({"version":"ai18-image-memory-v2","placement":placement,"illustration_style":style,
+    let mut key_placement = placement.clone();
+    if key_placement.prompt.starts_with("[SEASONAL_MOTIF:") {
+        key_placement.page = 0;
+    }
+    crate::production_cache::digest(&json!({"version":"ai18-image-memory-v2","placement":key_placement,"illustration_style":style,
         "model":settings.image_model,"workflow":settings.comfy_workflow,"review":image_review_identity(settings)}))
 }
 

@@ -81,6 +81,8 @@ pub(crate) fn packages() -> Result<Vec<PackageFiles>> {
         ]),
     ]);
     packages.push(crate::educational_style::package()?);
+    packages.push(crate::planner_studio::instruction_package()?);
+    packages.push(crate::planner_studio::style_package()?);
     Ok(packages)
 }
 

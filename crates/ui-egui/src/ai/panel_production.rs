@@ -260,7 +260,11 @@ pub(super) fn budget_targets_for_estimate(
     );
     let per_page_requests = estimate.allowance().checked_div(estimate.review_pages).unwrap_or(1);
 
-    let book_requests = consumed_requests.saturating_add(retry_remaining_pages.saturating_mul(per_page_requests)).max(estimate.book_allowance);
+    let book_requests = if active_batch.is_some() {
+        consumed_requests.saturating_add(retry_remaining_pages.saturating_mul(per_page_requests)).max(estimate.book_allowance)
+    } else {
+        estimate.book_allowance
+    };
     let review_requests = consumed_requests.saturating_add(retry_review_pages.saturating_mul(per_page_requests)).max(estimate.allowance());
     let min_text_requests = consumed_requests.saturating_add(retry_review_pages).max(estimate.review_pages);
 
@@ -575,14 +579,16 @@ pub(super) fn production_blocking_issue(
     active: Option<usize>,
     a: bool,
 ) -> Option<&'static str> {
-    let script_conflict_issue = explicit_script_pages(&s.prompt).and_then(|script_pages| {
+    let explicit_pages = s.analyzed_prompt().explicit_pages;
+    let requested_pages = s.requested_target_pages();
+    let has_prompt = !s.prompt.trim().is_empty();
+    let script_conflict_issue = explicit_pages.and_then(|script_pages| {
         let mismatch = if s.new_document {
             s.pages != script_pages
         } else if s.continue_book {
-            documents
-                .iter()
-                .find(|document| Some(document.index) == active)
-                .is_some_and(|document| u32::try_from(document.pages).ok() != Some(script_pages))
+            documents.iter().find(|document| Some(document.index) == active).is_some_and(|document| {
+                u32::try_from(document.pages).ok().is_none_or(|cur| cur > script_pages || (cur < script_pages && document.has_interior_gaps()))
+            })
         } else {
             false
         };
@@ -592,12 +598,13 @@ pub(super) fn production_blocking_issue(
             "يجب أن يطابق عدد صفحات التعليمات الصريحة (PAGE) عدد صفحات الكتاب المستهدف.",
         ))
     });
-    let continuation_issue =
-        (s.continue_book && !documents.iter().any(|document| Some(document.index) == active && document.continuable)).then_some(text(
-            a,
-            "Select a book with completed opening pages and remaining blank pages, or choose Edit current document.",
-            "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر تحرير المستند الحالي.",
-        ));
+    let continuation_issue = (s.continue_book
+        && !documents.iter().any(|document| Some(document.index) == active && document.can_continue_with_target(requested_pages, has_prompt)))
+    .then_some(text(
+        a,
+        "Select a book with completed opening pages and remaining blank pages, or choose Edit current document.",
+        "اختر كتاباً فيه صفحات أولى مكتملة ثم صفحات فارغة، أو اختر تحرير المستند الحالي.",
+    ));
     s.production_issue(available, active.is_some(), a).or(continuation_issue).or(script_conflict_issue)
 }
 
@@ -726,10 +733,53 @@ pub(super) fn production(
             }
         });
         if s.settings.output_mode == OutputMode::NativeWithImages {
-            model(ui, a, "production_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
-            image_inspection_setting(ui, s, a);
+            ui.horizontal_wrapped(|ui| {
+                label(ui, a, "Visual density", "كثافة الرسوم والصور");
+                let prev_density = s.settings.visual_density;
+                for (mode, en, ar) in [
+                    (
+                        VisualDensityMode::SmartHybrid,
+                        "Smart hybrid (seasonal motifs + vector)",
+                        "الهجين الذكي (زخارف شهرية + فيكتور أصيل)",
+                    ),
+                    (
+                        VisualDensityMode::PureNativeVector,
+                        "100% pure native vector (0 image calls)",
+                        "فيكتور أصيل 100% (سرعة قصوى بدون طلبات صور)",
+                    ),
+                    (
+                        VisualDensityMode::RichPerPageImages,
+                        "Rich custom illustrations per page",
+                        "رسوم مخصصة غنية لكل صفحة",
+                    ),
+                ] {
+                    ui.selectable_value(&mut s.settings.visual_density, mode, rtl::widget(ui, text(a, en, ar)));
+                }
+                if s.settings.visual_density != prev_density {
+                    s.rates_confirmed = has_configured_rates(&s.settings);
+                    if s.workflow_ready() {
+                        requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                    }
+                }
+            });
+            if s.settings.visual_density != VisualDensityMode::PureNativeVector {
+                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
+                image_inspection_setting(ui, s, a);
+            }
         }
-        label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
+        ui.horizontal_wrapped(|ui| {
+            label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
+            if button(ui, a, "Load script file (.md/.txt)…", "تحميل ملف سكربت (.md/.txt)…") {
+                s.pick_script_file = true;
+            }
+            if !s.prompt.is_empty() && button(ui, a, "Clear prompt", "تفريغ النص") {
+                s.prompt.clear();
+                s.edit_large_script_inline = false;
+                if s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
+                    s.clear_failure_alert();
+                }
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             label(ui, a, "Design style", "نمط التصميم");
             let available_styles = selectable_skill_cards(&s.snapshot.skills, true, !s.automatic_skills);
@@ -763,27 +813,87 @@ pub(super) fn production(
             }
         });
         // Keep room for the compact update row and the production action. Long
-        // briefs remain complete and scroll inside their own composer.
-        let prompt_rtl = if s.prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.prompt) };
-        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
-            let mut layouter = bidi_layouter(true);
-            rtl::show_text_edit(
-                ui,
-                egui::TextEdit::multiline(&mut s.prompt)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY)
-                    .horizontal_align(if prompt_rtl { egui::Align::Max } else { egui::Align::Min })
-                    .layouter(&mut layouter)
-                    .hint_text(rtl::widget(
+        // briefs > 16 KiB render a zero-freeze summary card unless raw editing is toggled.
+        let (cached_has_rtl, cached_explicit_pages, cached_natural_pages, cached_preview_head) = {
+            let analysis = s.analyzed_prompt();
+            (analysis.has_rtl, analysis.explicit_pages, analysis.natural_pages, analysis.preview_head.clone())
+        };
+        if s.prompt.len() > 16_384 && !s.edit_large_script_inline {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                let kb = s.prompt.len().div_ceil(1024);
+                let detected_summary = if let Some(pages) = cached_explicit_pages {
+                    if a {
+                        format!("تم تحميل سكربت إنتاج كبير ({kb} كيلوبايت · {pages} صفحة صريحة) — التمرير السريع وتقسيم الدفعات مفعلان تلقائياً.")
+                    } else {
+                        format!("Large production script loaded ({kb} KiB · {pages} explicit pages) — zero-lag mode and per-batch slicing active.")
+                    }
+                } else if let Some(pages) = cached_natural_pages {
+                    if a {
+                        format!("تم تحميل وصف إنتاج كبير ({kb} كيلوبايت · {pages} صفحة مكتشفة) — الوضع السريع مفعل.")
+                    } else {
+                        format!("Large production brief loaded ({kb} KiB · {pages} pages detected) — zero-lag mode active.")
+                    }
+                } else if a {
+                    format!("تم تحميل نص إنتاج كبير ({kb} كيلوبايت) — الوضع السريع مفعل لمنع تجميد الواجهة.")
+                } else {
+                    format!("Large production brief loaded ({kb} KiB) — zero-lag mode active.")
+                };
+                rtl::label(ui, egui::RichText::new(detected_summary).strong());
+                if !cached_preview_head.is_empty() {
+                    rtl::label(ui, egui::RichText::new(&cached_preview_head).weak());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if button(ui, a, "Edit raw script text", "تحرير النص الخام") {
+                        s.edit_large_script_inline = true;
+                    }
+                    if button(ui, a, "Replace script file…", "استبدال ملف السكربت…") {
+                        s.pick_script_file = true;
+                    }
+                });
+            });
+        } else {
+            if s.prompt.len() > 16_384 {
+                ui.horizontal_wrapped(|ui| {
+                    if button(ui, a, "Collapse to fast script card", "العودة لبطاقة السكربت السريعة") {
+                        s.edit_large_script_inline = false;
+                    }
+                });
+                let prev_len = s.prompt.len();
+                egui::ScrollArea::vertical().id_salt("ai_prompt_composer_raw").max_height(110.0).show(ui, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut s.prompt).code_editor().desired_rows(5).desired_width(f32::INFINITY));
+                });
+                if s.prompt.len() != prev_len && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
+                    s.clear_failure_alert();
+                }
+            } else {
+                let prompt_rtl = if s.prompt.trim().is_empty() { a } else { cached_has_rtl };
+                let prev_prompt_fp = PromptAnalysisCache::fingerprint(&s.prompt);
+                egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
+                    let mut layouter = bidi_layouter(true);
+                    rtl::show_text_edit(
                         ui,
-                        text(
-                            a,
-                            "Describe your design, audience and desired result...",
-                            "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
-                        ),
-                    )),
-            );
-        });
+                        egui::TextEdit::multiline(&mut s.prompt)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .horizontal_align(if prompt_rtl { egui::Align::Max } else { egui::Align::Min })
+                            .layouter(&mut layouter)
+                            .hint_text(rtl::widget(
+                                ui,
+                                text(
+                                    a,
+                                    "Describe your design, audience and desired result...",
+                                    "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
+                                ),
+                            )),
+                    );
+                });
+                if PromptAnalysisCache::fingerprint(&s.prompt) != prev_prompt_fp
+                    && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable)
+                {
+                    s.clear_failure_alert();
+                }
+            }
+        }
         rtl::label(
             ui,
             if a {
@@ -796,19 +906,28 @@ pub(super) fn production(
             },
         );
         if s.prompt.len() > 32768 {
-            rtl::label(
-                ui,
-                format!(
-                    "{} {} {}",
-                    text(a, "Conservative input budget reservation starts at", "يبدأ حجز ميزانية الإدخال التحفظي من"),
-                    s.prompt.len().div_ceil(3).saturating_add(1024),
-                    text(
-                        a,
-                        "tokens; skill/document context is additional. Actual usage comes from the provider.",
-                        "توكن؛ يضاف سياق المهارات والمستند. الاستخدام الفعلي يبلغه المزود."
-                    )
-                ),
-            );
+            if cached_explicit_pages.is_some() {
+                label(
+                    ui,
+                    a,
+                    "Explicit PAGE script is sliced automatically per batch; only the active batch pages and compact style header are sent per request.",
+                    "يُقسّم السكربت الصريح (PAGE) تلقائياً لكل دفعة؛ يُرسل محتوى صفحات الدفعة الحالية وترويسة النمط المضغوطة فقط في كل طلب.",
+                );
+            } else {
+                rtl::label(
+                    ui,
+                    format!(
+                        "{} {} {}",
+                        text(a, "Conservative input budget reservation starts at", "يبدأ حجز ميزانية الإدخال التحفظي من"),
+                        s.prompt.len().div_ceil(3).saturating_add(1024),
+                        text(
+                            a,
+                            "tokens; skill/document context is additional. Actual usage comes from the provider.",
+                            "توكن؛ يضاف سياق المهارات والمستند. الاستخدام الفعلي يبلغه المزود."
+                        )
+                    ),
+                );
+            }
         }
         ui.horizontal_wrapped(|ui| {
             if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Edit current document", "تحرير المستند الحالي"))).clicked() {
@@ -843,6 +962,38 @@ pub(super) fn production(
             }
             label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
             ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000));
+            let pacing_label = match s.settings.execution_pacing {
+                ExecutionPacing::AutoContinue => text(a, "Auto-continue full book", "إنتاج مستمر تلقائياً للكتاب بالكامل"),
+                ExecutionPacing::StopAfterFirstBatch => {
+                    text(a, "Review 1st batch, then auto-continue", "مراجعة الدفعة الأولى فقط ثم إكمال تلقائي")
+                }
+                ExecutionPacing::ReviewEveryBatch => text(a, "Pause every batch for proof", "التوقف للمراجعة بعد كل دفعة"),
+            };
+            let prev_pacing = s.settings.execution_pacing;
+            egui::ComboBox::from_id_salt("ai_execution_pacing").selected_text(rtl::widget(ui, pacing_label)).show_ui(ui, |ui| {
+                for (mode, en, ar) in [
+                    (
+                        ExecutionPacing::AutoContinue,
+                        "Auto-continue full book",
+                        "إنتاج مستمر تلقائياً للكتاب بالكامل",
+                    ),
+                    (
+                        ExecutionPacing::StopAfterFirstBatch,
+                        "Review 1st batch, then auto-continue",
+                        "مراجعة الدفعة الأولى فقط ثم إكمال تلقائي",
+                    ),
+                    (
+                        ExecutionPacing::ReviewEveryBatch,
+                        "Pause every batch for proof",
+                        "التوقف للمراجعة بعد كل دفعة",
+                    ),
+                ] {
+                    ui.selectable_value(&mut s.settings.execution_pacing, mode, rtl::widget(ui, text(a, en, ar)));
+                }
+            });
+            if s.settings.execution_pacing != prev_pacing && s.workflow_ready() {
+                requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+            }
             if let Some(document) = preserved_document_geometry(s, documents, *activate_document) {
                 let mut actual = document.facing_pages;
                 ui.add_enabled(false, egui::Checkbox::new(&mut actual, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة"))));
@@ -890,7 +1041,7 @@ pub(super) fn production(
             });
             if let Some(selected) = selected
                 && s.continue_book
-                && let Some(reason) = selected.non_continuable_reason(a)
+                && let Some(reason) = selected.continuation_guidance(a, s.requested_target_pages(), !s.prompt.trim().is_empty())
             {
                 rtl::label(ui, reason);
             }
@@ -903,7 +1054,7 @@ pub(super) fn production(
                 );
             }
         }
-        if let Some(script_pages) = explicit_script_pages(&s.prompt) {
+        if let Some(script_pages) = cached_explicit_pages {
             if s.new_document && s.pages != script_pages {
                 ui.horizontal_wrapped(|ui| {
                     rtl::label(
@@ -926,6 +1077,9 @@ pub(super) fn production(
             } else if !s.new_document
                 && let Some(selected) = documents.iter().find(|document| Some(document.index) == *activate_document)
                 && u32::try_from(selected.pages).ok() != Some(script_pages)
+                && !(s.continue_book
+                    && !selected.has_interior_gaps()
+                    && u32::try_from(selected.pages).ok().is_some_and(|cur| cur < script_pages))
             {
                 ui.horizontal_wrapped(|ui| {
                     rtl::label(
@@ -970,7 +1124,7 @@ pub(super) fn production(
                 });
             }
         } else if s.new_document
-            && let Some(detected) = natural_prompt_pages(&s.prompt)
+            && let Some(detected) = cached_natural_pages
             && s.pages != detected
         {
             ui.horizontal_wrapped(|ui| {
@@ -1024,12 +1178,26 @@ pub(super) fn production(
                 },
             );
         }
-        label(
-            ui,
-            a,
-            "Your review page count stays unchanged. Internal requests build this group, then stop for your approval before the next review group.",
-            "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
-        );
+        match s.settings.execution_pacing {
+            ExecutionPacing::AutoContinue => label(
+                ui,
+                a,
+                "Continuous production: batches publish live to the document and continue automatically until the book finishes (or you click Pause).",
+                "توليد مستمر تلقائياً: تُنشر كل دفعة مباشرة في المستند وتستمر الدفعات تلقائياً حتى اكتمال الكتاب (أو الضغط على إيقاف مؤقت).",
+            ),
+            ExecutionPacing::StopAfterFirstBatch => label(
+                ui,
+                a,
+                "First-batch proof: stops once after batch 1 for your visual review, then continues the remaining book automatically.",
+                "اعتماد الدفعة الأولى فقط: يتوقف مرة واحدة بعد الدفعة الأولى لمراجعتك البصرية، ثم يكمل بقية الكتاب تلقائياً.",
+            ),
+            ExecutionPacing::ReviewEveryBatch => label(
+                ui,
+                a,
+                "Your review page count stays unchanged. Internal requests build this group, then stop for your approval before the next review group.",
+                "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
+            ),
+        }
         if let Some(estimate) = s.request_estimate(documents, *activate_document) {
             let tokens = s.token_estimate(documents, *activate_document);
             let targets = budget_targets_for_estimate(s, documents, *activate_document, &estimate, tokens);

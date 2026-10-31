@@ -83,7 +83,9 @@ pub(super) fn validate_settings(settings: &AiSettings) -> Result<(), String> {
         return Err("Human review groups must contain 1–1000 pages, or zero for a short one-shot task".into());
     }
     validate_endpoint(&settings.text_model)?;
-    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages
+        && settings.visual_density != designcraft_ai_types::protocol::VisualDensityMode::PureNativeVector
+    {
         validate_endpoint(&settings.image_model)?;
     }
     if settings.text_model.model.len() > 256 || settings.image_model.model.len() > 256 {
@@ -123,6 +125,8 @@ pub(super) fn apply_execution_settings_to_draft(draft: &mut ProductionDraft, set
         draft.request.settings.text_model = settings.text_model.clone();
         draft.request.settings.image_model = settings.image_model.clone();
         draft.request.settings.output_mode = settings.output_mode;
+        draft.request.settings.visual_density = settings.visual_density;
+        draft.request.settings.execution_pacing = settings.execution_pacing;
         draft.request.settings.verify_generated_images = settings.verify_generated_images;
         draft.request.settings.allow_paid_repairs = settings.allow_paid_repairs;
         draft.request.settings.image_rates = settings.image_rates.clone();
@@ -145,7 +149,9 @@ pub(crate) fn require_text_model(settings: &AiSettings) -> Result<(), String> {
     Ok(())
 }
 pub(crate) fn require_generation_models(settings: &AiSettings) -> Result<(), String> {
-    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+    if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages
+        && settings.visual_density != designcraft_ai_types::protocol::VisualDensityMode::PureNativeVector
+    {
         if settings.image_model.provider != ProviderKind::ComfyUi && settings.image_model.model.trim().is_empty() {
             return Err("Choose an image model before starting illustrated generation".into());
         }

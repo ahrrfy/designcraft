@@ -18,8 +18,12 @@ impl Runner<'_> {
         profile: Option<&designcraft_ai_types::DesignProfile>,
         settings: &AiSettings,
     ) -> Result<String, String> {
+        let mut key_placement = placement.clone();
+        if key_placement.prompt.starts_with("[SEASONAL_MOTIF:") {
+            key_placement.page = 0;
+        }
         crate::production_cache::digest(
-            &json!({"version":"ai18-illustration-v2","placement":placement,"style":style,"model":settings.image_model,"workflow":settings.comfy_workflow,"review":image_review_identity(settings),"size":self.print_image_size(placement,profile,&settings.image_model)?}),
+            &json!({"version":"ai18-illustration-v2","placement":key_placement,"style":style,"model":settings.image_model,"workflow":settings.comfy_workflow,"review":image_review_identity(settings),"size":self.print_image_size(placement,profile,&settings.image_model)?}),
         )
     }
     pub(super) fn preload_images(
@@ -597,7 +601,7 @@ impl Runner<'_> {
     }
     pub(super) fn production(
         &mut self,
-        request: TaskRequest,
+        mut request: TaskRequest,
         mut context: Value,
         catalog: Value,
         skills: Vec<SkillSnapshot>,
@@ -605,6 +609,9 @@ impl Runner<'_> {
         prefs: Prefs,
     ) -> Result<Product, String> {
         self.progress("Preparing native production context", 0.05)?;
+        if request.settings.visual_density == designcraft_ai_types::VisualDensityMode::PureNativeVector {
+            request.settings.output_mode = OutputMode::NativeOnly;
+        }
         let scope =
             context.get("batch_scope").map(|value| serde_json::from_value::<BatchScope>(value.clone()).map_err(|e| e.to_string())).transpose()?;
         validate_prompt(&request.prompt)?;
@@ -1366,6 +1373,9 @@ impl Runner<'_> {
                         facing_pages: request.settings.facing_pages || base.doc.settings.facing_pages,
                         total_pages: total_pages_hint,
                         subject: None,
+                        visual_density: request.settings.visual_density,
+                        soft_fit_slots: true,
+                        explicit_script: false,
                     },
                 )?;
                 validate_template_family_sequence(&raw, style, previous.clone(), scope, &families, &request.prompt)?;

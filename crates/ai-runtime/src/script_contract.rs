@@ -41,6 +41,8 @@ struct CopySource {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ScriptPage {
     pub page: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_range: Option<[u32; 2]>,
     pub title: String,
     pub english_print_copy: Option<String>,
     pub arabic_print_copy: Option<String>,
@@ -82,7 +84,7 @@ fn has_explicit_script_markers(brief: &str) -> bool {
         if trimmed.starts_with("* **") || trimmed.starts_with("- **") {
             return true;
         }
-        for prefix in ["صفحة", "الصفحة"] {
+        for prefix in ["صفحات", "الصفحات", "صفحة", "الصفحة"] {
             if let Some(rest) = trimmed.strip_prefix(prefix)
                 && rest.starts_with(char::is_whitespace)
                 && rest.trim_start().starts_with(|c| script_digit_value(c).is_some())
@@ -98,31 +100,7 @@ fn has_explicit_script_markers(brief: &str) -> bool {
     false
 }
 
-fn page_heading(line: &str, allow_bare_arabic: bool) -> Result<Option<(u32, String)>, String> {
-    let line = line.trim();
-    let (heading, is_markdown) = if line.starts_with('#') {
-        (line.trim_start_matches('#').trim_start(), true)
-    } else if allow_bare_arabic {
-        (line, false)
-    } else {
-        return Ok(None);
-    };
-    let (rest, is_arabic_kw) = if is_markdown && heading.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("page")) {
-        (heading.get(4..).ok_or("Invalid page heading boundary")?, false)
-    } else if let Some(rest) = heading.strip_prefix("الصفحة").or_else(|| heading.strip_prefix("صفحة")) {
-        (rest, true)
-    } else {
-        return Ok(None);
-    };
-    if !rest.starts_with(char::is_whitespace) {
-        return Ok(None);
-    }
-    let rest = rest.trim_start();
-    let boundary = rest.find(|c: char| script_digit_value(c).is_none()).unwrap_or(rest.len());
-    let digits_str = rest.get(..boundary).ok_or("Invalid page number boundary")?;
-    if digits_str.is_empty() {
-        return if is_markdown { Err("Explicit PAGE headings require a number from 1 to 1000".into()) } else { Ok(None) };
-    }
+fn parse_script_page_number(digits_str: &str) -> Result<u32, String> {
     let mut number = 0u32;
     for ch in digits_str.chars() {
         let d = script_digit_value(ch).ok_or("Explicit PAGE headings require a number from 1 to 1000")?;
@@ -131,20 +109,104 @@ fn page_heading(line: &str, allow_bare_arabic: bool) -> Result<Option<(u32, Stri
     if !(1..=MAX_PAGES).contains(&number) {
         return Err("Explicit PAGE headings require a number from 1 to 1000".into());
     }
-    let suffix = rest.get(boundary..).ok_or("Invalid page title boundary")?.trim_start();
-    if is_arabic_kw && is_markdown && suffix.is_empty() {
-        return Ok(Some((number - 1, format!("الصفحة {number}"))));
+    Ok(number)
+}
+
+fn strip_title_separator(s: &str) -> Option<&str> {
+    s.strip_prefix('—').or_else(|| s.strip_prefix('–')).or_else(|| s.strip_prefix('-')).or_else(|| s.strip_prefix(':'))
+}
+
+fn page_heading(line: &str, allow_bare_arabic: bool) -> Result<Option<(u32, u32, String)>, String> {
+    let line = line.trim();
+    let (heading, is_markdown) = if line.starts_with('#') {
+        (line.trim_start_matches('#').trim_start(), true)
+    } else if allow_bare_arabic {
+        (line, false)
+    } else {
+        return Ok(None);
+    };
+    let (rest, is_arabic_kw) = if is_markdown && heading.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("pages")) {
+        let tail = heading.get(5..).ok_or("Invalid page heading boundary")?;
+        if tail.is_empty() {
+            return Err("Explicit PAGE headings require a number from 1 to 1000".into());
+        }
+        if !tail.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        (tail, false)
+    } else if is_markdown && heading.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("page")) {
+        let tail = heading.get(4..).ok_or("Invalid page heading boundary")?;
+        if tail.is_empty() {
+            return Err("Explicit PAGE headings require a number from 1 to 1000".into());
+        }
+        if !tail.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        (tail, false)
+    } else if let Some(rest) = heading
+        .strip_prefix("الصفحات")
+        .or_else(|| heading.strip_prefix("صفحات"))
+        .or_else(|| heading.strip_prefix("الصفحة"))
+        .or_else(|| heading.strip_prefix("صفحة"))
+    {
+        if !rest.starts_with(char::is_whitespace) {
+            return Ok(None);
+        }
+        (rest, true)
+    } else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    let boundary = rest.find(|c: char| script_digit_value(c).is_none()).unwrap_or(rest.len());
+    let digits_str = rest.get(..boundary).ok_or("Invalid page number boundary")?;
+    if digits_str.is_empty() {
+        return if is_markdown { Err("Explicit PAGE headings require a number from 1 to 1000".into()) } else { Ok(None) };
     }
-    let stripped =
-        suffix.strip_prefix('—').or_else(|| suffix.strip_prefix('–')).or_else(|| suffix.strip_prefix('-')).or_else(|| suffix.strip_prefix(':'));
-    let Some(raw_title) = stripped else {
+    let start_number = parse_script_page_number(digits_str)?;
+    let after_first = rest.get(boundary..).ok_or("Invalid page title boundary")?;
+    let mut end_number = start_number;
+    let mut suffix = after_first.trim_start();
+
+    // Check for an explicit page range such as `013-014 - Title` or `013 - 014 - Title`
+    // without mistaking single-page numeric titles like `01 - 2026 Yearly Planner` for ranges.
+    let attached_range = after_first.starts_with('-') || after_first.starts_with('–');
+    if let Some(after_dash) = suffix.strip_prefix('-').or_else(|| suffix.strip_prefix('–')) {
+        let trimmed_dash = after_dash.trim_start();
+        let end_boundary = trimmed_dash.find(|c: char| script_digit_value(c).is_none()).unwrap_or(trimmed_dash.len());
+        if let Some(end_digits) = trimmed_dash.get(..end_boundary).filter(|s| !s.is_empty()) {
+            let trailing = trimmed_dash.get(end_boundary..).unwrap_or("").trim_start();
+            let has_trailing_sep = strip_title_separator(trailing).is_some() || (is_arabic_kw && is_markdown && trailing.is_empty());
+            if attached_range && after_dash.starts_with(|c| script_digit_value(c).is_some()) {
+                let parsed_end = parse_script_page_number(end_digits)?;
+                if parsed_end < start_number || parsed_end.saturating_sub(start_number) > 31 {
+                    return Err("Explicit PAGES range must be ascending within 1..=1000 (at most 32 pages per block)".into());
+                }
+                end_number = parsed_end;
+                suffix = trailing;
+            } else if has_trailing_sep
+                && let Ok(parsed_end) = parse_script_page_number(end_digits)
+                && parsed_end >= start_number
+                && parsed_end.saturating_sub(start_number) <= 31
+            {
+                end_number = parsed_end;
+                suffix = trailing;
+            }
+        }
+    }
+
+    if is_arabic_kw && is_markdown && suffix.is_empty() {
+        let default_title =
+            if start_number == end_number { format!("الصفحة {start_number}") } else { format!("الصفحات {start_number}–{end_number}") };
+        return Ok(Some((start_number - 1, end_number - 1, default_title)));
+    }
+    let Some(raw_title) = strip_title_separator(suffix) else {
         return if is_markdown { Err("Explicit PAGE headings require a dash or colon before the title".into()) } else { Ok(None) };
     };
     let title = raw_title.trim();
     if title.is_empty() || base_char_count(title) > 512 || title.chars().count() > 1536 {
         return Err("Explicit page title is empty or exceeds 512 characters".into());
     }
-    Ok(Some((number - 1, title.to_owned())))
+    Ok(Some((start_number - 1, end_number - 1, title.to_owned())))
 }
 
 fn field_heading(line: &str) -> Option<(&str, &str)> {
@@ -175,7 +237,7 @@ fn layout_signature(script: &str) -> Option<String> {
         }
         if let Some((label, value)) = field_heading(line) {
             let label = label.to_ascii_lowercase();
-            active = label == "layout & grid architecture" || label == "layout architecture";
+            active = label == "layout & grid architecture" || label == "grid & layout architecture" || label == "layout architecture";
             if active {
                 if layout.is_some() {
                     return None;
@@ -238,7 +300,12 @@ fn page_fields(body: &str) -> Result<(Option<String>, Option<String>, Option<Str
             } else if label.starts_with("Arabic Print Copy") || label.starts_with("النص العربي") || label.starts_with("النص المطبوع")
             {
                 Some(1)
-            } else if label.contains("Illustration Prompt") || label.contains("وصف الرسم") || label.contains("التوجيه البصري") {
+            } else if label.contains("Illustration Prompt")
+                || label.contains("Styling Prompt")
+                || label.contains("Art & Visual")
+                || label.contains("وصف الرسم")
+                || label.contains("التوجيه البصري")
+            {
                 Some(2)
             } else {
                 None
@@ -272,6 +339,48 @@ fn page_fields(body: &str) -> Result<(Option<String>, Option<String>, Option<Str
     Ok((english, arabic, illustration))
 }
 
+/// Strip multi-kilobyte Imposition Map sections or giant Markdown pipe tables from
+/// per-batch global instructions so every batch stays compact while keeping global print specs.
+fn compact_global_instructions(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(4096));
+    let mut skip_imposition_section = false;
+    let mut table_buf = String::new();
+    let flush_table = |buf: &mut String, dst: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        if buf.len() <= 2048 {
+            dst.push_str(buf);
+        }
+        buf.clear();
+    };
+    for line in raw.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            flush_table(&mut table_buf, &mut out);
+            let lower = trimmed.to_ascii_lowercase();
+            skip_imposition_section = lower.contains("imposition map")
+                || trimmed.contains("خريطة الترقيم")
+                || trimmed.contains("خريطة الملازم")
+                || trimmed.contains("فهرس الصفحات الشامل");
+            if skip_imposition_section {
+                continue;
+            }
+        }
+        if skip_imposition_section {
+            continue;
+        }
+        if trimmed.starts_with('|') {
+            table_buf.push_str(line);
+            continue;
+        }
+        flush_table(&mut table_buf, &mut out);
+        out.push_str(line);
+    }
+    flush_table(&mut table_buf, &mut out);
+    out.trim().to_owned()
+}
+
 /// Parse only explicit Markdown PAGE blocks. A generic brief keeps its existing path.
 pub(crate) fn parse(brief: &str) -> Result<Option<ScriptContract>, String> {
     if brief.len() > MAX_BRIEF_BYTES || brief.contains('\0') {
@@ -279,40 +388,47 @@ pub(crate) fn parse(brief: &str) -> Result<Option<ScriptContract>, String> {
     }
     let allow_bare = has_explicit_script_markers(brief);
     let mut headers = Vec::new();
+    let mut expected_next = 0u32;
     let mut offset = 0usize;
     let mut fenced = false;
     for line in brief.split_inclusive('\n') {
         if line.trim_start().starts_with("```") {
             fenced = !fenced;
-        } else if !fenced && let Some((page, title)) = page_heading(line, allow_bare)? {
-            let expected = u32::try_from(headers.len()).map_err(|_| "Too many explicit page headings")?;
-            if page != expected {
-                return Err(format!("Explicit page script must contain each page once in order; expected PAGE {:02}", u64::from(expected) + 1));
+        } else if !fenced && let Some((start_page, end_page, title)) = page_heading(line, allow_bare)? {
+            if start_page != expected_next {
+                return Err(format!("Explicit page script must contain each page once in order; expected PAGE {:02}", u64::from(expected_next) + 1));
             }
-            if headers.len() >= usize::try_from(MAX_PAGES).map_err(|_| "Invalid page limit")? {
+            if end_page >= MAX_PAGES {
                 return Err("Explicit page script exceeds 1000 pages".into());
             }
-            headers.push((offset, offset.checked_add(line.len()).ok_or("Script offset overflow")?, page, title));
+            expected_next = end_page.checked_add(1).ok_or("Too many explicit page headings")?;
+            headers.push((offset, offset.checked_add(line.len()).ok_or("Script offset overflow")?, start_page, end_page, title));
         }
         offset = offset.checked_add(line.len()).ok_or("Script offset overflow")?;
     }
-    let Some((first, _, _, _)) = headers.first() else {
+    let Some((first, _, _, _, _)) = headers.first() else {
         return Ok(None);
     };
-    let global_instructions = brief.get(..*first).ok_or("Invalid global script boundary")?.trim().to_owned();
-    let mut pages = Vec::with_capacity(headers.len());
-    for (index, (start, body_start, page, title)) in headers.iter().enumerate() {
+    let raw_global = brief.get(..*first).ok_or("Invalid global script boundary")?.trim();
+    let global_instructions = compact_global_instructions(raw_global);
+    let mut pages = Vec::with_capacity(usize::try_from(expected_next).unwrap_or(headers.len()));
+    for (index, (start, body_start, start_page, end_page, title)) in headers.iter().enumerate() {
         let stop = headers.get(index.saturating_add(1)).map(|header| header.0).unwrap_or(brief.len());
         let body = brief.get(*body_start..stop).ok_or("Invalid explicit page script boundary")?;
         let (english_print_copy, arabic_print_copy, illustration_prompt) = page_fields(body)?;
-        pages.push(ScriptPage {
-            page: *page,
-            title: title.clone(),
-            english_print_copy,
-            arabic_print_copy,
-            illustration_prompt,
-            full_script: brief.get(*start..stop).ok_or("Invalid explicit page block")?.trim().to_owned(),
-        });
+        let full_script = brief.get(*start..stop).ok_or("Invalid explicit page block")?.trim().to_owned();
+        let shared_range = (*start_page < *end_page).then_some([*start_page, *end_page]);
+        for page_num in *start_page..=*end_page {
+            pages.push(ScriptPage {
+                page: page_num,
+                shared_range,
+                title: title.clone(),
+                english_print_copy: english_print_copy.clone(),
+                arabic_print_copy: arabic_print_copy.clone(),
+                illustration_prompt: illustration_prompt.clone(),
+                full_script: full_script.clone(),
+            });
+        }
     }
     Ok(Some(ScriptContract { global_instructions, pages }))
 }
@@ -331,7 +447,7 @@ impl ScriptContract {
         }
         Ok(json!({"outline_status":"explicit_user_page_script","page_numbering":"page is zero-based; PAGE headings are one-based",
             "global_production_specifications":self.global_instructions,"scoped_page_plan":self.scoped_pages(scope)?,
-            "precedence_rule":"Follow these exact authored page topics, sequence, layout requirements and designated printable copy. Do not insert a fallback contents page, cycle families, change lessons, remove diacritics, or replace supplied copy. Split copy across native text frames as needed. Icon/name-line markers describe native objects; retain numeral practice arrays. Native math activities must bind their stated quantities; raster semantic correctness still requires human visual review."}))
+            "precedence_rule":"Follow these exact authored page topics, sequence, layout requirements and designated printable copy. Do not insert a fallback contents page, cycle families, change lessons, remove diacritics, or replace supplied copy. Split copy across native text frames or native tables as needed. Icon/name-line markers describe native objects; retain numeral practice arrays. Native math activities must bind their stated quantities; raster semantic correctness still requires human visual review."}))
     }
 }
 
@@ -341,8 +457,15 @@ pub(crate) fn scoped_prompt(brief: &str, scope: BatchScope) -> Result<String, St
         return Ok(brief.to_owned());
     };
     let mut output = contract.global_instructions.clone();
+    let mut last_shared: Option<[u32; 2]> = None;
     for page in contract.scoped_pages(scope)? {
-        output.push_str("\n\n");
+        if page.shared_range.is_some() && page.shared_range == last_shared {
+            continue;
+        }
+        last_shared = page.shared_range;
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
         output.push_str(&page.full_script);
     }
     Ok(output)
@@ -517,8 +640,30 @@ fn reference_index(value: Option<&Value>) -> Result<usize, String> {
     index.parse().map_err(|_| "Invalid script-copy story index".into())
 }
 
-fn native_stories(plan: &ProductionPlan) -> Result<BTreeMap<usize, (u32, String)>, String> {
+fn table_reference_index(value: Option<&Value>) -> Result<usize, String> {
+    let reference = value.and_then(Value::as_str).ok_or("Script-copy validation needs a native table reference")?;
+    let body = reference
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| reference.strip_prefix('$'))
+        .ok_or("Invalid script-copy table reference")?;
+    let (index, path) = body.split_once('.').ok_or("Invalid script-copy table reference")?;
+    if !matches!(path, "table" | "id") {
+        return Err("Script-copy table mutation must target a native table".into());
+    }
+    index.parse().map_err(|_| "Invalid script-copy table index".into())
+}
+
+type TableCopyMap = BTreeMap<(usize, u64, u64), (u32, String)>;
+
+fn native_stories_and_tables(plan: &ProductionPlan) -> Result<(BTreeMap<usize, (u32, String)>, BTreeSet<usize>, TableCopyMap), String> {
     let mut stories: BTreeMap<usize, (u32, String)> = BTreeMap::new();
+    let mut table_host_frames: BTreeSet<usize> = BTreeSet::new();
+    let mut tables: BTreeMap<usize, u32> = BTreeMap::new();
+    let mut table_cells: TableCopyMap = BTreeMap::new();
+    let mut last_story: Option<usize> = None;
+    let mut last_table: Option<usize> = None;
+
     for (index, action) in plan.commands.iter().enumerate() {
         if action.command == "frame.create" && action.params.get("content").and_then(Value::as_str) == Some("text") {
             let page = action
@@ -529,23 +674,89 @@ fn native_stories(plan: &ProductionPlan) -> Result<BTreeMap<usize, (u32, String)
                 .ok_or("Explicit-script text frame needs a page")?;
             let text = action.params.get("text").and_then(Value::as_str).unwrap_or("");
             stories.insert(index, (page, text.replace("$$", "$")));
+            last_story = Some(index);
         } else if action.command == "story.setText" {
             let source = reference_index(action.params.get("story"))?;
             let story = stories.get_mut(&source).ok_or("Script-copy mutation targets an unknown story")?;
             story.1 = action.params.get("text").and_then(Value::as_str).ok_or("Script-copy mutation needs text")?.replace("$$", "$");
-        } else if matches!(action.command.as_str(), "text.insert" | "table.insert" | "table.setCell") {
+            last_story = Some(source);
+        } else if action.command == "table.insert" {
+            let host_frame = if action.params.get("story").is_some() {
+                reference_index(action.params.get("story"))?
+            } else {
+                last_story.ok_or("Explicit-script table.insert needs an earlier native text story")?
+            };
+            let &(page, _) = stories.get(&host_frame).ok_or("Explicit-script table.insert targets an unknown story")?;
+            table_host_frames.insert(host_frame);
+            tables.insert(index, page);
+            last_table = Some(index);
+            if let Some(rows_arr) = action.params.get("cells").or_else(|| action.params.get("data")).and_then(Value::as_array) {
+                for (r_idx, row_val) in rows_arr.iter().take(64).enumerate() {
+                    if let Some(cols_arr) = row_val.as_array() {
+                        for (c_idx, cell_val) in cols_arr.iter().take(64).enumerate() {
+                            if let Some(cell_text) = cell_val.as_str() {
+                                table_cells.insert((index, r_idx as u64, c_idx as u64), (page, cell_text.replace("$$", "$")));
+                            }
+                        }
+                    } else if let Some(cell_text) = row_val.as_str() {
+                        table_cells.insert((index, r_idx as u64, 0), (page, cell_text.replace("$$", "$")));
+                    }
+                }
+            }
+        } else if action.command == "table.setCell" {
+            let table_idx = if action.params.get("table").is_some() {
+                table_reference_index(action.params.get("table"))?
+            } else if let Some(active) = last_table {
+                active
+            } else if action.params.get("story").is_some() {
+                let story_idx = reference_index(action.params.get("story"))?;
+                let &(page, _) = stories.get(&story_idx).ok_or("Explicit-script table.setCell targets an unknown story")?;
+                tables.insert(story_idx, page);
+                story_idx
+            } else {
+                return Err("Explicit-script table.setCell needs an active or referenced native table".into());
+            };
+            let &page = tables.get(&table_idx).ok_or("Explicit-script table.setCell targets an unknown table")?;
+            if let Some(cell_text) = action.params.get("text").and_then(Value::as_str) {
+                let cleaned = cell_text.replace("$$", "$");
+                let r_bounds = if let Some(r) = action.params.get("row").and_then(Value::as_u64) {
+                    (r, r)
+                } else if let Some(arr) = action.params.get("rows").and_then(Value::as_array).filter(|a| a.len() == 2) {
+                    let a = arr[0].as_u64().unwrap_or(0);
+                    let b = arr[1].as_u64().unwrap_or(a).max(a).min(a.saturating_add(63));
+                    (a, b)
+                } else {
+                    (0, 0)
+                };
+                let c_bounds = if let Some(c) = action.params.get("col").and_then(Value::as_u64) {
+                    (c, c)
+                } else if let Some(arr) = action.params.get("cols").and_then(Value::as_array).filter(|a| a.len() == 2) {
+                    let a = arr[0].as_u64().unwrap_or(0);
+                    let b = arr[1].as_u64().unwrap_or(a).max(a).min(a.saturating_add(63));
+                    (a, b)
+                } else {
+                    (0, 0)
+                };
+                for r in r_bounds.0..=r_bounds.1 {
+                    for c in c_bounds.0..=c_bounds.1 {
+                        table_cells.insert((table_idx, r, c), (page, cleaned.clone()));
+                    }
+                }
+            }
+        } else if action.command == "text.insert" {
             return Err(
-                "Explicit-script copy must use final native frame text or story.setText so every supplied word can be verified before images".into(),
+                "Explicit-script copy must use final native frame text, story.setText, or table.setCell so every supplied word can be verified before images"
+                    .into(),
             );
         }
     }
-    Ok(stories)
+    Ok((stories, table_host_frames, table_cells))
 }
 
 fn native_copy(plan: &ProductionPlan) -> Result<BTreeMap<u32, String>, String> {
-    let stories = native_stories(plan)?;
+    let (stories, _, table_cells) = native_stories_and_tables(plan)?;
     let mut pages: BTreeMap<u32, String> = BTreeMap::new();
-    for (page, text) in stories.into_values() {
+    for (page, text) in stories.into_values().chain(table_cells.into_values()) {
         let copy = pages.entry(page).or_default();
         if copy.len().saturating_add(text.len()).saturating_add(1) > MAX_BRIEF_BYTES {
             return Err("Native page copy exceeds its bounded verification limit".into());
@@ -561,13 +772,85 @@ pub(crate) fn validate_plan(brief: &str, scope: BatchScope, plan: &ProductionPla
     let Some(contract) = parse(brief)? else {
         return Ok(());
     };
+    let scope_end = end(scope)?;
     let bound = bound_copy_ids(brief, scope, plan)?;
     let copy = native_copy(plan)?;
     for page in contract.scoped_pages(scope)? {
-        let actual = copy
+        let page_actual = copy
             .get(&page.page)
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| format!("Page {} has no verifiable native printable copy", u64::from(page.page) + 1))?;
+        if let Some([r_start, r_end]) = page.shared_range {
+            let mut combined = String::new();
+            for member in r_start..=r_end {
+                if (scope.start..scope_end).contains(&member)
+                    && let Some(member_copy) = copy.get(&member)
+                {
+                    if !combined.is_empty() {
+                        combined.push(' ');
+                    }
+                    combined.push_str(member_copy);
+                }
+            }
+            let full_range_in_scope = scope.start <= r_start && scope_end > r_end;
+            if full_range_in_scope {
+                if page.page == r_start {
+                    let mut designated = false;
+                    for (language, code, expected) in [("English", "en", &page.english_print_copy), ("Arabic", "ar", &page.arabic_print_copy)] {
+                        if let Some(expected) = expected {
+                            designated = true;
+                            for (index, raw) in expected.split('|').enumerate() {
+                                let segment = printable_segment(raw);
+                                let any_bound = (r_start..=r_end).any(|p| copy_id(p, code, index).map(|id| bound.contains(&id)).unwrap_or(false));
+                                if segment.is_empty() || any_bound {
+                                    continue;
+                                }
+                                if !contains_copy(&combined, &segment) {
+                                    let preview: String = segment.chars().take(100).collect();
+                                    return Err(format!(
+                                        "Pages {}–{} are missing or change supplied {language} print copy: {preview}",
+                                        u64::from(r_start) + 1,
+                                        u64::from(r_end) + 1
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if !designated && !contains_copy(&combined, &normalized(&page.title)) {
+                        return Err(format!(
+                            "Pages {}–{} do not preserve their explicit authored title",
+                            u64::from(r_start) + 1,
+                            u64::from(r_end) + 1
+                        ));
+                    }
+                }
+            } else {
+                // Partial range scope (e.g. 1 page of a 2-page spread): verify at least one
+                // supplied segment or title word lands on this page while companion copy stays on its twin.
+                let mut matched_any = contains_copy(page_actual, &normalized(&page.title));
+                let mut has_expected = false;
+                for expected in [&page.english_print_copy, &page.arabic_print_copy].into_iter().flatten() {
+                    for raw in expected.split('|') {
+                        let segment = printable_segment(raw);
+                        if !segment.is_empty() {
+                            has_expected = true;
+                            if contains_copy(page_actual, &segment) {
+                                matched_any = true;
+                            }
+                        }
+                    }
+                }
+                if has_expected && !matched_any {
+                    return Err(format!(
+                        "Page {} of spread {}–{} carries none of the spread's supplied print copy",
+                        u64::from(page.page) + 1,
+                        u64::from(r_start) + 1,
+                        u64::from(r_end) + 1
+                    ));
+                }
+            }
+            continue;
+        }
         let mut designated = false;
         for (language, code, expected) in [("English", "en", &page.english_print_copy), ("Arabic", "ar", &page.arabic_print_copy)] {
             if let Some(expected) = expected {
@@ -577,14 +860,14 @@ pub(crate) fn validate_plan(brief: &str, scope: BatchScope, plan: &ProductionPla
                     if segment.is_empty() || bound.contains(&copy_id(page.page, code, index)?) {
                         continue;
                     }
-                    if !contains_copy(actual, &segment) {
+                    if !contains_copy(page_actual, &segment) {
                         let preview: String = segment.chars().take(100).collect();
                         return Err(format!("Page {} is missing or changes supplied {language} print copy: {preview}", u64::from(page.page) + 1));
                     }
                 }
             }
         }
-        if !designated && !contains_copy(actual, &normalized(&page.title)) {
+        if !designated && !contains_copy(page_actual, &normalized(&page.title)) {
             return Err(format!("Page {} does not preserve its explicit authored title", u64::from(page.page) + 1));
         }
     }
@@ -1102,12 +1385,12 @@ fn bound_copy_ids(brief: &str, scope: BatchScope, plan: &ProductionPlan) -> Resu
         return Ok(BTreeSet::new());
     }
     let sources = copy_sources(brief, scope)?;
-    let stories = native_stories(plan)?;
+    let (stories, table_host_frames, _) = native_stories_and_tables(plan)?;
     let digest = format!("{:x}", Sha256::digest(brief.as_bytes()));
     let mut frames = BTreeSet::new();
     let mut coverage: BTreeMap<String, Vec<[usize; 2]>> = BTreeMap::new();
     for (label_index, frame, label, value) in provenance {
-        if value.brief_sha256 != digest || value.copy_id.len() > 64 || !frames.insert(frame) {
+        if value.brief_sha256 != digest || value.copy_id.len() > 64 || !frames.insert(frame) || table_host_frames.contains(&frame) {
             return Err("Host copy provenance is stale, forged or repeated for a native frame".into());
         }
         let source = sources.get(&value.copy_id).ok_or("Host copy provenance source is outside the current page scope")?;
@@ -1644,5 +1927,76 @@ mod tests {
         let concatenated = format!("{valid_plan} {valid_plan}");
         let err = compile_native_plan(&concatenated, BatchScope { start: 0, count: 1 }).unwrap_err();
         assert!(err.contains("Invalid native content plan"), "{err}");
+    }
+
+    #[test]
+    fn pages_ranges_imposition_table_compaction_and_native_tables_validate_cleanly() {
+        let huge_imposition: String = (1..=80)
+            .map(|i| format!("| **{i:03}** | Recto | Month | Starlight Blossom Planner Entry {i} / مفكرة نجوم الأحلام | Daily Sanctuary |\n"))
+            .collect();
+        let brief = format!(
+            "# STATIONERY PRINT & DESIGN PRODUCTION SCRIPT: PLANNER\n\
+             **Trim Size:** A5 Portrait (148 x 210 mm)\n\n\
+             ## 1. COMPLETE ARCHITECTURE & IMPOSITION MAP\n\n\
+             | Page(s) | Position | Section | Title | Purpose |\n\
+             | --- | --- | --- | --- | --- |\n\
+             {huge_imposition}\n\
+             ## 2. PAGE-BY-PAGE & SPREAD-BY-SPREAD PRODUCTION SCRIPT\n\n\
+             ### PAGES 001 - 2026 Starlight Blossom Cover\n\
+             - **English Print Copy (LTR):**\n\
+               > STARLIGHT BLOSSOM 2026\n\
+             - **Arabic Print Copy (RTL):**\n\
+               > مُفَكِّرَةُ نُجُومِ الأَحْلَامِ\n\
+             - **Visual & Editorial Styling Prompt:** Watercolor botanical wreath.\n\n\
+             ### PAGES 002-003 - January Monthly Garden Spread\n\
+             - **English Print Copy (LTR):**\n\
+               > JANUARY GARDEN | HABIT TRACKER\n\
+             - **Arabic Print Copy (RTL):**\n\
+               > حَدِيقَةُ يَنَايِرَ | مُتَتَبِّعُ العَادَاتِ\n\
+             - **Visual & Editorial Styling Prompt:** Soft sage watercolor leaves.\n"
+        );
+        let parsed = parse(&brief).unwrap().unwrap();
+        assert_eq!(parsed.pages.len(), 3);
+        assert_eq!(parsed.pages[0].page, 0);
+        assert_eq!(parsed.pages[0].shared_range, None);
+        assert_eq!(parsed.pages[0].title, "2026 Starlight Blossom Cover");
+        assert_eq!(parsed.pages[0].illustration_prompt.as_deref(), Some("Watercolor botanical wreath."));
+        assert_eq!(parsed.pages[1].page, 1);
+        assert_eq!(parsed.pages[1].shared_range, Some([1, 2]));
+        assert_eq!(parsed.pages[2].page, 2);
+        assert_eq!(parsed.pages[2].shared_range, Some([1, 2]));
+        assert!(!parsed.global_instructions.contains("Starlight Blossom Planner Entry 40"));
+        assert!(parsed.global_instructions.contains("A5 Portrait (148 x 210 mm)"));
+
+        let scoped = scoped_prompt(&brief, BatchScope { start: 1, count: 2 }).unwrap();
+        assert_eq!(scoped.matches("### PAGES 002-003").count(), 1);
+        assert!(!scoped.contains("Starlight Blossom Planner Entry 40"));
+
+        // Verify native table.insert + table.setCell copy extraction across spread pages 1..=2.
+        let spread_plan = ProductionPlan {
+            title: "January Garden".into(),
+            commands: vec![
+                EngineAction {
+                    command: "frame.create".into(),
+                    params: json!({"spread":1,"content":"text","rect":[40,42,379,100],"text":"JANUARY GARDEN — حَدِيقَةُ يَنَايِرَ"}),
+                },
+                EngineAction { command: "frame.create".into(), params: json!({"spread":2,"content":"text","rect":[40,42,379,300],"text":""}) },
+                EngineAction { command: "table.insert".into(), params: json!({"story":"$1.story","rows":2,"cols":2}) },
+                EngineAction { command: "table.setCell".into(), params: json!({"table":"$2.table","row":0,"col":0,"text":"HABIT TRACKER"}) },
+                EngineAction {
+                    command: "table.setCell".into(), params: json!({"table":"$2.table","row":0,"col":1,"text":"مُتَتَبِّعُ العَادَاتِ"})
+                },
+            ],
+            images: vec![],
+        };
+        validate_plan(&brief, BatchScope { start: 1, count: 2 }, &spread_plan).unwrap();
+        validate_plan(&brief, BatchScope { start: 1, count: 1 }, &spread_plan).unwrap();
+
+        // Overwriting a table cell with wrong text must fail copy validation.
+        let mut overwritten_cell = spread_plan.clone();
+        overwritten_cell
+            .commands
+            .push(EngineAction { command: "table.setCell".into(), params: json!({"table":"$2.table","row":0,"col":0,"text":"WRONG HEADER"}) });
+        assert!(validate_plan(&brief, BatchScope { start: 1, count: 2 }, &overwritten_cell).is_err());
     }
 }

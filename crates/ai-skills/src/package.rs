@@ -1,10 +1,11 @@
 use crate::{NativeManifest, Result, SkillError};
-use designcraft_ai_types::EngineAction;
+use designcraft_ai_types::{EngineAction, sanitize_user_path};
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub type PackageFiles = BTreeMap<String, Vec<u8>>;
 pub(crate) const MAX_FILE: u64 = 16 * 1024 * 1024;
@@ -250,6 +251,401 @@ pub(crate) fn parse_actions(bytes: &[u8]) -> Result<Vec<EngineAction>> {
         return Err(SkillError::Invalid("invalid native template actions".into()));
     }
     Ok(actions)
+}
+
+pub(crate) fn sanitize_fs_path(path: &Path) -> PathBuf {
+    if let Some(raw) = path.to_str() {
+        let cleaned = sanitize_user_path(raw);
+        if !cleaned.is_empty() && cleaned != raw {
+            return PathBuf::from(cleaned);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn is_ignored_os_metadata(parts: &[&str]) -> bool {
+    parts.iter().any(|part| {
+        matches!(*part, ".DS_Store" | "Thumbs.db" | "desktop.ini" | "__MACOSX" | ".git" | "__pycache__" | ".pytest_cache" | "node_modules")
+    })
+}
+
+fn validate_raw_relative_parts(parts: &[&str]) -> Result<()> {
+    if parts.is_empty()
+        || parts.len() > MAX_DEPTH + 2
+        || parts.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || p.ends_with(['.', ' ']) || p.chars().any(char::is_control))
+    {
+        return Err(SkillError::Invalid("unsafe package path component".into()));
+    }
+    for part in parts {
+        reject_windows_name(part)?;
+    }
+    Ok(())
+}
+
+fn remap_external_skill_path(rel: &str, has_native_manifest: bool) -> Result<Option<String>> {
+    if rel.is_empty() || rel.len() > 240 || rel.contains(['\\', ':', '\0']) || rel.starts_with('/') || rel.ends_with('/') {
+        return Err(SkillError::Invalid("unsafe package path".into()));
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    validate_raw_relative_parts(&parts)?;
+    if is_ignored_os_metadata(&parts) {
+        return Ok(None);
+    }
+    if has_native_manifest {
+        validate_path(rel)?;
+        return Ok(Some(rel.to_owned()));
+    }
+    if rel == "SKILL.md" || rel == "designcraft.json" {
+        return Ok(Some(rel.to_owned()));
+    }
+    let first = parts[0];
+    if matches!(first, "scripts" | "bin" | "tests" | ".github" | ".vscode") {
+        return Ok(None);
+    }
+    let ext = Path::new(rel).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let is_text = matches!(ext.as_str(), "md" | "txt" | "json" | "csv");
+    let is_asset = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "svg" | "pdf");
+    if !is_text && !is_asset {
+        return Ok(None);
+    }
+    let mapped = if matches!(first, "references" | "assets" | "templates") {
+        rel.to_owned()
+    } else if matches!(first, "visual_mockups" | "mockups" | "images" | "previews") {
+        format!("assets/{}", parts[1..].join("/"))
+    } else if first == "examples" {
+        if is_text { format!("references/{}", parts[1..].join("/")) } else { format!("assets/{}", parts[1..].join("/")) }
+    } else if parts.len() == 1 && is_text {
+        format!("references/{rel}")
+    } else if is_asset {
+        format!("assets/{}", parts.last().copied().unwrap_or("asset.png"))
+    } else {
+        return Ok(None);
+    };
+    validate_path(&mapped)?;
+    Ok(Some(mapped))
+}
+
+fn unwrap_external_skill_root(mut current: PathBuf) -> Result<PathBuf> {
+    if current.is_file()
+        && matches!(current.file_name().and_then(|n| n.to_str()), Some("SKILL.md" | "designcraft.json"))
+        && let Some(parent) = current.parent()
+    {
+        current = parent.to_path_buf();
+    }
+    for _ in 0..3 {
+        reject_symlink(&current)?;
+        if !current.is_dir() {
+            break;
+        }
+        if current.join("SKILL.md").is_file() {
+            return Ok(current);
+        }
+        let mut subdirs = Vec::new();
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            reject_symlink(&path)?;
+            if entry.file_type()?.is_dir() {
+                let name = entry.file_name();
+                if let Some(s) = name.to_str()
+                    && !is_ignored_os_metadata(&[s])
+                {
+                    subdirs.push(path);
+                }
+            }
+        }
+        let with_skill: Vec<PathBuf> = subdirs.iter().filter(|d| d.join("SKILL.md").is_file()).cloned().collect();
+        if with_skill.len() == 1 {
+            current = with_skill[0].clone();
+        } else if with_skill.is_empty() && subdirs.len() == 1 {
+            current = subdirs.remove(0);
+        } else {
+            break;
+        }
+    }
+    Ok(current)
+}
+
+fn synthesize_external_native_adapter(files: &mut PackageFiles) -> Result<()> {
+    if files.contains_key("designcraft.json") {
+        return Ok(());
+    }
+    let Some(skill_bytes) = files.get("SKILL.md") else {
+        return Ok(());
+    };
+    if skill_bytes.len() > 256 * 1024 {
+        return Ok(());
+    }
+    let Ok(text) = std::str::from_utf8(skill_bytes) else {
+        return Ok(());
+    };
+    let normalized = text.replace("\r\n", "\n");
+    let Some(rest) = normalized.strip_prefix("---\n") else {
+        return Ok(());
+    };
+    let Some((yaml, body)) = rest.split_once("\n---\n") else {
+        return Ok(());
+    };
+    let Ok(front) = serde_yaml::from_str::<Frontmatter>(yaml) else {
+        return Ok(());
+    };
+    if !front.allowed_tools.is_null() {
+        return Ok(());
+    }
+    validate_id(&front.name)?;
+    // Keep total snapshot text (`instructions` + `references`) safely below MAX_SNAPSHOT_TEXT_BYTES (64 KiB).
+    let max_ref_budget = (56 * 1024usize).saturating_sub(body.trim().len());
+    let mut used_ref_bytes = 0usize;
+    let mut declared_refs = Vec::new();
+    let mut demoted_to_assets = Vec::new();
+    for (path, bytes) in files.iter() {
+        if path.starts_with("references/") && crate::is_supported_text_reference(path) {
+            if std::str::from_utf8(bytes).is_ok() && used_ref_bytes.saturating_add(bytes.len()) <= max_ref_budget {
+                used_ref_bytes = used_ref_bytes.saturating_add(bytes.len());
+                declared_refs.push(path.clone());
+            } else {
+                demoted_to_assets.push(path.clone());
+            }
+        }
+    }
+    for old_ref in demoted_to_assets {
+        if let Some(bytes) = files.remove(&old_ref) {
+            let tail = old_ref.strip_prefix("references/").unwrap_or("reference.md");
+            let asset_path = format!("assets/{tail}");
+            if validate_path(&asset_path).is_ok() && !files.contains_key(&asset_path) {
+                files.insert(asset_path, bytes);
+            }
+        }
+    }
+    let sample_path = "templates/sample.json".to_string();
+    if !files.contains_key(&sample_path) {
+        let summary: String = front.description.chars().take(160).collect();
+        let rtl = summary.chars().any(|c| ('\u{0600}'..='\u{06ff}').contains(&c));
+        let sample_actions = vec![
+            EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread":0,"rect":[54.0,54.0,540.0,108.0],"content":"text","text":front.name,"caret":false}),
+            },
+            EngineAction {
+                command: "type.char".into(),
+                params: json!({"attrs":{"fontFamily":"Tahoma","fontStyle":"Bold","size":20.0,"leading":{"kind":"points","value":26.0}}}),
+            },
+            EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":"leftToRight","align":"left","hyphenate":false}}) },
+            EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread":0,"rect":[54.0,124.0,540.0,260.0],"content":"text","text":summary,"caret":false}),
+            },
+            EngineAction {
+                command: "type.char".into(),
+                params: json!({"attrs":{"fontFamily":"Tahoma","fontStyle":"Regular","size":14.0,"leading":{"kind":"points","value":20.0}}}),
+            },
+            EngineAction {
+                command: "type.para".into(),
+                params: json!({"attrs":{"direction":if rtl {"rightToLeft"} else {"leftToRight"},"align":if rtl {"right"} else {"left"},"hyphenate":false}}),
+            },
+        ];
+        files.insert(sample_path.clone(), serde_json::to_vec_pretty(&sample_actions)?);
+    }
+    let manifest = NativeManifest {
+        schema_version: 1,
+        skill_id: front.name,
+        required_commands: vec!["frame.create".into(), "type.char".into(), "type.para".into()],
+        references: declared_refs,
+        templates: vec![sample_path.clone()],
+        sample_template: Some(sample_path),
+        external_tools: Vec::new(),
+        compatibility_notes: "Automatically adapted external Agent Skill package to native DesignCraft layout guidance and validated sample.".into(),
+        design_profile: None,
+    };
+    files.insert("designcraft.json".into(), serde_json::to_vec_pretty(&manifest)?);
+    Ok(())
+}
+
+pub(crate) fn read_external_folder(raw_root: &Path) -> Result<PackageFiles> {
+    let clean = sanitize_fs_path(raw_root);
+    for ancestor in clean.ancestors().filter(|p| p.exists()) {
+        reject_symlink(ancestor)?;
+    }
+    let root = unwrap_external_skill_root(clean)?;
+    for ancestor in root.ancestors().filter(|p| p.exists()) {
+        reject_symlink(ancestor)?;
+    }
+    reject_symlink(&root)?;
+    if !root.is_dir() {
+        return Err(SkillError::Invalid("package root is not a directory".into()));
+    }
+    let has_native_manifest = root.join("designcraft.json").is_file();
+    if has_native_manifest {
+        return read_folder(&root);
+    }
+    let mut raw_entries = Vec::new();
+    let mut stack = vec![(root.clone(), 0usize)];
+    let mut entries = 0usize;
+    while let Some((directory, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            return Err(SkillError::Invalid("package nesting limit".into()));
+        }
+        reject_symlink(&directory)?;
+        for item in fs::read_dir(&directory)? {
+            let item = item?;
+            entries = entries.saturating_add(1);
+            if entries > MAX_FILES * 4 {
+                return Err(SkillError::Invalid("package entry limit".into()));
+            }
+            let path = item.path();
+            reject_symlink(&path)?;
+            if item.file_type()?.is_dir() {
+                let dir_name = item.file_name();
+                if let Some(s) = dir_name.to_str()
+                    && (is_ignored_os_metadata(&[s]) || matches!(s, "scripts" | "bin" | "tests" | ".github" | ".vscode"))
+                {
+                    continue;
+                }
+                stack.push((path, depth.saturating_add(1)));
+                continue;
+            }
+            let relative = path.strip_prefix(&root).map_err(|_| SkillError::Invalid("path escapes package".into()))?;
+            let parts: Option<Vec<_>> = relative
+                .components()
+                .map(|component| match component {
+                    Component::Normal(p) => p.to_str(),
+                    _ => None,
+                })
+                .collect();
+            let rel = parts.ok_or_else(|| SkillError::Invalid("non-UTF8 or unsafe filename".into()))?.join("/");
+            if let Some(mapped) = remap_external_skill_path(&rel, false)? {
+                raw_entries.push((mapped, path));
+            }
+        }
+    }
+    // Prioritize SKILL.md and references/* before optional assets/* mockups so large mockup suites never starve core instructions.
+    raw_entries.sort_by(|a, b| {
+        let rank = |name: &str| {
+            if name == "SKILL.md" {
+                0u8
+            } else if name.starts_with("references/") || name.starts_with("templates/") {
+                1u8
+            } else {
+                2u8
+            }
+        };
+        rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0))
+    });
+    let mut files = BTreeMap::new();
+    let mut folded = std::collections::BTreeSet::new();
+    let mut total = 0u64;
+    let budget_limit = MAX_PACKAGE.saturating_sub(256 * 1024);
+    for (mapped, path) in raw_entries {
+        let is_optional_asset = mapped.starts_with("assets/");
+        let meta_len = fs::symlink_metadata(&path)?.len();
+        if is_optional_asset && (meta_len > MAX_FILE || total.saturating_add(meta_len) > budget_limit || files.len() + 4 >= MAX_FILES) {
+            continue;
+        }
+        if !folded.insert(mapped.to_lowercase()) {
+            if is_optional_asset {
+                continue;
+            }
+            return Err(SkillError::Invalid("case-colliding package files".into()));
+        }
+        let bytes = read_bounded(&path, MAX_FILE)?;
+        total = total.checked_add(bytes.len() as u64).ok_or_else(|| SkillError::Invalid("package size overflow".into()))?;
+        if total > budget_limit || files.len() + 2 >= MAX_FILES {
+            if is_optional_asset {
+                continue;
+            }
+            return Err(SkillError::Invalid("package size or count limit".into()));
+        }
+        files.insert(mapped, bytes);
+    }
+    synthesize_external_native_adapter(&mut files)?;
+    validate_files(&files)?;
+    Ok(files)
+}
+
+pub(crate) fn read_external_zip(raw_path: &Path) -> Result<PackageFiles> {
+    let path = sanitize_fs_path(raw_path);
+    let compressed = read_bounded(&path, MAX_PACKAGE)?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&compressed))?;
+    if archive.len() > MAX_FILES * 4 {
+        return Err(SkillError::Invalid("ZIP entry limit".into()));
+    }
+    // First pass: enforce ZIP safety invariants on every entry before unwrapping or filtering.
+    let mut raw_names = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let name = entry.name().to_string();
+        if let Some(mode) = entry.unix_mode() {
+            let kind = mode & 0o170000;
+            if kind != 0 && kind != 0o100000 && kind != 0o040000 {
+                return Err(SkillError::Invalid("ZIP links and special files are forbidden".into()));
+            }
+        }
+        let trimmed = name.trim_end_matches('/');
+        if trimmed.is_empty() || trimmed.contains(['\\', ':', '\0']) || name.starts_with('/') {
+            return Err(SkillError::Invalid("unsafe ZIP directory".into()));
+        }
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        validate_raw_relative_parts(&parts)?;
+        if !entry.is_dir() {
+            raw_names.push((index, name));
+        }
+    }
+    // Detect whether SKILL.md lives inside a single wrapper prefix (e.g. `pkg/planners-studio/SKILL.md`).
+    let has_root_skill = raw_names.iter().any(|(_, n)| n == "SKILL.md");
+    let strip_prefix = if has_root_skill {
+        String::new()
+    } else {
+        let skill_prefixes: Vec<String> = raw_names.iter().filter_map(|(_, n)| n.strip_suffix("/SKILL.md").map(|p| format!("{p}/"))).collect();
+        if skill_prefixes.len() == 1 { skill_prefixes[0].clone() } else { String::new() }
+    };
+    let has_native_manifest = raw_names.iter().any(|(_, n)| n.strip_prefix(&strip_prefix).unwrap_or(n) == "designcraft.json");
+    if has_native_manifest && strip_prefix.is_empty() {
+        return read_zip(&path);
+    }
+    let mut total = 0u64;
+    let mut files = BTreeMap::new();
+    let mut folded = std::collections::BTreeSet::new();
+    let budget_limit = MAX_PACKAGE.saturating_sub(256 * 1024);
+    for (index, full_name) in raw_names {
+        let Some(rel) = (if strip_prefix.is_empty() { Some(full_name.as_str()) } else { full_name.strip_prefix(&strip_prefix) }) else {
+            continue;
+        };
+        let Some(mapped) = remap_external_skill_path(rel, has_native_manifest)? else {
+            continue;
+        };
+        let entry = archive.by_index(index)?;
+        let is_optional_asset = !has_native_manifest && mapped.starts_with("assets/");
+        if is_optional_asset && (entry.size() > MAX_FILE || total.saturating_add(entry.size()) > budget_limit || files.len() + 4 >= MAX_FILES) {
+            continue;
+        }
+        if !folded.insert(mapped.to_lowercase()) {
+            if is_optional_asset {
+                continue;
+            }
+            return Err(SkillError::Invalid("duplicate ZIP entry".into()));
+        }
+        if entry.size() > MAX_FILE {
+            return Err(SkillError::Invalid("ZIP expanded size limit".into()));
+        }
+        let mut bytes = Vec::new();
+        entry.take(MAX_FILE.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE {
+            return Err(SkillError::Invalid("ZIP file size limit".into()));
+        }
+        total = total.checked_add(bytes.len() as u64).ok_or_else(|| SkillError::Invalid("ZIP size overflow".into()))?;
+        if total > budget_limit || files.len() + 2 >= MAX_FILES {
+            if is_optional_asset {
+                continue;
+            }
+            return Err(SkillError::Invalid("ZIP expanded size limit".into()));
+        }
+        files.insert(mapped, bytes);
+    }
+    if !has_native_manifest {
+        synthesize_external_native_adapter(&mut files)?;
+    }
+    validate_files(&files)?;
+    Ok(files)
 }
 
 pub(crate) fn read_folder(root: &Path) -> Result<PackageFiles> {
