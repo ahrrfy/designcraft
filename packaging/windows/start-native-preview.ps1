@@ -196,7 +196,7 @@ try {
     if ($taskBook) { $taskArguments += (Format-QuotedWinArg $taskBook) }
     # Automated starts stay hidden; a user-initiated interactive launch is visible.
     $taskStyle = if ($Hidden) { 'Hidden' } else { 'Normal' }
-    $taskProcess = Start-Process -FilePath $taskExecutable -ArgumentList $taskArguments -WindowStyle $taskStyle -PassThru
+    if ($taskArguments.Count -gt 0) { $taskProcess = Start-Process -FilePath $taskExecutable -ArgumentList $taskArguments -WindowStyle $taskStyle -PassThru } else { $taskProcess = Start-Process -FilePath $taskExecutable -WindowStyle $taskStyle -PassThru }
     if ($null -eq $taskProcess) { throw 'Could not start the native preview.' }
     $taskFields = @{
         app_pid=$taskProcess.Id; executable=$taskExecutable;

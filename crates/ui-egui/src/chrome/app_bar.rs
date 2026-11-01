@@ -347,6 +347,21 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                             if ui.button("GitHub").clicked() {
                                 app.ui.pending_urls.push(crate::about::FORK_URL.into());
                             }
+                            ui.add_space(6.0);
+                            let ai_label = if app.ui.language == "ar" { "الذكاء" } else { "AI" };
+                            if ui
+                                .selectable_label(app.ui.ai.open, crate::rtl::widget(ui, egui::RichText::new(ai_label).font(semibold(11.5))))
+                                .on_hover_ui(|ui| {
+                                    crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "AI Production…"));
+                                })
+                                .clicked()
+                            {
+                                if app.ui.ai.open {
+                                    app.ui.ai.open = false;
+                                } else {
+                                    let _ = app.run("ai.production", json!({}));
+                                }
+                            }
                             tools_start = ui.min_rect().min.x;
                             ui.data_mut(|d| d.insert_temp(egui::Id::unique("app_bar_tools_start"), tools_start));
                             ui.min_rect().width()
@@ -360,8 +375,8 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
             });
             // Centred title.
             let title = match app.session.active() {
-                Some(d) => format!("DesignCraft — {}", crate::rtl::isolate(&d.title())),
-                None => "DesignCraft".to_string(),
+                Some(d) => format!("{} — {}", crate::about::fork_name(&app.ui.language), crate::rtl::isolate(&d.title())),
+                None => crate::about::fork_name(&app.ui.language).to_string(),
             };
             // Centred between the menus and the right-hand controls; left out when it won't fit.
             let galley = crate::rtl::plain(ui.ctx(), &title, egui::FontId::proportional(11.5), t.text);
