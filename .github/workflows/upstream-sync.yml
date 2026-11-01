@@ -141,8 +141,8 @@ jobs:
           gh auth setup-git
           git push --set-upstream origin "$branch"
           gh pr create --base main --head "$branch" --draft --title "Review upstream ${short_up} conflicts" --body-file "$report"
-          gh pr list --state open --json number,headRefName --jq --arg cur "$branch" '.[] | select((.headRefName | startswith("sync/upstream-")) and .headRefName != $cur) | .number' | while IFS= read -r pr_num; do
-            if [ -n "$pr_num" ]; then
+          gh pr list --state open --json number,headRefName --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | "\(.number) \(.headRefName)"' | while IFS=' ' read -r pr_num pr_head; do
+            if [ -n "$pr_num" ] && [ "$pr_head" != "$branch" ]; then
               gh pr close "$pr_num" --delete-branch --comment "Superseded by newer upstream sync review branch ${branch}." || true
             fi
           done
