@@ -74,11 +74,21 @@ jobs:
             printf 'Existing integration PR: %s\n' "$existing" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # GITHUB_TOKEN cannot push commits that modify .github/workflows/*; preserve the
+          # fork's workflows during automated scheduled syncs while merging all code/assets.
+          restore_fork_workflows() {
+            if [ -n "$(git diff --name-only --cached "$base" -- .github/workflows)" ] || [ -n "$(git diff --name-only "$base" -- .github/workflows)" ]; then
+              git rm -rf --ignore-unmatch -- .github/workflows >/dev/null
+              git checkout "$base" -- .github/workflows
+              git add -- .github/workflows
+            fi
+          }
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "$branch"
           git diff --name-status "$base...$upstream" > "$RUNNER_TEMP/upstream-paths.txt"
           if git merge --no-ff --no-commit "$upstream"; then
+            restore_fork_workflows
             if grep -qE '(^|[[:space:]])([^[:space:]]+/)?Cargo\.toml$' "$RUNNER_TEMP/upstream-paths.txt"; then
               printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
             else
@@ -89,21 +99,13 @@ jobs:
           fi
           git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
           if [ -s "$RUNNER_TEMP/upstream-conflicts.txt" ] && ! grep -qvE '^(\.github/workflows/[^/]+\.yml|Cargo\.lock)$' "$RUNNER_TEMP/upstream-conflicts.txt"; then
-            while IFS= read -r wf_path; do
-              case "$wf_path" in
-                .github/workflows/*.yml)
-                  if git cat-file -e "HEAD:$wf_path" 2>/dev/null; then
-                    git checkout --ours -- "$wf_path"
-                    git add -- "$wf_path"
-                  else
-                    git rm -f -- "$wf_path"
-                  fi
-                  ;;
-              esac
-            done < "$RUNNER_TEMP/upstream-conflicts.txt"
+            restore_fork_workflows
+            if grep -qx 'Cargo.lock' "$RUNNER_TEMP/upstream-conflicts.txt"; then
+              git checkout --theirs Cargo.lock
+            fi
             git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
             if [ ! -s "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
-              if grep -qE '(^|[[:space:]])([^[:space:]]+/)?Cargo\.toml$' "$RUNNER_TEMP/upstream-paths.txt"; then
+              if grep -qE '(^|[[:space:]])([^[:space:]]+/)?Cargo\.toml$' "$RUNNER_TEMP/upstream-paths.txt" || [ -n "$(git diff --name-only --cached "$base" -- Cargo.lock)" ] || [ -n "$(git diff --name-only "$base" -- Cargo.lock)" ]; then
                 printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
               else
                 git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
@@ -114,6 +116,7 @@ jobs:
           fi
           conflict_count="$(wc -l < "$RUNNER_TEMP/upstream-conflicts.txt" | tr -d '[:space:]')"
           if [ "$conflict_count" = "1" ] && grep -qx 'Cargo.lock' "$RUNNER_TEMP/upstream-conflicts.txt"; then
+            restore_fork_workflows
             git checkout --theirs Cargo.lock
             printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
             exit 0
