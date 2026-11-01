@@ -927,3 +927,40 @@ fn caption_buttons_fit_the_minimum_window_width() {
         assert!(!h.click(p).is_empty(), "{id} remains clickable");
     }
 }
+
+#[test]
+fn smart_design_branding_and_ai_controls_work_on_start_screen_and_app_bar() {
+    let app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+    let mut h = test_window::open(app, vec2(1440.0, 900.0));
+    h.state_mut().app.run("file.close", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Welcome to Smart Design").is_some(), "English fork welcome heading is shown");
+    assert!(h.query_by_label("Welcome to DesignCraft").is_none(), "Upstream vanilla welcome heading is replaced");
+    assert!(!h.state().app.ui.ai.open);
+
+    // Start screen primary AI button opens AI Production directly without needing an open document.
+    h.get_by_label("  AI Production & Skills  ").click();
+    h.run_steps(3);
+    assert!(h.state().app.ui.ai.open, "Start screen AI Production button opens AI Production");
+
+    // Top app bar AI toggle closes and reopens AI Production.
+    let bar = test_window::panel_rect(&h, "app_bar");
+    let ai_rect = h.query_all_by_label("AI").map(|n| n.rect()).find(|r| bar.contains(r.center())).expect("AI button in app_bar");
+    test_window::click_at(&mut h, ai_rect.center());
+    h.run_steps(3);
+    assert!(!h.state().app.ui.ai.open, "App bar AI button toggles AI Production closed");
+    test_window::click_at(&mut h, ai_rect.center());
+    h.run_steps(3);
+    assert!(h.state().app.ui.ai.open, "App bar AI button toggles AI Production open");
+
+    // Arabic interface displays Arabic Smart Design branding and Arabic AI controls.
+    h.state_mut().app.run("ai.production", json!({"open": false})).unwrap();
+    h.state_mut().app.run("app.language", json!({"lang": "de"})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Willkommen bei Smart Design").is_some(), "German localized fork welcome heading is shown");
+    h.state_mut().app.run("app.language", json!({"lang": "ar"})).unwrap();
+    h.run_steps(3);
+    let bar_ar = test_window::panel_rect(&h, "app_bar");
+    assert!(h.query_by_label("مرحباً بك في التصميم الذكي (Smart Design)").is_some(), "Arabic fork welcome heading is shown");
+    assert!(h.query_all_by_label("الذكاء").any(|n| bar_ar.contains(n.rect().center())), "Arabic AI toggle appears in app bar");
+}

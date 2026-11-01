@@ -14,7 +14,15 @@ pub fn start_screen(app: &mut DesignApp, ui: &mut egui::Ui) {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.label(crate::rtl::widget(
                     ui,
-                    egui::RichText::new(crate::i18n::tr(&app.ui.language, "Welcome to DesignCraft")).font(semibold(28.0)).color(t.text_strong),
+                    egui::RichText::new(if app.ui.language == "ar" {
+                        "مرحباً بك في التصميم الذكي (Smart Design)".to_string()
+                    } else {
+                        crate::i18n::tr(&app.ui.language, "Welcome to DesignCraft")
+                            .replace("DesignCraftu", "Smart Design")
+                            .replace("DesignCraft", crate::about::fork_name(&app.ui.language))
+                    })
+                    .font(semibold(28.0))
+                    .color(t.text_strong),
                 ));
                 ui.label(crate::rtl::widget(
                     ui,
@@ -37,6 +45,19 @@ pub fn start_screen(app: &mut DesignApp, ui: &mut egui::Ui) {
                         .clicked()
                     {
                         let _ = app.run("app.newDocumentDialog", json!({}));
+                    }
+                    let ai_btn =
+                        if app.ui.language == "ar" { "  الإنتاج بالذكاء والمهارات  " } else { "  AI Production & Skills  " };
+                    if ui
+                        .add(
+                            egui::Button::new(crate::rtl::widget(ui, egui::RichText::new(ai_btn).size(14.0).color(Color32::WHITE)))
+                                .fill(t.accent)
+                                .corner_radius(16.0)
+                                .min_size(vec2(0.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        let _ = app.run("ai.production", json!({}));
                     }
                     if ui
                         .add(
