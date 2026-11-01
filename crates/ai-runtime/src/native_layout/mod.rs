@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod aliases;
 mod fit;
 mod geometry;
+pub(crate) mod harmonize;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +31,8 @@ use self::geometry::{
     BackgroundGrowth, FittingObstacle, background_growth_blocks, blocks_translation, containing_background_growths, contains, fitting_obstacles,
     is_allowed_fit_location, is_expandable_card_shape, is_snug_growable_background, overlaps, position_collision, shift,
 };
+#[allow(unused_imports)]
+pub(crate) use self::harmonize::{HarmonizeOptions, extract_brand_palette_from_attachments, harmonize_actions};
 
 pub(crate) fn is_fallback_symbol_or_honorific(ch: char) -> bool {
     if ch.is_whitespace() || ch.is_control() {

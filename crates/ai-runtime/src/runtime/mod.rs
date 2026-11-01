@@ -27,9 +27,12 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::persistence::{
+    allocate_knowledge_pack_id, enforce_execution_mode, list_knowledge_pack_dir_ids, persist_knowledge_pack_files, remove_knowledge_pack_dir,
+    require_generation_models, require_text_model,
+};
 #[allow(unused_imports)]
 use self::persistence::{apply_execution_settings_to_draft, read_json, validate_production_draft, validate_settings, write_json, write_profile};
-pub(crate) use self::persistence::{require_generation_models, require_text_model};
 pub(crate) use self::proofs::book_binding;
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -37,10 +40,10 @@ use self::proofs::new_a4;
 #[allow(unused_imports)]
 use self::proofs::{
     active_design_revision, bounded_task_skills, choose_compatible_skills, compact_context, corrected_design_context, design_revision,
-    enrich_production_context, ensure_preflight, ensure_preflight_at, ensure_publication_idle, initialize_facing_document, initialize_print_document,
-    is_publication_temporarily_busy, merge_pinned_and_automatic_skills, normalize_skill_search, print_params, production_document_params,
-    prompt_names_skill_id, selected_skill_references, skill_is_compatible, skill_match_score, supported_commands, task_document_context,
-    task_skill_context_bytes, validate_skill_templates,
+    enrich_production_context, enrich_production_context_with_memory, ensure_preflight, ensure_preflight_at, ensure_publication_idle,
+    initialize_facing_document, initialize_print_document, is_publication_temporarily_busy, merge_pinned_and_automatic_skills,
+    normalize_skill_search, print_params, production_document_params, prompt_names_skill_id, selected_skill_references, skill_is_compatible,
+    skill_match_score, supported_commands, task_document_context, task_skill_context_bytes, validate_skill_templates,
 };
 #[allow(unused_imports)]
 use self::state::{
@@ -65,6 +68,8 @@ pub struct ProductionRunner {
     print_attempts: BTreeSet<String>,
     print_contracts: BTreeMap<u64, crate::print_contract::PrintContract>,
     local_server: crate::localserver::LocalOllama,
+    design_memory: BTreeMap<u64, crate::brief_planner::SessionDesignMemory>,
+    failed_cloud_task: Option<TaskRequest>,
 }
 
 impl Drop for ProductionRunner {

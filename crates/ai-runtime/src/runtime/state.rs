@@ -15,6 +15,7 @@ pub(super) struct Pending {
     pub(super) expected_prefs: Option<Prefs>,
     pub(super) skills: Vec<(String, String)>,
     pub(super) settings: AiSettings,
+    pub(super) executed_model: (ProviderKind, String),
     pub(super) deferred_outcome: Option<worker::Outcome>,
     pub(super) deferred_batch: Option<(worker::Outcome, Box<UsageLedger>)>,
 }
@@ -124,6 +125,7 @@ impl ProductionRunner {
             draft_warning = last_failed.message.clone();
             initial_stage = "failed".into();
         }
+        let knowledge_packs = crate::rag::list_knowledge_packs(&profile_access, &root).unwrap_or_default();
         let mut host = Self {
             root,
             profile_access,
@@ -136,6 +138,7 @@ impl ProductionRunner {
                 production_draft,
                 message: draft_warning,
                 batch: recovered_batch,
+                knowledge_packs,
                 ..Default::default()
             },
             keys: Vec::new(),
@@ -148,6 +151,8 @@ impl ProductionRunner {
             print_attempts,
             print_contracts: BTreeMap::new(),
             local_server: Default::default(),
+            design_memory: BTreeMap::new(),
+            failed_cloud_task: None,
         };
         if let Some(dir) = std::env::var_os("DESIGNCRAFT_SKILLS_DIR").filter(|val| !val.is_empty())
             && let Err(error) = host.install_portable_catalog(Path::new(&dir))
@@ -430,14 +435,24 @@ pub(super) fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 pub(super) fn selected_models(settings: &AiSettings) -> Vec<designcraft_ai_types::ModelSelection> {
-    let text = settings.text_model.clone();
-    let image = settings.image_model.clone();
-    if text.provider == image.provider && validate_endpoint(&text).ok() == validate_endpoint(&image).ok() { vec![text] } else { vec![text, image] }
+    let mut out = vec![settings.text_model.clone()];
+    let mut push_unique = |candidate: designcraft_ai_types::ModelSelection| {
+        let cand_ep = validate_endpoint(&candidate).ok();
+        if !out.iter().any(|existing| existing.provider == candidate.provider && validate_endpoint(existing).ok() == cand_ep) {
+            out.push(candidate);
+        }
+    };
+    push_unique(settings.image_model.clone());
+    if let Some(hybrid) = &settings.hybrid_local_model {
+        push_unique(hybrid.clone());
+    }
+    out
 }
 
 /// Stored credentials keep precedence over environment fallbacks. A storage
 /// error may be ignored only when the caller's endpoint-aware resolver confirms
-/// a usable transient key. This helper never serializes or returns that key.
+/// a usable transient key (or when the provider is local and requires no key).
+/// This helper never serializes or returns that key.
 pub(super) fn credential_from_store_or_transient(
     selection: &designcraft_ai_types::ModelSelection,
     load: impl FnOnce() -> Result<Option<SecretString>, String>,
@@ -447,7 +462,7 @@ pub(super) fn credential_from_store_or_transient(
     match load() {
         Ok(stored) => Ok(stored),
         Err(error) => {
-            if transient_available() {
+            if selection.provider.is_local() || transient_available() {
                 Ok(None)
             } else {
                 Err(error)
@@ -461,16 +476,19 @@ pub(super) fn credential_status(
     presence: Result<bool, String>,
     transient_available: bool,
 ) -> CredentialStatus {
+    let local = selection.provider.is_local();
     let protected_storage_available = presence.is_ok();
     let persisted = presence.as_ref().copied().unwrap_or(false);
-    let available = persisted || transient_available;
+    let available = local || persisted || transient_available;
     let message = match presence {
         Ok(true) => "OS-protected key stored for this endpoint".into(),
         Ok(false) if transient_available => {
             "Credential available from an authorized session or canonical provider environment; no protected key stored".into()
         }
+        Ok(false) if local => "Local endpoint ready (optional Bearer token not required)".into(),
         Ok(false) => "No credential available for this endpoint; no protected key stored".into(),
         Err(error) if transient_available => format!("Credential available from an authorized session or canonical provider environment; {error}"),
+        Err(error) if local => format!("Local endpoint ready without stored key; {error}"),
         Err(error) => format!("No credential available for this endpoint; {error}"),
     };
     CredentialStatus { selection, persisted, available, protected_storage_available, message }

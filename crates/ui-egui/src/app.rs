@@ -204,6 +204,7 @@ impl DesignApp {
             return;
         }
         self.settle_live_preview();
+        let presenting = self.ui.screen_mode == ScreenMode::Presentation;
         // Input consumers run once, in the live first UI pass, before layout. Hidden logic ticks
         // must not replay shortcuts or dropped files from stale input.
         if ctx.current_pass_index() == 0 {
@@ -216,6 +217,9 @@ impl DesignApp {
                     if drop.generation != current {
                         continue;
                     }
+                    if !presenting && self.ui.hidden_panels == 0 && ai::accept_drop_if_over_studio(self, &drop.path, drop.pointer) {
+                        continue;
+                    }
                     let _ = self.open_dropped_at(&drop.path, drop.pointer);
                 }
             }
@@ -223,7 +227,6 @@ impl DesignApp {
         }
         let t0 = now_ms();
         let t = theme::Tokens::get(&ctx);
-        let presenting = self.ui.screen_mode == ScreenMode::Presentation;
         if presenting || self.ui.hidden_panels != 0 {
             panel_docking::cancel_gesture(&ctx);
         }
@@ -246,6 +249,12 @@ impl DesignApp {
             }
             if self.ui.hidden_panels != 1 {
                 toolbar::show(self, ui);
+            }
+            if self.ui.hidden_panels == 0 {
+                ai::sync_dock_harmony(self);
+                if self.ui.ai.open && self.ui.ai.docked {
+                    ai::show_docked(self, ui);
+                }
             }
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.pasteboard)).show(ui, |ui| {
@@ -304,7 +313,9 @@ impl DesignApp {
         story_editor::show(self, &ctx);
         dialogs::show(self, &ctx);
         about::show(self, &ctx);
-        ai::show(self, &ctx);
+        if !presenting && self.ui.hidden_panels == 0 {
+            ai::show(self, &ctx);
+        }
         updates_ui::show(self, &ctx);
         menus::palette(self, &ctx);
         // The IME is observed once, here: after the canvas, the floating panels, the story editor,

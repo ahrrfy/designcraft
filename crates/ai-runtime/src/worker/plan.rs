@@ -10,9 +10,26 @@ pub(super) fn model_needs_thinking_margin(selection: &ModelSelection) -> bool {
     match selection.provider {
         ProviderKind::Gemini => true,
         ProviderKind::OpenAi => leaf.starts_with("o1") || leaf.starts_with("o3") || leaf.starts_with("o4") || leaf.starts_with("gpt-5"),
-        ProviderKind::Ollama => leaf.starts_with("deepseek-r1") || leaf.starts_with("qwq") || leaf.starts_with("qwen3"),
+        ProviderKind::Ollama | ProviderKind::LocalOpenAi => {
+            leaf.starts_with("deepseek-r1")
+                || leaf.starts_with("qwq")
+                || leaf.starts_with("qwen3")
+                || leaf.starts_with("gpt-oss")
+                || leaf.contains("reasoning")
+                || leaf.contains("think")
+        }
         _ => false,
     }
+}
+
+pub(crate) fn is_token_truncation_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("max_tokens")
+        || lower.contains("finish_reason: length")
+        || lower.contains("finishreason: max_tokens")
+        || lower.contains("truncated")
+        || lower.contains("eof while parsing")
+        || lower.contains("unterminated string")
 }
 
 pub(super) fn arabic_vowel_mark(c: char) -> bool {

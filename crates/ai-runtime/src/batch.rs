@@ -16,7 +16,7 @@ const MAX_PROOF_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(super) struct BatchJob {
-    task: TaskRequest,
+    pub(super) task: TaskRequest,
     skills: Vec<SkillSnapshot>,
     roots: Option<Arc<file_access::AutomationRoots>>,
     ledger: Option<UsageLedger>,
@@ -415,12 +415,16 @@ impl ProductionRunner {
     ) -> Result<(), String> {
         let (pages, completed, existing) = match task.target {
             TaskTarget::NewA4 { pages } => (pages, 0, None),
+            TaskTarget::NewDocument { pages, .. } => {
+                let current = session.doc().map_err(|e| e.to_string())?;
+                (pages, 0, Some((current.uid, current.revision)))
+            }
             TaskTarget::ContinueBook => {
                 let (pages, completed) =
                     continuation_or_blank_progress(&base, skills.iter().find_map(|skill| skill.design_profile.as_ref()), &task.prompt)?;
                 (pages, completed, Some((base.uid, base.revision)))
             }
-            TaskTarget::CurrentDocument => return Err("Choose new A4 book or explicitly continue remaining blank pages".into()),
+            TaskTarget::CurrentDocument => return Err("Choose new document or explicitly continue remaining blank pages".into()),
         };
         let size = task.settings.pages_per_batch;
         if !(1..=1000).contains(&size) || !(1..=1000).contains(&pages) {
@@ -432,7 +436,9 @@ impl ProductionRunner {
         self.sequence = self.sequence.saturating_add(1);
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis();
         let id = format!("book-{stamp}-{}-{}", std::process::id(), self.sequence);
-        let spread_aligned = completed == 0 && task.settings.facing_pages && size == 2 && pages > 1;
+        let uses_facing =
+            task.settings.facing_pages || matches!(&task.target, TaskTarget::NewDocument { geometry, .. } if geometry.facing_pages.unwrap_or(false));
+        let spread_aligned = completed == 0 && uses_facing && size == 2 && pages > 1;
         let total_batches =
             if spread_aligned { 1_u32.saturating_add(pages.saturating_sub(1).div_ceil(2)) } else { pages.saturating_sub(completed).div_ceil(size) };
         let snapshot = BatchSnapshot {
@@ -494,6 +500,7 @@ impl ProductionRunner {
             self.snapshot.batch = Some(failed.snapshot.clone());
             let persisted = self.persist_batch(&failed.snapshot);
             self.batch = Some(failed);
+            self.snapshot.can_continue_locally = self.compute_can_continue_locally();
             return Err(match persisted {
                 Ok(()) => error,
                 Err(write_error) => format!("{error}; could not persist failed checkpoint: {write_error}"),
@@ -514,7 +521,23 @@ impl ProductionRunner {
             scope.start.saturating_add(scope.count).saturating_sub(1),
             job.snapshot.total_pages
         ));
-        let settings = job.task.settings.clone();
+        let mut effective_task = job.task.clone();
+        if effective_task.settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::SmartHybrid && job.snapshot.current_batch >= 2 {
+            let local_sel = effective_task
+                .settings
+                .hybrid_local_model
+                .clone()
+                .ok_or_else(|| "SmartHybrid local continuation model is missing for Batch 2+".to_string())?;
+            effective_task.settings.text_model = local_sel;
+            effective_task.settings.verify_generated_images = false;
+            if !effective_task.settings.image_model.provider.is_local() {
+                effective_task.settings.output_mode = designcraft_ai_types::OutputMode::NativeOnly;
+            }
+            if effective_task.settings.budget.max_output_tokens >= effective_task.settings.resources.context_tokens {
+                effective_task.settings.resources.context_tokens = effective_task.settings.budget.max_output_tokens.saturating_add(4096).min(131_072);
+            }
+        }
+        let settings = effective_task.settings.clone();
         // Durable intent precedes the network request; recovery still cannot resume it.
         job.snapshot.status = "running".into();
         job.snapshot.retryable = false;
@@ -527,10 +550,9 @@ impl ProductionRunner {
         let keys = self.worker_keys();
         let ledger = job.ledger.as_ref().ok_or("Batch admission ledger is unavailable")?.clone();
         job.before = ledger.summary();
-        let task = job.task.clone();
         let pins = job.skills.iter().map(|s| (s.skill_id.clone(), s.revision.clone())).collect();
         let work = worker::Work::Production {
-            request: task.clone(),
+            request: effective_task.clone(),
             context,
             catalog: worker::batch_catalog(designcraft_engine::cmd::production::catalog()),
             skills: job.skills.clone(),
@@ -544,6 +566,7 @@ impl ProductionRunner {
                 job.snapshot.retryable = retry_candidate(&job);
                 self.snapshot.batch = Some(job.snapshot.clone());
                 self.batch = Some(job);
+                self.snapshot.can_continue_locally = self.compute_can_continue_locally();
                 return Err(error);
             }
         };
@@ -551,17 +574,19 @@ impl ProductionRunner {
         let id = batch_report_id(&job);
         let expected = job.snapshot.document_uid.zip(job.snapshot.document_revision);
         let expected_doc = job.publication_base.as_ref().map(|st| st.doc.clone());
+        let executed_model = (settings.text_model.provider, settings.text_model.model.clone());
         self.pending = Some(Pending {
             roots: job.roots.clone(),
             worker,
             id,
             started: Instant::now(),
-            task: Some(task),
+            task: Some(effective_task),
             expected,
             expected_doc,
             expected_prefs: None,
             skills: pins,
             settings,
+            executed_model,
             deferred_outcome: None,
             deferred_batch: None,
         });
@@ -592,14 +617,18 @@ impl ProductionRunner {
             if current.uid != uid {
                 return Err("Select this failed task's book before Retry; another open document will not be modified".into());
             }
-            let (base, context) = task_document_context(session, &TaskTarget::ContinueBook, profile, &job.task.prompt, &job.task.settings)?;
-            let (total, completed) = continuation_or_blank_progress(&base, profile, &job.task.prompt)?;
-            if total != job.snapshot.total_pages || completed != job.snapshot.completed_pages {
-                return Err("The target pages or book page count changed; prepare a fresh continuation instead of overwriting content".into());
+            if matches!(job.task.target, TaskTarget::NewDocument { .. }) && job.snapshot.completed_pages == 0 {
+                task_document_context(session, &job.task.target, profile, &job.task.prompt, &job.task.settings)?
+            } else {
+                let (base, context) = task_document_context(session, &TaskTarget::ContinueBook, profile, &job.task.prompt, &job.task.settings)?;
+                let (total, completed) = continuation_or_blank_progress(&base, profile, &job.task.prompt)?;
+                if total != job.snapshot.total_pages || completed != job.snapshot.completed_pages {
+                    return Err("The target pages or book page count changed; prepare a fresh continuation instead of overwriting content".into());
+                }
+                (base, context)
             }
-            (base, context)
         } else {
-            if !matches!(job.task.target, TaskTarget::NewA4 { .. }) || job.snapshot.completed_pages != 0 {
+            if !matches!(job.task.target, TaskTarget::NewA4 { .. } | TaskTarget::NewDocument { .. }) || job.snapshot.completed_pages != 0 {
                 return Err("The failed task has no matching book authority".into());
             }
             task_document_context(session, &job.task.target, profile, &job.task.prompt, &job.task.settings)?
@@ -959,9 +988,9 @@ impl ProductionRunner {
             design_style: self.style_use(&pending.skills, pending.task.as_ref().map(|task| &task.target)),
             id: pending.id,
             status: "failed".into(),
-            title: job.task.prompt.chars().take(80).collect(),
-            provider: pending.settings.text_model.provider,
-            model: pending.settings.text_model.model.clone(),
+            title: crate::brief_planner::sanitize_visible_title(&job.task.prompt),
+            provider: pending.executed_model.0,
+            model: pending.executed_model.1.clone(),
             settings: Some(pending.settings.clone()),
             skills: pending.skills,
             usage: usage.clone(),
@@ -1001,8 +1030,28 @@ impl ProductionRunner {
         let mut auto_next_launch: Option<(DocState, Value, u32)> = None;
         match result {
             Ok(()) => {
+                if let Ok(state) = session.doc() {
+                    let uid = state.uid;
+                    let doc_arc = state.doc.clone();
+                    let entry = self.design_memory.entry(uid).or_insert_with(|| crate::brief_planner::SessionDesignMemory::new(uid));
+                    entry.harvest_from_document(
+                        uid,
+                        &doc_arc,
+                        None,
+                        Some(&crate::brief_planner::sanitize_visible_title(&job.task.prompt)),
+                        &job.task.knowledge_pack_ids,
+                        Some(&report.title),
+                    );
+                }
                 job.snapshot.completed_pages = job.snapshot.completed_pages.saturating_add(batch_report.page_count);
                 job.snapshot.checkpoint = job.snapshot.checkpoint.saturating_add(1);
+                if job.snapshot.completed_pages >= job.snapshot.total_pages && !job.task.target_formats.is_empty() {
+                    let _ = crate::doc_tools::materialize_target_formats_on_session(
+                        session,
+                        &job.task.target_formats,
+                        job.task.settings.multi_format_mode,
+                    );
+                }
                 let draft_note = self.bind_production_draft(session, &job.snapshot.job_id).err();
                 let pacing_continues = job.task.settings.execution_pacing == ExecutionPacing::AutoContinue
                     || (job.task.settings.execution_pacing == ExecutionPacing::StopAfterFirstBatch && job.snapshot.current_batch > 1);
@@ -1124,6 +1173,7 @@ impl ProductionRunner {
         if matches!(job.snapshot.status.as_str(), "awaiting_human_proof" | "failed") {
             self.batch = Some(job);
         }
+        self.snapshot.can_continue_locally = self.compute_can_continue_locally();
     }
 
     fn publish_batch(
@@ -1187,9 +1237,13 @@ impl ProductionRunner {
             let current = session.doc().map_err(|e| e.to_string())?;
             let mut base = current.clone();
             base.selection = Default::default();
-            let desired_rtl = book_binding(&job.task.settings, &job.task.prompt);
-            let change_layout = job.task.settings.facing_pages && !base.doc.settings.facing_pages;
-            let change_single_binding = !job.task.settings.facing_pages
+            let (want_facing, desired_rtl) = if let TaskTarget::NewDocument { ref geometry, .. } = job.task.target {
+                (geometry.facing_pages.unwrap_or(false), geometry.right_to_left.unwrap_or_else(|| book_binding(&job.task.settings, &job.task.prompt)))
+            } else {
+                (job.task.settings.facing_pages, book_binding(&job.task.settings, &job.task.prompt))
+            };
+            let change_layout = want_facing && !base.doc.settings.facing_pages;
+            let change_single_binding = !want_facing
                 && !base.doc.settings.facing_pages
                 && base.doc.spreads.iter().all(|s| s.items.is_empty())
                 && base.doc.settings.right_to_left_binding != desired_rtl;
@@ -1843,7 +1897,7 @@ mod tests {
     use super::*;
     use designcraft_ai_providers::Usage;
     use designcraft_ai_types::ModelSelection;
-    use designcraft_ai_types::protocol::*;
+    use designcraft_ai_types::protocol::BudgetSpec;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicU32;
@@ -1874,6 +1928,7 @@ mod tests {
             auto_select_skills: false,
             target: TaskTarget::NewA4 { pages: 2 },
             export_directory: None,
+            ..Default::default()
         }
     }
     #[test]
@@ -2234,6 +2289,7 @@ mod tests {
             expected_doc: continuing.then(|| before.doc.clone()),
             expected_prefs: None,
             skills: vec![],
+            executed_model: (request.settings.text_model.provider, request.settings.text_model.model.clone()),
             settings: request.settings,
             deferred_outcome: None,
             deferred_batch: None,
@@ -3532,6 +3588,7 @@ mod tests {
             auto_select_skills: false,
             target: TaskTarget::ContinueBook,
             export_directory: None,
+            ..Default::default()
         };
         runner.save_production_draft(&session, &task_req).unwrap();
         runner.bind_production_draft(&session, "job-usd-backfill").unwrap();
@@ -4182,6 +4239,7 @@ mod tests {
                 expected_doc: existing.as_ref().map(|d| d.doc.clone()),
                 expected_prefs: None,
                 skills: vec![],
+                executed_model: (request.settings.text_model.provider, request.settings.text_model.model.clone()),
                 settings: request.settings,
                 deferred_outcome: None,
                 deferred_batch: None,

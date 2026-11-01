@@ -1352,6 +1352,7 @@ name = "designcraft-ai-runtime"
 version = "0.15.2"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "designcraft-ai-providers",
  "designcraft-ai-skills",
  "designcraft-ai-types",
@@ -1360,7 +1361,9 @@ dependencies = [
  "designcraft-format",
  "designcraft-geom",
  "designcraft-images",
+ "designcraft-pdf",
  "designcraft-render",
+ "designcraft-textimport",
  "hayro",
  "image",
  "keyring",

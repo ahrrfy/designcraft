@@ -50,7 +50,7 @@ pub(super) const CONTEXT_OBJECT: &[&str] = &[
 /// Added to the object menu when a graphic frame is selected.
 pub(super) const CONTEXT_GRAPHIC_FRAME: &[&str] = &["menu:Object/Fitting"];
 
-pub(super) const CONTEXT_OBJECT_TAIL: &[&str] = &["menu:Object/Content", "menu:Object/Effects"];
+pub(super) const CONTEXT_OBJECT_TAIL: &[&str] = &["menu:Object/Content", "menu:Object/Effects", "-", "ui:ai.runPrompt"];
 
 /// Added to the object menu when a text frame is selected.
 pub(super) const CONTEXT_TEXT_FRAME: &[&str] = &["-", "cmd:type.fillWithPlaceholder", "cmd:object.textFrameOptions"];
@@ -72,6 +72,8 @@ pub(super) const CONTEXT_TEXT: &[&str] = &[
     "ui:app.storyEditor",
     "-",
     "cmd:edit.selectAll",
+    "-",
+    "ui:ai.runPrompt",
 ];
 
 pub(super) const CONTEXT_CANVAS: &[&str] = &[

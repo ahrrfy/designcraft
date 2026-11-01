@@ -157,6 +157,7 @@ impl Vault {
             ProviderKind::OpenAi => "open_ai",
             ProviderKind::Gemini => "gemini",
             ProviderKind::Ollama => "ollama",
+            ProviderKind::LocalOpenAi => "local_open_ai",
             ProviderKind::ComfyUi => "comfy_ui",
         };
         let slot = digest(&[self.profile_digest.as_bytes(), provider.as_bytes(), endpoint.as_str().as_bytes(), b"default"]);

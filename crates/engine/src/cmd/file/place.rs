@@ -11,8 +11,14 @@ use super::{
 pub(super) fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
     // The file's size and time before it is read (a linked text file remembers them).
     let mut before = None;
-    let (data, name, link) = if let Some(aid_num) = p.get("reuseAsset").and_then(Value::as_u64) {
-        let existing = s.doc()?.doc.assets.get(&AssetId(aid_num)).ok_or_else(|| bad("file.place", format!("no such asset {aid_num}")))?;
+    let reused_asset_id = match p.get("reuseAsset").filter(|v| !v.is_null()) {
+        Some(v) => Some(AssetId(v.as_u64().ok_or_else(|| bad("file.place", "`reuseAsset` must be a non-negative integer"))?)),
+        None => None,
+    };
+    let mut reused_pdf_defaults = (0u32, PdfCrop::Crop);
+    let (data, name, link) = if let Some(existing_id) = reused_asset_id {
+        let existing = s.doc()?.doc.assets.get(&existing_id).ok_or_else(|| bad("file.place", format!("no such asset {}", existing_id.0)))?;
+        reused_pdf_defaults = (existing.page, existing.pdf_crop);
         (Arc::clone(&existing.data), str_param(p, "name").map(str::to_owned).unwrap_or_else(|| existing.name.clone()), existing.link.clone())
     } else if let Some(b) = str_param(p, "base64") {
         (Arc::new(base64_decode(b)), str_param(p, "name").unwrap_or("image").to_string(), None)
@@ -68,7 +74,7 @@ pub(super) fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
             let zero_based = one_based.checked_sub(1).ok_or_else(invalid_page)?;
             u32::try_from(zero_based).map_err(|_| invalid_page())?
         }
-        _ => 0,
+        _ => reused_pdf_defaults.0,
     };
     let (pw, ph) = match pdf_page {
         0 => designcraft_render::image_size(&data).ok_or_else(|| bad("file.place", "unsupported or corrupt image"))?,
@@ -84,7 +90,7 @@ pub(super) fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
     let pdf_crop = match str_param(p, "pdfCrop") {
         Some(k) if is_pdf => PdfCrop::from_name(k)
             .ok_or_else(|| bad("file.place", format!("unknown pdfCrop `{k}` (crop, art, trim, bleed, media, contentVisible, contentAll)")))?,
-        _ => PdfCrop::Crop,
+        _ => reused_pdf_defaults.1,
     };
     let mime = designcraft_render::image_mime(&data).to_string();
     let mut asset = Asset { page: pdf_page, name, mime, link, data, pixels: Some((pw, ph)), pdf_crop, ..Default::default() };
@@ -116,8 +122,14 @@ pub(super) fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         return load_cursor(s, asset, (bw, bh));
     }
     s.edit(|d, sel| {
-        let fresh = AssetId(d.alloc());
-        let aid = d.add_asset(Asset { id: fresh, ..asset });
+        let aid = match reused_asset_id {
+            Some(existing_id) if d.assets.get(&existing_id).is_some_and(|a| a.page == asset.page && a.pdf_crop == asset.pdf_crop) => existing_id,
+            _ => {
+                let fresh = AssetId(d.alloc());
+                d.add_asset(Asset { id: fresh, ..asset })
+            }
+        };
+
         // The width the whole page (or image) gets; the height follows the proportions.
         let w = match want_w {
             Some(w) => w,
@@ -763,5 +775,30 @@ mod layout_place_tests {
         assert!((bb.x0 - 100.0).abs() < 1e-6 && (bb.y0 - 100.0).abs() < 1e-6, "page top-left at 0,0: {bb:?}");
         assert!(d.stories.values().any(|st| st.text == "From page one"), "stories come along");
         assert!(b.execute("file.place", &json!({"base64": b64, "name": "src.idml", "layoutPage": 2})).is_err(), "page 2 is empty");
+    }
+
+    #[test]
+    fn reuse_asset_places_multiple_frames_sharing_single_asset_and_rejects_invalid_ids() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let first = s.execute("file.place", &json!({"base64": png, "name": "logo.png", "x": 36, "y": 36, "width": 100})).unwrap();
+        let aid = first["asset"].as_u64().unwrap();
+        let second = s.execute("file.place", &json!({"reuseAsset": aid, "x": 180, "y": 36, "width": 60})).unwrap();
+        let third = s.execute("file.place", &json!({"reuseAsset": aid, "x": 280, "y": 36, "width": 140})).unwrap();
+
+        assert_eq!(second["asset"], first["asset"]);
+        assert_eq!(third["asset"], first["asset"]);
+        assert_ne!(first["id"], second["id"]);
+        assert_ne!(second["id"], third["id"]);
+        let d = &s.doc().unwrap().doc;
+        assert_eq!(d.assets.len(), 1, "all three placed graphics must share the single Asset entry");
+        assert_eq!(d.spreads[0].items.len(), 3);
+
+        let rev = s.doc().unwrap().revision;
+        for bad_param in [json!({"reuseAsset": 999999, "x": 0, "y": 0}), json!({"reuseAsset": 0}), json!({"reuseAsset": "1"})] {
+            assert!(s.execute("file.place", &bad_param).is_err(), "{bad_param}");
+            assert_eq!(s.doc().unwrap().revision, rev);
+        }
     }
 }

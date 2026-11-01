@@ -1,7 +1,7 @@
 use super::{
-    AiSettings, AiSnapshot, ArabicTashkeelMode, BTreeMap, BTreeSet, BatchSnapshot, ExecutionPacing, Instant, ModelSelection, OutputMode,
-    ProviderKind, TaskRequest, TaskTarget, TokenRates, Value, VisualDensityMode, elapsed, is_non_image_model, rtl, selectable_skill_cards,
-    supports_gemini_image_review, text,
+    AiSettings, AiSnapshot, ArabicTashkeelMode, AttachmentRole, BTreeMap, BTreeSet, BatchSnapshot, DocumentGeometrySpec, DocumentIntentSpec,
+    ExecutionMode, ExecutionPacing, Instant, ModelSelection, OutputMode, ProviderKind, SelectionContext, TaskAttachment, TaskRequest, TaskTarget,
+    TokenRates, Value, VisualDensityMode, elapsed, is_non_image_model, rtl, selectable_skill_cards, supports_gemini_image_review, text,
 };
 
 pub(super) const MAX_REQUEST_ALLOWANCE: u32 = 10_000;
@@ -484,6 +484,18 @@ pub(super) fn is_planner_prompt_ui(lower: &str) -> bool {
     .any(|kw| lower.contains(kw))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum PromptGenre {
+    #[default]
+    BookOrCurriculum,
+    SocialOrAds,
+    BusinessCard,
+    Poster,
+    Certificate,
+    Presentation,
+    Planner,
+}
+
 #[derive(Clone)]
 pub(super) struct PromptAnalysisCache {
     pub(super) len: usize,
@@ -494,6 +506,9 @@ pub(super) struct PromptAnalysisCache {
     pub(super) auto_binding_false: bool,
     pub(super) normalized_search: String,
     pub(super) is_planner: bool,
+    pub(super) genre: PromptGenre,
+    pub(super) inferred_geometry: Option<DocumentGeometrySpec>,
+    pub(super) inferred_target_formats: Vec<DocumentGeometrySpec>,
     pub(super) preview_head: String,
 }
 
@@ -506,8 +521,240 @@ pub(super) static EMPTY_PROMPT_CACHE: PromptAnalysisCache = PromptAnalysisCache 
     auto_binding_false: false,
     normalized_search: String::new(),
     is_planner: false,
+    genre: PromptGenre::BookOrCurriculum,
+    inferred_geometry: None,
+    inferred_target_formats: Vec::new(),
     preview_head: String::new(),
 };
+
+pub(super) fn preset_social_square() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 1080.0,
+        height_pt: 1080.0,
+        intent: DocumentIntentSpec::Web,
+        units: "px".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([54.0, 54.0, 54.0, 54.0]),
+        bleed_pt: 0.0,
+        columns: 1,
+        column_gutter_pt: 12.0,
+        preset_label: "Social 1:1 (1080×1080)".into(),
+    }
+}
+
+pub(super) fn preset_social_story() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 1080.0,
+        height_pt: 1920.0,
+        intent: DocumentIntentSpec::Mobile,
+        units: "px".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([64.0, 64.0, 64.0, 64.0]),
+        bleed_pt: 0.0,
+        columns: 1,
+        column_gutter_pt: 12.0,
+        preset_label: "Story 9:16 (1080×1920)".into(),
+    }
+}
+
+pub(super) fn preset_banner_widescreen() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 1920.0,
+        height_pt: 1080.0,
+        intent: DocumentIntentSpec::Web,
+        units: "px".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([72.0, 72.0, 72.0, 72.0]),
+        bleed_pt: 0.0,
+        columns: 1,
+        column_gutter_pt: 16.0,
+        preset_label: "Banner 16:9 (1920×1080)".into(),
+    }
+}
+
+pub(super) fn preset_business_card() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 255.12,
+        height_pt: 155.91,
+        intent: DocumentIntentSpec::Print,
+        units: "mm".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([14.17, 14.17, 14.17, 14.17]),
+        bleed_pt: 8.504,
+        columns: 1,
+        column_gutter_pt: 8.0,
+        preset_label: "Business Card (90×55 mm)".into(),
+    }
+}
+
+pub(super) fn preset_poster_a3() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 841.89,
+        height_pt: 1190.55,
+        intent: DocumentIntentSpec::Print,
+        units: "mm".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([36.0, 36.0, 36.0, 36.0]),
+        bleed_pt: 8.504,
+        columns: 1,
+        column_gutter_pt: 16.0,
+        preset_label: "Poster A3".into(),
+    }
+}
+
+pub(super) fn preset_certificate_a4_landscape() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 841.89,
+        height_pt: 595.28,
+        intent: DocumentIntentSpec::Print,
+        units: "mm".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([36.0, 36.0, 36.0, 36.0]),
+        bleed_pt: 8.504,
+        columns: 1,
+        column_gutter_pt: 12.0,
+        preset_label: "Certificate A4 Landscape".into(),
+    }
+}
+
+pub(super) fn preset_a4_portrait() -> DocumentGeometrySpec {
+    DocumentGeometrySpec {
+        width_pt: 595.276,
+        height_pt: 841.89,
+        intent: DocumentIntentSpec::Print,
+        units: "mm".into(),
+        facing_pages: Some(false),
+        right_to_left: None,
+        margins_pt: Some([36.0, 36.0, 36.0, 36.0]),
+        bleed_pt: 0.0,
+        columns: 1,
+        column_gutter_pt: 12.0,
+        preset_label: "A4".into(),
+    }
+}
+
+pub(super) fn infer_prompt_geometry(
+    normalized_lower: &str,
+    is_planner: bool,
+) -> (PromptGenre, Option<DocumentGeometrySpec>, Vec<DocumentGeometrySpec>) {
+    if normalized_lower.trim().is_empty() {
+        return (PromptGenre::BookOrCurriculum, None, Vec::new());
+    }
+    if is_planner {
+        return (PromptGenre::Planner, None, Vec::new());
+    }
+    let has = |terms: &[&str]| terms.iter().any(|t| normalized_lower.contains(t));
+    let is_book_kw = has(&[
+        "كتاب",
+        "منهج",
+        "كراسة",
+        "كراسه",
+        "مجلة",
+        "مجله",
+        "كتيب",
+        "مذكرة",
+        "درس",
+        "فصل دراسي",
+        "workbook",
+        "curriculum",
+        "textbook",
+        "booklet",
+        "magazine",
+        "book ",
+        " book",
+    ]);
+
+    if has(&["بطاقة عمل", "بطاقات عمل", "كرت شخصي", "كروت شخصية", "business card", "visiting card"]) {
+        return (PromptGenre::BusinessCard, Some(preset_business_card()), Vec::new());
+    }
+    if has(&["شهادة تقدير", "شهادة شكر", "شهادة اجتياز", "شهاده تقدير", "شهادات تقدير", "certificate", "diploma"])
+    {
+        return (PromptGenre::Certificate, Some(preset_certificate_a4_landscape()), Vec::new());
+    }
+    if !is_book_kw && has(&["بوستر", "بوسترات", "ملصق اعلاني", "ملصق إعلاني", "ملصق جداري", "a3 poster", "poster"])
+    {
+        return (PromptGenre::Poster, Some(preset_poster_a3()), Vec::new());
+    }
+    if !is_book_kw && has(&["عرض تقديمي", "عروض تقديمية", "شرائح عرض", "سلايدات", "بوربوينت", "pitch deck", "slide deck", "presentation"])
+    {
+        return (PromptGenre::Presentation, Some(preset_banner_widescreen()), Vec::new());
+    }
+
+    let explicit_social = has(&[
+        "سوشيل",
+        "سوشيال",
+        "انستقرام",
+        "إنستغرام",
+        "انستا",
+        "تيك توك",
+        "سناب",
+        "فيسبوك",
+        "لينكدإن",
+        "لينكدان",
+        "social media",
+        "instagram",
+        "tiktok",
+        "facebook",
+        "linkedin",
+        "1080x1080",
+        "1080×1080",
+        "1080x1920",
+        "1080×1920",
+    ]);
+    let ad_or_post = !is_book_kw
+        && has(&[
+            "اعلان",
+            "إعلان",
+            "اعلانات",
+            "إعلانات",
+            "بوست",
+            "بوستات",
+            "منشور",
+            "منشورات",
+            "ستوري",
+            "ريلز",
+            "بنر",
+            "بانر",
+            "ad campaign",
+            "social post",
+            "instagram post",
+            "story",
+            "stories",
+            "banner",
+        ]);
+
+    if explicit_social || ad_or_post {
+        let wants_story = has(&["ستوري", "ريلز", "تيك توك", "سناب", "9:16", "1080x1920", "1080×1920", "story", "stories", "reel", "tiktok"]);
+        let wants_banner = has(&["16:9", "1920x1080", "1920×1080", "بنر", "بانر", "يوتيوب", "لينكدإن", "لينكدان", "banner", "widescreen"]);
+        let wants_square = has(&["1:1", "1080x1080", "1080×1080", "مربع", "انستقرام", "بوست", "square"]);
+        let multi_campaign = (has(&["احجام", "أحجام", "مقاسات", "متعددة", "campaign sizes", "multi-format", "multiple sizes"])
+            && (has(&["شخصية", "تجارية", "شركات", "مختلفة", "متنوعة", "personal", "commercial", "corporate"])
+                || (usize::from(wants_story) + usize::from(wants_banner) + usize::from(wants_square) >= 2)))
+            || (usize::from(wants_story) + usize::from(wants_banner) + usize::from(wants_square) >= 2);
+
+        let primary = if multi_campaign {
+            preset_social_square()
+        } else if wants_story && !wants_square && !wants_banner {
+            preset_social_story()
+        } else if wants_banner && !wants_square && !wants_story {
+            preset_banner_widescreen()
+        } else {
+            preset_social_square()
+        };
+
+        let campaign_formats =
+            if multi_campaign { vec![preset_social_square(), preset_social_story(), preset_banner_widescreen()] } else { Vec::new() };
+        return (PromptGenre::SocialOrAds, Some(primary), campaign_formats);
+    }
+
+    (PromptGenre::BookOrCurriculum, None, Vec::new())
+}
 
 impl PromptAnalysisCache {
     pub(super) fn fingerprint(prompt: &str) -> (usize, u64) {
@@ -533,6 +780,7 @@ impl PromptAnalysisCache {
         let auto_binding_false = automatic_proof_binding(sample, false);
         let normalized_search = normalize_skill_search_ui(sample);
         let is_planner = is_planner_prompt_ui(&normalized_search);
+        let (genre, inferred_geometry, inferred_target_formats) = infer_prompt_geometry(&normalized_search, is_planner);
         let preview_head = prompt
             .lines()
             .map(str::trim)
@@ -547,7 +795,20 @@ impl PromptAnalysisCache {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Self { len, hash, explicit_pages, natural_pages, has_rtl, auto_binding_false, normalized_search, is_planner, preview_head }
+        Self {
+            len,
+            hash,
+            explicit_pages,
+            natural_pages,
+            has_rtl,
+            auto_binding_false,
+            normalized_search,
+            is_planner,
+            genre,
+            inferred_geometry,
+            inferred_target_formats,
+            preview_head,
+        }
     }
 }
 
@@ -608,9 +869,26 @@ pub(super) fn natural_prompt_pages(prompt: &str) -> Option<u32> {
             continue;
         }
         let lower = trimmed.to_lowercase();
-        for header in
-            ["بعدد الصفحات", "عدد صفحات الكتاب", "عدد الصفحات", "إجمالي الصفحات", "اجمالي الصفحات", "page count", "total pages", "number of pages"]
-        {
+        for header in [
+            "بعدد الصفحات",
+            "عدد صفحات الكتاب",
+            "عدد الصفحات",
+            "إجمالي الصفحات",
+            "اجمالي الصفحات",
+            "عدد التصاميم",
+            "عدد الإعلانات",
+            "عدد الاعلانات",
+            "عدد البوستات",
+            "عدد المنشورات",
+            "عدد البطاقات",
+            "عدد الشرائح",
+            "page count",
+            "total pages",
+            "number of pages",
+            "design count",
+            "ad count",
+            "slide count",
+        ] {
             if let Some(idx) = lower.find(header)
                 && let Some(after_header) = lower.get(idx.saturating_add(header.len())..)
             {
@@ -667,7 +945,10 @@ pub(super) fn natural_prompt_pages(prompt: &str) -> Option<u32> {
                 continue;
             }
             let after_unbracketed = after.trim_start_matches([')', ']', '»']);
-            if let Some(hyphen_tail) = after_unbracketed.strip_prefix("-pages").or_else(|| after_unbracketed.strip_prefix("-page"))
+            if let Some(hyphen_tail) =
+                ["-pages", "-page", "-designs", "-design", "-posts", "-post", "-ads", "-slides", "-slide", "-cards", "-posters", "-banners"]
+                    .iter()
+                    .find_map(|prefix| after_unbracketed.strip_prefix(prefix))
                 && hyphen_tail.chars().next().is_none_or(|c| !c.is_alphabetic() && c != '_')
             {
                 let tail_trimmed = hyphen_tail.trim_start_matches([' ', '\t', '-', '–', '—']);
@@ -678,7 +959,40 @@ pub(super) fn natural_prompt_pages(prompt: &str) -> Option<u32> {
                 continue;
             }
             let unit_rest = after_unbracketed.trim_start_matches([' ', '\t']);
-            for unit in ["صفحات", "صفحة", "صفحه", "pages", "page"] {
+            for unit in [
+                "صفحات",
+                "صفحة",
+                "صفحه",
+                "تصاميم",
+                "تصميمات",
+                "تصميم",
+                "إعلانات",
+                "اعلانات",
+                "إعلان",
+                "اعلان",
+                "بوستات",
+                "بوست",
+                "منشورات",
+                "منشور",
+                "بطاقات",
+                "بطاقة",
+                "شرائح",
+                "سلايدات",
+                "ملصقات",
+                "بوسترات",
+                "pages",
+                "page",
+                "designs",
+                "design",
+                "posts",
+                "post",
+                "ads",
+                "slides",
+                "slide",
+                "cards",
+                "posters",
+                "banners",
+            ] {
                 if let Some(tail) = unit_rest.strip_prefix(unit)
                     && tail.chars().next().is_none_or(|c| !c.is_alphabetic() && c != '_')
                 {
@@ -806,6 +1120,12 @@ impl ProofDisplay {
 #[derive(Clone)]
 pub struct AiUiState {
     pub open: bool,
+    pub docked: bool,
+    pub focus_mode: bool,
+    pub(crate) synced_dock_harmony: bool,
+    pub(crate) auto_collapsed_dock: bool,
+    pub(crate) drawn_frame: Option<u64>,
+    pub(crate) last_panel_rect: Option<egui::Rect>,
     pub(crate) preview_update: crate::preview_update::PreviewUpdate,
     pub tab: usize,
     pub snapshot: AiSnapshot,
@@ -819,6 +1139,21 @@ pub struct AiUiState {
     pub(super) continue_book: bool,
     pub(super) restored_target_unconfirmed: bool,
     pub(super) pages: u32,
+    pub(super) pages_manually_edited: bool,
+    pub(super) custom_geometry: Option<DocumentGeometrySpec>,
+    pub(super) target_formats: Vec<DocumentGeometrySpec>,
+    pub(super) attachments: Vec<TaskAttachment>,
+    pub(super) attachment_path_input: String,
+    pub(super) attachment_role_input: AttachmentRole,
+    pub(super) pick_attachment_file: bool,
+    pub(super) expand_references_section: Option<bool>,
+    pub(super) kp_name_input: String,
+    pub(super) kp_desc_input: String,
+    pub(super) live_selection: Option<SelectionContext>,
+    pub(super) scope_to_selection: bool,
+    pub(super) focus_prompt_next_frame: bool,
+    pub(super) navigate_to_page: Option<usize>,
+    pub(super) quick_export_cmd: Option<&'static str>,
     pub(super) automatic_skills: bool,
     pub(super) selected_skills: BTreeSet<String>,
     pub(super) directory: String,
@@ -864,6 +1199,7 @@ pub struct AiUiState {
     pub(super) companion_proof: Option<CompanionProof>,
     pub(super) proof_error: String,
     pub(super) local_ollama: ModelSelection,
+    pub(super) local_openai: ModelSelection,
     pub(super) local_comfy: ModelSelection,
     pub(super) pending_models: Option<ModelSelection>,
     pub(super) local_probe: Option<(ModelSelection, Vec<String>, String, bool)>,
@@ -903,6 +1239,12 @@ impl Default for AiUiState {
     fn default() -> Self {
         Self {
             open: false,
+            docked: true,
+            focus_mode: false,
+            synced_dock_harmony: false,
+            auto_collapsed_dock: false,
+            drawn_frame: None,
+            last_panel_rect: None,
             preview_update: crate::preview_update::PreviewUpdate::default(),
             tab: 0,
             snapshot: AiSnapshot::default(),
@@ -916,6 +1258,21 @@ impl Default for AiUiState {
             continue_book: false,
             restored_target_unconfirmed: false,
             pages: 8,
+            pages_manually_edited: false,
+            custom_geometry: None,
+            target_formats: Vec::new(),
+            attachments: Vec::new(),
+            attachment_path_input: String::new(),
+            attachment_role_input: AttachmentRole::Auto,
+            pick_attachment_file: false,
+            expand_references_section: None,
+            kp_name_input: String::new(),
+            kp_desc_input: String::new(),
+            live_selection: None,
+            scope_to_selection: true,
+            focus_prompt_next_frame: false,
+            navigate_to_page: None,
+            quick_export_cmd: None,
             automatic_skills: true,
             selected_skills: BTreeSet::new(),
             directory: String::new(),
@@ -961,6 +1318,11 @@ impl Default for AiUiState {
             companion_proof: None,
             proof_error: String::new(),
             local_ollama: ModelSelection { provider: ProviderKind::Ollama, model: String::new(), endpoint: Some("http://127.0.0.1:11434".into()) },
+            local_openai: ModelSelection {
+                provider: ProviderKind::LocalOpenAi,
+                model: String::new(),
+                endpoint: Some("http://127.0.0.1:1234/v1".into()),
+            },
             local_comfy: ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: Some("http://127.0.0.1:8188".into()) },
             pending_models: None,
             local_probe: None,
@@ -1020,6 +1382,10 @@ impl AiUiState {
         })
     }
 
+    pub(super) fn is_book_or_curriculum_genre(&self) -> bool {
+        self.custom_geometry.is_none() && matches!(self.analyzed_prompt().genre, PromptGenre::BookOrCurriculum | PromptGenre::Planner)
+    }
+
     pub(super) fn requested_target_pages(&self) -> Option<u32> {
         let analysis = self.analyzed_prompt();
         analysis.explicit_pages.or(analysis.natural_pages).or_else(|| {
@@ -1034,10 +1400,25 @@ impl AiUiState {
         self.automatic_skills = request.auto_select_skills;
         self.selected_skills = request.skill_ids.iter().cloned().collect();
         self.directory = request.export_directory.clone().unwrap_or_default();
-        self.new_document = matches!(request.target, TaskTarget::NewA4 { .. });
+        self.attachments = request.attachments.clone();
+        if !request.knowledge_pack_ids.is_empty() {
+            self.settings.active_knowledge_packs = request.knowledge_pack_ids.clone();
+        }
+        self.target_formats = request.target_formats.clone();
+        self.new_document = matches!(request.target, TaskTarget::NewA4 { .. } | TaskTarget::NewDocument { .. });
         self.continue_book = matches!(request.target, TaskTarget::ContinueBook);
-        if let TaskTarget::NewA4 { pages } = request.target {
-            self.pages = pages;
+        match &request.target {
+            TaskTarget::NewA4 { pages } => {
+                self.pages = *pages;
+                self.pages_manually_edited = true;
+                self.custom_geometry = None;
+            }
+            TaskTarget::NewDocument { pages, geometry } => {
+                self.pages = *pages;
+                self.pages_manually_edited = true;
+                self.custom_geometry = Some(geometry.clone());
+            }
+            TaskTarget::CurrentDocument | TaskTarget::ContinueBook => {}
         }
         self.rates_confirmed = has_configured_rates(&self.settings);
         self.workflow_json = self.settings.comfy_workflow.as_ref().map(Value::to_string).unwrap_or_default();
@@ -1053,6 +1434,8 @@ impl AiUiState {
         self.workflow_error.clear();
         if self.settings.text_model.provider == ProviderKind::Ollama {
             self.local_ollama = self.settings.text_model.clone();
+        } else if self.settings.text_model.provider == ProviderKind::LocalOpenAi {
+            self.local_openai = self.settings.text_model.clone();
         }
         if self.settings.image_model.provider == ProviderKind::ComfyUi {
             self.local_comfy = self.settings.image_model.clone();
@@ -1077,6 +1460,10 @@ impl AiUiState {
                     merged.comfy_workflow = snapshot.settings.comfy_workflow.clone();
                     merged.execution_pacing = snapshot.settings.execution_pacing;
                     merged.visual_density = snapshot.settings.visual_density;
+                    merged.execution_mode = snapshot.settings.execution_mode;
+                    merged.hybrid_local_model = snapshot.settings.hybrid_local_model.clone();
+                    merged.active_knowledge_packs = snapshot.settings.active_knowledge_packs.clone();
+                    merged.multi_format_mode = snapshot.settings.multi_format_mode;
                     if snapshot.settings.arabic_tashkeel != ArabicTashkeelMode::Auto {
                         merged.arabic_tashkeel = snapshot.settings.arabic_tashkeel;
                     }
@@ -1091,6 +1478,12 @@ impl AiUiState {
                 self.restored_target_unconfirmed = !self.new_document;
             }
             self.initialized = true;
+        }
+        for ep in &snapshot.discovered_local_endpoints {
+            if ep.reachable && !ep.models.is_empty() {
+                self.discovered_models.insert((ep.provider, Some(ep.endpoint.clone())), ep.models.clone());
+                self.discovered_models.insert((ep.provider, None), ep.models.clone());
+            }
         }
         let key = snapshot.review.as_ref().map(|r| (r.id.clone(), r.revision.clone()));
         if key != self.review_key {
@@ -1224,20 +1617,85 @@ impl AiUiState {
             })
     }
 
+    pub(super) fn effective_new_document_geometry(&self) -> Option<DocumentGeometrySpec> {
+        if let Some(custom) = &self.custom_geometry {
+            return Some(custom.clone());
+        }
+        self.analyzed_prompt().inferred_geometry.clone()
+    }
+
+    pub(super) fn effective_target_formats(&self) -> Vec<DocumentGeometrySpec> {
+        if !self.target_formats.is_empty() {
+            return self.target_formats.clone();
+        }
+        self.analyzed_prompt().inferred_target_formats.clone()
+    }
+
+    pub(super) fn effective_new_document_pages(&self) -> u32 {
+        if !self.pages_manually_edited && self.pages == 8 && self.effective_new_document_geometry().is_some() {
+            let analysis = self.analyzed_prompt();
+            if let Some(detected) = analysis.explicit_pages.or(analysis.natural_pages) {
+                return detected;
+            }
+        }
+        self.pages
+    }
+
+    pub(crate) fn attach_file_path(&mut self, raw_path: &str, explicit_role: Option<AttachmentRole>) -> bool {
+        let cleaned = super::sanitize_user_path(raw_path);
+        if cleaned.is_empty() {
+            return false;
+        }
+        if self.attachments.iter().any(|existing| existing.path == cleaned) {
+            return true;
+        }
+        let role = explicit_role.unwrap_or_else(|| {
+            let ext = std::path::Path::new(&cleaned).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+            match ext.as_str() {
+                "xlsx" | "csv" => AttachmentRole::DataRecords,
+                "svg" => AttachmentRole::BrandLogo,
+                "png" | "jpg" | "jpeg" | "webp" => AttachmentRole::ContentAsset,
+                _ => AttachmentRole::KnowledgeReference,
+            }
+        });
+        self.attachments.push(TaskAttachment { path: cleaned, role });
+        self.expand_references_section = Some(true);
+        true
+    }
+
     pub(super) fn production_task(&self) -> TaskRequest {
+        let target_formats = self.effective_target_formats();
+        let target = if self.new_document {
+            let pages = self.effective_new_document_pages();
+            if let Some(mut geometry) = self.effective_new_document_geometry() {
+                if geometry.facing_pages.is_none() {
+                    geometry.facing_pages = Some(self.settings.facing_pages);
+                }
+                TaskTarget::NewDocument { pages, geometry }
+            } else if !target_formats.is_empty() {
+                let mut geometry = preset_a4_portrait();
+                geometry.facing_pages = Some(self.settings.facing_pages);
+                TaskTarget::NewDocument { pages, geometry }
+            } else {
+                TaskTarget::NewA4 { pages }
+            }
+        } else if self.continue_book {
+            TaskTarget::ContinueBook
+        } else {
+            TaskTarget::CurrentDocument
+        };
+        let selection_context = if !self.new_document && !self.continue_book && self.scope_to_selection { self.live_selection.clone() } else { None };
         TaskRequest {
             prompt: self.prompt.clone(),
             settings: self.settings.clone(),
             auto_select_skills: self.automatic_skills,
             skill_ids: self.selected_skills.iter().cloned().collect(),
-            target: if self.new_document {
-                TaskTarget::NewA4 { pages: self.pages }
-            } else if self.continue_book {
-                TaskTarget::ContinueBook
-            } else {
-                TaskTarget::CurrentDocument
-            },
+            target,
             export_directory: (!self.directory.trim().is_empty()).then(|| self.directory.clone()),
+            attachments: self.attachments.clone(),
+            knowledge_pack_ids: self.settings.active_knowledge_packs.clone(),
+            selection_context,
+            target_formats,
         }
     }
 
@@ -1361,6 +1819,13 @@ impl AiUiState {
                 "The selected text model is an image/media model. Choose a text model (for example gemini-3.8-flash) above.",
                 "نموذج النص المختار مخصص للصور أو الوسائط. اختر نموذج نص (مثل gemini-3.8-flash) من الحقل أعلاه.",
             )
+        } else if self.settings.execution_mode == ExecutionMode::LocalOnly
+            && matches!(self.settings.text_model.provider, ProviderKind::Gemini | ProviderKind::OpenAi)
+        {
+            (
+                "Local-only execution mode is active. Choose Ollama or Local OpenAI for the text model, or switch Execution Mode.",
+                "وضع التنفيذ المحلي الخالص مفعل. اختر Ollama أو Local OpenAI لنموذج النص، أو غيّر وضع التنفيذ.",
+            )
         } else if !self.new_document && !document {
             ("Open a document or choose New document.", "افتح مستنداً أو اختر مستنداً جديداً.")
         } else if self.restored_target_unconfirmed {
@@ -1368,10 +1833,23 @@ impl AiUiState {
                 "Choose the target book or prepare its remaining pages before producing the saved request.",
                 "اختر الكتاب المستهدف أو جهّز صفحاته المتبقية قبل إنتاج التعليمات المحفوظة.",
             )
+        } else if uses_images
+            && self.settings.execution_mode == ExecutionMode::LocalOnly
+            && matches!(self.settings.image_model.provider, ProviderKind::Gemini | ProviderKind::OpenAi)
+        {
+            (
+                "Local-only execution mode is active. Choose ComfyUI for local images, or switch to Editable elements.",
+                "وضع التنفيذ المحلي الخالص مفعل. اختر ComfyUI للصور المحلية، أو حوّل الوضع إلى عناصر قابلة للتحرير.",
+            )
         } else if uses_images && self.settings.image_model.provider == ProviderKind::Ollama {
             (
                 "Ollama does not generate raster images here. Choose Gemini, OpenAI, or ComfyUI for the image model, or switch to Editable elements.",
                 "مزود Ollama لا يولّد صوراً نقطية هنا. اختر Gemini أو OpenAI أو ComfyUI لنموذج الصور، أو حوّل الوضع إلى عناصر قابلة للتحرير.",
+            )
+        } else if uses_images && self.settings.image_model.provider == ProviderKind::LocalOpenAi {
+            (
+                "Local OpenAI text servers do not generate raster images here. Choose ComfyUI, Gemini, or OpenAI for the image model, or switch to Editable elements.",
+                "خوادم Local OpenAI النصية لا تولّد صوراً نقطية هنا. اختر ComfyUI أو Gemini أو OpenAI لنموذج الصور، أو حوّل الوضع إلى عناصر قابلة للتحرير.",
             )
         } else if uses_images && self.settings.image_model.provider != ProviderKind::ComfyUi && self.settings.image_model.model.trim().is_empty() {
             ("Choose an image model in Providers and keys.", "اختر نموذج الصور من تبويب المزودين والمفاتيح.")
@@ -1479,10 +1957,11 @@ impl AiUiState {
         };
         let requested_pages = self.requested_target_pages();
         let remaining = if self.new_document {
-            if scripted_pages.is_some_and(|pages| pages != self.pages) {
+            let new_pages = self.effective_new_document_pages();
+            if scripted_pages.is_some_and(|pages| pages != new_pages) {
                 return None;
             }
-            self.pages
+            new_pages
         } else {
             let document = documents.iter().find(|document| Some(document.index) == active)?;
             if !document.can_continue_with_target(requested_pages, !self.prompt.trim().is_empty()) {

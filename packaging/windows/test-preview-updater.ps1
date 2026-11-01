@@ -191,5 +191,41 @@ try {
 Remove-UnlockedCanonicalBackups $canonicalDir
 Check (-not (Test-Path -LiteralPath $lockedOldPath)) 'Unlocked designcraft.exe.old remained after cleanup.'
 Check (@(Get-ChildItem -LiteralPath $canonicalDir -Filter 'designcraft.exe.old.*' -Force).Count -eq 0) 'Unlocked suffixed designcraft.exe.old.* remained after cleanup.'
-Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, canonical in-place single-slot promotion, multi-update locked .old rollover, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
+& {
+    $script:restCalls = 0
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $script:restCalls++
+        if ($script:restCalls -lt 3) { throw [Net.WebException]::new('Unable to connect to the remote server') }
+        return [pscustomobject]@{ status = 'ahead' }
+    }
+    $res = Invoke-PreviewRestWithRetry -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers @{} -TimeoutSec 5 -MaxAttempts 3 -RetryDelaySeconds 0
+    Check ($res.status -eq 'ahead' -and $script:restCalls -eq 3) 'Transient REST timeout did not retry and recover.'
+
+    $script:clientCalls = 0
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $script:clientCalls++
+        $err = [Exception]::new('Not Found')
+        $err | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 404 }) -Force
+        throw $err
+    }
+    Reject { Invoke-PreviewRestWithRetry -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers @{} -TimeoutSec 5 -MaxAttempts 3 -RetryDelaySeconds 0 }
+    Check ($script:clientCalls -eq 1) 'Client 404 error was retried unnecessarily.'
+    Reject { Invoke-PreviewRestWithRetry -Uri 'https://evil.example/repos/ahrrfy/designcraft/releases' -Headers @{} -TimeoutSec 5 -MaxAttempts 2 -RetryDelaySeconds 0 }
+
+    $dlOut = Join-Path $testRoot 'retry-download.json'
+    $script:dlCalls = 0
+    function Invoke-WebRequest {
+        param([switch]$UseBasicParsing, $Uri, $OutFile, $TimeoutSec)
+        $script:dlCalls++
+        [IO.File]::WriteAllText($OutFile, 'partial-bytes')
+        if ($script:dlCalls -eq 1) { throw [IO.IOException]::new('Connection reset by peer') }
+        [IO.File]::WriteAllText($OutFile, '{"ok":true}')
+    }
+    Invoke-PreviewDownloadWithRetry -Uri 'https://github.com/ahrrfy/designcraft/releases/download/v0.15.2-ai.test/update.json' -OutFile $dlOut -TimeoutSec 5 -MaxAttempts 3 -RetryDelaySeconds 0
+    Check ($script:dlCalls -eq 2 -and (Get-Content -LiteralPath $dlOut -Raw) -eq '{"ok":true}') 'Transient download reset did not clean partial file and recover.'
+    Reject { Invoke-PreviewDownloadWithRetry -Uri 'https://evil.example/update.json' -OutFile $dlOut -TimeoutSec 5 -MaxAttempts 2 -RetryDelaySeconds 0 }
+}
+Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, transient network retry, persisted live-app staging, canonical in-place single-slot promotion, multi-update locked .old rollover, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

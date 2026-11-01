@@ -1119,3 +1119,60 @@ fn apply_group_defers_preflight_until_all_repair_chunks_complete() {
     let err = s.execute("production.applyGroup", &unrepaired).unwrap_err().to_string();
     assert!(err.contains("preflight rejected draft"), "got {err}");
 }
+
+#[test]
+fn liquid_layout_alternate_layouts_reuse_asset_and_headless_variables_execute_in_production() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 600.0, "height": 800.0, "pages": 1, "facingPages": false, "binding": "rightToLeft"})).unwrap();
+    let before = s.doc().unwrap().doc.clone();
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    let plan = json!({
+        "outputMode": "native_with_images",
+        "label": "Multi-Format Campaign",
+        "commands": [
+            {"command": "liquid.pageRule", "params": {"rule": "objectBased", "pages": [1]}},
+            {"command": "variables.define", "params": {"name": "CampaignTag", "type": "custom", "text": "إصدار ٢٠٢٦"}},
+            {"command": "frame.create", "params": {"rect": [54, 54, 546, 120], "content": "text", "text": "حملة التعليم — ", "caret": false}},
+            {"command": "variables.insert", "params": {"name": "CampaignTag", "frame": "$2.id"}},
+            {"command": "liquid.object", "params": {"ids": ["$2.id"], "resizeWidth": true, "resizeHeight": false, "pinTop": true, "pinLeft": true, "pinRight": true}},
+            {"command": "file.place", "params": {"base64": png, "name": "badge.png", "x": 54, "y": 160, "width": 120}},
+            {"command": "file.place", "params": {"reuseAsset": "$5.asset", "x": 220, "y": 160, "width": 120}},
+            {"command": "file.place", "params": {"reuseAsset": "$5.asset", "x": 386, "y": 160, "width": 120}},
+            {"command": "layout.createAlternate", "params": {"name": "Social Square", "width": 600.0, "height": 600.0, "rule": "objectBased"}}
+        ]
+    });
+
+    let res = s.execute("production.apply", &plan).unwrap();
+    assert_eq!(res["steps"], 9);
+    let doc = &s.doc().unwrap().doc;
+    assert_eq!(doc.assets.len(), 1, "reuseAsset must deduplicate to a single Asset entry in doc.assets");
+    assert_eq!(res["results"][5]["asset"], res["results"][6]["asset"]);
+    assert_eq!(res["results"][5]["asset"], res["results"][7]["asset"]);
+    assert_eq!(doc.page_count(), 2, "layout.createAlternate adds the alternate page");
+    let (_, _, alt_page) = doc.pages().nth(1).unwrap();
+    assert!((alt_page.bounds().height() - 600.0).abs() < 1e-3);
+
+    // Reject missing reuseAsset, simultaneous base64 + reuseAsset, or reuseAsset in native_only mode:
+    let snapshot = s.doc().unwrap().doc.clone();
+    let bad_missing = json!({
+        "outputMode": "native_with_images",
+        "commands": [{"command": "file.place", "params": {"reuseAsset": 999999, "x": 54, "y": 54, "width": 80}}]
+    });
+    assert!(s.execute("production.apply", &bad_missing).is_err());
+    let existing_aid = res["results"][5]["asset"].as_u64().unwrap();
+    let bad_both = json!({
+        "outputMode": "native_with_images",
+        "commands": [{"command": "file.place", "params": {"base64": png, "reuseAsset": existing_aid, "name": "x.png", "x": 54, "y": 54, "width": 80}}]
+    });
+    assert!(s.execute("production.apply", &bad_both).is_err());
+    let bad_native_only = json!({
+        "outputMode": "native_only",
+        "commands": [{"command": "file.place", "params": {"reuseAsset": existing_aid, "x": 54, "y": 54, "width": 80}}]
+    });
+    assert!(s.execute("production.apply", &bad_native_only).is_err());
+    assert!(Arc::ptr_eq(&snapshot, &s.doc().unwrap().doc));
+
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(Arc::ptr_eq(&before, &s.doc().unwrap().doc));
+}

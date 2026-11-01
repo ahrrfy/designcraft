@@ -303,7 +303,7 @@ fn draft(s: &Session, p: &Value, mut cancelled: impl FnMut() -> bool) -> Result<
             }
         }
         if id == "file.place" {
-            let raster = check_image(&resolved)?;
+            let raster = check_image(&work.doc()?.doc, &resolved)?;
             if image_sources.insert(raster.sha256) {
                 image_bytes = image_bytes
                     .checked_add(raster.bytes)

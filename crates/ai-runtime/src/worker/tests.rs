@@ -185,6 +185,7 @@ fn ai24_cached_plan_with_no_room_for_repeated_images_is_rejected_before_reuse() 
         auto_select_skills: true,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
@@ -485,8 +486,9 @@ fn ai23_template_family_checks_previous_native_page_and_internal_sequence() {
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
             export_directory: None,
+            ..Default::default()
         };
-        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let before = session.doc().unwrap().doc.clone();
@@ -559,8 +561,9 @@ fn ai23_single_page_parts_check_body_variety_against_actual_previous_native_page
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let result = Runner {
@@ -650,6 +653,7 @@ fn ai23_cached_plan_emits_measured_native_layout_recovery_diagnostics() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let provider = Ai23SyntheticProvider::new(vec![]);
     let mut ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
@@ -712,8 +716,9 @@ fn ai23_group_print_admission_checks_later_resolution_before_first_image() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let result = Runner {
@@ -780,8 +785,9 @@ fn ai23_fixed_profile_generic_group_keeps_shared_source_crops_and_views() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 5 },
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let product = Runner {
@@ -849,8 +855,9 @@ fn long_bilingual_brief_reaches_model_without_truncation() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let result = Runner {
@@ -916,8 +923,9 @@ fn current_document_uses_open_geometry_and_ignores_unused_profile_atlas() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let result = Runner {
@@ -992,8 +1000,9 @@ fn current_document_images_follow_actual_frames_and_keep_profile_style() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let result = Runner {
@@ -1080,8 +1089,9 @@ fn current_document_geometry_changes_are_rejected_before_image_purchase() {
                 auto_select_skills: false,
                 target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
                 export_directory: None,
+                ..Default::default()
             };
-            let mut ledger = UsageLedger::new(settings.budget).unwrap();
+            let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
             let (sender, _receiver) = mpsc::channel();
             let cancel = AtomicBool::new(false);
             let result = Runner {
@@ -1178,9 +1188,10 @@ fn generic_review_beyond_one_plan_is_partitioned_before_provider_calls() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::ContinueBook,
         export_directory: None,
+        ..Default::default()
     };
     let provider = GenericScopeProvider(RefCell::new(vec![]));
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let scope = BatchScope { start: 1, count: 513 };
@@ -1271,8 +1282,9 @@ fn generic_internal_failure_or_cancellation_keeps_live_review_unpublished() {
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 35 },
             export_directory: None,
+            ..Default::default()
         };
-        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let provider = AbortProvider { cancel_second, calls: std::cell::Cell::new(0) };
@@ -1370,8 +1382,9 @@ fn template_review_scope_is_split_internally_without_reducing_requested_pages() 
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 4 },
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let result = Runner {
@@ -1531,8 +1544,9 @@ fn ai10_generated_arabic_is_plain_without_altering_explicitly_supplied_or_reques
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         };
-        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let mut runner = Runner {
@@ -1617,8 +1631,9 @@ fn ai10_repeated_body_layout_is_rejected_before_buying_illustrations() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 48 },
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -1732,6 +1747,7 @@ fn incompatible_shared_image_ratio_fails_before_text_or_any_image_purchase() {
                 auto_select_skills: false,
                 target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
                 export_directory: None,
+                ..Default::default()
             },
             json!({}),
             catalog(),
@@ -1829,11 +1845,12 @@ fn template_text_uses_actual_native_fit_without_cutting_copy_or_shrinking_type()
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
             export_directory: None,
+            ..Default::default()
         };
         let mut session = Session::new();
         session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
         let original = session.doc().unwrap().doc.clone();
-        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let result = Runner {
@@ -1922,8 +1939,9 @@ fn template_review_validates_all_text_before_buying_any_images() {
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
             export_directory: None,
+            ..Default::default()
         };
-        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, _receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let result = Runner {
@@ -2056,8 +2074,9 @@ fn template_content_request(start_page: u32) {
             designcraft_ai_types::protocol::TaskTarget::ContinueBook
         },
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -2169,6 +2188,7 @@ fn explicit_low_ram_in_spawned_worker_stops_before_ledger_and_http() {
                 auto_select_skills: false,
                 target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
                 export_directory: None,
+                ..Default::default()
             },
             context: json!({}),
             catalog: designcraft_engine::cmd::production::catalog(),
@@ -2452,8 +2472,9 @@ fn failed_raw_plan_does_not_repeat_a_provider_call_without_explicit_opt_in() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -2723,6 +2744,7 @@ fn late_validation_repairs_use_authored_response_without_host_font_actions() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     assert!(
         runner.production(request, json!({}), designcraft_engine::cmd::production::catalog(), vec![], base.clone(), session.prefs.clone()).is_err()
@@ -2773,6 +2795,7 @@ fn command_validation_repairs_on_private_document_with_one_ledger() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let product = runner.production(request, json!({}), catalog, vec![], base, session.prefs.clone()).unwrap();
     assert!(matches!(product, Product::Plan(_)));
@@ -2831,6 +2854,7 @@ fn overset_layout_is_rejected_before_spending_on_images() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let error = runner.production(request, json!({}), catalog, vec![], base, session.prefs.clone()).err().unwrap();
     assert!(error.contains("overset"), "{error}");
@@ -3287,6 +3311,7 @@ fn preflight_errors_are_repaired_before_returning_a_plan() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     assert!(matches!(runner.production(request, json!({}), catalog, vec![], base, session.prefs.clone()), Ok(Product::Plan(_))));
     assert_eq!(ledger.summary().requests, 2);
@@ -3531,10 +3556,11 @@ fn generic_facing_request_includes_future_companion_as_context_only() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 14 },
         export_directory: None,
+        ..Default::default()
     };
     let mut session = Session::new();
     session.execute("file.new", &json!({"preset":"A4","pages":14,"facingPages":false})).unwrap();
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -3585,11 +3611,12 @@ fn generic_cached_geometry_is_checked_before_artwork_and_raw_cache_writes() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
         export_directory: None,
+        ..Default::default()
     };
     let mut session = Session::new();
     session.execute("file.new", &json!({"preset":"A4","pages":1,"facingPages":false})).unwrap();
     let skills = vec![text_fit_style()];
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -3688,10 +3715,10 @@ fn adaptive_explicit_script_omits_large_template_examples_but_keeps_exact_pinned
     }
     let provider = InspectAdaptive(std::cell::Cell::new(0));
     let settings = AiSettings { budget: BudgetSpec { token_limit: 500_000, ..Default::default() }, ..Default::default() };
-    let request=TaskRequest{prompt:"### PAGE 01 — Ownership\n* **English Print Copy (LTR):**\n > My book\n### PAGE 02 — Guide\n* **English Print Copy (LTR):**\n > Teacher guide\n".into(),settings:settings.clone(),skill_ids:vec![],auto_select_skills:false,target:designcraft_ai_types::protocol::TaskTarget::NewA4{pages:2},export_directory:None};
+    let request=TaskRequest{prompt:"### PAGE 01 — Ownership\n* **English Print Copy (LTR):**\n > My book\n### PAGE 02 — Guide\n* **English Print Copy (LTR):**\n > Teacher guide\n".into(),settings:settings.clone(),skill_ids:vec![],auto_select_skills:false,target:designcraft_ai_types::protocol::TaskTarget::NewA4{pages:2},export_directory:None, ..Default::default() };
     let mut session = Session::new();
     session.execute("file.new", &json!({"width":720,"height":960,"pages":2,"facingPages":false,"margins":51})).unwrap();
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -3755,8 +3782,9 @@ fn ai21_resolved_print_fonts_reach_planner_before_geometry_is_authored() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let provider = InspectPrintFonts(expected);
@@ -3804,11 +3832,12 @@ fn ai20_opened_custom_book_continuation_adapts_style_commands_to_actual_geometry
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::ContinueBook,
         export_directory: None,
+        ..Default::default()
     };
     let mut session = Session::new();
     session.execute("file.new", &json!({"width":720,"height":960,"pages":2,"facingPages":false,"margins":51})).unwrap();
     session.execute("frame.create", &json!({"spread":0,"rect":[60,60,180,120]})).unwrap();
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mut runner = Runner {
@@ -3891,8 +3920,9 @@ fn incomplete_provider_generation_enters_repair_loop_and_records_partial_evidenc
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let provider = RecoverAfterIncomplete(std::cell::Cell::new(0));
@@ -3987,8 +4017,9 @@ fn current_document_edits_existing_objects_and_replaces_graphic_frames_in_place(
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _receiver) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let provider = EditOpenedDoc { heading_id, heading_story, obsolete_id };
@@ -4385,10 +4416,11 @@ fn template_content_paid_repair_loop_recovers_slot_overset_only_when_opted_in() 
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
             export_directory: None,
+            ..Default::default()
         };
         let mut session = Session::new();
         session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
-        let mut ledger = UsageLedger::new(settings.budget).unwrap();
+        let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
         let (sender, receiver) = mpsc::channel();
         let cancel = AtomicBool::new(false);
         let provider = RepairingMock { prompts: &prompts_seen };
@@ -4607,6 +4639,7 @@ fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards()
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         },
         json!({}),
         designcraft_engine::cmd::production::catalog(),
@@ -4665,6 +4698,7 @@ fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards()
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let cache_ctx = json!({"_production_cache_root": cache_dir.path().to_string_lossy()});
     let mut plan_ledger = UsageLedger::new(settings.budget.clone()).unwrap();
@@ -4739,6 +4773,7 @@ fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards()
             auto_select_skills: false,
             target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
             export_directory: None,
+            ..Default::default()
         },
         json!({"batch_scope": {"start": 0, "count": 2}}),
         designcraft_engine::cmd::production::catalog(),
@@ -5083,6 +5118,7 @@ fn agent_loop_multi_turn_inspects_and_applies_relational_document_edits_in_one_u
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (sender, _rx) = mpsc::channel();
@@ -5225,6 +5261,7 @@ fn agent_loop_gates_paid_cloud_images_unless_explicitly_requested_or_free_comfyu
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger1 = UsageLedger::new(paid_settings.budget.clone()).unwrap();
     let (tx1, _rx1) = mpsc::channel();
@@ -5257,6 +5294,7 @@ fn agent_loop_gates_paid_cloud_images_unless_explicitly_requested_or_free_comfyu
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger2 = UsageLedger::new(paid_settings.budget.clone()).unwrap();
     let (tx2, _rx2) = mpsc::channel();
@@ -5350,6 +5388,7 @@ fn agent_loop_local_json_fallback_repairs_and_completes_without_tool_calls() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (tx, _rx) = mpsc::channel();
@@ -5484,6 +5523,7 @@ fn open_doc_native_only_verify_generated_images_auto_executes_comfyui_and_prefli
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let ov = ws.inspect_document_overview(&dummy_req).unwrap();
     assert_eq!(ov["specialMarkers"]["currentPageNumber"].as_str(), Some("\u{E000}"));
@@ -5510,6 +5550,7 @@ fn open_doc_native_only_verify_generated_images_auto_executes_comfyui_and_prefli
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger_local = UsageLedger::new(local_settings.budget.clone()).unwrap();
     let (tx_l, _rx_l) = mpsc::channel();
@@ -5549,6 +5590,7 @@ fn open_doc_native_only_verify_generated_images_auto_executes_comfyui_and_prefli
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let mut ledger_oa = UsageLedger::new(openai_settings.budget.clone()).unwrap();
     let (tx_oa, _rx_oa) = mpsc::channel();
@@ -5796,8 +5838,9 @@ fn agent_loop_render_visual_check_multimodal_and_turn_pruning() {
         auto_select_skills: false,
         target: designcraft_ai_types::protocol::TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
-    let mut ledger = UsageLedger::new(settings.budget).unwrap();
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
     let (tx, _rx) = mpsc::channel();
     let cancel = AtomicBool::new(false);
     let mock = VisionLoopMock { turn: std::cell::Cell::new(0) };
@@ -5838,4 +5881,148 @@ fn agent_loop_render_visual_check_multimodal_and_turn_pruning() {
         }
     }
     assert!(found_grouped_live_caption, "atomic grouped LiveCaption must exist on spread 1");
+}
+
+#[test]
+fn bug004_max_tokens_and_multipage_truncation_auto_recover_via_compact_retry_and_single_page_split() {
+    let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+
+    // Case A: Single-page plan hits MAX_TOKENS on call 1 -> automatically retries with compact JSON & doubled output tokens on call 2!
+    let valid_p0 = json!({
+        "title": "Recovered Social Poster",
+        "commands": [
+            {"command": "frame.create", "params": {"spread": 0, "rect": [72, 72, 480, 240], "content": "text", "text": "Clean Recovery"}}
+        ],
+        "images": []
+    });
+    // Note: `Mock` pops responses from the end of `Vec` (LIFO), so push call 2 first, then call 1!
+    let mock_single = Mock {
+        responses: RefCell::new(vec![
+            Ok(GenerationResponse {
+                text: valid_p0.to_string(),
+                usage: Usage { input_tokens: Some(45), output_tokens: Some(120), ..Default::default() },
+                error: None,
+            }),
+            Ok(GenerationResponse {
+                text: "{\"title\":\"Cut off".into(),
+                usage: Usage { input_tokens: Some(40), output_tokens: Some(256), ..Default::default() },
+                error: Some("Gemini stopped before completing output: MAX_TOKENS".into()),
+            }),
+        ]),
+    };
+    let mut session = Session::new();
+    session.execute("file.new", &json!({"preset": "A4", "pages": 1, "facingPages": false})).unwrap();
+    let settings = AiSettings {
+        budget: BudgetSpec { token_limit: 500_000, max_output_tokens: 1024, max_requests: 6, ..Default::default() },
+        ..Default::default()
+    };
+    let req_single = TaskRequest {
+        prompt: "Design a clean one-page poster".into(),
+        settings: settings.clone(),
+        target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 1 },
+        ..Default::default()
+    };
+    let mut ledger = UsageLedger::new(settings.budget.clone()).unwrap();
+    let (tx, _rx) = mpsc::channel();
+    let cancel = AtomicBool::new(false);
+    let mut runner = Runner {
+        cache_root: None,
+        print: None,
+        planning_only: false,
+        ledger: &mut ledger,
+        keys: &[],
+        cancel: &cancel,
+        sender: &tx,
+        provider: &mock_single,
+    };
+    let Product::Plan(recovered_plan) = runner
+        .production(
+            req_single,
+            json!({"pages": 1}),
+            session.execute("production.catalog", &json!({})).unwrap(),
+            vec![],
+            session.doc().unwrap().clone(),
+            session.prefs.clone(),
+        )
+        .expect("MAX_TOKENS single-page auto-recovery must succeed")
+    else {
+        panic!("expected recovered Plan");
+    };
+    assert_eq!(recovered_plan.title, "Recovered Social Poster");
+    assert_eq!(ledger.summary().requests, 2);
+
+    // Case B: 2-page batch hits MAX_TOKENS on both full-batch attempts -> automatically splits into 1-page sub-requests (page 0 + page 1)!
+    let split_p0 = json!({
+        "title": "Brochure Page 1",
+        "commands": [
+            {"command": "frame.create", "params": {"spread": 0, "rect": [72, 72, 460, 220], "content": "text", "text": "Cover Headline"}}
+        ],
+        "images": []
+    });
+    let split_p1 = json!({
+        "title": "Brochure Page 2",
+        "commands": [
+            {"command": "frame.create", "params": {"spread": 1, "rect": [72, 96, 460, 280], "content": "text", "text": "Interior Details"}}
+        ],
+        "images": []
+    });
+    // LIFO order: call 4 (split_p1), call 3 (split_p0), call 2 (compact retry truncated), call 1 (initial batch truncated)
+    let mock_split = Mock {
+        responses: RefCell::new(vec![
+            Ok(GenerationResponse {
+                text: split_p1.to_string(),
+                usage: Usage { input_tokens: Some(40), output_tokens: Some(115), ..Default::default() },
+                error: None,
+            }),
+            Ok(GenerationResponse {
+                text: split_p0.to_string(),
+                usage: Usage { input_tokens: Some(40), output_tokens: Some(110), ..Default::default() },
+                error: None,
+            }),
+            Ok(GenerationResponse {
+                text: "{\"title\":\"Truncated compact retry".into(),
+                usage: Usage { input_tokens: Some(50), output_tokens: Some(1024), ..Default::default() },
+                error: Some("Gemini stopped before completing output: MAX_TOKENS".into()),
+            }),
+            Ok(GenerationResponse {
+                text: "{\"title\":\"Truncated batch 1".into(),
+                usage: Usage { input_tokens: Some(50), output_tokens: Some(512), ..Default::default() },
+                error: Some("Gemini stopped before completing output: MAX_TOKENS".into()),
+            }),
+        ]),
+    };
+    let mut session2 = Session::new();
+    session2.execute("file.new", &json!({"preset": "A4", "pages": 2, "facingPages": false})).unwrap();
+    let mut ledger2 = UsageLedger::new(settings.budget.clone()).unwrap();
+    let mut runner2 = Runner {
+        cache_root: None,
+        print: None,
+        planning_only: false,
+        ledger: &mut ledger2,
+        keys: &[],
+        cancel: &cancel,
+        sender: &tx,
+        provider: &mock_split,
+    };
+    let req_multi = TaskRequest {
+        prompt: "Design a 2-page corporate brochure".into(),
+        settings: settings.clone(),
+        target: designcraft_ai_types::protocol::TaskTarget::NewA4 { pages: 2 },
+        ..Default::default()
+    };
+    let Product::Plan(merged_plan) = runner2
+        .production(
+            req_multi,
+            json!({"pages": 2}),
+            session2.execute("production.catalog", &json!({})).unwrap(),
+            vec![],
+            session2.doc().unwrap().clone(),
+            session2.prefs.clone(),
+        )
+        .expect("multi-page MAX_TOKENS must split to 1-page sub-plans and succeed")
+    else {
+        panic!("expected merged Plan");
+    };
+    assert!(merged_plan.commands.len() >= 2);
 }

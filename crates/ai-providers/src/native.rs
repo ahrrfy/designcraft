@@ -93,6 +93,10 @@ pub(super) struct Transport<'a> {
 impl<'a> Transport<'a> {
     pub(super) fn new(selection: &ModelSelection, key: Option<&'a str>) -> Result<Self, String> {
         let base = validate_endpoint(selection)?;
+        let key = match selection.provider {
+            ProviderKind::LocalOpenAi | ProviderKind::Ollama | ProviderKind::ComfyUi => key.map(str::trim).filter(|k| !k.is_empty()),
+            ProviderKind::OpenAi | ProviderKind::Gemini => key,
+        };
         if key.is_some_and(|key| !key.is_empty() && base.as_str().contains(key)) {
             return Err("API key must not occur in the endpoint URL".into());
         }
@@ -111,8 +115,8 @@ impl<'a> Transport<'a> {
     }
 
     fn request(&self, method: reqwest::Method, url: Url) -> Result<RequestBuilder, String> {
-        let generation =
-            method == reqwest::Method::POST && matches!(self.provider, ProviderKind::Gemini | ProviderKind::OpenAi | ProviderKind::Ollama);
+        let generation = method == reqwest::Method::POST
+            && matches!(self.provider, ProviderKind::Gemini | ProviderKind::OpenAi | ProviderKind::Ollama | ProviderKind::LocalOpenAi);
         let mut request = self.client.request(method, url);
         if generation {
             request = request.timeout(GENERATION_TIMEOUT);
@@ -218,6 +222,7 @@ impl LocalOriginLease {
         let tag = match provider {
             ProviderKind::Ollama => 1_u8,
             ProviderKind::ComfyUi => 2_u8,
+            ProviderKind::LocalOpenAi => 3_u8,
             ProviderKind::OpenAi | ProviderKind::Gemini => return Ok(Self { token: None }),
         };
         let key = (tag, base.origin().ascii_serialization());
@@ -439,7 +444,11 @@ fn response_read_error(error: &std::io::Error) -> &'static str {
 
 pub(super) fn model_id(selection: &ModelSelection) -> Result<&str, String> {
     let model = selection.model.strip_prefix("models/").unwrap_or(&selection.model);
-    if model.is_empty() || model.len() > 256 || !model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.:/".contains(&c)) {
+    let allow_local_chars = selection.provider == ProviderKind::LocalOpenAi;
+    if model.is_empty()
+        || model.len() > 256
+        || !model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.:/".contains(&c) || (allow_local_chars && (c == b'@' || c == b'+')))
+    {
         return Err("Invalid model identifier".into());
     }
     if model.split('/').any(|part| part == ".." || part == "." || part.is_empty()) {
@@ -713,6 +722,20 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
             json!({"model":model,"stream":false,"messages":[{"role":"system","content":request.system},{"role":"user","content":request.prompt}],
                 "format":request.json_schema,"options":options,"keep_alive":request.resources.keep_alive_seconds})
         }
+        ProviderKind::LocalOpenAi => {
+            let user_prompt = gemini_json_prompt(request)?;
+            json!({
+                "model": model,
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": request.system},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "max_tokens": request.max_output_tokens,
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"}
+            })
+        }
         ProviderKind::ComfyUi => return Err("ComfyUI supports image workflows, not layout text generation".into()),
     };
     if !request.images.is_empty() {
@@ -734,6 +757,18 @@ pub(super) fn generation_body(selection: &ModelSelection, request: &GenerationRe
             ProviderKind::Ollama => {
                 if let Some(message) = body.pointer_mut("/messages/1") {
                     message["images"] = json!(encoded_images);
+                }
+            }
+            ProviderKind::LocalOpenAi => {
+                let mut content = vec![json!({"type": "text", "text": gemini_json_prompt(request)?})];
+                for (input, encoded) in request.images.iter().zip(&encoded_images) {
+                    content.push(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{};base64,{encoded}", input.mime_type)}
+                    }));
+                }
+                if let Some(message) = body.pointer_mut("/messages/1") {
+                    message["content"] = Value::Array(content);
                 }
             }
             ProviderKind::ComfyUi => return Err("ComfyUI does not support reference analysis".into()),
@@ -766,6 +801,7 @@ pub(super) fn generate_with_post(
         ProviderKind::OpenAi => "responses".into(),
         ProviderKind::Gemini => format!("models/{}:generateContent", model_id(selection)?),
         ProviderKind::Ollama => "api/chat".into(),
+        ProviderKind::LocalOpenAi => "chat/completions".into(),
         ProviderKind::ComfyUi => return Err("ComfyUI requires an image workflow".into()),
     };
     let response = match post(&path, &body, false) {
@@ -786,6 +822,18 @@ pub(super) fn generate_with_post(
             }
             post(&path, &fallback_body, true)?
         }
+        Err(error)
+            if selection.provider == ProviderKind::LocalOpenAi
+                && (error.starts_with("AI provider HTTP 400:") || error.starts_with("AI provider HTTP 422:"))
+                && body.get("response_format").is_some() =>
+        {
+            crate::check_cancel(cancel)?;
+            let mut fallback_body = body;
+            if let Some(obj) = fallback_body.as_object_mut() {
+                obj.remove("response_format");
+            }
+            post(&path, &fallback_body, true)?
+        }
         Err(error) => return Err(error),
     };
     parse_generation(selection.provider, &response)
@@ -800,6 +848,13 @@ pub(super) fn parse_usage(provider: ProviderKind, value: &Value) -> Usage {
             output_tokens: number("output_tokens"),
             cached_input_tokens: usage.and_then(|u| u.pointer("/input_tokens_details/cached_tokens")).and_then(Value::as_u64),
             reasoning_tokens: usage.and_then(|u| u.pointer("/output_tokens_details/reasoning_tokens")).and_then(Value::as_u64),
+            cache_write_tokens: None,
+        },
+        ProviderKind::LocalOpenAi => Usage {
+            input_tokens: number("prompt_tokens"),
+            output_tokens: number("completion_tokens"),
+            cached_input_tokens: usage.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")).and_then(Value::as_u64),
+            reasoning_tokens: usage.and_then(|u| u.pointer("/completion_tokens_details/reasoning_tokens")).and_then(Value::as_u64),
             cache_write_tokens: None,
         },
         ProviderKind::Gemini => Usage {
@@ -832,6 +887,51 @@ pub(super) fn gemini_candidate_text(candidate: &Value) -> String {
         .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
         .filter_map(|p| p.get("text").and_then(Value::as_str))
         .collect::<String>()
+}
+
+pub(super) fn chat_completion_message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) != Some("thinking") && part.get("thought").and_then(Value::as_bool) != Some(true))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>(),
+        _ => String::new(),
+    }
+}
+
+pub(super) fn strip_think_blocks(raw: &str) -> String {
+    let mut rest = raw.trim_start();
+    if !rest.starts_with("<think>") {
+        return raw.to_string();
+    }
+    let mut stripped_any = false;
+    while let Some(after_open) = rest.strip_prefix("<think>") {
+        if let Some(end_idx) = after_open.find("</think>") {
+            rest = after_open.get(end_idx + "</think>".len()..).unwrap_or("").trim_start();
+            stripped_any = true;
+        } else {
+            break;
+        }
+    }
+    if stripped_any { rest.trim().to_string() } else { raw.to_string() }
+}
+
+fn clean_local_json_text(raw: &str) -> String {
+    let stripped = strip_think_blocks(raw);
+    if serde_json::from_str::<Value>(&stripped).is_ok() {
+        return stripped;
+    }
+    let trimmed = stripped.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && end > start
+        && let Some(slice) = trimmed.get(start..=end)
+        && serde_json::from_str::<Value>(slice).is_ok_and(|v| v.is_object())
+    {
+        return slice.to_string();
+    }
+    stripped
 }
 
 pub(super) fn parse_generation(provider: ProviderKind, value: &Value) -> Result<GenerationResponse, String> {
@@ -910,6 +1010,23 @@ fn generation_text(provider: ProviderKind, value: &Value) -> Result<String, Stri
             }
             value.pointer("/message/content").and_then(Value::as_str).ok_or("Ollama response has no message content")?.to_string()
         }
+        ProviderKind::LocalOpenAi => {
+            let choice =
+                value.get("choices").and_then(Value::as_array).and_then(|choices| choices.first()).ok_or("Local OpenAI response has no choices")?;
+            let message = choice.get("message").ok_or("Local OpenAI response has no message")?;
+            if message.get("refusal").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                return Err("AI provider refused the request".into());
+            }
+            let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+            if finish_reason == Some("length") {
+                return Err("Local OpenAI response hit output token limit (finish_reason: length)".into());
+            }
+            if finish_reason == Some("content_filter") {
+                return Err("Local OpenAI response stopped due to content_filter".into());
+            }
+            let raw = chat_completion_message_text(message);
+            clean_local_json_text(&raw)
+        }
         ProviderKind::ComfyUi => return Err("ComfyUI does not provide structured text generation".into()),
     };
     if text.is_empty() || text.len() > MAX_JSON_BYTES {
@@ -924,7 +1041,7 @@ pub(super) fn list_models(selection: &ModelSelection, key: Option<&str>, cancel:
     let transport = Transport::new(selection, key)?;
     let mut models = Vec::new();
     let path = match selection.provider {
-        ProviderKind::OpenAi => "models",
+        ProviderKind::OpenAi | ProviderKind::LocalOpenAi => "models",
         ProviderKind::Gemini => "models",
         ProviderKind::Ollama => "api/tags",
         ProviderKind::ComfyUi => "models/checkpoints",
@@ -940,6 +1057,22 @@ pub(super) fn list_models(selection: &ModelSelection, key: Option<&str>, cancel:
                     models.push(ModelInfo { id: id.into(), supports_generate_content: Some(false) });
                 }
             }
+        } else if selection.provider == ProviderKind::LocalOpenAi {
+            let list = value
+                .get("data")
+                .and_then(Value::as_array)
+                .or_else(|| value.get("models").and_then(Value::as_array))
+                .ok_or("AI provider returned an invalid model list")?;
+            for item in list {
+                if let Some(raw_id) = item.get("id").and_then(Value::as_str).or_else(|| item.get("name").and_then(Value::as_str)) {
+                    let clean_id = raw_id.strip_prefix("models/").unwrap_or(raw_id).trim();
+                    if !clean_id.is_empty() && !designcraft_ai_types::is_non_text_model(clean_id) {
+                        models.push(ModelInfo { id: clean_id.into(), supports_generate_content: Some(true) });
+                    }
+                }
+            }
+            models.sort_by(|a, b| a.id.cmp(&b.id));
+            models.dedup_by(|a, b| a.id == b.id);
         } else {
             let list = value
                 .get(if selection.provider == ProviderKind::OpenAi { "data" } else { "models" })
@@ -1017,6 +1150,9 @@ pub(super) fn generate_images(
     request: &ImageRequest,
     cancel: &AtomicBool,
 ) -> Result<ImageResponse, String> {
+    if selection.provider == ProviderKind::LocalOpenAi {
+        return Err("LocalOpenAi does not generate raster images; select ComfyUI or Native Vector mode".into());
+    }
     if request.prompt.is_empty() || request.prompt.len() > MAX_JSON_BYTES / 2 {
         return Err("Image prompt is empty or exceeds size limit".into());
     }

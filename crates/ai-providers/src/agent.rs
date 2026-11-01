@@ -1,7 +1,7 @@
-use super::{AgentMessage, AgentTurnRequest, AgentTurnResponse, AtomicBool, MAX_JSON_BYTES, ModelSelection, ProviderKind, ToolCall, Value};
+use super::{AgentMessage, AgentTurnRequest, AgentTurnResponse, AtomicBool, MAX_JSON_BYTES, ModelSelection, ProviderKind, ToolCall, Usage, Value};
 use crate::native::{
-    LocalOriginLease, Transport, encode_json, gemini_candidate_text, gemini_thinking_config, model_id, parse_usage, sanitize_reason_token,
-    validate_value,
+    LocalOriginLease, Transport, chat_completion_message_text, encode_json, gemini_candidate_text, gemini_thinking_config, model_id, parse_usage,
+    sanitize_reason_token, strip_think_blocks, validate_value,
 };
 use base64::Engine;
 use serde_json::json;
@@ -154,6 +154,15 @@ fn history_uses_ollama_json_fallback(request: &AgentTurnRequest) -> bool {
         matches!(
             msg,
             AgentMessage::Assistant { tool_calls, .. } if tool_calls.iter().any(|tc| tc.id.starts_with("ollama_json_call_"))
+        )
+    })
+}
+
+fn history_uses_local_openai_json_fallback(request: &AgentTurnRequest) -> bool {
+    request.messages.iter().any(|msg| {
+        matches!(
+            msg,
+            AgentMessage::Assistant { tool_calls, .. } if tool_calls.iter().any(|tc| tc.id.starts_with("local_openai_json_call_"))
         )
     })
 }
@@ -452,14 +461,158 @@ fn gemini_agent_turn_body(model: &str, request: &AgentTurnRequest, encoded_image
     Ok(body)
 }
 
-pub(super) fn agent_turn_body(selection: &ModelSelection, request: &AgentTurnRequest, ollama_json_fallback: bool) -> Result<Value, String> {
+fn local_openai_agent_turn_body(
+    model: &str,
+    request: &AgentTurnRequest,
+    encoded_images: &[EncodedMessageImages],
+    json_fallback: bool,
+) -> Result<Value, String> {
+    let mut system = request.system.clone();
+    if json_fallback && !request.tools.is_empty() {
+        let catalog: Vec<Value> =
+            request.tools.iter().map(|t| json!({"name": t.name, "description": t.description, "parameters": t.parameters})).collect();
+        let catalog_str = serde_json::to_string(&catalog).map_err(|_| "Cannot encode fallback tool catalog")?;
+        system.push_str(
+            "\n\nJSON TOOL CALL PROTOCOL (strict JSON response required):\n\
+            To invoke one or more tools, respond ONLY with JSON:\n\
+            {\"tool_calls\": [{\"name\": \"<tool_name>\", \"arguments\": { ... }}]}\n\
+            When all edits and checks are complete, respond ONLY with JSON:\n\
+            {\"final_response\": \"<concise summary>\"}\n\
+            AVAILABLE TOOLS:\n",
+        );
+        system.push_str(&catalog_str);
+    }
+    let mut messages = vec![json!({"role": "system", "content": system})];
+    for (msg, msg_images) in request.messages.iter().zip(encoded_images) {
+        match msg {
+            AgentMessage::User { text, images } => {
+                if images.is_empty() || msg_images.user.is_empty() {
+                    messages.push(json!({"role": "user", "content": text}));
+                } else {
+                    let mut content = vec![json!({"type": "text", "text": text})];
+                    for (img, encoded) in images.iter().zip(&msg_images.user) {
+                        content.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{};base64,{encoded}", img.mime_type)},
+                        }));
+                    }
+                    messages.push(json!({"role": "user", "content": content}));
+                }
+            }
+            AgentMessage::Assistant { text, tool_calls, .. } => {
+                if json_fallback {
+                    let content = if !tool_calls.is_empty() {
+                        let calls: Vec<Value> = tool_calls.iter().map(|tc| json!({"name": tc.name, "arguments": tc.arguments})).collect();
+                        serde_json::to_string(&json!({"tool_calls": calls})).unwrap_or_else(|_| text.clone())
+                    } else {
+                        text.clone()
+                    };
+                    messages.push(json!({"role": "assistant", "content": content}));
+                } else {
+                    let mut m = json!({"role": "assistant", "content": text});
+                    if !tool_calls.is_empty() {
+                        let mut calls = Vec::with_capacity(tool_calls.len());
+                        for tc in tool_calls {
+                            let args_str = serde_json::to_string(&tc.arguments).map_err(|_| "Cannot serialize tool call arguments")?;
+                            calls.push(json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": args_str,
+                                },
+                            }));
+                        }
+                        m["tool_calls"] = Value::Array(calls);
+                    }
+                    messages.push(m);
+                }
+            }
+            AgentMessage::ToolResults { results } => {
+                let mut visual_parts = Vec::new();
+                for (res, res_images) in results.iter().zip(&msg_images.tool_results) {
+                    for (img, encoded) in res.images.iter().zip(res_images) {
+                        visual_parts.push((img.mime_type.as_str(), encoded.as_str()));
+                    }
+                }
+                if json_fallback {
+                    let payload: Vec<Value> = results.iter().map(|r| json!({"tool": r.name, "call_id": r.call_id, "output": r.output})).collect();
+                    let content_text = serde_json::to_string(&json!({"tool_results": payload})).map_err(|_| "Cannot encode tool results")?;
+                    if visual_parts.is_empty() {
+                        messages.push(json!({"role": "user", "content": content_text}));
+                    } else {
+                        let mut content = vec![json!({"type": "text", "text": content_text})];
+                        for (mime, encoded) in visual_parts {
+                            content.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{mime};base64,{encoded}")},
+                            }));
+                        }
+                        messages.push(json!({"role": "user", "content": content}));
+                    }
+                } else {
+                    for res in results {
+                        let out_str = serde_json::to_string(&res.output).map_err(|_| "Cannot serialize tool result")?;
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": res.call_id,
+                            "content": out_str,
+                        }));
+                    }
+                    if !visual_parts.is_empty() {
+                        let mut content = vec![json!({
+                            "type": "text",
+                            "text": "Visual render output attached from tool inspection:",
+                        })];
+                        for (mime, encoded) in visual_parts {
+                            content.push(json!({
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{mime};base64,{encoded}")},
+                            }));
+                        }
+                        messages.push(json!({"role": "user", "content": content}));
+                    }
+                }
+            }
+        }
+    }
+    let mut body = json!({
+        "model": model,
+        "stream": false,
+        "messages": messages,
+        "max_tokens": request.max_output_tokens,
+        "temperature": 0.2,
+    });
+    if !json_fallback && !request.tools.is_empty() {
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    }
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tools);
+    }
+    Ok(body)
+}
+
+pub(super) fn agent_turn_body(selection: &ModelSelection, request: &AgentTurnRequest, local_json_fallback: bool) -> Result<Value, String> {
     let model = model_id(selection)?;
     let include_tool_images = crate::supports_agent_vision(selection);
     let encoded_images = validate_agent_request(request, include_tool_images)?;
     let body = match selection.provider {
         ProviderKind::OpenAi => openai_agent_turn_body(model, request, &encoded_images)?,
         ProviderKind::Gemini => gemini_agent_turn_body(model, request, &encoded_images)?,
+        ProviderKind::LocalOpenAi => local_openai_agent_turn_body(model, request, &encoded_images, local_json_fallback)?,
         ProviderKind::Ollama => {
+            let ollama_json_fallback = local_json_fallback;
             request.resources.validate()?;
             if request.max_output_tokens >= request.resources.context_tokens {
                 return Err("Local output limit must be smaller than the context window".into());
@@ -605,12 +758,17 @@ pub(super) fn generate_agent_turn_with_post(
     cancel: &AtomicBool,
     mut post: impl FnMut(&str, &Value, bool) -> Result<Value, String>,
 ) -> Result<AgentTurnResponse, String> {
-    let initial_ollama_fallback = selection.provider == ProviderKind::Ollama && history_uses_ollama_json_fallback(request);
-    let body = agent_turn_body(selection, request, initial_ollama_fallback)?;
+    let initial_local_fallback = match selection.provider {
+        ProviderKind::Ollama => history_uses_ollama_json_fallback(request),
+        ProviderKind::LocalOpenAi => history_uses_local_openai_json_fallback(request),
+        _ => false,
+    };
+    let body = agent_turn_body(selection, request, initial_local_fallback)?;
     let path = match selection.provider {
         ProviderKind::OpenAi => "responses".into(),
         ProviderKind::Gemini => format!("models/{}:generateContent", model_id(selection)?),
         ProviderKind::Ollama => "api/chat".into(),
+        ProviderKind::LocalOpenAi => "chat/completions".into(),
         ProviderKind::ComfyUi => return Err("ComfyUI requires an image workflow".into()),
     };
     let response = match post(&path, &body, false) {
@@ -638,8 +796,8 @@ pub(super) fn generate_agent_turn_with_post(
             post(&path, &fallback_body, true)?
         }
         Err(error)
-            if selection.provider == ProviderKind::Ollama
-                && !initial_ollama_fallback
+            if matches!(selection.provider, ProviderKind::Ollama | ProviderKind::LocalOpenAi)
+                && !initial_local_fallback
                 && (error.starts_with("AI provider HTTP 400:") || error.starts_with("AI provider HTTP 422:"))
                 && !request.tools.is_empty() =>
         {
@@ -889,7 +1047,121 @@ pub(super) fn parse_agent_turn(provider: ProviderKind, value: &Value) -> Result<
             }
             Ok(AgentTurnResponse { text, tool_calls, raw_provider_turn: None, usage, error: None })
         }
+        ProviderKind::LocalOpenAi => parse_local_openai_agent_turn(value, usage),
         ProviderKind::ComfyUi => Err("ComfyUI does not provide agent tool turns".into()),
+    }
+}
+
+fn parse_local_openai_agent_turn(value: &Value, usage: Usage) -> Result<AgentTurnResponse, String> {
+    let Some(choice) = value.get("choices").and_then(Value::as_array).and_then(|choices| choices.first()) else {
+        return Ok(AgentTurnResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            raw_provider_turn: None,
+            usage,
+            error: Some("Local OpenAI response has no choices".into()),
+        });
+    };
+    let Some(message) = choice.get("message") else {
+        return Ok(AgentTurnResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            raw_provider_turn: None,
+            usage,
+            error: Some("Local OpenAI response has no message".into()),
+        });
+    };
+    if let Some(early_err) = local_openai_choice_error(choice, message) {
+        return Ok(AgentTurnResponse { text: String::new(), tool_calls: Vec::new(), raw_provider_turn: None, usage, error: Some(early_err) });
+    }
+    let raw_text = chat_completion_message_text(message);
+    let mut text = strip_think_blocks(&raw_text);
+    let mut tool_calls = match parse_local_openai_native_tool_calls(message) {
+        Ok(calls) => calls,
+        Err(err) => return Ok(AgentTurnResponse { text, tool_calls: Vec::new(), raw_provider_turn: None, usage, error: Some(err) }),
+    };
+    if tool_calls.is_empty()
+        && let Some(envelope) = extract_json_envelope(&text)
+    {
+        apply_local_openai_json_envelope(&envelope, &mut text, &mut tool_calls);
+    }
+    if text.len() > MAX_JSON_BYTES || (text.is_empty() && tool_calls.is_empty()) {
+        return Ok(AgentTurnResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+            raw_provider_turn: None,
+            usage,
+            error: Some("Local OpenAI returned empty or excessive agent response".into()),
+        });
+    }
+    Ok(AgentTurnResponse { text, tool_calls, raw_provider_turn: None, usage, error: None })
+}
+
+fn local_openai_choice_error(choice: &Value, message: &Value) -> Option<String> {
+    if message.get("refusal").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+        return Some("AI provider refused the request".into());
+    }
+    match choice.get("finish_reason").and_then(Value::as_str) {
+        Some("length") => Some("Local OpenAI response hit output token limit (finish_reason: length)".into()),
+        Some("content_filter") => Some("Local OpenAI response stopped due to content_filter".into()),
+        _ => None,
+    }
+}
+
+fn parse_local_openai_native_tool_calls(message: &Value) -> Result<Vec<ToolCall>, String> {
+    let mut tool_calls = Vec::new();
+    for (idx, tc) in message.get("tool_calls").and_then(Value::as_array).into_iter().flatten().enumerate() {
+        let func = tc.get("function").unwrap_or(tc);
+        let Some(name) = func.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            return Err("Local OpenAI tool_call missing name".into());
+        };
+        let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map_or_else(|| format!("local_openai_call_{idx}"), str::to_string);
+        let arguments = match func.get("arguments") {
+            Some(Value::String(raw)) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(trimmed).map_err(|_| format!("Local OpenAI tool '{name}' returned malformed JSON arguments"))?
+                }
+            }
+            Some(v) if !v.is_null() => v.clone(),
+            _ => json!({}),
+        };
+        tool_calls.push(ToolCall { id, name: name.to_string(), arguments });
+    }
+    Ok(tool_calls)
+}
+
+fn decode_fallback_tool_arguments(raw_args: Option<&Value>) -> Value {
+    match raw_args {
+        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw.trim()).unwrap_or_else(|_| json!({})),
+        Some(v) if !v.is_null() => v.clone(),
+        _ => json!({}),
+    }
+}
+
+fn apply_local_openai_json_envelope(envelope: &Value, text: &mut String, tool_calls: &mut Vec<ToolCall>) {
+    if let Some(calls) = envelope.get("tool_calls").and_then(Value::as_array) {
+        for (idx, tc) in calls.iter().enumerate() {
+            let func = tc.get("function").unwrap_or(tc);
+            if let Some(name) = func.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                let arguments = decode_fallback_tool_arguments(func.get("arguments").or_else(|| func.get("args")));
+                tool_calls.push(ToolCall { id: format!("local_openai_json_call_{idx}"), name: name.to_string(), arguments });
+            }
+        }
+        if !tool_calls.is_empty() {
+            *text = envelope.get("thought").and_then(Value::as_str).unwrap_or("").to_string();
+        }
+    } else if let Some(name) = envelope.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())
+        && envelope.get("arguments").is_some()
+        && envelope.as_object().is_some_and(|m| m.len() <= 4)
+    {
+        let arguments = decode_fallback_tool_arguments(envelope.get("arguments"));
+        tool_calls.push(ToolCall { id: "local_openai_json_call_0".into(), name: name.to_string(), arguments });
+        text.clear();
+    } else if let Some(final_text) = envelope.get("final_response").and_then(Value::as_str) {
+        *text = final_text.to_string();
     }
 }
 

@@ -1,8 +1,10 @@
 use super::{
-    AiRequest, AiUiState, ArabicTashkeelMode, BatchSnapshot, DiagnosticAlertKind, ExecutionPacing, MAX_REQUEST_ALLOWANCE, MAX_TOKEN_LIMIT,
-    OpenDocument, OutputMode, ProductionDraft, PromptAnalysisCache, ProviderKind, RequestEstimate, SkillCard, TaskTarget, TokenEstimate, TokenRates,
-    VisualDensityMode, automatic_proof_binding, bidi_layouter, button, explicit_script_pages, facing_proof_pair, field, has_configured_rates,
-    is_non_image_model, is_non_text_model, is_retired_gemini_text_model, label, model, named_rtl_text_edit, natural_prompt_pages, provider, rtl,
+    AiRequest, AiUiState, ArabicTashkeelMode, AttachmentRole, BatchSnapshot, DiagnosticAlertKind, DocumentIntentSpec, ExecutionMode, ExecutionPacing,
+    MAX_REQUEST_ALLOWANCE, MAX_TOKEN_LIMIT, ModelSelection, MultiFormatOutputMode, OpenDocument, OutputMode, ProductionDraft, PromptAnalysisCache,
+    ProviderKind, RequestEstimate, SkillCard, TaskTarget, TokenEstimate, TokenRates, VisualDensityMode, automatic_proof_binding, bidi_layouter,
+    button, explicit_script_pages, facing_proof_pair, field, has_configured_rates, is_non_image_model, is_non_text_model,
+    is_retired_gemini_text_model, label, model, named_rtl_text_edit, natural_prompt_pages, preset_a4_portrait, preset_banner_widescreen,
+    preset_business_card, preset_certificate_a4_landscape, preset_poster_a3, preset_social_square, preset_social_story, provider, provider_name, rtl,
     supports_gemini_image_review, text,
 };
 
@@ -44,6 +46,7 @@ pub(super) fn pending_image_approval_card(ui: &mut egui::Ui, s: &AiUiState, a: b
         ProviderKind::Gemini => "Gemini",
         ProviderKind::OpenAi => "OpenAI",
         ProviderKind::Ollama => "Ollama",
+        ProviderKind::LocalOpenAi => "Local OpenAI",
         ProviderKind::ComfyUi => "ComfyUI",
     };
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -56,7 +59,7 @@ pub(super) fn pending_image_approval_card(ui: &mut egui::Ui, s: &AiUiState, a: b
         if !approval.summary.is_empty() {
             rtl::label(ui, &approval.summary);
         }
-        let is_local_provider = matches!(approval.provider, ProviderKind::ComfyUi | ProviderKind::Ollama);
+        let is_local_provider = matches!(approval.provider, ProviderKind::ComfyUi | ProviderKind::Ollama | ProviderKind::LocalOpenAi);
         let cost_note = if is_local_provider {
             if a {
                 "توليد محلي مجاني ($0.00) · تُطبَّق الصور في خطوة تراجع واحدة.".to_owned()
@@ -216,7 +219,7 @@ pub(super) fn matching_retryable_failed_batch<'a>(
     if batch.status != "failed" || !batch.retryable || batch.job_id != draft.id {
         return None;
     }
-    let unpublished_new_book = matches!(draft.request.target, TaskTarget::NewA4 { .. })
+    let unpublished_new_book = matches!(draft.request.target, TaskTarget::NewA4 { .. } | TaskTarget::NewDocument { .. })
         && batch.completed_pages == 0
         && batch.document_uid.is_none()
         && draft.document_uid.is_none();
@@ -318,7 +321,8 @@ pub(super) fn production_recovery(
     }
     if let Some(draft) = &s.snapshot.production_draft
         && (matches!(draft.request.target, TaskTarget::ContinueBook)
-            || (matches!(draft.request.target, TaskTarget::NewA4 { .. }) && (draft.document_uid.is_some() || draft.document_path.is_some())))
+            || (matches!(draft.request.target, TaskTarget::NewA4 { .. } | TaskTarget::NewDocument { .. })
+                && (draft.document_uid.is_some() || draft.document_path.is_some())))
     {
         let selected = saved_book_document(draft, documents, *activate_document).filter(|document| document.continuable);
         ui.horizontal_wrapped(|ui| {
@@ -382,6 +386,15 @@ pub(super) fn production_recovery(
             }
             requests.push(AiRequest::RetryBatch { job_id: batch.job_id.clone() });
         }
+    }
+    if s.snapshot.can_continue_locally
+        && !s.snapshot.busy
+        && s.active_diagnostic_alert().is_none()
+        && button(ui, a, "Continue remaining pages locally", "متابعة الصفحات المتبقية محلياً")
+    {
+        let job_id = s.snapshot.batch.as_ref().map(|b| b.job_id.clone()).filter(|id| !id.is_empty());
+        let local_model = best_configured_local_text_model(s);
+        requests.push(AiRequest::ContinueRemainingLocally { job_id, local_model });
     }
     if s.snapshot.batch.as_ref().is_some_and(|batch| batch.status == "failed" && batch.completed_pages == 0) && !s.snapshot.busy {
         let can_start_fresh = production_blocking_issue(s, available, documents, *activate_document, a).is_none();
@@ -537,6 +550,7 @@ pub(super) fn render_diagnostic_alert_banner(
                             s.new_document = true;
                             s.continue_book = false;
                             s.pages = script_pages;
+                            s.pages_manually_edited = true;
                             s.restored_target_unconfirmed = false;
                             s.clear_failure_alert();
                         }
@@ -553,6 +567,22 @@ pub(super) fn render_diagnostic_alert_banner(
                     }
                     DiagnosticAlertKind::General => {}
                 }
+                let offer_local_fallback = s.snapshot.can_continue_locally
+                    || (matches!(
+                        alert.kind,
+                        DiagnosticAlertKind::ConnectionOrRateLimit
+                            | DiagnosticAlertKind::MissingCredential
+                            | DiagnosticAlertKind::CostBudget
+                            | DiagnosticAlertKind::RequestBudget
+                    ) && best_configured_local_text_model(s).is_some());
+                if offer_local_fallback
+                    && ui.button(rtl::widget(ui, text(a, "Continue remaining pages locally", "متابعة الصفحات المتبقية محلياً"))).clicked()
+                {
+                    let job_id = s.snapshot.batch.as_ref().map(|b| b.job_id.clone()).filter(|id| !id.is_empty());
+                    let local_model = best_configured_local_text_model(s);
+                    s.clear_failure_alert();
+                    requests.push(AiRequest::ContinueRemainingLocally { job_id, local_model });
+                }
                 if ui.button(rtl::widget(ui, text(a, "Dismiss Alert", "إخفاء التنبيه"))).clicked() {
                     s.clear_failure_alert();
                 }
@@ -560,6 +590,41 @@ pub(super) fn render_diagnostic_alert_banner(
         },
     );
     ui.add_space(6.0);
+}
+
+fn best_configured_local_text_model(s: &AiUiState) -> Option<ModelSelection> {
+    if let Some(hybrid) = &s.settings.hybrid_local_model
+        && hybrid.provider.is_local()
+        && hybrid.provider.is_text_provider()
+        && !hybrid.model.trim().is_empty()
+    {
+        return Some(hybrid.clone());
+    }
+    if s.settings.text_model.provider.is_local()
+        && s.settings.text_model.provider.is_text_provider()
+        && !s.settings.text_model.model.trim().is_empty()
+    {
+        return Some(s.settings.text_model.clone());
+    }
+    if !s.local_ollama.model.trim().is_empty() {
+        return Some(s.local_ollama.clone());
+    }
+    if !s.local_openai.model.trim().is_empty() {
+        return Some(s.local_openai.clone());
+    }
+    for ep in &s.snapshot.discovered_local_endpoints {
+        if ep.reachable
+            && ep.provider.is_text_provider()
+            && let Some(model_name) = ep.models.iter().find(|m| !is_non_text_model(m))
+        {
+            return Some(ModelSelection {
+                provider: ep.provider,
+                model: model_name.clone(),
+                endpoint: (!ep.endpoint.trim().is_empty()).then(|| ep.endpoint.clone()),
+            });
+        }
+    }
+    None
 }
 
 pub(super) fn selectable_skill_cards(skills: &[SkillCard], include_design_profiles: bool, require_trusted_or_active: bool) -> Vec<&SkillCard> {
@@ -593,7 +658,7 @@ pub(super) fn production_blocking_issue(
     let has_prompt = !s.prompt.trim().is_empty();
     let script_conflict_issue = explicit_pages.and_then(|script_pages| {
         let mismatch = if s.new_document {
-            s.pages != script_pages
+            s.effective_new_document_pages() != script_pages
         } else if s.continue_book {
             documents.iter().find(|document| Some(document.index) == active).is_some_and(|document| {
                 u32::try_from(document.pages).ok().is_none_or(|cur| cur > script_pages || (cur < script_pages && document.has_interior_gaps()))
@@ -648,14 +713,18 @@ pub(super) fn production(
         });
         return;
     }
+    let mut shortcut_submit = false;
     ui.add_enabled_ui(!s.task_active(), |ui| {
         show_continuable_book_banner(ui, s, a, documents, *activate_document);
+        show_execution_mode_bar(ui, s, a, requests);
         show_production_model_and_mode_controls(ui, s, a, requests);
-        let pages_hint = show_production_prompt_composer(ui, s, a);
+        let (pages_hint, submitted) = show_production_prompt_composer(ui, s, a);
+        shortcut_submit = submitted;
+        show_script_or_prompt_page_mismatch(ui, s, a, documents, activate_document, pages_hint);
+        show_primary_produce_action_bar(ui, s, a, available, documents, *activate_document, shortcut_submit, requests);
         show_target_mode_row(ui, s, a, documents, *activate_document, requests);
         production_binding(ui, s, a, documents, *activate_document);
         show_existing_target_controls(ui, s, a, documents, activate_document);
-        show_script_or_prompt_page_mismatch(ui, s, a, documents, activate_document, pages_hint);
         show_production_footer_and_actions(ui, s, a, available, documents, *activate_document, requests);
     });
     ui.separator();
@@ -694,11 +763,88 @@ fn show_continuable_book_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, d
     });
 }
 
+fn show_execution_mode_bar(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
+    let t = crate::theme::Tokens::get(ui.ctx());
+    let prev = s.settings.execution_mode;
+    ui.horizontal_wrapped(|ui| {
+        rtl::label(ui, egui::RichText::new(text(a, "Execution:", "التنفيذ:")).color(t.text_dim));
+        for (mode, en, ar) in [
+            (ExecutionMode::Auto, "Auto", "تلقائي"),
+            (ExecutionMode::CloudOnly, "Cloud", "سحابي"),
+            (ExecutionMode::LocalOnly, "Local", "محلي خالص"),
+            (ExecutionMode::SmartHybrid, "Smart Hybrid", "هجين ذكي"),
+        ] {
+            if ui.selectable_label(s.settings.execution_mode == mode, rtl::widget(ui, text(a, en, ar))).clicked() {
+                s.settings.execution_mode = mode;
+            }
+        }
+    });
+    if s.settings.execution_mode != prev {
+        match s.settings.execution_mode {
+            ExecutionMode::LocalOnly => {
+                if !s.settings.text_model.provider.is_local() {
+                    s.settings.text_model = best_configured_local_text_model(s).unwrap_or_else(|| s.local_ollama.clone());
+                }
+                if !s.settings.image_model.provider.is_local() {
+                    s.settings.image_model = s.local_comfy.clone();
+                }
+                s.settings.verify_generated_images = false;
+                let max_out_ceiling = s.settings.resources.context_tokens.saturating_div(2).max(512);
+                s.settings.budget.max_output_tokens = s.settings.budget.max_output_tokens.min(max_out_ceiling);
+            }
+            ExecutionMode::CloudOnly => {
+                if s.settings.text_model.provider.is_local() {
+                    s.settings.text_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+                }
+            }
+            ExecutionMode::SmartHybrid => {
+                if s.settings.hybrid_local_model.is_none() {
+                    s.settings.hybrid_local_model = Some(best_configured_local_text_model(s).unwrap_or_else(|| s.local_ollama.clone()));
+                }
+            }
+            ExecutionMode::Auto => {}
+        }
+        if s.workflow_ready() {
+            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+        }
+    }
+    if s.settings.execution_mode == ExecutionMode::SmartHybrid {
+        let mut hybrid = s.settings.hybrid_local_model.clone().unwrap_or_else(|| s.local_ollama.clone());
+        let prev_prov = hybrid.provider;
+        let prev_model = hybrid.model.clone();
+        ui.horizontal_wrapped(|ui| {
+            rtl::label(
+                ui,
+                egui::RichText::new(text(a, "Art Direction: Cloud · Continuation: Local", "الإخراج الفني: سحابي · الاستكمال: محلي")).color(t.accent),
+            );
+            crate::widgets::name_combo(
+                craft_ui::ComboBox::from_id_salt("smart_hybrid_local_provider").selected_text(provider_name(hybrid.provider)).show_ui(ui, |ui| {
+                    for p in [ProviderKind::Ollama, ProviderKind::LocalOpenAi] {
+                        ui.selectable_value(&mut hybrid.provider, p, provider_name(p));
+                    }
+                }),
+                "Smart hybrid local provider selector",
+            );
+            ui.add(egui::TextEdit::singleline(&mut hybrid.model).desired_width(130.0).hint_text("qwen2.5:14b"))
+                .accessible_name("Smart hybrid local model input");
+        });
+        let changed = hybrid.provider != prev_prov || hybrid.model != prev_model || s.settings.hybrid_local_model.is_none();
+        s.settings.hybrid_local_model = Some(hybrid);
+        if changed
+            && s.workflow_ready()
+            && (s.settings.hybrid_local_model.as_ref().map(|m| (&m.provider, &m.model)) != Some((&prev_prov, &prev_model)))
+        {
+            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+        }
+    }
+}
+
 fn show_production_model_and_mode_controls(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
     ui.horizontal_wrapped(|ui| {
         provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
         label(ui, a, "Model or agent", "النموذج أو الوكيل");
-        ui.add(egui::TextEdit::singleline(&mut s.settings.text_model.model).desired_width(230.0)).accessible_name("Production model input");
+        let model_w = (ui.available_width() - 150.0).clamp(115.0, 220.0);
+        ui.add(egui::TextEdit::singleline(&mut s.settings.text_model.model).desired_width(model_w)).accessible_name("Production model input");
         if button(ui, a, "Discover", "اكتشاف") {
             s.pending_models = Some(s.settings.text_model.clone());
             requests.push(AiRequest::ListModels { selection: s.settings.text_model.clone() });
@@ -790,7 +936,7 @@ fn show_output_mode_and_visual_density(ui: &mut egui::Ui, s: &mut AiUiState, a: 
     }
 }
 
-fn show_production_prompt_composer(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) -> (Option<u32>, Option<u32>) {
+fn show_production_prompt_composer(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) -> ((Option<u32>, Option<u32>), bool) {
     ui.horizontal_wrapped(|ui| {
         label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
         if button(ui, a, "Load script file (.md/.txt)…", "تحميل ملف سكربت (.md/.txt)…") {
@@ -805,21 +951,15 @@ fn show_production_prompt_composer(ui: &mut egui::Ui, s: &mut AiUiState, a: bool
         }
     });
     show_design_style_selector(ui, s, a);
+    show_quick_format_chips(ui, s, a);
     // Keep room for the compact update row and the production action. Long
     // briefs > 16 KiB render a zero-freeze summary card unless raw editing is toggled.
     let (cached_has_rtl, cached_explicit_pages, cached_natural_pages, cached_preview_head) = {
         let analysis = s.analyzed_prompt();
         (analysis.has_rtl, analysis.explicit_pages, analysis.natural_pages, analysis.preview_head.clone())
     };
-    show_prompt_editor_widget(ui, s, a, cached_has_rtl, (cached_explicit_pages, cached_natural_pages), &cached_preview_head);
-    rtl::label(
-        ui,
-        if a {
-            format!("طول التعليمات: {}", rtl::ltr(format!("{} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)))
-        } else {
-            format!("Prompt length: {} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)
-        },
-    );
+    let submitted = show_prompt_editor_widget(ui, s, a, cached_has_rtl, (cached_explicit_pages, cached_natural_pages), &cached_preview_head);
+    show_live_blueprint_and_length_row(ui, s, a);
     if s.prompt.len() > 32768 {
         if cached_explicit_pages.is_some() {
             label(
@@ -844,7 +984,71 @@ fn show_production_prompt_composer(ui: &mut egui::Ui, s: &mut AiUiState, a: bool
             );
         }
     }
-    (cached_explicit_pages, cached_natural_pages)
+    ((cached_explicit_pages, cached_natural_pages), submitted)
+}
+
+fn show_quick_format_chips(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
+    egui::ScrollArea::horizontal().id_salt("ai_quick_format_chips").max_height(24.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let active_label = s.custom_geometry.as_ref().map(|g| g.preset_label.clone());
+            if ui.selectable_label(s.custom_geometry.is_none(), rtl::widget(ui, text(a, "Auto / A4", "تلقائي / A4"))).clicked() {
+                s.custom_geometry = None;
+                s.new_document = true;
+                s.continue_book = false;
+            }
+            for (spec, en, ar) in [
+                (preset_social_square(), "Social 1:1", "بوست 1:1"),
+                (preset_social_story(), "Story 9:16", "ستوري 9:16"),
+                (preset_banner_widescreen(), "Banner 16:9", "بنر 16:9"),
+                (preset_business_card(), "Business Card", "بطاقة عمل"),
+                (preset_poster_a3(), "Poster A3", "بوستر A3"),
+                (preset_certificate_a4_landscape(), "Certificate", "شهادة"),
+            ] {
+                let is_sel = active_label.as_deref() == Some(spec.preset_label.as_str());
+                if ui.selectable_label(is_sel, rtl::widget(ui, text(a, en, ar))).clicked() {
+                    s.custom_geometry = Some(spec);
+                    s.new_document = true;
+                    s.continue_book = false;
+                }
+            }
+        });
+    });
+}
+
+fn show_live_blueprint_and_length_row(ui: &mut egui::Ui, s: &AiUiState, a: bool) {
+    let t = crate::theme::Tokens::get(ui.ctx());
+    if s.new_document && (!s.prompt.trim().is_empty() || s.custom_geometry.is_some() || !s.target_formats.is_empty()) {
+        let pages = s.effective_new_document_pages();
+        let geom = s.effective_new_document_geometry();
+        let campaign_count = s.effective_target_formats().len();
+        let size_str = if let Some(g) = &geom { g.preset_label.clone() } else { "A4".into() };
+        let intent_str = match geom.as_ref().map(|g| g.intent).unwrap_or(DocumentIntentSpec::Print) {
+            DocumentIntentSpec::Print => text(a, "Print", "طباعة"),
+            DocumentIntentSpec::Web => text(a, "Web", "رقمي / ويب"),
+            DocumentIntentSpec::Mobile => text(a, "Mobile", "جوال"),
+        };
+        let is_rtl_doc = s.settings.right_to_left_binding.unwrap_or_else(|| automatic_proof_binding(&s.prompt, a));
+        let dir_str = if is_rtl_doc { "RTL" } else { "LTR" };
+        let campaign_suffix = if campaign_count > 1 {
+            if a { format!(" · +{campaign_count} مقاسات حملة") } else { format!(" · +{campaign_count} campaign formats") }
+        } else {
+            String::new()
+        };
+        let pill = if a {
+            format!("المخطط: {} · {intent_str} · {pages} صفحة · {dir_str}{campaign_suffix}", rtl::ltr(&size_str))
+        } else {
+            format!("Blueprint: {size_str} · {intent_str} · {pages} page(s) · {dir_str}{campaign_suffix}")
+        };
+        rtl::label(ui, egui::RichText::new(pill).color(t.accent));
+    }
+    rtl::label(
+        ui,
+        if a {
+            format!("طول التعليمات: {}", rtl::ltr(format!("{} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)))
+        } else {
+            format!("Prompt length: {} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)
+        },
+    );
 }
 
 fn show_design_style_selector(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
@@ -866,8 +1070,9 @@ fn show_design_style_selector(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
             .and_then(|card| card.design_profile.as_ref())
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| s.settings.design_style.clone().unwrap_or_else(|| text(a, "Automatic from the request", "تلقائي حسب المطلوب").into()));
+        let combo_w = (ui.available_width() - 150.0).clamp(140.0, 260.0);
         crate::widgets::name_combo(
-            craft_ui::ComboBox::from_id_salt("production_design_style").selected_text(rtl::widget(ui, selected)).width(260.0).show_ui(ui, |ui| {
+            craft_ui::ComboBox::from_id_salt("production_design_style").selected_text(rtl::widget(ui, selected)).width(combo_w).show_ui(ui, |ui| {
                 ui.selectable_value(&mut s.settings.design_style, None, rtl::widget(ui, text(a, "Automatic from the request", "تلقائي حسب المطلوب")));
                 for card in available_styles {
                     if let Some(profile) = &card.design_profile {
@@ -890,7 +1095,9 @@ fn show_prompt_editor_widget(
     cached_has_rtl: bool,
     pages_hint: (Option<u32>, Option<u32>),
     cached_preview_head: &str,
-) {
+) -> bool {
+    let mut shortcut_submit = false;
+    let want_focus = std::mem::take(&mut s.focus_prompt_next_frame);
     let (cached_explicit_pages, cached_natural_pages) = pages_hint;
     if s.prompt.len() > 16_384 && !s.edit_large_script_inline {
         egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -916,9 +1123,16 @@ fn show_prompt_editor_widget(
             }
         });
         let prev_len = s.prompt.len();
-        egui::ScrollArea::vertical().id_salt("ai_prompt_composer_raw").max_height(110.0).show(ui, |ui| {
-            ui.add(egui::TextEdit::multiline(&mut s.prompt).code_editor().desired_rows(5).desired_width(f32::INFINITY))
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer_raw").max_height(100.0).show(ui, |ui| {
+            let resp = ui
+                .add(egui::TextEdit::multiline(&mut s.prompt).code_editor().desired_rows(4).desired_width(f32::INFINITY))
                 .accessible_name("Raw production script editor");
+            if want_focus {
+                resp.request_focus();
+            }
+            if resp.has_focus() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter)) {
+                shortcut_submit = true;
+            }
         });
         if s.prompt.len() != prev_len && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
             s.clear_failure_alert();
@@ -926,12 +1140,12 @@ fn show_prompt_editor_widget(
     } else {
         let prompt_rtl = if s.prompt.trim().is_empty() { a } else { cached_has_rtl };
         let prev_prompt_fp = PromptAnalysisCache::fingerprint(&s.prompt);
-        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(70.0).show(ui, |ui| {
             let mut layouter = bidi_layouter(true);
-            named_rtl_text_edit(
+            let resp = named_rtl_text_edit(
                 ui,
                 egui::TextEdit::multiline(&mut s.prompt)
-                    .desired_rows(4)
+                    .desired_rows(3)
                     .desired_width(f32::INFINITY)
                     .align(if prompt_rtl { egui::Align2::RIGHT_TOP } else { egui::Align2::LEFT_TOP })
                     .layouter(&mut layouter)
@@ -941,11 +1155,18 @@ fn show_prompt_editor_widget(
                     )),
                 "Production prompt editor",
             );
+            if want_focus {
+                resp.request_focus();
+            }
+            if resp.has_focus() && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter)) {
+                shortcut_submit = true;
+            }
         });
         if PromptAnalysisCache::fingerprint(&s.prompt) != prev_prompt_fp && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
             s.clear_failure_alert();
         }
     }
+    shortcut_submit
 }
 
 fn large_script_summary_text(a: bool, kb: usize, explicit_pages: Option<u32>, natural_pages: Option<u32>) -> String {
@@ -1001,11 +1222,17 @@ fn show_target_mode_row(
             s.pick_target_document = true;
         }
         if s.new_document {
-            if a {
-                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000)).accessible_name("New document page count");
+            let mut display_pages = s.effective_new_document_pages();
+            let changed = if a {
+                let r = ui.add(egui::DragValue::new(&mut display_pages).range(1..=1000)).accessible_name("New document page count");
                 label(ui, a, "pages", "صفحة");
+                r.changed()
             } else {
-                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages")).accessible_name("New document page count");
+                ui.add(egui::DragValue::new(&mut display_pages).range(1..=1000).suffix(" pages")).accessible_name("New document page count").changed()
+            };
+            if changed {
+                s.pages = display_pages;
+                s.pages_manually_edited = true;
             }
         }
         label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
@@ -1096,6 +1323,7 @@ fn show_existing_target_controls(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, 
         rtl::label(ui, reason);
     }
     if !s.continue_book {
+        show_live_selection_context_badge(ui, s, a);
         label(
             ui,
             a,
@@ -1103,6 +1331,42 @@ fn show_existing_target_controls(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, 
             "يحرر المحتوى الموجود بمهمة واحدة. اختر استكمال صفحات الكتاب المتبقية للإنتاج في مجموعات مراجعة.",
         );
     }
+}
+
+fn show_live_selection_context_badge(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
+    let Some(sel) = &s.live_selection else {
+        return;
+    };
+    let t = crate::theme::Tokens::get(ui.ctx());
+    let item_count = sel.selected_item_ids.len();
+    let page_one_based = sel.active_page.map(|p| p.saturating_add(1)).unwrap_or(1);
+    let summary = if item_count > 0 {
+        if a {
+            format!("التحديد المباشر: {item_count} عنصر في الصفحة {page_one_based}")
+        } else {
+            format!("Selection: {item_count} item(s) on Page {page_one_based}")
+        }
+    } else if a {
+        format!("التحديد النصي المباشر: الصفحة {page_one_based}")
+    } else {
+        format!("Text selection on Page {page_one_based}")
+    };
+    egui::Frame::NONE
+        .fill(t.panel_darker)
+        .stroke(egui::Stroke::new(1.0, t.accent))
+        .corner_radius(t.radius)
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                rtl::label(ui, egui::RichText::new(&summary).strong().color(t.accent));
+                ui.checkbox(&mut s.scope_to_selection, rtl::widget(ui, text(a, "Scope AI edits to selection", "حصر التعديل بالعناصر المحددة")));
+            });
+            if let Some(snippet) = &sel.selected_text_snippet
+                && !snippet.is_empty()
+            {
+                rtl::label(ui, egui::RichText::new(format!("“{snippet}”")).color(t.text_dim));
+            }
+        });
 }
 
 fn show_script_or_prompt_page_mismatch(
@@ -1114,15 +1378,16 @@ fn show_script_or_prompt_page_mismatch(
     pages_hint: (Option<u32>, Option<u32>),
 ) {
     let (cached_explicit_pages, cached_natural_pages) = pages_hint;
+    let active_new_pages = s.effective_new_document_pages();
     if let Some(script_pages) = cached_explicit_pages {
-        if s.new_document && s.pages != script_pages {
+        if s.new_document && active_new_pages != script_pages {
             ui.horizontal_wrapped(|ui| {
                 rtl::label(
                     ui,
                     if a {
-                        format!("تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
+                        format!("تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما ضُبط المستند الجديد على {active_new_pages} صفحة.")
                     } else {
-                        format!("Script defines {script_pages} explicit PAGE blocks, but New document is set to {} pages.", s.pages)
+                        format!("Script defines {script_pages} explicit PAGE blocks, but New document is set to {active_new_pages} pages.")
                     },
                 );
                 let match_label = if a {
@@ -1132,6 +1397,7 @@ fn show_script_or_prompt_page_mismatch(
                 };
                 if ui.button(rtl::widget(ui, &match_label)).clicked() {
                     s.pages = script_pages;
+                    s.pages_manually_edited = true;
                 }
             });
         } else if !s.new_document
@@ -1143,15 +1409,15 @@ fn show_script_or_prompt_page_mismatch(
         }
     } else if s.new_document
         && let Some(detected) = cached_natural_pages
-        && s.pages != detected
+        && active_new_pages != detected
     {
         ui.horizontal_wrapped(|ui| {
             rtl::label(
                 ui,
                 egui::RichText::new(if a {
-                    format!("يذكر الوصف {detected} صفحة، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
+                    format!("يذكر الوصف {detected} صفحة، بينما ضُبط المستند الجديد على {active_new_pages} صفحة.")
                 } else {
-                    format!("Prompt mentions {detected} pages, while New document is set to {} pages.", s.pages)
+                    format!("Prompt mentions {detected} pages, while New document is set to {active_new_pages} pages.")
                 })
                 .color(ui.visuals().warn_fg_color),
             );
@@ -1162,6 +1428,7 @@ fn show_script_or_prompt_page_mismatch(
             };
             if ui.button(rtl::widget(ui, &match_label)).clicked() {
                 s.pages = detected;
+                s.pages_manually_edited = true;
                 s.restored_target_unconfirmed = false;
                 s.clear_failure_alert();
             }
@@ -1218,6 +1485,40 @@ fn show_existing_doc_script_mismatch(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn show_primary_produce_action_bar(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    available: bool,
+    documents: &[OpenDocument],
+    active_document: Option<usize>,
+    shortcut_submit: bool,
+    requests: &mut Vec<AiRequest>,
+) {
+    pending_image_approval_card(ui, s, a, requests);
+    let issue = production_blocking_issue(s, available, documents, active_document, a);
+    if let Some(reason) = issue {
+        rtl::label(ui, reason);
+    }
+    ui.horizontal_wrapped(|ui| {
+        let clicked = ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked();
+        if (clicked || shortcut_submit) && issue.is_none() {
+            requests.push(AiRequest::Start(s.production_task()));
+        }
+        if s.new_document || s.continue_book {
+            let preview_label = if s.is_book_or_curriculum_genre() {
+                text(a, "Preview curriculum locally (no API request)", "معاينة خطة المنهج محلياً (دون طلب API)")
+            } else {
+                text(a, "Preview design locally (no API request)", "معاينة التصميم محلياً (دون طلب API)")
+            };
+            if ui.add_enabled(available && !s.prompt.trim().is_empty(), egui::Button::new(rtl::widget(ui, preview_label))).clicked() {
+                requests.push(AiRequest::PreviewProduction(s.production_task()));
+            }
+        }
+    });
+}
+
 fn show_production_footer_and_actions(
     ui: &mut egui::Ui,
     s: &mut AiUiState,
@@ -1227,22 +1528,6 @@ fn show_production_footer_and_actions(
     active_document: Option<usize>,
     requests: &mut Vec<AiRequest>,
 ) {
-    if s.automatic_skills {
-        label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
-    }
-    if !s.snapshot.skill_warnings.is_empty() {
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Skipped skill drafts — details", "مسودات مهارات مستبعدة — التفاصيل"))).show(ui, |ui| {
-            for warning in &s.snapshot.skill_warnings {
-                rtl::label(ui, warning);
-            }
-        });
-    }
-    label(
-        ui,
-        a,
-        "Template styles use the model for content; native drawing and formatting commands are assembled locally.",
-        "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
-    );
     if let Some(cost) = s.settings.budget.max_cost_usd {
         rtl::label(
             ui,
@@ -1253,30 +1538,229 @@ fn show_production_footer_and_actions(
             },
         );
     }
-    show_pacing_description(ui, s.settings.execution_pacing, a);
+    if !s.snapshot.skill_warnings.is_empty() {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Skipped skill drafts — details", "مسودات مهارات مستبعدة — التفاصيل"))).show(ui, |ui| {
+            for warning in &s.snapshot.skill_warnings {
+                rtl::label(ui, warning);
+            }
+        });
+    }
     show_production_estimates_and_limits(ui, s, a, documents, active_document, requests);
-    pending_image_approval_card(ui, s, a, requests);
-    let issue = production_blocking_issue(s, available, documents, active_document, a);
-    if let Some(reason) = issue {
-        rtl::label(ui, reason);
-    }
-    if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked() {
-        requests.push(AiRequest::Start(s.production_task()));
-    }
-    if (s.new_document || s.continue_book)
-        && ui
-            .add_enabled(
-                available && !s.prompt.trim().is_empty(),
-                egui::Button::new(rtl::widget(ui, text(a, "Preview curriculum locally (no API request)", "معاينة خطة المنهج محلياً (دون طلب API)"))),
-            )
-            .clicked()
-    {
-        requests.push(AiRequest::PreviewProduction(s.production_task()));
-    }
     ui.separator();
+    show_references_and_knowledge_packs_section(ui, s, a, cfg!(not(target_arch = "wasm32")), requests);
+    show_campaign_and_quick_export_section(ui, s, a, active_document.is_some(), requests);
     arabic_typography_bar(ui, s, a, requests);
     show_curriculum_preview_card(ui, s, a);
     show_advanced_and_export_sections(ui, s, a, available, active_document.is_some(), requests);
+}
+
+fn attachment_role_label(role: AttachmentRole, a: bool) -> &'static str {
+    match role {
+        AttachmentRole::Auto => text(a, "Auto", "تلقائي"),
+        AttachmentRole::KnowledgeReference => text(a, "Reference", "مرجع معرفي"),
+        AttachmentRole::BrandLogo => text(a, "Brand logo", "شعار وهوية"),
+        AttachmentRole::DataRecords => text(a, "Data records", "سجلات بيانات"),
+        AttachmentRole::ContentAsset => text(a, "Content asset", "أصل بصري"),
+    }
+}
+
+fn show_references_and_knowledge_packs_section(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, can_pick_file: bool, requests: &mut Vec<AiRequest>) {
+    let active_refs = s.attachments.len().saturating_add(s.settings.active_knowledge_packs.len());
+    let header_title = if active_refs > 0 {
+        if a { format!("المراجع وحزم المعرفة ({active_refs})") } else { format!("References & Knowledge Packs ({active_refs})") }
+    } else {
+        text(a, "References & Knowledge Packs", "المراجع وحزم المعرفة").to_owned()
+    };
+    egui::CollapsingHeader::new(rtl::widget(ui, header_title))
+        .id_salt("ai_references_and_knowledge_packs")
+        .open(s.expand_references_section.take())
+        .show(ui, |ui| {
+            label(
+                ui,
+                a,
+                "Drop files (.pdf, .docx, .xlsx, .csv, .rtf, .png, .svg) onto AI Studio or attach paths below.",
+                "اسحب الملفات (.pdf, .docx, .xlsx, .csv, .rtf, .png, .svg) إلى الاستوديو أو أرفق مساراتها أدناه.",
+            );
+            ui.horizontal_wrapped(|ui| {
+                let mut path_layouter = bidi_layouter(false);
+                named_rtl_text_edit(
+                    ui,
+                    egui::TextEdit::singleline(&mut s.attachment_path_input).desired_width(180.0).layouter(&mut path_layouter).hint_text(text(
+                        a,
+                        "Reference or asset path…",
+                        "مسار ملف المرجع أو الأصل…",
+                    )),
+                    "Reference attachment path input",
+                );
+                crate::widgets::name_combo(
+                    craft_ui::ComboBox::from_id_salt("ai_attachment_role")
+                        .selected_text(rtl::widget(ui, attachment_role_label(s.attachment_role_input, a)))
+                        .show_ui(ui, |ui| {
+                            for role in [
+                                AttachmentRole::Auto,
+                                AttachmentRole::KnowledgeReference,
+                                AttachmentRole::BrandLogo,
+                                AttachmentRole::DataRecords,
+                                AttachmentRole::ContentAsset,
+                            ] {
+                                ui.selectable_value(&mut s.attachment_role_input, role, rtl::widget(ui, attachment_role_label(role, a)));
+                            }
+                        }),
+                    "Attachment role selector",
+                );
+                if ui
+                    .add_enabled(!s.attachment_path_input.trim().is_empty(), egui::Button::new(rtl::widget(ui, text(a, "Attach file", "إرفاق ملف"))))
+                    .clicked()
+                {
+                    let raw = std::mem::take(&mut s.attachment_path_input);
+                    let role = (s.attachment_role_input != AttachmentRole::Auto).then_some(s.attachment_role_input);
+                    let _ = s.attach_file_path(&raw, role);
+                }
+                if can_pick_file && button(ui, a, "Browse attachment…", "استعراض مرفق…") {
+                    s.pick_attachment_file = true;
+                }
+            });
+            let mut remove_idx = None;
+            for (idx, att) in s.attachments.iter_mut().enumerate() {
+                ui.push_id(("attached_item", idx), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let short_name = std::path::Path::new(&att.path).file_name().and_then(|n| n.to_str()).unwrap_or(att.path.as_str()).to_owned();
+                        rtl::label(ui, rtl::ltr(&short_name));
+                        crate::widgets::name_combo(
+                            craft_ui::ComboBox::from_id_salt(("att_role_row", idx))
+                                .selected_text(rtl::widget(ui, attachment_role_label(att.role, a)))
+                                .show_ui(ui, |ui| {
+                                    for role in [
+                                        AttachmentRole::Auto,
+                                        AttachmentRole::KnowledgeReference,
+                                        AttachmentRole::BrandLogo,
+                                        AttachmentRole::DataRecords,
+                                        AttachmentRole::ContentAsset,
+                                    ] {
+                                        ui.selectable_value(&mut att.role, role, rtl::widget(ui, attachment_role_label(role, a)));
+                                    }
+                                }),
+                            format!("Attachment {} role selector", idx.saturating_add(1)),
+                        );
+                        if button(ui, a, "Remove", "إزالة") {
+                            remove_idx = Some(idx);
+                        }
+                    });
+                });
+            }
+            if let Some(idx) = remove_idx
+                && idx < s.attachments.len()
+            {
+                s.attachments.remove(idx);
+            }
+            ui.separator();
+            label(ui, a, "Local Knowledge Packs (reusable offline RAG)", "حزم المعرفة المحلية (مراجع ثابتة قابلة لإعادة الاستخدام)");
+            let mut packs_changed = false;
+            for pack in s.snapshot.knowledge_packs.clone() {
+                ui.push_id(("kp_row", &pack.id), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut active = s.settings.active_knowledge_packs.iter().any(|id| id == &pack.id);
+                        let label_str = format!("{} ({} · {} chunks)", pack.name, pack.file_count, pack.chunk_count);
+                        if ui.checkbox(&mut active, rtl::widget(ui, label_str)).changed() {
+                            if active {
+                                if !s.settings.active_knowledge_packs.contains(&pack.id) {
+                                    s.settings.active_knowledge_packs.push(pack.id.clone());
+                                }
+                            } else {
+                                s.settings.active_knowledge_packs.retain(|id| id != &pack.id);
+                            }
+                            packs_changed = true;
+                        }
+                        if button(ui, a, "Delete pack", "حذف الحزمة") {
+                            s.settings.active_knowledge_packs.retain(|id| id != &pack.id);
+                            requests.push(AiRequest::DeleteKnowledgePack { id: pack.id.clone() });
+                        }
+                    });
+                });
+            }
+            if packs_changed && s.workflow_ready() {
+                requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut s.kp_name_input).desired_width(140.0).hint_text(text(
+                    a,
+                    "New pack name…",
+                    "اسم حزمة المعرفة…",
+                )))
+                .accessible_name("Knowledge pack name input");
+                ui.add(egui::TextEdit::singleline(&mut s.kp_desc_input).desired_width(150.0).hint_text(text(
+                    a,
+                    "Description (optional)",
+                    "وصف اختياري",
+                )))
+                .accessible_name("Knowledge pack description input");
+                let can_create_kp = !s.kp_name_input.trim().is_empty() && !s.attachments.is_empty();
+                if ui.add_enabled(can_create_kp, egui::Button::new(rtl::widget(ui, text(a, "Create Knowledge Pack", "إنشاء حزمة معرفة")))).clicked()
+                {
+                    let name = std::mem::take(&mut s.kp_name_input).trim().to_owned();
+                    let description = std::mem::take(&mut s.kp_desc_input).trim().to_owned();
+                    let paths = s.attachments.iter().map(|att| att.path.clone()).collect();
+                    requests.push(AiRequest::CreateKnowledgePack { name, description, paths });
+                }
+            });
+        });
+}
+
+fn show_campaign_and_quick_export_section(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, has_active_document: bool, requests: &mut Vec<AiRequest>) {
+    egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Multi-Format Campaign & Quick Export", "الحملات متعددة المقاسات والتصدير السريع")))
+        .id_salt("ai_campaign_and_quick_export")
+        .show(ui, |ui| {
+            label(ui, a, "Campaign target formats (generated together):", "مقاسات الحملة المستهدفة (تُولَّد معاً):");
+            ui.horizontal_wrapped(|ui| {
+                for (spec, en, ar) in [
+                    (preset_social_square(), "Social 1:1 (1080×1080)", "بوست 1:1 (1080×1080)"),
+                    (preset_social_story(), "Story 9:16 (1080×1920)", "ستوري 9:16 (1080×1920)"),
+                    (preset_banner_widescreen(), "Banner 16:9 (1920×1080)", "بنر 16:9 (1920×1080)"),
+                    (preset_poster_a3(), "Poster A3", "بوستر A3"),
+                    (preset_a4_portrait(), "Print A4", "طباعة A4"),
+                ] {
+                    let mut checked = s.target_formats.iter().any(|f| f.preset_label == spec.preset_label);
+                    if ui.checkbox(&mut checked, rtl::widget(ui, text(a, en, ar))).changed() {
+                        if checked {
+                            s.target_formats.push(spec);
+                        } else {
+                            s.target_formats.retain(|f| f.preset_label != spec.preset_label);
+                        }
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let prev_mf = s.settings.multi_format_mode;
+                ui.selectable_value(
+                    &mut s.settings.multi_format_mode,
+                    MultiFormatOutputMode::AlternateLayouts,
+                    rtl::widget(ui, text(a, "Alternate layouts in 1 document", "تخطيطات بديلة في مستند واحد")),
+                );
+                ui.selectable_value(
+                    &mut s.settings.multi_format_mode,
+                    MultiFormatOutputMode::SeparateDocuments,
+                    rtl::widget(ui, text(a, "Separate documents", "مستندات مستقلة")),
+                );
+                if s.settings.multi_format_mode != prev_mf && s.workflow_ready() {
+                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                }
+            });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                label(ui, a, "1-Click Quick Export:", "تصدير فوري بنقرة واحدة:");
+                for (cmd, label_txt) in [
+                    ("app.exportPdf", "PDF"),
+                    ("app.exportIdml", "IDML"),
+                    ("app.exportEpub", "EPUB"),
+                    ("app.exportPptx", "PPTX"),
+                    ("app.exportPng", "PNG"),
+                ] {
+                    if ui.add_enabled(has_active_document, egui::Button::new(label_txt)).clicked() {
+                        s.quick_export_cmd = Some(cmd);
+                    }
+                }
+            });
+        });
 }
 
 fn show_pacing_description(ui: &mut egui::Ui, pacing: ExecutionPacing, a: bool) {
@@ -1559,6 +2043,16 @@ fn show_advanced_and_export_sections(
         |ui| {
             budgets(ui, s, a);
             ui.separator();
+            show_pacing_description(ui, s.settings.execution_pacing, a);
+            if s.automatic_skills {
+                label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
+            }
+            label(
+                ui,
+                a,
+                "Template styles use the model for content; native drawing and formatting commands are assembled locally.",
+                "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
+            );
             ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
             if s.automatic_skills {
                 egui::CollapsingHeader::new(rtl::widget(

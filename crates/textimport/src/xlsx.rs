@@ -182,6 +182,20 @@ pub fn records(bytes: &[u8], sheet: Option<&str>) -> Result<Vec<Vec<String>>, Im
     Ok(out)
 }
 
+/// All worksheet names in workbook order.
+pub(crate) fn sheet_names(bytes: &[u8]) -> Result<Vec<String>, ImportError> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| ImportError::Corrupt(e.to_string()))?;
+    let wb = parse(&part(&mut zip, "xl/workbook.xml")?.ok_or_else(|| ImportError::Corrupt("no xl/workbook.xml (not an Excel workbook)".into()))?)?;
+    let names: Vec<String> = wb
+        .child("sheets")
+        .map(|s| s.els().filter(|e| e.name == "sheet").filter_map(|e| e.attr("name").map(str::to_string)).collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        return Err(ImportError::Corrupt("the workbook has no sheets".into()));
+    }
+    Ok(names)
+}
+
 /// Workbook order, or the sheet named `wanted`.
 fn sheet_target(zip: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>, wanted: Option<&str>) -> Result<String, ImportError> {
     let wb = parse(&part(zip, "xl/workbook.xml")?.ok_or_else(|| ImportError::Corrupt("no xl/workbook.xml (not an Excel workbook)".into()))?)?;

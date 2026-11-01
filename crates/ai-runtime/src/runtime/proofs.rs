@@ -111,6 +111,12 @@ impl ProductionRunner {
                     let revision = design_revision(&entry)
                         .filter(|r| skill_is_compatible(r, &supported))
                         .or_else(|| active_design_revision(&entry).filter(|r| skill_is_compatible(r, &supported)))?;
+                    if (entry.skill_id.starts_with("kg-") || entry.skill_id.starts_with("early-years-"))
+                        && !has_educational_kg_cues(prompt)
+                        && !prompt_names_skill_id(prompt, &entry.skill_id)
+                    {
+                        return None;
+                    }
                     let profile = revision.manifest.design_profile.as_ref()?;
                     let lower = normalize_skill_search(prompt);
                     let hits = profile.keywords.iter().filter(|word| lower.contains(&normalize_skill_search(word))).count();
@@ -410,10 +416,10 @@ impl ProductionRunner {
 /// budget. Command planners can omit optional sample templates, largest first;
 /// the content compiler never needs non-style command examples.
 pub(super) fn bounded_task_skills(mut skills: Vec<SkillSnapshot>, target: &TaskTarget) -> Result<Vec<SkillSnapshot>, String> {
-    if matches!(target, TaskTarget::CurrentDocument) {
-        // The opened document supplies its actual geometry. Fixed page-template
-        // commands are examples, while instructions, references and profile
-        // identity remain pinned guidance for its command planner.
+    if matches!(target, TaskTarget::CurrentDocument | TaskTarget::NewDocument { .. }) {
+        // The opened or custom-geometry document supplies its actual geometry.
+        // Fixed A4 page-template commands are cleared while instructions, references
+        // and profile identity remain pinned guidance for its command planner.
         for skill in &mut skills {
             if skill.design_profile.is_some() {
                 skill.templates.clear();
@@ -651,8 +657,108 @@ pub(super) fn prompt_names_skill_id(prompt: &str, skill_id: &str) -> bool {
     })
 }
 
+pub(crate) fn has_educational_kg_cues(raw_prompt: &str) -> bool {
+    let prompt = normalize_skill_search(raw_prompt);
+    let words: Vec<&str> = prompt.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let word_matches =
+        |w: &str, term: &str| w == term || ["ال", "وال", "بال", "لل", "كال", "فال", "و"].iter().any(|pref| w.strip_prefix(pref) == Some(term));
+    let mentions =
+        |terms: &[&str]| {
+            terms.iter().any(|term| {
+                if term.contains(' ') || term.contains('-') { prompt.contains(term) } else { words.iter().any(|w| word_matches(w, term)) }
+            })
+        };
+    let upper_stage = mentions(&[
+        "ثانوي",
+        "ثانوية",
+        "ثانويه",
+        "إعدادي",
+        "اعدادي",
+        "متوسط",
+        "متوسطة",
+        "متوسطه",
+        "جامعي",
+        "جامعة",
+        "جامعه",
+        "secondary",
+        "high school",
+        "middle school",
+        "university",
+        "college",
+    ]);
+    if upper_stage {
+        return false;
+    }
+    mentions(&[
+        "أطفال",
+        "اطفال",
+        "طفل",
+        "روضة",
+        "روضه",
+        "تمهيدي",
+        "للصغار",
+        "ابتدائي",
+        "تلاميذ",
+        "مدرسة",
+        "مدرسه",
+        "مدرسي",
+        "مدرسية",
+        "منهج",
+        "مناهج",
+        "مقرر",
+        "مادة",
+        "ماده",
+        "درس",
+        "دروس",
+        "كراس",
+        "كتيب علوم",
+        "كتيب رياضيات",
+        "كتيب حاسوب",
+        "كتاب علوم",
+        "كتاب رياضيات",
+        "أكسفورد",
+        "اكسفورد",
+        "كامبريدج",
+        "كامبردج",
+        "فاملي اند فريندز",
+        "فرست فريندز",
+        "كارنيت",
+        "جارنيت",
+        "kg",
+        "kg1",
+        "kg2",
+        "fs1",
+        "fs2",
+        "kindergarten",
+        "preschool",
+        "children",
+        "early years",
+        "early-years",
+        "primary",
+        "kids",
+        "curriculum",
+        "workbook",
+        "coursebook",
+        "textbook",
+        "worksheet",
+        "syllabus",
+        "scope and sequence",
+        "oxford",
+        "cambridge",
+        "family and friends",
+        "first friends",
+        "garnet",
+        "phonics",
+        "handwriting",
+    ])
+}
+
 pub(super) fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::CatalogEntry) -> usize {
     let exact_id_boost = if prompt_names_skill_id(prompt, &entry.skill_id) { 80 } else { 0 };
+    if (entry.skill_id.starts_with("kg-") || entry.skill_id.starts_with("early-years-")) && exact_id_boost == 0 && !has_educational_kg_cues(prompt) {
+        return 0;
+    }
+    let raw_prompt = prompt;
     let prompt = normalize_skill_search(prompt);
     let haystack = normalize_skill_search(&format!("{} {} {}", entry.skill_id, entry.name, entry.description));
     let words = prompt
@@ -846,7 +952,7 @@ pub(super) fn skill_match_score(prompt: &str, entry: &designcraft_ai_skills::Cat
             "flashcard",
         ]);
     let print = book || mentions(&["طباعة", "للطباعة", "مطبعة", "مطبوع", "print", "a4"]);
-    let kg = !upper_stage && (children || intl || computing) && (book || visual);
+    let kg = !upper_stage && has_educational_kg_cues(raw_prompt) && (children || intl || computing || book || visual);
     let architecture = mentions(&[
         "تسلسل",
         "وتسلسله",
@@ -1030,6 +1136,22 @@ pub(super) fn task_document_context(
             let context = compact_context(&scratch)?;
             Ok((scratch.doc().map_err(|e| e.to_string())?.clone(), context))
         }
+        TaskTarget::NewDocument { pages, geometry } => {
+            crate::intent_geometry::validate_geometry_spec(geometry)?;
+            if let Some(profile) = profile {
+                profile.validate()?;
+            }
+            let mut scratch = Session::new();
+            scratch.prefs = session.prefs.clone();
+            let params = crate::intent_geometry::geometry_to_file_new_params(geometry, *pages, settings, brief)?;
+            scratch.execute("file.new", &params).map_err(|e| e.to_string())?;
+            if geometry.facing_pages.unwrap_or(false) {
+                let state = crate::facing_pages::canonicalize(scratch.doc().map_err(|e| e.to_string())?, &scratch.prefs)?;
+                scratch.add_document(state);
+            }
+            let context = compact_context(&scratch)?;
+            Ok((scratch.doc().map_err(|e| e.to_string())?.clone(), context))
+        }
     }
 }
 pub(super) fn production_document_params(
@@ -1108,9 +1230,61 @@ pub(super) fn ensure_publication_idle(session: &Session) -> Result<(), String> {
 /// Task environment is rebuilt for every explicit start, retry and approved
 /// group. It is host data, never authority recovered from a model response.
 pub(super) fn enrich_production_context(context: &mut Value, root: &Path, base: &DocState, task: &TaskRequest) -> Result<(), String> {
+    enrich_production_context_with_memory(context, root, base, task, None)
+}
+
+pub(super) fn enrich_production_context_with_memory(
+    context: &mut Value,
+    root: &Path,
+    base: &DocState,
+    task: &TaskRequest,
+    memory: Option<&crate::brief_planner::SessionDesignMemory>,
+) -> Result<(), String> {
     let context = context.as_object_mut().ok_or("Invalid native production context")?;
     context.insert("_production_cache_root".into(), json!(root.join("production-cache-v1")));
-    if task.settings.facing_pages {
+    context.insert("_ai_profile_root".into(), json!(root));
+    let art_blueprint = crate::brief_planner::expand_brief_blueprint(task, Some(&base.doc));
+    if let Ok(bp_val) = serde_json::to_value(&art_blueprint) {
+        context.insert("brief_art_direction".into(), bp_val);
+    }
+    if let Some(mem) = memory {
+        let summary = mem.format_context_summary(task.selection_context.as_ref());
+        if !summary.is_empty() {
+            context.insert("session_design_memory".into(), json!(summary));
+        }
+    }
+    if let Some(sel) = &task.selection_context
+        && let Ok(sel_val) = serde_json::to_value(sel)
+    {
+        context.insert("selection_context".into(), sel_val);
+        context.insert(
+            "selection_edit_directive".into(),
+            json!("Modify ONLY the targeted page/frame(s) in selection_context unless the brief explicitly requests broader layout changes."),
+        );
+    }
+    let brand_palette = crate::native_layout::extract_brand_palette_from_attachments(&task.attachments);
+    if !brand_palette.is_empty() {
+        context.insert("extracted_brand_palette".into(), json!(brand_palette));
+    }
+    let mut pack_ids = task.knowledge_pack_ids.clone();
+    for id in &task.settings.active_knowledge_packs {
+        if !pack_ids.contains(id) {
+            pack_ids.push(id.clone());
+        }
+    }
+    if !task.attachments.is_empty() || !pack_ids.is_empty() {
+        let profile_roots = file_access::AutomationRoots::new(&[root], &[root]).ok().flatten();
+        let (rag_idx, _, _) = crate::rag::build_task_knowledge_index(profile_roots.as_deref(), Some(root), &task.attachments, &pack_ids, &[]);
+        let hits = rag_idx.search(&task.prompt, 6);
+        if !hits.is_empty()
+            && let Ok(hits_val) = serde_json::to_value(&hits)
+        {
+            context.insert("rag_grounding_hits".into(), hits_val);
+        }
+    }
+    let uses_facing =
+        task.settings.facing_pages || matches!(&task.target, TaskTarget::NewDocument { geometry, .. } if geometry.facing_pages.unwrap_or(false));
+    if uses_facing {
         context.insert("facing_editorial_direction".into(), json!({
             "enabled":true,"rightToLeft":book_binding(&task.settings,&task.prompt),
             "instruction":"Plan occasional visually connected facing pairs, like an educational magazine: shared thematic scene, aligned sections, related activities and a continuous restrained identity. Use chapter openers and selected learning sequences, not one repeated spread everywhere. Preserve each page's supplied lesson and printable copy. Keep critical text/answer areas clear of the binding gutter; headers/folios follow left/right positions. Coordinate with the adjacent supplied PAGE block; both pages retain independently editable native elements. Cover page 1 stands alone; reader pairs are pages 2–3, 4–5 and so on."
@@ -1118,7 +1292,7 @@ pub(super) fn enrich_production_context(context: &mut Value, root: &Path, base: 
     }
     if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
         context.insert("production_print_contract".into(), serde_json::to_value(&contract).map_err(|e| e.to_string())?);
-        if !matches!(task.target, TaskTarget::NewA4 { .. })
+        if !matches!(task.target, TaskTarget::NewA4 { .. } | TaskTarget::NewDocument { .. })
             && let Err(message) = contract.validate_existing(base)
         {
             context.insert(

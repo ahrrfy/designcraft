@@ -12,8 +12,11 @@ mod docx;
 mod docx_numbering;
 pub mod export;
 mod rtf;
+mod structured;
 pub mod tagged;
 mod xlsx;
+
+pub use structured::{StructuredDocumentExtract, StructuredTableExtract, csv_records, extract_structured_text, xlsx_sheet_names};
 
 /// Data-merge row cap (header not included). More than this is an error.
 pub const DATA_MERGE_MAX_ROWS: usize = 100_000;

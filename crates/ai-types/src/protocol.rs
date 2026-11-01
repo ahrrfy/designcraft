@@ -66,6 +66,143 @@ pub enum VisualDensityMode {
     RichPerPageImages,
 }
 
+/// Controls routing between local and cloud text/layout providers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiExecutionMode {
+    #[default]
+    Auto,
+    LocalOnly,
+    CloudOnly,
+    SmartHybrid,
+}
+
+/// Controls how multi-format deliverables are emitted when `target_formats` contains multiple geometries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiFormatOutputMode {
+    #[default]
+    AlternateLayouts,
+    SeparateDocuments,
+}
+
+/// Primary publishing intent for a new document geometry specification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentIntentKind {
+    #[default]
+    Print,
+    Web,
+    Mobile,
+}
+
+/// Geometry specification for new documents and multi-format production targets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DocumentGeometrySpec {
+    pub width_pt: f64,
+    pub height_pt: f64,
+    pub intent: DocumentIntentKind,
+    pub units: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facing_pages: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_to_left: Option<bool>,
+    /// Optional `[top, bottom, inside_or_left, outside_or_right]` margins in points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margins_pt: Option<[f64; 4]>,
+    pub bleed_pt: f64,
+    pub columns: u32,
+    pub column_gutter_pt: f64,
+    pub preset_label: String,
+}
+
+impl Default for DocumentGeometrySpec {
+    fn default() -> Self {
+        Self {
+            width_pt: 595.276,
+            height_pt: 841.89,
+            intent: DocumentIntentKind::Print,
+            units: "mm".into(),
+            facing_pages: None,
+            right_to_left: None,
+            margins_pt: None,
+            bleed_pt: 0.0,
+            columns: 1,
+            column_gutter_pt: 12.0,
+            preset_label: "A4".into(),
+        }
+    }
+}
+
+/// Snapshot of the user's current canvas/story selection passed as scoped context for AI edits.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SelectionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_page: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_item_ids: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_story_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_text_snippet: Option<String>,
+}
+
+/// Role assigned to an attached file in a [`TaskRequest`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentRole {
+    #[default]
+    Auto,
+    KnowledgeReference,
+    BrandLogo,
+    DataRecords,
+    ContentAsset,
+}
+
+/// User-supplied file attachment paired with its intended production role.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskAttachment {
+    pub path: String,
+    pub role: AttachmentRole,
+}
+
+/// Summary metadata for a persisted local knowledge pack.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnowledgePackSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub file_count: usize,
+    pub chunk_count: usize,
+    pub updated_at: String,
+    pub sources: Vec<String>,
+}
+
+/// Local inference server status discovered on loopback ports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveredLocalEndpoint {
+    pub provider: ProviderKind,
+    pub endpoint: String,
+    pub reachable: bool,
+    pub models: Vec<String>,
+    pub message: String,
+}
+
+impl Default for DiscoveredLocalEndpoint {
+    fn default() -> Self {
+        Self { provider: ProviderKind::Ollama, endpoint: String::new(), reachable: false, models: Vec::new(), message: String::new() }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiSettings {
@@ -100,6 +237,18 @@ pub struct AiSettings {
     /// Controls decorative illustration reuse vs pure native vector vs per-page images.
     #[serde(default)]
     pub visual_density: VisualDensityMode,
+    /// Controls local-only, cloud-only, automatic, or smart-hybrid routing.
+    #[serde(default)]
+    pub execution_mode: AiExecutionMode,
+    /// Optional local model selection used for continuation/routine batches in SmartHybrid mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid_local_model: Option<ModelSelection>,
+    /// Controls how multi-format targets are materialized.
+    #[serde(default)]
+    pub multi_format_mode: MultiFormatOutputMode,
+    /// IDs of local knowledge packs pinned across tasks by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_knowledge_packs: Vec<String>,
 }
 impl Default for AiSettings {
     fn default() -> Self {
@@ -121,11 +270,15 @@ impl Default for AiSettings {
             arabic_font: None,
             execution_pacing: ExecutionPacing::ReviewEveryBatch,
             visual_density: VisualDensityMode::SmartHybrid,
+            execution_mode: AiExecutionMode::Auto,
+            hybrid_local_model: None,
+            multi_format_mode: MultiFormatOutputMode::AlternateLayouts,
+            active_knowledge_packs: Vec::new(),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskTarget {
     CurrentDocument,
@@ -135,7 +288,22 @@ pub enum TaskTarget {
     NewA4 {
         pages: u32,
     },
+    NewDocument {
+        pages: u32,
+        #[serde(default)]
+        geometry: DocumentGeometrySpec,
+    },
 }
+
+impl TaskTarget {
+    pub const fn requested_pages(&self) -> Option<u32> {
+        match self {
+            Self::NewA4 { pages } | Self::NewDocument { pages, .. } => Some(*pages),
+            Self::CurrentDocument | Self::ContinueBook => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRequest {
@@ -146,9 +314,33 @@ pub struct TaskRequest {
     pub auto_select_skills: bool,
     pub target: TaskTarget,
     pub export_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<TaskAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knowledge_pack_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_context: Option<SelectionContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_formats: Vec<DocumentGeometrySpec>,
 }
 fn auto_skills() -> bool {
     true
+}
+impl Default for TaskRequest {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            settings: AiSettings::default(),
+            skill_ids: Vec::new(),
+            auto_select_skills: true,
+            target: TaskTarget::CurrentDocument,
+            export_directory: None,
+            attachments: Vec::new(),
+            knowledge_pack_ids: Vec::new(),
+            selection_context: None,
+            target_formats: Vec::new(),
+        }
+    }
 }
 /// Saved progress metadata preserved when binding a new-book draft to continuation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +582,19 @@ pub enum AiRequest {
     DismissImageRegeneration {
         job_id: String,
     },
+    DiscoverLocalEndpoints,
+    ContinueRemainingLocally {
+        job_id: Option<String>,
+        local_model: Option<ModelSelection>,
+    },
+    CreateKnowledgePack {
+        name: String,
+        description: String,
+        paths: Vec<String>,
+    },
+    DeleteKnowledgePack {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -571,6 +776,12 @@ pub struct AiSnapshot {
     pub resources: Option<crate::ResourceSnapshot>,
     #[serde(default)]
     pub print_proof: Option<PrintProof>,
+    #[serde(default)]
+    pub knowledge_packs: Vec<KnowledgePackSummary>,
+    #[serde(default)]
+    pub discovered_local_endpoints: Vec<DiscoveredLocalEndpoint>,
+    #[serde(default)]
+    pub can_continue_locally: bool,
 }
 
 #[cfg(test)]

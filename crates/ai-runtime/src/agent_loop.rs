@@ -17,7 +17,7 @@ pub(crate) fn has_configured_image_model(settings: &AiSettings) -> bool {
     }
     match settings.image_model.provider {
         ProviderKind::ComfyUi => settings.comfy_workflow.is_some(),
-        ProviderKind::Ollama => false,
+        ProviderKind::Ollama | ProviderKind::LocalOpenAi => false,
         ProviderKind::Gemini | ProviderKind::OpenAi => {
             let model = settings.image_model.model.trim();
             !model.is_empty() && !designcraft_ai_types::is_non_image_model(settings.image_model.provider, model)
@@ -58,6 +58,7 @@ pub(crate) fn run_open_document_agent_loop(
     let mut workspace = DocToolWorkspace::new(base, prefs, catalog.clone(), min_ppi);
     workspace.allow_image_queue = allow_image_queue;
     workspace.supports_vision = supports_vision;
+    workspace.ai_root = context.get("_ai_profile_root").and_then(Value::as_str).map(std::path::PathBuf::from);
     let overview = workspace.inspect_document_overview(request)?;
 
     let system = build_agent_system_prompt(catalog, skills, allow_image_queue, supports_vision)?;
@@ -303,7 +304,13 @@ fn build_agent_system_prompt(catalog: &Value, skills: &[SkillSnapshot], allow_im
          - Within a single `apply_engine_commands` batch, reference earlier results via `$N.id` or `$N.story` (0-based within that batch).\n\
          - Before calling `complete_task`, `preflight.oversetErrors` MUST be `0`. If font replacement or text edits cause overset text, run `{{\"command\": \"story.fitOverset\", \"params\": {{\"minSize\": 8.0}}}}` or enlarge/reflow the frame inside `safeRectInSpread`.\n\
          {image_tool_guidance}\n\
-         6. COMPLETION:\n\
+         6. KNOWLEDGE RAG, PREFLIGHT, DATA RECORDS & MULTI-FORMAT ADAPTATION:\n\
+         - Call `search_project_knowledge` whenever user attachments or active Knowledge Packs contain source copy, brand rules, or curriculum facts.\n\
+         - Call `lookup_engine_commands` to inspect exact command parameter schemas before using unfamiliar engine commands.\n\
+         - Call `inspect_preflight` anytime to verify zero overset/missing-glyph/bleed errors.\n\
+         - Call `populate_data_records` when an attached `.xlsx`/`.csv`/`.tsv` (`DataRecords`) should populate repeated cards, badges, menus, or catalog items.\n\
+         - Call `adapt_layout_formats` when adapting a campaign across multiple social/print formats (`AlternateLayouts` or `SeparateDocuments`).\n\
+         7. COMPLETION:\n\
          - Once every requirement in the user's prompt is satisfied and there is zero overset text, call `complete_task` with a clear `title` and `summary` (in the user's prompt language). All applied batches commit to the user's open document as ONE atomic Undo step.\n\
          \n\
          VETTED NATIVE ENGINE COMMAND CATALOG:\n\
@@ -316,9 +323,19 @@ fn build_agent_system_prompt(catalog: &Value, skills: &[SkillSnapshot], allow_im
 
 fn build_initial_user_message(request: &TaskRequest, context: &Value, overview: &Value) -> Result<String, String> {
     let resolved_fonts = context.get("resolved_print_fonts").cloned().unwrap_or(Value::Null);
+    let art_direction = context.get("brief_art_direction").cloned().unwrap_or(Value::Null);
+    let selection_ctx = context.get("selection_context").cloned().unwrap_or(Value::Null);
+    let design_memory = context.get("session_design_memory").cloned().unwrap_or(Value::Null);
+    let rag_hits = context.get("rag_grounding_hits").cloned().unwrap_or(Value::Null);
     let payload = json!({
         "userPrompt": request.prompt,
         "resolvedPrintFonts": resolved_fonts,
+        "artDirection": art_direction,
+        "selectionContext": selection_ctx,
+        "sessionDesignMemory": design_memory,
+        "initialKnowledgeHits": rag_hits,
+        "attachments": request.attachments,
+        "targetFormats": request.target_formats,
         "documentOverview": overview,
     });
     serde_json::to_string(&payload).map_err(|e| e.to_string())
@@ -421,9 +438,8 @@ fn extract_json_object(text: &str) -> Option<&str> {
 }
 
 fn default_title_from_prompt(prompt: &str) -> String {
-    let trimmed = prompt.trim();
-    let snippet: String = trimmed.chars().take(64).collect();
-    if snippet.is_empty() { "AI Document Edit".into() } else { snippet }
+    let clean = crate::brief_planner::sanitize_visible_title(prompt);
+    if clean.trim().is_empty() { "AI Document Edit".into() } else { clean }
 }
 
 #[allow(dead_code)]

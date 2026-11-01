@@ -1,14 +1,43 @@
-//! Windows only: embed the app icon and version info (VERSIONINFO) into `designcraft.exe`, so it
-//! shows in Explorer, the taskbar, the Start menu and Alt-Tab.
+//! Embeds `DESIGNCRAFT_BUILD_SHA` on all targets (falling back to `git rev-parse --short=12 HEAD`
+//! when unset or empty), and on Windows embeds the app icon and version info (`VERSIONINFO`) into
+//! `designcraft.exe` so it shows in Explorer, the taskbar, the Start menu and Alt-Tab.
 //!
-//! On every other target this does nothing. A missing resource compiler is a warning, so a
-//! cross-compile from macOS or Linux still links, unless `DESIGNCRAFT_REQUIRE_WINRES=1` turns it
-//! into an error (for release builds).
+//! A missing Windows resource compiler is a warning, so a cross-compile from macOS or Linux still
+//! links, unless `DESIGNCRAFT_REQUIRE_WINRES=1` turns it into an error (for release builds).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../assets/app-icon/designcraft.ico");
+    println!("cargo:rerun-if-env-changed=DESIGNCRAFT_BUILD_SHA");
     println!("cargo:rerun-if-env-changed=DESIGNCRAFT_REQUIRE_WINRES");
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let git_head = manifest_dir.join("../../.git/HEAD");
+    if git_head.exists() {
+        println!("cargo:rerun-if-changed=../../.git/HEAD");
+        if let Ok(head_contents) = std::fs::read_to_string(&git_head)
+            && let Some(ref_rel) = head_contents.trim().strip_prefix("ref: ")
+            && !ref_rel.contains("..")
+        {
+            let ref_path = manifest_dir.join("../../.git").join(ref_rel);
+            if ref_path.exists() {
+                println!("cargo:rerun-if-changed=../../.git/{ref_rel}");
+            }
+        }
+    }
+
+    let env_sha = std::env::var("DESIGNCRAFT_BUILD_SHA").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    if env_sha.is_none()
+        && let Ok(output) = std::process::Command::new("git").args(["rev-parse", "--short=12", "HEAD"]).current_dir(manifest_dir).output()
+        && output.status.success()
+        && let Ok(raw) = String::from_utf8(output.stdout)
+    {
+        let sha = raw.trim();
+        if !sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            println!("cargo:rustc-env=DESIGNCRAFT_BUILD_SHA={sha}");
+        }
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

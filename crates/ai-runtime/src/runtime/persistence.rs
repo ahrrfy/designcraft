@@ -5,7 +5,11 @@ use super::{
 
 impl ProductionRunner {
     pub(super) fn save_production_draft(&mut self, session: &Session, task: &TaskRequest) -> Result<(), String> {
-        let current = if matches!(task.target, TaskTarget::NewA4 { .. }) { None } else { Some(session.doc().map_err(|e| e.to_string())?) };
+        let current = match task.target {
+            TaskTarget::NewA4 { .. } => None,
+            TaskTarget::NewDocument { .. } => session.doc().ok(),
+            TaskTarget::CurrentDocument | TaskTarget::ContinueBook => Some(session.doc().map_err(|e| e.to_string())?),
+        };
         let completed_pages = current
             .map(|doc| {
                 crate::facing_pages::canonicalize(doc, &session.prefs)
@@ -14,7 +18,7 @@ impl ProductionRunner {
             })
             .unwrap_or(0);
         let target_total_pages = match task.target {
-            TaskTarget::NewA4 { pages } => Some(pages),
+            TaskTarget::NewA4 { pages } | TaskTarget::NewDocument { pages, .. } => Some(pages),
             TaskTarget::ContinueBook => current.and_then(|doc| u32::try_from(doc.doc.page_count()).ok()),
             TaskTarget::CurrentDocument => None,
         };
@@ -46,7 +50,7 @@ impl ProductionRunner {
         let Some(mut draft) = self.snapshot.production_draft.clone() else { return Ok(()) };
         let current = session.doc().map_err(|e| e.to_string())?;
         let prior_total = match draft.request.target {
-            TaskTarget::NewA4 { pages } => Some(pages),
+            TaskTarget::NewA4 { pages } | TaskTarget::NewDocument { pages, .. } => Some(pages),
             _ => None,
         };
         let completed_pages = if let Some(job) = self.batch.as_ref().filter(|job| job.snapshot.job_id == id) {
@@ -79,7 +83,9 @@ impl ProductionRunner {
 
 pub(super) fn validate_settings(settings: &AiSettings) -> Result<(), String> {
     settings.resources.validate()?;
-    if settings.text_model.provider == ProviderKind::Ollama && settings.budget.max_output_tokens >= settings.resources.context_tokens {
+    if matches!(settings.text_model.provider, ProviderKind::Ollama | ProviderKind::LocalOpenAi)
+        && settings.budget.max_output_tokens >= settings.resources.context_tokens
+    {
         return Err("Ollama output token limit must be smaller than the local context window".into());
     }
     if settings.pages_per_batch > 1000 {
@@ -90,6 +96,18 @@ pub(super) fn validate_settings(settings: &AiSettings) -> Result<(), String> {
         && settings.visual_density != designcraft_ai_types::protocol::VisualDensityMode::PureNativeVector
     {
         validate_endpoint(&settings.image_model)?;
+    }
+    if let Some(hybrid) = &settings.hybrid_local_model {
+        validate_endpoint(hybrid)?;
+        if hybrid.model.len() > 256 {
+            return Err("Model name is too long".into());
+        }
+        if !hybrid.provider.is_local() || hybrid.provider == ProviderKind::ComfyUi {
+            return Err("SmartHybrid local continuation model must use Ollama or LocalOpenAi".into());
+        }
+    }
+    if settings.active_knowledge_packs.len() > 32 || settings.active_knowledge_packs.iter().any(|id| id.len() > 256) {
+        return Err("Too many or oversized active knowledge pack identifiers".into());
     }
     if settings.text_model.model.len() > 256 || settings.image_model.model.len() > 256 {
         return Err("Model name is too long".into());
@@ -105,6 +123,15 @@ pub(super) fn validate_settings(settings: &AiSettings) -> Result<(), String> {
 }
 pub(super) fn validate_production_draft(draft: &ProductionDraft) -> Result<(), String> {
     validate_settings(&draft.request.settings)?;
+    if let TaskTarget::NewDocument { pages, ref geometry } = draft.request.target {
+        if !(1..=1000).contains(&pages) {
+            return Err("Saved production instructions contain invalid page count".into());
+        }
+        crate::intent_geometry::validate_geometry_spec(geometry)?;
+    }
+    for fmt in &draft.request.target_formats {
+        crate::intent_geometry::validate_geometry_spec(fmt)?;
+    }
     if draft.id.len() > 256
         || draft.request.prompt.trim().is_empty()
         || draft.request.prompt.len() > MAX_BRIEF_BYTES
@@ -113,6 +140,11 @@ pub(super) fn validate_production_draft(draft: &ProductionDraft) -> Result<(), S
         || draft.request.export_directory.as_ref().is_some_and(|path| path.len() > 32_768)
         || draft.request.skill_ids.len() > 8
         || draft.request.skill_ids.iter().any(|id| id.len() > 256)
+        || draft.request.attachments.len() > 32
+        || draft.request.attachments.iter().any(|a| a.path.len() > 32_768)
+        || draft.request.knowledge_pack_ids.len() > 32
+        || draft.request.knowledge_pack_ids.iter().any(|id| id.len() > 256)
+        || draft.request.target_formats.len() > 16
         || matches!(draft.request.target, TaskTarget::NewA4 { pages } if !(1..=1000).contains(&pages))
         || draft.progress.completed_pages > 1000
         || draft.progress.target_total_pages.is_some_and(|pages| !(1..=1000).contains(&pages))
@@ -130,6 +162,10 @@ pub(super) fn apply_execution_settings_to_draft(draft: &mut ProductionDraft, set
         draft.request.settings.output_mode = settings.output_mode;
         draft.request.settings.visual_density = settings.visual_density;
         draft.request.settings.execution_pacing = settings.execution_pacing;
+        draft.request.settings.execution_mode = settings.execution_mode;
+        draft.request.settings.hybrid_local_model = settings.hybrid_local_model.clone();
+        draft.request.settings.multi_format_mode = settings.multi_format_mode;
+        draft.request.settings.active_knowledge_packs = settings.active_knowledge_packs.clone();
         draft.request.settings.verify_generated_images = settings.verify_generated_images;
         draft.request.settings.allow_paid_repairs = settings.allow_paid_repairs;
         draft.request.settings.image_rates = settings.image_rates.clone();
@@ -137,6 +173,52 @@ pub(super) fn apply_execution_settings_to_draft(draft: &mut ProductionDraft, set
         draft.request.settings.resources = settings.resources.clone();
     } else {
         draft.request.settings = settings.clone();
+    }
+}
+pub(crate) fn enforce_execution_mode(settings: &mut AiSettings) -> Result<(), String> {
+    use designcraft_ai_types::protocol::AiExecutionMode;
+    match settings.execution_mode {
+        AiExecutionMode::Auto => Ok(()),
+        AiExecutionMode::LocalOnly => {
+            if !settings.text_model.provider.is_local() {
+                return Err("LocalOnly execution mode forbids cloud text providers; select Ollama or LocalOpenAi".into());
+            }
+            if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages
+                && settings.visual_density != designcraft_ai_types::protocol::VisualDensityMode::PureNativeVector
+                && !settings.image_model.provider.is_local()
+            {
+                return Err("LocalOnly execution mode forbids cloud image providers; select ComfyUI or switch Output Mode to Native Only".into());
+            }
+            if !designcraft_ai_types::supports_gemini_image_review(settings.text_model.provider, &settings.text_model.model) {
+                settings.verify_generated_images = false;
+            }
+            Ok(())
+        }
+        AiExecutionMode::CloudOnly => {
+            if settings.text_model.provider.is_local() {
+                return Err("CloudOnly execution mode forbids local text endpoints; select Gemini or OpenAI".into());
+            }
+            if settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages
+                && settings.visual_density != designcraft_ai_types::protocol::VisualDensityMode::PureNativeVector
+                && settings.image_model.provider.is_local()
+            {
+                return Err("CloudOnly execution mode forbids local image endpoints; select a cloud image provider or Native Only".into());
+            }
+            Ok(())
+        }
+        AiExecutionMode::SmartHybrid => {
+            if settings.text_model.provider.is_local() {
+                return Err("SmartHybrid execution mode expects a cloud text model for Batch 1 foundation planning".into());
+            }
+            let Some(hybrid) = &settings.hybrid_local_model else {
+                return Err("SmartHybrid execution mode requires hybrid_local_model (Ollama or LocalOpenAi) for Batch 2+ continuation".into());
+            };
+            if !hybrid.provider.is_local() || hybrid.provider == ProviderKind::ComfyUi || hybrid.model.trim().is_empty() {
+                return Err("SmartHybrid local continuation model must specify a valid Ollama or LocalOpenAi text model".into());
+            }
+            validate_endpoint(hybrid)?;
+            Ok(())
+        }
     }
 }
 pub(crate) fn require_text_model(settings: &AiSettings) -> Result<(), String> {
@@ -160,6 +242,11 @@ pub(crate) fn require_generation_models(settings: &AiSettings) -> Result<(), Str
         }
         if settings.image_model.provider == ProviderKind::Ollama {
             return Err("Ollama image generation is unsupported; choose an explicit image provider or switch Output Mode to Native Only".into());
+        }
+        if settings.image_model.provider == ProviderKind::LocalOpenAi {
+            return Err(
+                "LocalOpenAi image generation is unsupported; choose ComfyUI, a cloud image provider, or switch Output Mode to Native Only".into()
+            );
         }
         if !settings.image_model.model.trim().is_empty()
             && designcraft_ai_types::is_non_image_model(settings.image_model.provider, &settings.image_model.model)
@@ -196,4 +283,73 @@ pub(super) fn write_json(access: &file_access::AutomationRoots, path: &Path, val
 pub(super) fn write_profile(access: &file_access::AutomationRoots, path: &Path, bytes: &[u8]) -> Result<(), String> {
     access.check(path, file_access::Access::Write)?;
     designcraft_engine::atomic::write_atomic(path, bytes).map_err(|e| e.to_string())
+}
+
+pub(crate) fn allocate_knowledge_pack_id(profile_access: &file_access::AutomationRoots, ai_root: &Path, base_slug: &str) -> Result<String, String> {
+    let packs_root = ai_root.join("knowledge-packs");
+    profile_access.check(&packs_root, file_access::Access::Write)?;
+    std::fs::create_dir_all(&packs_root).map_err(|e| e.to_string())?;
+    let mut pack_id = base_slug.to_string();
+    let mut suffix = 2u32;
+    while packs_root.join(&pack_id).exists() && suffix <= 100 {
+        pack_id = format!("{base_slug}-{suffix}");
+        suffix += 1;
+    }
+    crate::rag::validate_pack_id(&pack_id)?;
+    Ok(pack_id)
+}
+
+pub(crate) fn persist_knowledge_pack_files(
+    profile_access: &file_access::AutomationRoots,
+    ai_root: &Path,
+    pack_id: &str,
+    manifest_bytes: &[u8],
+    chunks_bytes: &[u8],
+) -> Result<(), String> {
+    crate::rag::validate_pack_id(pack_id)?;
+    let pack_dir = ai_root.join("knowledge-packs").join(pack_id);
+    profile_access.check(&pack_dir, file_access::Access::Write)?;
+    std::fs::create_dir_all(&pack_dir).map_err(|e| e.to_string())?;
+    write_profile(profile_access, &pack_dir.join("manifest.json"), manifest_bytes)?;
+    write_profile(profile_access, &pack_dir.join("chunks.json"), chunks_bytes)?;
+    Ok(())
+}
+
+pub(crate) fn remove_knowledge_pack_dir(profile_access: &file_access::AutomationRoots, ai_root: &Path, id: &str) -> Result<(), String> {
+    crate::rag::validate_pack_id(id)?;
+    let pack_dir = ai_root.join("knowledge-packs").join(id);
+    profile_access.check(&pack_dir, file_access::Access::Write)?;
+    let Ok(meta) = std::fs::symlink_metadata(&pack_dir) else {
+        return Err(format!("Knowledge pack '{id}' does not exist"));
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err("Refusing to remove symlinked or invalid knowledge pack path".into());
+    }
+    std::fs::remove_dir_all(&pack_dir).map_err(|e| e.to_string())
+}
+
+pub(crate) fn list_knowledge_pack_dir_ids(profile_access: &file_access::AutomationRoots, ai_root: &Path) -> Result<Vec<String>, String> {
+    let packs_root = ai_root.join("knowledge-packs");
+    profile_access.check(&packs_root, file_access::Access::Read)?;
+    let entries = match std::fs::read_dir(&packs_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut ids = Vec::new();
+    for entry in entries.flatten().take(128) {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let Some(id_str) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if crate::rag::validate_pack_id(&id_str).is_ok() {
+            ids.push(id_str);
+        }
+    }
+    Ok(ids)
 }

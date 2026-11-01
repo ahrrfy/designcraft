@@ -200,7 +200,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create Alternate Layout…",
             ["Layout"],
             None,
-            "{name, width, height, rule?: page rule for the copies (default: keep each page's)} — every page copied after the last at the new size (a new section marked `name`), objects following the liquid rules",
+            "{name?, width, height, rule?: page rule for the copies (default: keep each page's)} — every page copied after the last at the new size (a new section marked `name`), objects following the liquid rules",
             has_doc,
             create_alternate
         ),

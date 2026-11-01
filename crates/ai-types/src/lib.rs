@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 pub mod design;
 pub mod protocol;
 pub use design::{DesignCorrection, DesignImageSlot, DesignProfile, DesignStyleUse, DesignTextSlot, PageFamily};
-pub use protocol::{ArabicTashkeelMode, ExecutionPacing, VisualDensityMode};
+pub use protocol::{
+    AiExecutionMode, ArabicTashkeelMode, AttachmentRole, DiscoveredLocalEndpoint, DocumentGeometrySpec, DocumentIntentKind, ExecutionPacing,
+    KnowledgePackSummary, MultiFormatOutputMode, SelectionContext, TaskAttachment, VisualDensityMode,
+};
 pub mod resources;
 pub use resources::{GpuSnapshot, LocalResourcePolicy, ResourceSnapshot};
 
@@ -17,7 +20,18 @@ pub enum ProviderKind {
     OpenAi,
     Gemini,
     Ollama,
+    LocalOpenAi,
     ComfyUi,
+}
+
+impl ProviderKind {
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::Ollama | Self::LocalOpenAi | Self::ComfyUi)
+    }
+
+    pub const fn is_text_provider(self) -> bool {
+        matches!(self, Self::OpenAi | Self::Gemini | Self::Ollama | Self::LocalOpenAi)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,7 +131,7 @@ pub fn is_retired_gemini_model(provider: ProviderKind, model: &str) -> bool {
 /// Identifies providers or model identifiers that cannot generate images so illustrated runs fail
 /// before spending text-planning tokens.
 pub fn is_non_image_model(provider: ProviderKind, model: &str) -> bool {
-    if provider == ProviderKind::Ollama {
+    if matches!(provider, ProviderKind::Ollama | ProviderKind::LocalOpenAi) {
         return true;
     }
     if provider == ProviderKind::ComfyUi {
@@ -375,6 +389,9 @@ mod tests {
         assert!(is_non_image_model(ProviderKind::OpenAi, "gpt-4o"));
         assert!(is_non_image_model(ProviderKind::OpenAi, "o3-mini"));
         assert!(is_non_image_model(ProviderKind::Ollama, "qwen2.5:14b"));
+        assert!(is_non_image_model(ProviderKind::LocalOpenAi, "qwen3-14b-instruct"));
+        assert!(is_non_image_model(ProviderKind::LocalOpenAi, "flux.1-dev"));
+        assert!(is_non_image_model(ProviderKind::LocalOpenAi, ""));
         assert!(is_non_image_model(ProviderKind::OpenAi, "jina-clip-image-embed"));
         assert!(is_non_image_model(ProviderKind::Gemini, "jina-clip-image-embed"));
         for unknown_llm in
@@ -421,6 +438,7 @@ mod tests {
         for gemma_text in ["gemma-3-12b-it", "gemma-3-27b-it", "gemma2:9b", "gemma3:12b", "google/gemma-3-27b-it"] {
             assert!(!is_non_text_model(gemma_text), "expected {gemma_text} to be allowed as a text model");
             assert!(is_non_image_model(ProviderKind::Ollama, gemma_text));
+            assert!(is_non_image_model(ProviderKind::LocalOpenAi, gemma_text));
             assert!(is_non_image_model(ProviderKind::OpenAi, gemma_text));
             assert!(is_non_image_model(ProviderKind::Gemini, gemma_text));
         }
@@ -455,6 +473,7 @@ mod tests {
         assert!(!supports_gemini_image_review(ProviderKind::Gemini, "gemini-4-flash-image"));
         assert!(!supports_gemini_image_review(ProviderKind::OpenAi, "gpt-4o"));
         assert!(!supports_gemini_image_review(ProviderKind::Ollama, "llava"));
+        assert!(!supports_gemini_image_review(ProviderKind::LocalOpenAi, "llava"));
         assert!(!supports_gemini_image_review(ProviderKind::Gemini, "gemini-3.1-flash-image"));
     }
 
@@ -499,5 +518,117 @@ mod tests {
         let decoded: crate::protocol::AiSettings = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.execution_pacing, ExecutionPacing::AutoContinue);
         assert_eq!(decoded.visual_density, VisualDensityMode::PureNativeVector);
+    }
+
+    #[test]
+    fn provider_kind_local_openai_classification_and_legacy_defaults() {
+        assert_eq!(serde_json::to_string(&ProviderKind::LocalOpenAi).unwrap(), "\"local_open_ai\"");
+        assert_eq!(serde_json::from_str::<ProviderKind>("\"local_open_ai\"").unwrap(), ProviderKind::LocalOpenAi);
+
+        assert_eq!(
+            [
+                ProviderKind::OpenAi.is_local(),
+                ProviderKind::Gemini.is_local(),
+                ProviderKind::Ollama.is_local(),
+                ProviderKind::LocalOpenAi.is_local(),
+                ProviderKind::ComfyUi.is_local(),
+            ],
+            [false, false, true, true, true]
+        );
+        assert_eq!(
+            [
+                ProviderKind::OpenAi.is_text_provider(),
+                ProviderKind::Gemini.is_text_provider(),
+                ProviderKind::Ollama.is_text_provider(),
+                ProviderKind::LocalOpenAi.is_text_provider(),
+                ProviderKind::ComfyUi.is_text_provider(),
+            ],
+            [true, true, true, true, false]
+        );
+
+        let legacy_settings: crate::protocol::AiSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy_settings.execution_pacing, ExecutionPacing::ReviewEveryBatch);
+        assert_eq!(legacy_settings.execution_mode, AiExecutionMode::Auto);
+        assert!(legacy_settings.hybrid_local_model.is_none());
+        assert_eq!(legacy_settings.multi_format_mode, MultiFormatOutputMode::AlternateLayouts);
+        assert!(legacy_settings.active_knowledge_packs.is_empty());
+
+        let default_endpoint = DiscoveredLocalEndpoint::default();
+        assert_eq!(default_endpoint.provider, ProviderKind::Ollama);
+        assert!(!default_endpoint.reachable);
+    }
+
+    #[test]
+    fn task_request_new_document_attachments_and_selection_round_trip() {
+        let legacy_task_json = serde_json::json!({
+            "prompt": "Create a 4-page brochure",
+            "settings": {},
+            "skill_ids": [],
+            "target": {"kind": "new_a4", "pages": 4},
+            "export_directory": null
+        });
+        let legacy_task: crate::protocol::TaskRequest = serde_json::from_value(legacy_task_json).unwrap();
+        assert!(legacy_task.auto_select_skills);
+        assert!(legacy_task.attachments.is_empty());
+        assert!(legacy_task.knowledge_pack_ids.is_empty());
+        assert!(legacy_task.selection_context.is_none());
+        assert!(legacy_task.target_formats.is_empty());
+        assert_eq!(
+            [
+                legacy_task.target.requested_pages(),
+                crate::protocol::TaskTarget::CurrentDocument.requested_pages(),
+                crate::protocol::TaskTarget::ContinueBook.requested_pages(),
+            ],
+            [Some(4), None, None]
+        );
+
+        let omitted_geometry: crate::protocol::TaskTarget = serde_json::from_value(serde_json::json!({"kind": "new_document", "pages": 12})).unwrap();
+        assert_eq!(omitted_geometry, crate::protocol::TaskTarget::NewDocument { pages: 12, geometry: DocumentGeometrySpec::default() });
+        assert_eq!(omitted_geometry.requested_pages(), Some(12));
+
+        let custom_geometry = DocumentGeometrySpec {
+            width_pt: 419.528,
+            height_pt: 595.276,
+            intent: DocumentIntentKind::Print,
+            units: "mm".into(),
+            facing_pages: Some(true),
+            right_to_left: Some(true),
+            margins_pt: Some([34.0, 34.0, 42.0, 34.0]),
+            bleed_pt: 8.504,
+            columns: 2,
+            column_gutter_pt: 10.0,
+            preset_label: "A5".into(),
+        };
+        let mut rich_task = legacy_task;
+        rich_task.settings.execution_mode = AiExecutionMode::SmartHybrid;
+        rich_task.settings.hybrid_local_model = Some(ModelSelection {
+            provider: ProviderKind::LocalOpenAi,
+            model: "qwen3-14b-instruct".into(),
+            endpoint: Some("http://127.0.0.1:1234/v1".into()),
+        });
+        rich_task.settings.multi_format_mode = MultiFormatOutputMode::SeparateDocuments;
+        rich_task.settings.active_knowledge_packs = vec!["brand-pack".into()];
+        rich_task.target = crate::protocol::TaskTarget::NewDocument { pages: 16, geometry: custom_geometry.clone() };
+        rich_task.attachments = vec![TaskAttachment { path: "logo.svg".into(), role: AttachmentRole::BrandLogo }];
+        rich_task.knowledge_pack_ids = vec!["brand-pack".into()];
+        rich_task.selection_context = Some(SelectionContext {
+            active_page: Some(2),
+            selected_item_ids: vec![101, 102],
+            selected_labels: vec!["hero-title".into()],
+            selected_kinds: vec!["text".into()],
+            selected_story_id: Some(7),
+            selected_text_snippet: Some("مرحبا".into()),
+        });
+        rich_task.target_formats = vec![custom_geometry];
+
+        let encoded = serde_json::to_string(&rich_task).unwrap();
+        let decoded: crate::protocol::TaskRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.settings.execution_mode, AiExecutionMode::SmartHybrid);
+        assert_eq!(decoded.settings.multi_format_mode, MultiFormatOutputMode::SeparateDocuments);
+        assert_eq!(decoded.target.requested_pages(), Some(16));
+        assert_eq!(decoded.attachments.len(), 1);
+        assert_eq!(decoded.attachments[0].role, AttachmentRole::BrandLogo);
+        assert_eq!(decoded.selection_context.as_ref().and_then(|s| s.active_page), Some(2));
+        assert_eq!(decoded.target_formats.len(), 1);
     }
 }

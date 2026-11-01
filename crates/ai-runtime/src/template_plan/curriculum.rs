@@ -29,7 +29,8 @@ pub(crate) enum CurriculumSubject {
 /// Extracts a concise human-readable topic phrase from an open-ended user prompt
 /// so custom subjects and publications reflect the user's actual request.
 pub(crate) fn extract_prompt_topic(prompt: &str) -> String {
-    let first_line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or(prompt).trim();
+    let pre_sanitized = crate::brief_planner::sanitize_visible_title(prompt);
+    let first_line = pre_sanitized.trim();
     let stop_words = [
         "اريد",
         "أريد",
@@ -37,6 +38,9 @@ pub(crate) fn extract_prompt_topic(prompt: &str) -> String {
         "أبي",
         "ابغى",
         "أبغى",
+        "احتاج",
+        "أحتاج",
+        "مطلوب",
         "صمم",
         "انتج",
         "أنتج",
@@ -53,6 +57,8 @@ pub(crate) fn extract_prompt_topic(prompt: &str) -> String {
         "صفحات",
         "صفحة",
         "صفحه",
+        "تصاميم",
+        "تصميم",
         "please",
         "create",
         "design",
@@ -60,12 +66,16 @@ pub(crate) fn extract_prompt_topic(prompt: &str) -> String {
         "make",
         "build",
         "generate",
+        "want",
+        "need",
     ];
     let cleaned: Vec<&str> = first_line
         .split_whitespace()
         .filter(|w| {
             let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
-            !trimmed.is_empty() && !stop_words.contains(&trimmed.to_lowercase().as_str())
+            let digits_only = !trimmed.is_empty()
+                && trimmed.chars().all(|c| c.is_ascii_digit() || ('\u{0660}'..='\u{0669}').contains(&c) || ('\u{06F0}'..='\u{06F9}').contains(&c));
+            !trimmed.is_empty() && !digits_only && !stop_words.contains(&trimmed.to_lowercase().as_str())
         })
         .take(10)
         .collect();

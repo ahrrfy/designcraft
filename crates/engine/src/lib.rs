@@ -681,6 +681,10 @@ impl Session {
             // A command that takes `ids` acts on the objects the call names, so the selection
             // doesn't matter: with a text caret, nothing selected, or a selection the command
             // can't act on, `{"ids": [5]}` still runs.
+            if id == "variables.insert" && self.active().is_some() && ["frame", "story"].iter().any(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+            {
+                return Ok(());
+            }
             let named = if cmd::selection_reason(&e) { cmd::named_targets(spec, params) } else { None };
             let Some(ids) = named else { return Err(EngineError::Disabled(id.into(), e)) };
             let st = self.doc()?;

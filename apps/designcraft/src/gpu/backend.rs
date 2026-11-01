@@ -126,6 +126,16 @@ pub struct Choice {
     pub switched_from: Option<Backend>,
 }
 
+/// Version key stored in `gpu.json`: includes `DESIGNCRAFT_BUILD_SHA` when present so preview
+/// builds that share `CARGO_PKG_VERSION` start afresh and re-probe native DirectX 12 / Metal /
+/// Vulkan instead of staying pinned to an older build's fallback record.
+pub fn version_key(pkg_version: &str, build_sha: Option<&str>) -> String {
+    match build_sha.map(str::trim).filter(|sha| !sha.is_empty()) {
+        Some(sha) => format!("{pkg_version}+{sha}"),
+        None => pkg_version.to_owned(),
+    }
+}
+
 /// The backends a restart's skip list leaves out ([`super::skip_arg`]): a restart found no adapter
 /// of them that could show the window.
 pub fn skipped_backends(skip: &[String]) -> Vec<Backend> {
@@ -358,6 +368,21 @@ mod tests {
         assert_eq!(c.record, record(Some(Backend::Dx12), &[]));
         assert_eq!(c.switched_from, None);
         assert!(choose(&[], &Record::default(), V, &[]).is_none());
+    }
+
+    #[test]
+    fn new_build_sha_starts_afresh_for_same_package_version() {
+        assert_eq!(version_key("0.15.2", None), "0.15.2");
+        assert_eq!(version_key("0.15.2", Some("   ")), "0.15.2");
+        let old_key = version_key("0.15.2", None);
+        let new_key = version_key("0.15.2", Some("08e6ca339a85"));
+        assert_eq!(new_key, "0.15.2+08e6ca339a85");
+
+        let poisoned = Record { version: old_key, trying: None, failed: vec![Backend::Dx12] };
+        let c = choose(WIN, &poisoned, &new_key, &[]).unwrap();
+        assert_eq!(c.backend, Backend::Dx12);
+        assert!(c.record.failed.is_empty());
+        assert_eq!(c.switched_from, None);
     }
 
     #[test]
