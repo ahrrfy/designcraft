@@ -18,7 +18,6 @@ vello_cpu = { workspace = true }
 vello_common = { workspace = true }
 image = { workspace = true }
 fast_image_resize = { workspace = true }
-quick_cache = { workspace = true }
 craft-pdf = { workspace = true, features = ["raster"] }
 designcraft-images = { workspace = true }
 log = { workspace = true }

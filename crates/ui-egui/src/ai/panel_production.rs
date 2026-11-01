@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    AiRequest, AiUiState, ArabicTashkeelMode, BatchSnapshot, DiagnosticAlertKind, ExecutionPacing, MAX_REQUEST_ALLOWANCE, MAX_TOKEN_LIMIT,
+    OpenDocument, OutputMode, ProductionDraft, PromptAnalysisCache, ProviderKind, RequestEstimate, SkillCard, TaskTarget, TokenEstimate, TokenRates,
+    VisualDensityMode, automatic_proof_binding, bidi_layouter, button, explicit_script_pages, facing_proof_pair, field, has_configured_rates,
+    is_non_image_model, is_non_text_model, is_retired_gemini_text_model, label, model, named_rtl_text_edit, natural_prompt_pages, provider, rtl,
+    supports_gemini_image_review, text,
+};
 
 pub(super) fn same_document_path(left: &str, right: &str) -> bool {
     #[cfg(target_os = "windows")]
@@ -114,26 +120,29 @@ pub(super) fn arabic_typography_bar(ui: &mut egui::Ui, s: &mut AiUiState, a: boo
         .unwrap_or_else(|| text(a, "Automatic (best installed Arabic font)", "تلقائي (أفضل خط عربي مثبت)").to_owned());
     ui.horizontal_wrapped(|ui| {
         label(ui, a, "Arabic font", "الخط العربي");
-        egui::ComboBox::from_id_salt("ai_arabic_font").selected_text(rtl::widget(ui, &current_font_label)).show_ui(ui, |ui| {
-            if ui
-                .selectable_label(
-                    s.settings.arabic_font.is_none(),
-                    rtl::widget(ui, text(a, "Automatic (best installed Arabic font)", "تلقائي (أفضل خط عربي مثبت)")),
-                )
-                .clicked()
-                && s.settings.arabic_font.is_some()
-            {
-                s.settings.arabic_font = None;
-                settings_changed = true;
-            }
-            for family in &available_fonts {
-                let is_sel = s.settings.arabic_font.as_deref().is_some_and(|cur| cur.eq_ignore_ascii_case(family));
-                if ui.selectable_label(is_sel, rtl::widget(ui, family)).clicked() && !is_sel {
-                    s.settings.arabic_font = Some(family.clone());
+        crate::widgets::name_combo(
+            craft_ui::ComboBox::from_id_salt("ai_arabic_font").selected_text(rtl::widget(ui, &current_font_label)).show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(
+                        s.settings.arabic_font.is_none(),
+                        rtl::widget(ui, text(a, "Automatic (best installed Arabic font)", "تلقائي (أفضل خط عربي مثبت)")),
+                    )
+                    .clicked()
+                    && s.settings.arabic_font.is_some()
+                {
+                    s.settings.arabic_font = None;
                     settings_changed = true;
                 }
-            }
-        });
+                for family in &available_fonts {
+                    let is_sel = s.settings.arabic_font.as_deref().is_some_and(|cur| cur.eq_ignore_ascii_case(family));
+                    if ui.selectable_label(is_sel, rtl::widget(ui, family)).clicked() && !is_sel {
+                        s.settings.arabic_font = Some(family.clone());
+                        settings_changed = true;
+                    }
+                }
+            }),
+            "Arabic font selector",
+        );
     });
     if settings_changed {
         requests.push(AiRequest::UpdateSettings(s.settings.clone()));
@@ -640,798 +649,927 @@ pub(super) fn production(
         return;
     }
     ui.add_enabled_ui(!s.task_active(), |ui| {
-        if let Some(document) = documents.iter().find(|document| Some(document.index) == *activate_document && document.continuable) {
-            ui.horizontal_wrapped(|ui| {
-                let label = if a { format!("استكمال الصفحات {} المتبقية", document.remaining_pages) } else { format!("Continue remaining {} pages", document.remaining_pages) };
-                if ui.button(rtl::widget(ui, &label)).clicked() {
-                    s.new_document = false;
-                    s.continue_book = true;
-                    s.restored_target_unconfirmed = false;
-                }
-                let completed = document.pages.saturating_sub(document.remaining_pages);
-                let next_page = completed.saturating_add(1);
-                rtl::label(
-                    ui,
-                    if a {
-                        format!(
-                            "{} · الصفحات المكتملة 1–{} · الصفحة التالية {} من {}",
-                            document.title, completed, next_page, document.pages
-                        )
-                    } else {
-                        format!(
-                            "{} · Completed pages 1–{} · Next page {} of {}",
-                            document.title, completed, next_page, document.pages
-                        )
-                    },
-                );
-            });
+        show_continuable_book_banner(ui, s, a, documents, *activate_document);
+        show_production_model_and_mode_controls(ui, s, a, requests);
+        let pages_hint = show_production_prompt_composer(ui, s, a);
+        show_target_mode_row(ui, s, a, documents, *activate_document, requests);
+        production_binding(ui, s, a, documents, *activate_document);
+        show_existing_target_controls(ui, s, a, documents, activate_document);
+        show_script_or_prompt_page_mismatch(ui, s, a, documents, activate_document, pages_hint);
+        show_production_footer_and_actions(ui, s, a, available, documents, *activate_document, requests);
+    });
+    ui.separator();
+    if s.snapshot.batch.as_ref().is_some_and(|batch| matches!(batch.status.as_str(), "running" | "awaiting_human_proof")) {
+        batch_review(ui, s, a, requests);
+    } else if s.snapshot.batch.is_some() {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Previous task", "المهمة السابقة"))).show(ui, |ui| batch_review(ui, s, a, requests));
+    }
+}
+
+fn show_continuable_book_banner(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], active_document: Option<usize>) {
+    let Some(document) = documents.iter().find(|document| Some(document.index) == active_document && document.continuable) else {
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        let btn_label = if a {
+            format!("استكمال الصفحات {} المتبقية", document.remaining_pages)
+        } else {
+            format!("Continue remaining {} pages", document.remaining_pages)
+        };
+        if ui.button(rtl::widget(ui, &btn_label)).clicked() {
+            s.new_document = false;
+            s.continue_book = true;
+            s.restored_target_unconfirmed = false;
         }
-        ui.horizontal_wrapped(|ui| {
-            provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
-            label(ui, a, "Model or agent", "النموذج أو الوكيل");
-            ui.add(egui::TextEdit::singleline(&mut s.settings.text_model.model).desired_width(230.0));
-            if button(ui, a, "Discover", "اكتشاف") {
-                s.pending_models = Some(s.settings.text_model.clone());
-                requests.push(AiRequest::ListModels { selection: s.settings.text_model.clone() });
-            }
-            if button(ui, a, "Keys and providers", "المفاتيح والمزودون") {
-                s.tab = 3;
-            }
-        });
-        if let Some(models) = s.discovered_models.get(&(s.settings.text_model.provider, s.settings.text_model.endpoint.clone())) {
-            let filtered: Vec<&String> = models.iter().filter(|name| !is_non_text_model(name)).collect();
-            if !filtered.is_empty() {
-                egui::ComboBox::from_id_salt("production_discovered_models")
+        let completed = document.pages.saturating_sub(document.remaining_pages);
+        let next_page = completed.saturating_add(1);
+        rtl::label(
+            ui,
+            if a {
+                format!("{} · الصفحات المكتملة 1–{} · الصفحة التالية {} من {}", document.title, completed, next_page, document.pages)
+            } else {
+                format!("{} · Completed pages 1–{} · Next page {} of {}", document.title, completed, next_page, document.pages)
+            },
+        );
+    });
+}
+
+fn show_production_model_and_mode_controls(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
+    ui.horizontal_wrapped(|ui| {
+        provider(ui, "production_text_provider", &mut s.settings.text_model.provider, false);
+        label(ui, a, "Model or agent", "النموذج أو الوكيل");
+        ui.add(egui::TextEdit::singleline(&mut s.settings.text_model.model).desired_width(230.0)).accessible_name("Production model input");
+        if button(ui, a, "Discover", "اكتشاف") {
+            s.pending_models = Some(s.settings.text_model.clone());
+            requests.push(AiRequest::ListModels { selection: s.settings.text_model.clone() });
+        }
+        if button(ui, a, "Keys and providers", "المفاتيح والمزودون") {
+            s.tab = 3;
+        }
+    });
+    if let Some(models) = s.discovered_models.get(&(s.settings.text_model.provider, s.settings.text_model.endpoint.clone())) {
+        let filtered: Vec<&String> = models.iter().filter(|name| !is_non_text_model(name)).collect();
+        if !filtered.is_empty() {
+            crate::widgets::name_combo(
+                craft_ui::ComboBox::from_id_salt("production_discovered_models")
                     .selected_text(rtl::widget(ui, text(a, "Available models", "النماذج المتاحة")))
-                    .show_ui(
-                    ui,
-                    |ui| {
+                    .show_ui(ui, |ui| {
                         for name in filtered {
                             ui.selectable_value(&mut s.settings.text_model.model, name.clone(), name);
                         }
-                    },
-                );
+                    }),
+                "Production available models",
+            );
+        }
+    }
+    if s.active_diagnostic_alert().map(|alert| alert.kind) != Some(DiagnosticAlertKind::InvalidModel)
+        && is_retired_gemini_text_model(s.settings.text_model.provider, &s.settings.text_model.model)
+    {
+        ui.horizontal_wrapped(|ui| {
+            rtl::label(
+                ui,
+                egui::RichText::new(text(
+                    a,
+                    "Selected Gemini model series is retired and may return HTTP 404. Switch to gemini-3.8-flash before producing.",
+                    "سلسلة نموذج Gemini المختارة متقاعدة وقد تعيد خطأ HTTP 404. انتقل إلى gemini-3.8-flash قبل الإنتاج.",
+                ))
+                .color(ui.visuals().warn_fg_color),
+            );
+            if ui.button(rtl::widget(ui, text(a, "Use gemini-3.8-flash", "استخدام gemini-3.8-flash"))).clicked() {
+                s.settings.text_model.model = "gemini-3.8-flash".into();
+                requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+                s.clear_failure_alert();
+            }
+        });
+    }
+    show_output_mode_and_visual_density(ui, s, a, requests);
+}
+
+fn show_output_mode_and_visual_density(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
+    ui.horizontal_wrapped(|ui| {
+        let prev_mode = s.settings.output_mode;
+        ui.selectable_value(
+            &mut s.settings.output_mode,
+            OutputMode::NativeOnly,
+            rtl::widget(ui, text(a, "Editable elements", "عناصر قابلة للتحرير")),
+        );
+        ui.selectable_value(
+            &mut s.settings.output_mode,
+            OutputMode::NativeWithImages,
+            rtl::widget(ui, text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور")),
+        );
+        if s.settings.output_mode != prev_mode {
+            s.rates_confirmed = has_configured_rates(&s.settings);
+            if s.workflow_ready() {
+                requests.push(AiRequest::UpdateSettings(s.settings.clone()));
             }
         }
-        if s.active_diagnostic_alert().map(|alert| alert.kind) != Some(DiagnosticAlertKind::InvalidModel)
-            && is_retired_gemini_text_model(s.settings.text_model.provider, &s.settings.text_model.model)
-        {
-            ui.horizontal_wrapped(|ui| {
-                rtl::label(
-                    ui,
-                    egui::RichText::new(text(
-                        a,
-                        "Selected Gemini model series is retired and may return HTTP 404. Switch to gemini-3.8-flash before producing.",
-                        "سلسلة نموذج Gemini المختارة متقاعدة وقد تعيد خطأ HTTP 404. انتقل إلى gemini-3.8-flash قبل الإنتاج.",
-                    ))
-                    .color(ui.visuals().warn_fg_color),
-                );
-                if ui.button(rtl::widget(ui, text(a, "Use gemini-3.8-flash", "استخدام gemini-3.8-flash"))).clicked() {
-                    s.settings.text_model.model = "gemini-3.8-flash".into();
-                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-                    s.clear_failure_alert();
-                }
-            });
-        }
+    });
+    if s.settings.output_mode == OutputMode::NativeWithImages {
         ui.horizontal_wrapped(|ui| {
-            let prev_mode = s.settings.output_mode;
-            ui.selectable_value(
-                &mut s.settings.output_mode,
-                OutputMode::NativeOnly,
-                rtl::widget(ui, text(a, "Editable elements", "عناصر قابلة للتحرير")),
-            );
-            ui.selectable_value(
-                &mut s.settings.output_mode,
-                OutputMode::NativeWithImages,
-                rtl::widget(ui, text(a, "Editable elements and images", "عناصر قابلة للتحرير وصور")),
-            );
-            if s.settings.output_mode != prev_mode {
+            label(ui, a, "Visual density", "كثافة الرسوم والصور");
+            let prev_density = s.settings.visual_density;
+            for (mode, en, ar) in [
+                (VisualDensityMode::SmartHybrid, "Smart hybrid (seasonal motifs + vector)", "الهجين الذكي (زخارف شهرية + فيكتور أصيل)"),
+                (VisualDensityMode::PureNativeVector, "100% pure native vector (0 image calls)", "فيكتور أصيل 100% (سرعة قصوى بدون طلبات صور)"),
+                (VisualDensityMode::RichPerPageImages, "Rich custom illustrations per page", "رسوم مخصصة غنية لكل صفحة"),
+            ] {
+                ui.selectable_value(&mut s.settings.visual_density, mode, rtl::widget(ui, text(a, en, ar)));
+            }
+            if s.settings.visual_density != prev_density {
                 s.rates_confirmed = has_configured_rates(&s.settings);
                 if s.workflow_ready() {
                     requests.push(AiRequest::UpdateSettings(s.settings.clone()));
                 }
             }
         });
-        if s.settings.output_mode == OutputMode::NativeWithImages {
-            ui.horizontal_wrapped(|ui| {
-                label(ui, a, "Visual density", "كثافة الرسوم والصور");
-                let prev_density = s.settings.visual_density;
-                for (mode, en, ar) in [
-                    (
-                        VisualDensityMode::SmartHybrid,
-                        "Smart hybrid (seasonal motifs + vector)",
-                        "الهجين الذكي (زخارف شهرية + فيكتور أصيل)",
-                    ),
-                    (
-                        VisualDensityMode::PureNativeVector,
-                        "100% pure native vector (0 image calls)",
-                        "فيكتور أصيل 100% (سرعة قصوى بدون طلبات صور)",
-                    ),
-                    (
-                        VisualDensityMode::RichPerPageImages,
-                        "Rich custom illustrations per page",
-                        "رسوم مخصصة غنية لكل صفحة",
-                    ),
-                ] {
-                    ui.selectable_value(&mut s.settings.visual_density, mode, rtl::widget(ui, text(a, en, ar)));
-                }
-                if s.settings.visual_density != prev_density {
-                    s.rates_confirmed = has_configured_rates(&s.settings);
-                    if s.workflow_ready() {
-                        requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-                    }
-                }
-            });
-            if s.settings.visual_density != VisualDensityMode::PureNativeVector {
-                model(ui, a, "production_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
-                image_inspection_setting(ui, s, a);
+        if s.settings.visual_density != VisualDensityMode::PureNativeVector {
+            model(ui, a, ("production_image_provider", true), &mut s.settings.image_model, &mut s.pending_models, &s.discovered_models, requests);
+            image_inspection_setting(ui, s, a);
+        }
+    }
+}
+
+fn show_production_prompt_composer(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) -> (Option<u32>, Option<u32>) {
+    ui.horizontal_wrapped(|ui| {
+        label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
+        if button(ui, a, "Load script file (.md/.txt)…", "تحميل ملف سكربت (.md/.txt)…") {
+            s.pick_script_file = true;
+        }
+        if !s.prompt.is_empty() && button(ui, a, "Clear prompt", "تفريغ النص") {
+            s.prompt.clear();
+            s.edit_large_script_inline = false;
+            if s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
+                s.clear_failure_alert();
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            label(ui, a, "What would you like to create?", "ما الذي تريد إنتاجه؟");
-            if button(ui, a, "Load script file (.md/.txt)…", "تحميل ملف سكربت (.md/.txt)…") {
-                s.pick_script_file = true;
-            }
-            if !s.prompt.is_empty() && button(ui, a, "Clear prompt", "تفريغ النص") {
-                s.prompt.clear();
-                s.edit_large_script_inline = false;
-                if s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
-                    s.clear_failure_alert();
-                }
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            label(ui, a, "Design style", "نمط التصميم");
-            let available_styles = selectable_skill_cards(&s.snapshot.skills, true, !s.automatic_skills);
-            let selected = s
-                .settings
-                .design_style
-                .as_ref()
-                .and_then(|id| {
-                    available_styles
-                        .iter()
-                        .copied()
-                        .find(|card| &card.id == id)
-                        .or_else(|| s.snapshot.skills.iter().rev().find(|card| &card.id == id && card.active))
-                        .or_else(|| s.snapshot.skills.iter().rev().find(|card| &card.id == id))
-                })
-                .and_then(|card| card.design_profile.as_ref())
-                .map(|profile| profile.name.clone())
-                .unwrap_or_else(|| {
-                    s.settings.design_style.clone().unwrap_or_else(|| text(a, "Automatic from the request", "تلقائي حسب المطلوب").into())
-                });
-            egui::ComboBox::from_id_salt("production_design_style").selected_text(rtl::widget(ui, selected)).width(260.0).show_ui(ui, |ui| {
+    });
+    show_design_style_selector(ui, s, a);
+    // Keep room for the compact update row and the production action. Long
+    // briefs > 16 KiB render a zero-freeze summary card unless raw editing is toggled.
+    let (cached_has_rtl, cached_explicit_pages, cached_natural_pages, cached_preview_head) = {
+        let analysis = s.analyzed_prompt();
+        (analysis.has_rtl, analysis.explicit_pages, analysis.natural_pages, analysis.preview_head.clone())
+    };
+    show_prompt_editor_widget(ui, s, a, cached_has_rtl, (cached_explicit_pages, cached_natural_pages), &cached_preview_head);
+    rtl::label(
+        ui,
+        if a {
+            format!("طول التعليمات: {}", rtl::ltr(format!("{} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)))
+        } else {
+            format!("Prompt length: {} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)
+        },
+    );
+    if s.prompt.len() > 32768 {
+        if cached_explicit_pages.is_some() {
+            label(
+                ui,
+                a,
+                "Explicit PAGE script is sliced automatically per batch; only the active batch pages and compact style header are sent per request.",
+                "يُقسّم السكربت الصريح (PAGE) تلقائياً لكل دفعة؛ يُرسل محتوى صفحات الدفعة الحالية وترويسة النمط المضغوطة فقط في كل طلب.",
+            );
+        } else {
+            rtl::label(
+                ui,
+                format!(
+                    "{} {} {}",
+                    text(a, "Conservative input budget reservation starts at", "يبدأ حجز ميزانية الإدخال التحفظي من"),
+                    s.prompt.len().div_ceil(3).saturating_add(1024),
+                    text(
+                        a,
+                        "tokens; skill/document context is additional. Actual usage comes from the provider.",
+                        "توكن؛ يضاف سياق المهارات والمستند. الاستخدام الفعلي يبلغه المزود."
+                    )
+                ),
+            );
+        }
+    }
+    (cached_explicit_pages, cached_natural_pages)
+}
+
+fn show_design_style_selector(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
+    ui.horizontal_wrapped(|ui| {
+        label(ui, a, "Design style", "نمط التصميم");
+        let available_styles = selectable_skill_cards(&s.snapshot.skills, true, !s.automatic_skills);
+        let selected = s
+            .settings
+            .design_style
+            .as_ref()
+            .and_then(|id| {
+                available_styles
+                    .iter()
+                    .copied()
+                    .find(|card| &card.id == id)
+                    .or_else(|| s.snapshot.skills.iter().rev().find(|card| &card.id == id && card.active))
+                    .or_else(|| s.snapshot.skills.iter().rev().find(|card| &card.id == id))
+            })
+            .and_then(|card| card.design_profile.as_ref())
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| s.settings.design_style.clone().unwrap_or_else(|| text(a, "Automatic from the request", "تلقائي حسب المطلوب").into()));
+        crate::widgets::name_combo(
+            craft_ui::ComboBox::from_id_salt("production_design_style").selected_text(rtl::widget(ui, selected)).width(260.0).show_ui(ui, |ui| {
                 ui.selectable_value(&mut s.settings.design_style, None, rtl::widget(ui, text(a, "Automatic from the request", "تلقائي حسب المطلوب")));
                 for card in available_styles {
                     if let Some(profile) = &card.design_profile {
                         ui.selectable_value(&mut s.settings.design_style, Some(card.id.clone()), rtl::widget(ui, &profile.name));
                     }
                 }
+            }),
+            "Design style selector",
+        );
+        if button(ui, a, "Style library", "مكتبة الأنماط") {
+            s.tab = 1;
+        }
+    });
+}
+
+fn show_prompt_editor_widget(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    cached_has_rtl: bool,
+    pages_hint: (Option<u32>, Option<u32>),
+    cached_preview_head: &str,
+) {
+    let (cached_explicit_pages, cached_natural_pages) = pages_hint;
+    if s.prompt.len() > 16_384 && !s.edit_large_script_inline {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            let kb = s.prompt.len().div_ceil(1024);
+            let detected_summary = large_script_summary_text(a, kb, cached_explicit_pages, cached_natural_pages);
+            rtl::label(ui, egui::RichText::new(detected_summary).strong());
+            if !cached_preview_head.is_empty() {
+                rtl::label(ui, egui::RichText::new(cached_preview_head).weak());
+            }
+            ui.horizontal_wrapped(|ui| {
+                if button(ui, a, "Edit raw script text", "تحرير النص الخام") {
+                    s.edit_large_script_inline = true;
+                }
+                if button(ui, a, "Replace script file…", "استبدال ملف السكربت…") {
+                    s.pick_script_file = true;
+                }
             });
-            if button(ui, a, "Style library", "مكتبة الأنماط") {
-                s.tab = 1;
+        });
+    } else if s.prompt.len() > 16_384 {
+        ui.horizontal_wrapped(|ui| {
+            if button(ui, a, "Collapse to fast script card", "العودة لبطاقة السكربت السريعة") {
+                s.edit_large_script_inline = false;
             }
         });
-        // Keep room for the compact update row and the production action. Long
-        // briefs > 16 KiB render a zero-freeze summary card unless raw editing is toggled.
-        let (cached_has_rtl, cached_explicit_pages, cached_natural_pages, cached_preview_head) = {
-            let analysis = s.analyzed_prompt();
-            (analysis.has_rtl, analysis.explicit_pages, analysis.natural_pages, analysis.preview_head.clone())
-        };
-        if s.prompt.len() > 16_384 && !s.edit_large_script_inline {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                let kb = s.prompt.len().div_ceil(1024);
-                let detected_summary = if let Some(pages) = cached_explicit_pages {
-                    if a {
-                        format!("تم تحميل سكربت إنتاج كبير ({kb} كيلوبايت · {pages} صفحة صريحة) — التمرير السريع وتقسيم الدفعات مفعلان تلقائياً.")
-                    } else {
-                        format!("Large production script loaded ({kb} KiB · {pages} explicit pages) — zero-lag mode and per-batch slicing active.")
-                    }
-                } else if let Some(pages) = cached_natural_pages {
-                    if a {
-                        format!("تم تحميل وصف إنتاج كبير ({kb} كيلوبايت · {pages} صفحة مكتشفة) — الوضع السريع مفعل.")
-                    } else {
-                        format!("Large production brief loaded ({kb} KiB · {pages} pages detected) — zero-lag mode active.")
-                    }
-                } else if a {
-                    format!("تم تحميل نص إنتاج كبير ({kb} كيلوبايت) — الوضع السريع مفعل لمنع تجميد الواجهة.")
-                } else {
-                    format!("Large production brief loaded ({kb} KiB) — zero-lag mode active.")
-                };
-                rtl::label(ui, egui::RichText::new(detected_summary).strong());
-                if !cached_preview_head.is_empty() {
-                    rtl::label(ui, egui::RichText::new(&cached_preview_head).weak());
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if button(ui, a, "Edit raw script text", "تحرير النص الخام") {
-                        s.edit_large_script_inline = true;
-                    }
-                    if button(ui, a, "Replace script file…", "استبدال ملف السكربت…") {
-                        s.pick_script_file = true;
-                    }
-                });
-            });
-        } else {
-            if s.prompt.len() > 16_384 {
-                ui.horizontal_wrapped(|ui| {
-                    if button(ui, a, "Collapse to fast script card", "العودة لبطاقة السكربت السريعة") {
-                        s.edit_large_script_inline = false;
-                    }
-                });
-                let prev_len = s.prompt.len();
-                egui::ScrollArea::vertical().id_salt("ai_prompt_composer_raw").max_height(110.0).show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut s.prompt).code_editor().desired_rows(5).desired_width(f32::INFINITY));
-                });
-                if s.prompt.len() != prev_len && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
-                    s.clear_failure_alert();
-                }
-            } else {
-                let prompt_rtl = if s.prompt.trim().is_empty() { a } else { cached_has_rtl };
-                let prev_prompt_fp = PromptAnalysisCache::fingerprint(&s.prompt);
-                egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
-                    let mut layouter = bidi_layouter(true);
-                    rtl::show_text_edit(
+        let prev_len = s.prompt.len();
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer_raw").max_height(110.0).show(ui, |ui| {
+            ui.add(egui::TextEdit::multiline(&mut s.prompt).code_editor().desired_rows(5).desired_width(f32::INFINITY))
+                .accessible_name("Raw production script editor");
+        });
+        if s.prompt.len() != prev_len && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
+            s.clear_failure_alert();
+        }
+    } else {
+        let prompt_rtl = if s.prompt.trim().is_empty() { a } else { cached_has_rtl };
+        let prev_prompt_fp = PromptAnalysisCache::fingerprint(&s.prompt);
+        egui::ScrollArea::vertical().id_salt("ai_prompt_composer").max_height(84.0).show(ui, |ui| {
+            let mut layouter = bidi_layouter(true);
+            named_rtl_text_edit(
+                ui,
+                egui::TextEdit::multiline(&mut s.prompt)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY)
+                    .align(if prompt_rtl { egui::Align2::RIGHT_TOP } else { egui::Align2::LEFT_TOP })
+                    .layouter(&mut layouter)
+                    .hint_text(rtl::widget(
                         ui,
-                        egui::TextEdit::multiline(&mut s.prompt)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .horizontal_align(if prompt_rtl { egui::Align::Max } else { egui::Align::Min })
-                            .layouter(&mut layouter)
-                            .hint_text(rtl::widget(
-                                ui,
-                                text(
-                                    a,
-                                    "Describe your design, audience and desired result...",
-                                    "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…",
-                                ),
-                            )),
-                    );
-                });
-                if PromptAnalysisCache::fingerprint(&s.prompt) != prev_prompt_fp
-                    && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable)
-                {
-                    s.clear_failure_alert();
-                }
+                        text(a, "Describe your design, audience and desired result...", "اكتب التصميم والفئة العمرية والنتيجة المطلوبة…"),
+                    )),
+                "Production prompt editor",
+            );
+        });
+        if PromptAnalysisCache::fingerprint(&s.prompt) != prev_prompt_fp && s.snapshot.batch.as_ref().is_none_or(|b| !b.retryable) {
+            s.clear_failure_alert();
+        }
+    }
+}
+
+fn large_script_summary_text(a: bool, kb: usize, explicit_pages: Option<u32>, natural_pages: Option<u32>) -> String {
+    if let Some(pages) = explicit_pages {
+        if a {
+            format!("تم تحميل سكربت إنتاج كبير ({kb} كيلوبايت · {pages} صفحة صريحة) — التمرير السريع وتقسيم الدفعات مفعلان تلقائياً.")
+        } else {
+            format!("Large production script loaded ({kb} KiB · {pages} explicit pages) — zero-lag mode and per-batch slicing active.")
+        }
+    } else if let Some(pages) = natural_pages {
+        if a {
+            format!("تم تحميل وصف إنتاج كبير ({kb} كيلوبايت · {pages} صفحة مكتشفة) — الوضع السريع مفعل.")
+        } else {
+            format!("Large production brief loaded ({kb} KiB · {pages} pages detected) — zero-lag mode active.")
+        }
+    } else if a {
+        format!("تم تحميل نص إنتاج كبير ({kb} كيلوبايت) — الوضع السريع مفعل لمنع تجميد الواجهة.")
+    } else {
+        format!("Large production brief loaded ({kb} KiB) — zero-lag mode active.")
+    }
+}
+
+fn show_target_mode_row(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    documents: &[OpenDocument],
+    active_document: Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Edit current document", "تحرير المستند الحالي"))).clicked()
+        {
+            s.new_document = false;
+            s.continue_book = false;
+            s.restored_target_unconfirmed = false;
+        }
+        if ui
+            .radio(s.new_document, rtl::widget(ui, text(a, "New document (style size; A4 default)", "مستند جديد (مقاس النمط؛ الافتراضي A4)")))
+            .clicked()
+        {
+            s.new_document = true;
+            s.continue_book = false;
+            s.restored_target_unconfirmed = false;
+        }
+        if ui.radio(s.continue_book, rtl::widget(ui, text(a, "Continue remaining book pages", "استكمال صفحات الكتاب المتبقية"))).clicked()
+        {
+            s.new_document = false;
+            s.continue_book = true;
+            s.restored_target_unconfirmed = false;
+        }
+        if button(ui, a, "Open file to edit…", "فتح ملف للتعديل…") {
+            s.pick_target_document = true;
+        }
+        if s.new_document {
+            if a {
+                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000)).accessible_name("New document page count");
+                label(ui, a, "pages", "صفحة");
+            } else {
+                ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages")).accessible_name("New document page count");
             }
         }
+        label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
+        ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000))
+            .accessible_name("Pages per review group");
+        show_execution_pacing_combo(ui, s, a, requests);
+        if let Some(document) = preserved_document_geometry(s, documents, active_document) {
+            let mut actual = document.facing_pages;
+            ui.add_enabled(false, egui::Checkbox::new(&mut actual, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة"))));
+        } else {
+            ui.checkbox(&mut s.settings.facing_pages, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة")));
+        }
+    });
+}
+
+fn show_execution_pacing_combo(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, requests: &mut Vec<AiRequest>) {
+    let pacing_label = match s.settings.execution_pacing {
+        ExecutionPacing::AutoContinue => text(a, "Auto-continue full book", "إنتاج مستمر تلقائياً للكتاب بالكامل"),
+        ExecutionPacing::StopAfterFirstBatch => text(a, "Review 1st batch, then auto-continue", "مراجعة الدفعة الأولى فقط ثم إكمال تلقائي"),
+        ExecutionPacing::ReviewEveryBatch => text(a, "Pause every batch for proof", "التوقف للمراجعة بعد كل دفعة"),
+    };
+    let prev_pacing = s.settings.execution_pacing;
+    crate::widgets::name_combo(
+        craft_ui::ComboBox::from_id_salt("ai_execution_pacing").selected_text(rtl::widget(ui, pacing_label)).show_ui(ui, |ui| {
+            for (mode, en, ar) in [
+                (ExecutionPacing::AutoContinue, "Auto-continue full book", "إنتاج مستمر تلقائياً للكتاب بالكامل"),
+                (ExecutionPacing::StopAfterFirstBatch, "Review 1st batch, then auto-continue", "مراجعة الدفعة الأولى فقط ثم إكمال تلقائي"),
+                (ExecutionPacing::ReviewEveryBatch, "Pause every batch for proof", "التوقف للمراجعة بعد كل دفعة"),
+            ] {
+                ui.selectable_value(&mut s.settings.execution_pacing, mode, rtl::widget(ui, text(a, en, ar)));
+            }
+        }),
+        "Execution pacing selector",
+    );
+    if s.settings.execution_pacing != prev_pacing && s.workflow_ready() {
+        requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+    }
+}
+
+fn show_existing_target_controls(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, documents: &[OpenDocument], activate_document: &mut Option<usize>) {
+    if s.new_document {
+        return;
+    }
+    let selected = documents.iter().find(|document| Some(document.index) == *activate_document);
+    ui.horizontal_wrapped(|ui| {
+        label(ui, a, "Target document", "المستند المستهدف");
+        crate::widgets::name_combo(
+            craft_ui::ComboBox::from_id_salt("ai_target_document")
+                .selected_text(rtl::widget(ui, selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً"))))
+                .show_ui(ui, |ui| {
+                    for document in documents {
+                        if ui.selectable_value(activate_document, Some(document.index), rtl::widget(ui, &document.title)).clicked() {
+                            s.restored_target_unconfirmed = false;
+                        }
+                    }
+                }),
+            "Target document selector",
+        );
+        if let Some(selected) = selected {
+            rtl::label(ui, format!("{} {}", selected.pages, text(a, "pages", "صفحة")));
+            rtl::label(ui, selected.page_map_line(a));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        label(
+            ui,
+            a,
+            "Document file (.designcraft, .idml, .indd, .indt, .pdf, .docx, .rtf, .txt, .md, .xlsx)",
+            "ملف المستند (.designcraft أو .idml أو .indd أو .indt أو .pdf أو .docx أو .rtf أو .txt أو .md أو .xlsx)",
+        );
+        let mut open_path_layouter = bidi_layouter(false);
+        named_rtl_text_edit(
+            ui,
+            egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0).layouter(&mut open_path_layouter),
+            "Target document file path input",
+        );
+        if button(ui, a, "Open path", "فتح المسار") {
+            s.open_target_document_requested = true;
+        }
+        if button(ui, a, "Browse…", "استعراض…") {
+            s.pick_target_document = true;
+        }
+    });
+    if let Some(selected) = selected
+        && s.continue_book
+        && let Some(reason) = selected.continuation_guidance(a, s.requested_target_pages(), !s.prompt.trim().is_empty())
+    {
+        rtl::label(ui, reason);
+    }
+    if !s.continue_book {
+        label(
+            ui,
+            a,
+            "Edits existing content in one task. Choose Continue remaining book pages for production in review groups.",
+            "يحرر المحتوى الموجود بمهمة واحدة. اختر استكمال صفحات الكتاب المتبقية للإنتاج في مجموعات مراجعة.",
+        );
+    }
+}
+
+fn show_script_or_prompt_page_mismatch(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    documents: &[OpenDocument],
+    activate_document: &mut Option<usize>,
+    pages_hint: (Option<u32>, Option<u32>),
+) {
+    let (cached_explicit_pages, cached_natural_pages) = pages_hint;
+    if let Some(script_pages) = cached_explicit_pages {
+        if s.new_document && s.pages != script_pages {
+            ui.horizontal_wrapped(|ui| {
+                rtl::label(
+                    ui,
+                    if a {
+                        format!("تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
+                    } else {
+                        format!("Script defines {script_pages} explicit PAGE blocks, but New document is set to {} pages.", s.pages)
+                    },
+                );
+                let match_label = if a {
+                    format!("مطابقة عدد صفحات المستند للتعليمات ({script_pages} صفحة)")
+                } else {
+                    format!("Match document page count to script ({script_pages} pages)")
+                };
+                if ui.button(rtl::widget(ui, &match_label)).clicked() {
+                    s.pages = script_pages;
+                }
+            });
+        } else if !s.new_document
+            && let Some(selected) = documents.iter().find(|document| Some(document.index) == *activate_document)
+            && u32::try_from(selected.pages).ok() != Some(script_pages)
+            && !(s.continue_book && !selected.has_interior_gaps() && u32::try_from(selected.pages).ok().is_some_and(|cur| cur < script_pages))
+        {
+            show_existing_doc_script_mismatch(ui, s, a, documents, selected, script_pages, activate_document);
+        }
+    } else if s.new_document
+        && let Some(detected) = cached_natural_pages
+        && s.pages != detected
+    {
+        ui.horizontal_wrapped(|ui| {
+            rtl::label(
+                ui,
+                egui::RichText::new(if a {
+                    format!("يذكر الوصف {detected} صفحة، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
+                } else {
+                    format!("Prompt mentions {detected} pages, while New document is set to {} pages.", s.pages)
+                })
+                .color(ui.visuals().warn_fg_color),
+            );
+            let match_label = if a {
+                format!("مطابقة عدد صفحات المستند مع الوصف ({detected} صفحة)")
+            } else {
+                format!("Match document pages to prompt ({detected} pages)")
+            };
+            if ui.button(rtl::widget(ui, &match_label)).clicked() {
+                s.pages = detected;
+                s.restored_target_unconfirmed = false;
+                s.clear_failure_alert();
+            }
+        });
+    }
+}
+
+fn show_existing_doc_script_mismatch(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    documents: &[OpenDocument],
+    selected: &OpenDocument,
+    script_pages: u32,
+    activate_document: &mut Option<usize>,
+) {
+    ui.horizontal_wrapped(|ui| {
         rtl::label(
             ui,
             if a {
                 format!(
-                    "طول التعليمات: {}",
-                    rtl::ltr(format!("{} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES))
+                    "تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما يحتوي المستند المحدد '{}' على {} صفحة.",
+                    selected.title, selected.pages
                 )
             } else {
-                format!("Prompt length: {} / {} UTF-8 bytes", s.prompt.len(), designcraft_ai_types::protocol::MAX_BRIEF_BYTES)
+                format!(
+                    "Script defines {script_pages} explicit PAGE blocks, but selected document '{}' has {} pages.",
+                    selected.title, selected.pages
+                )
             },
         );
-        if s.prompt.len() > 32768 {
-            if cached_explicit_pages.is_some() {
-                label(
-                    ui,
-                    a,
-                    "Explicit PAGE script is sliced automatically per batch; only the active batch pages and compact style header are sent per request.",
-                    "يُقسّم السكربت الصريح (PAGE) تلقائياً لكل دفعة؛ يُرسل محتوى صفحات الدفعة الحالية وترويسة النمط المضغوطة فقط في كل طلب.",
-                );
+        if let Some(matching_doc) = documents.iter().find(|doc| doc.index != selected.index && u32::try_from(doc.pages).ok() == Some(script_pages)) {
+            let switch_book_label = if a {
+                format!("التبديل إلى الكتاب المطابق ({})", matching_doc.title)
             } else {
-                rtl::label(
-                    ui,
-                    format!(
-                        "{} {} {}",
-                        text(a, "Conservative input budget reservation starts at", "يبدأ حجز ميزانية الإدخال التحفظي من"),
-                        s.prompt.len().div_ceil(3).saturating_add(1024),
-                        text(
-                            a,
-                            "tokens; skill/document context is additional. Actual usage comes from the provider.",
-                            "توكن؛ يضاف سياق المهارات والمستند. الاستخدام الفعلي يبلغه المزود."
-                        )
-                    ),
-                );
+                format!("Switch to matching book ({})", matching_doc.title)
+            };
+            if ui.button(rtl::widget(ui, &switch_book_label)).clicked() {
+                *activate_document = Some(matching_doc.index);
+                s.restored_target_unconfirmed = false;
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            if ui.radio(!s.new_document && !s.continue_book, rtl::widget(ui, text(a, "Edit current document", "تحرير المستند الحالي"))).clicked() {
-                s.new_document = false;
-                s.continue_book = false;
-                s.restored_target_unconfirmed = false;
-            }
-            if ui
-                .radio(s.new_document, rtl::widget(ui, text(a, "New document (style size; A4 default)", "مستند جديد (مقاس النمط؛ الافتراضي A4)")))
-                .clicked()
-            {
-                s.new_document = true;
-                s.continue_book = false;
-                s.restored_target_unconfirmed = false;
-            }
-            if ui.radio(s.continue_book, rtl::widget(ui, text(a, "Continue remaining book pages", "استكمال صفحات الكتاب المتبقية"))).clicked()
-            {
-                s.new_document = false;
-                s.continue_book = true;
-                s.restored_target_unconfirmed = false;
-            }
-            if button(ui, a, "Open file to edit…", "فتح ملف للتعديل…") {
-                s.pick_target_document = true;
-            }
-            if s.new_document {
-                if a {
-                    ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000));
-                    label(ui, a, "pages", "صفحة");
-                } else {
-                    ui.add(egui::DragValue::new(&mut s.pages).range(1..=1000).suffix(" pages"));
-                }
-            }
-            label(ui, a, "Pages per review", "الصفحات لكل مراجعة");
-            ui.add_enabled(s.new_document || s.continue_book, egui::DragValue::new(&mut s.settings.pages_per_batch).range(1..=1000));
-            let pacing_label = match s.settings.execution_pacing {
-                ExecutionPacing::AutoContinue => text(a, "Auto-continue full book", "إنتاج مستمر تلقائياً للكتاب بالكامل"),
-                ExecutionPacing::StopAfterFirstBatch => {
-                    text(a, "Review 1st batch, then auto-continue", "مراجعة الدفعة الأولى فقط ثم إكمال تلقائي")
-                }
-                ExecutionPacing::ReviewEveryBatch => text(a, "Pause every batch for proof", "التوقف للمراجعة بعد كل دفعة"),
-            };
-            let prev_pacing = s.settings.execution_pacing;
-            egui::ComboBox::from_id_salt("ai_execution_pacing").selected_text(rtl::widget(ui, pacing_label)).show_ui(ui, |ui| {
-                for (mode, en, ar) in [
-                    (
-                        ExecutionPacing::AutoContinue,
-                        "Auto-continue full book",
-                        "إنتاج مستمر تلقائياً للكتاب بالكامل",
-                    ),
-                    (
-                        ExecutionPacing::StopAfterFirstBatch,
-                        "Review 1st batch, then auto-continue",
-                        "مراجعة الدفعة الأولى فقط ثم إكمال تلقائي",
-                    ),
-                    (
-                        ExecutionPacing::ReviewEveryBatch,
-                        "Pause every batch for proof",
-                        "التوقف للمراجعة بعد كل دفعة",
-                    ),
-                ] {
-                    ui.selectable_value(&mut s.settings.execution_pacing, mode, rtl::widget(ui, text(a, en, ar)));
-                }
-            });
-            if s.settings.execution_pacing != prev_pacing && s.workflow_ready() {
-                requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-            }
-            if let Some(document) = preserved_document_geometry(s, documents, *activate_document) {
-                let mut actual = document.facing_pages;
-                ui.add_enabled(false, egui::Checkbox::new(&mut actual, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة"))));
-            } else {
-                ui.checkbox(&mut s.settings.facing_pages, rtl::widget(ui, text(a, "Facing pages", "صفحات متقابلة")));
+        let switch_new_label = if a {
+            format!("التبديل إلى مستند جديد من {script_pages} صفحة")
+        } else {
+            format!("Switch to new {script_pages}-page document")
+        };
+        if ui.button(rtl::widget(ui, &switch_new_label)).clicked() {
+            s.new_document = true;
+            s.continue_book = false;
+            s.pages = script_pages;
+            s.restored_target_unconfirmed = false;
+        }
+    });
+}
+
+fn show_production_footer_and_actions(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    available: bool,
+    documents: &[OpenDocument],
+    active_document: Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
+    if s.automatic_skills {
+        label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
+    }
+    if !s.snapshot.skill_warnings.is_empty() {
+        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Skipped skill drafts — details", "مسودات مهارات مستبعدة — التفاصيل"))).show(ui, |ui| {
+            for warning in &s.snapshot.skill_warnings {
+                rtl::label(ui, warning);
             }
         });
-        production_binding(ui, s, a, documents, *activate_document);
-        if !s.new_document {
-            let selected = documents.iter().find(|document| Some(document.index) == *activate_document);
-            ui.horizontal_wrapped(|ui| {
-                label(ui, a, "Target document", "المستند المستهدف");
-                egui::ComboBox::from_id_salt("ai_target_document")
-                    .selected_text(rtl::widget(
-                        ui,
-                        selected.map(|document| document.title.as_str()).unwrap_or(text(a, "Open a document", "افتح مستنداً")),
-                    ))
-                    .show_ui(ui, |ui| {
-                        for document in documents {
-                            if ui.selectable_value(activate_document, Some(document.index), rtl::widget(ui, &document.title)).clicked() {
-                                s.restored_target_unconfirmed = false;
-                            }
-                        }
-                    });
-                if let Some(selected) = selected {
-                    rtl::label(ui, format!("{} {}", selected.pages, text(a, "pages", "صفحة")));
-                    rtl::label(ui, selected.page_map_line(a));
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                label(
-                    ui,
-                    a,
-                    "Document file (.designcraft, .idml, .indd, .indt, .pdf, .docx, .rtf, .txt, .md, .xlsx)",
-                    "ملف المستند (.designcraft أو .idml أو .indd أو .indt أو .pdf أو .docx أو .rtf أو .txt أو .md أو .xlsx)",
-                );
-                let mut open_path_layouter = bidi_layouter(false);
-                rtl::show_text_edit(ui, egui::TextEdit::singleline(&mut s.open_document_path).desired_width(280.0).layouter(&mut open_path_layouter));
-                if button(ui, a, "Open path", "فتح المسار") {
-                    s.open_target_document_requested = true;
-                }
-                if button(ui, a, "Browse…", "استعراض…") {
-                    s.pick_target_document = true;
-                }
-            });
-            if let Some(selected) = selected
-                && s.continue_book
-                && let Some(reason) = selected.continuation_guidance(a, s.requested_target_pages(), !s.prompt.trim().is_empty())
-            {
-                rtl::label(ui, reason);
-            }
-            if !s.continue_book {
-                label(
-                    ui,
-                    a,
-                    "Edits existing content in one task. Choose Continue remaining book pages for production in review groups.",
-                    "يحرر المحتوى الموجود بمهمة واحدة. اختر استكمال صفحات الكتاب المتبقية للإنتاج في مجموعات مراجعة.",
-                );
-            }
-        }
-        if let Some(script_pages) = cached_explicit_pages {
-            if s.new_document && s.pages != script_pages {
-                ui.horizontal_wrapped(|ui| {
-                    rtl::label(
-                        ui,
-                        if a {
-                            format!("تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
-                        } else {
-                            format!("Script defines {script_pages} explicit PAGE blocks, but New document is set to {} pages.", s.pages)
-                        },
-                    );
-                    let match_label = if a {
-                        format!("مطابقة عدد صفحات المستند للتعليمات ({script_pages} صفحة)")
-                    } else {
-                        format!("Match document page count to script ({script_pages} pages)")
-                    };
-                    if ui.button(rtl::widget(ui, &match_label)).clicked() {
-                        s.pages = script_pages;
-                    }
-                });
-            } else if !s.new_document
-                && let Some(selected) = documents.iter().find(|document| Some(document.index) == *activate_document)
-                && u32::try_from(selected.pages).ok() != Some(script_pages)
-                && !(s.continue_book
-                    && !selected.has_interior_gaps()
-                    && u32::try_from(selected.pages).ok().is_some_and(|cur| cur < script_pages))
-            {
-                ui.horizontal_wrapped(|ui| {
-                    rtl::label(
-                        ui,
-                        if a {
-                            format!(
-                                "تحدد التعليمات {script_pages} صفحة صريحة (PAGE)، بينما يحتوي المستند المحدد '{}' على {} صفحة.",
-                                selected.title, selected.pages
-                            )
-                        } else {
-                            format!(
-                                "Script defines {script_pages} explicit PAGE blocks, but selected document '{}' has {} pages.",
-                                selected.title, selected.pages
-                            )
-                        },
-                    );
-                    if let Some(matching_doc) = documents
-                        .iter()
-                        .find(|doc| doc.index != selected.index && u32::try_from(doc.pages).ok() == Some(script_pages))
-                    {
-                        let switch_book_label = if a {
-                            format!("التبديل إلى الكتاب المطابق ({})", matching_doc.title)
-                        } else {
-                            format!("Switch to matching book ({})", matching_doc.title)
-                        };
-                        if ui.button(rtl::widget(ui, &switch_book_label)).clicked() {
-                            *activate_document = Some(matching_doc.index);
-                            s.restored_target_unconfirmed = false;
-                        }
-                    }
-                    let switch_new_label = if a {
-                        format!("التبديل إلى مستند جديد من {script_pages} صفحة")
-                    } else {
-                        format!("Switch to new {script_pages}-page document")
-                    };
-                    if ui.button(rtl::widget(ui, &switch_new_label)).clicked() {
-                        s.new_document = true;
-                        s.continue_book = false;
-                        s.pages = script_pages;
-                        s.restored_target_unconfirmed = false;
-                    }
-                });
-            }
-        } else if s.new_document
-            && let Some(detected) = cached_natural_pages
-            && s.pages != detected
+    }
+    label(
+        ui,
+        a,
+        "Template styles use the model for content; native drawing and formatting commands are assembled locally.",
+        "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
+    );
+    if let Some(cost) = s.settings.budget.max_cost_usd {
+        rtl::label(
+            ui,
+            if a {
+                format!("سقف كلفة المهمة (تقديري): {}", rtl::ltr(format!("${cost:.2}")))
+            } else {
+                format!("Task cost ceiling (estimate): ${cost:.2}")
+            },
+        );
+    }
+    show_pacing_description(ui, s.settings.execution_pacing, a);
+    show_production_estimates_and_limits(ui, s, a, documents, active_document, requests);
+    pending_image_approval_card(ui, s, a, requests);
+    let issue = production_blocking_issue(s, available, documents, active_document, a);
+    if let Some(reason) = issue {
+        rtl::label(ui, reason);
+    }
+    if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked() {
+        requests.push(AiRequest::Start(s.production_task()));
+    }
+    if (s.new_document || s.continue_book)
+        && ui
+            .add_enabled(
+                available && !s.prompt.trim().is_empty(),
+                egui::Button::new(rtl::widget(ui, text(a, "Preview curriculum locally (no API request)", "معاينة خطة المنهج محلياً (دون طلب API)"))),
+            )
+            .clicked()
+    {
+        requests.push(AiRequest::PreviewProduction(s.production_task()));
+    }
+    ui.separator();
+    arabic_typography_bar(ui, s, a, requests);
+    show_curriculum_preview_card(ui, s, a);
+    show_advanced_and_export_sections(ui, s, a, available, active_document.is_some(), requests);
+}
+
+fn show_pacing_description(ui: &mut egui::Ui, pacing: ExecutionPacing, a: bool) {
+    match pacing {
+        ExecutionPacing::AutoContinue => label(
+            ui,
+            a,
+            "Continuous production: batches publish live to the document and continue automatically until the book finishes (or you click Pause).",
+            "توليد مستمر تلقائياً: تُنشر كل دفعة مباشرة في المستند وتستمر الدفعات تلقائياً حتى اكتمال الكتاب (أو الضغط على إيقاف مؤقت).",
+        ),
+        ExecutionPacing::StopAfterFirstBatch => label(
+            ui,
+            a,
+            "First-batch proof: stops once after batch 1 for your visual review, then continues the remaining book automatically.",
+            "اعتماد الدفعة الأولى فقط: يتوقف مرة واحدة بعد الدفعة الأولى لمراجعتك البصرية، ثم يكمل بقية الكتاب تلقائياً.",
+        ),
+        ExecutionPacing::ReviewEveryBatch => label(
+            ui,
+            a,
+            "Your review page count stays unchanged. Internal requests build this group, then stop for your approval before the next review group.",
+            "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
+        ),
+    }
+}
+
+fn show_production_estimates_and_limits(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    documents: &[OpenDocument],
+    active_document: Option<usize>,
+    requests: &mut Vec<AiRequest>,
+) {
+    let Some(estimate) = s.request_estimate(documents, active_document) else {
+        return;
+    };
+    let tokens = s.token_estimate(documents, active_document);
+    let targets = budget_targets_for_estimate(s, documents, active_document, &estimate, tokens);
+    if estimate.remaining_pages > estimate.review_pages {
+        rtl::label(
+            ui,
+            format!(
+                "{}: {} · {} {} · {} {}",
+                text(a, "Remaining book requests (estimate, before repairs)", "طلبات بقية الكتاب (تقدير قبل الإصلاحات)"),
+                estimate.book_allowance,
+                estimate.remaining_pages,
+                text(a, "pages", "صفحة"),
+                estimate.remaining_groups,
+                text(a, "review groups", "مجموعات مراجعة")
+            ),
+        );
+        show_remaining_book_limit_buttons(ui, s, a, &targets, requests);
+    }
+    show_review_estimate_labels(ui, a, &estimate);
+    show_review_limit_warnings_and_buttons(ui, s, a, &estimate, &targets, requests);
+}
+
+fn show_remaining_book_limit_buttons(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, targets: &BudgetTargets, requests: &mut Vec<AiRequest>) {
+    let need_book_requests = s.settings.budget.max_requests < targets.book_requests;
+    let need_book_tokens = targets.book_tokens.is_some_and(|target| s.settings.budget.token_limit < target);
+    if !need_book_requests && !need_book_tokens {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if need_book_requests
+            && ui
+                .add_enabled(
+                    targets.book_requests <= MAX_REQUEST_ALLOWANCE,
+                    egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for remaining book", "ضبط حصة الطلبات لبقية الكتاب"))),
+                )
+                .clicked()
         {
-            ui.horizontal_wrapped(|ui| {
-                rtl::label(
-                    ui,
-                    egui::RichText::new(if a {
-                        format!("يذكر الوصف {detected} صفحة، بينما ضُبط المستند الجديد على {} صفحة.", s.pages)
-                    } else {
-                        format!("Prompt mentions {detected} pages, while New document is set to {} pages.", s.pages)
-                    })
-                    .color(ui.visuals().warn_fg_color),
-                );
-                let match_label = if a {
-                    format!("مطابقة عدد صفحات المستند مع الوصف ({detected} صفحة)")
-                } else {
-                    format!("Match document pages to prompt ({detected} pages)")
-                };
-                if ui.button(rtl::widget(ui, &match_label)).clicked() {
-                    s.pages = detected;
-                    s.restored_target_unconfirmed = false;
-                    s.clear_failure_alert();
-                }
-            });
+            s.settings.budget.max_requests = targets.book_requests;
+            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
         }
-        if s.automatic_skills {
-            label(ui, a, "Relevant skills are selected, checked and activated automatically.", "تُختار المهارات المناسبة وتُفحص وتُفعّل تلقائياً.");
+        if let Some(target) = targets.book_tokens
+            && s.settings.budget.token_limit < target
+            && ui.button(rtl::widget(ui, text(a, "Set token limit for remaining book", "ضبط سقف الرموز لبقية الكتاب"))).clicked()
+        {
+            s.settings.budget.token_limit = target;
+            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
         }
-        if !s.snapshot.skill_warnings.is_empty() {
-            egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Skipped skill drafts — details", "مسودات مهارات مستبعدة — التفاصيل"))).show(
-                ui,
-                |ui| {
-                    for warning in &s.snapshot.skill_warnings {
-                        rtl::label(ui, warning);
-                    }
-                },
-            );
-        }
+    });
+}
+
+fn show_review_estimate_labels(ui: &mut egui::Ui, a: bool, estimate: &RequestEstimate) {
+    rtl::label(
+        ui,
+        format!(
+            "{}: {}{} {} + {} {}{} = {}",
+            if estimate.scripted {
+                text(a, "Requests for this review (estimate)", "طلبات هذه المراجعة (تقدير)")
+            } else {
+                text(a, "Requests for this review (conservative estimate)", "طلبات هذه المراجعة (تقدير تحفظي)")
+            },
+            if estimate.scripted { "" } else { text(a, "up to ", "حتى ") },
+            estimate.review_pages,
+            text(a, "text", "للنص"),
+            estimate.image_allowance,
+            text(a, "images", "للصور"),
+            if estimate.vision_allowance > 0 {
+                format!(" + {} {}", estimate.vision_allowance, text(a, "vision checks", "لفحص الصور"))
+            } else {
+                String::new()
+            },
+            estimate.allowance()
+        ),
+    );
+    label(
+        ui,
+        a,
+        if estimate.scripted {
+            "One text request per PAGE; image allowance is provisional. Repairs and later reviews share the task limit. Token and cost limits still apply."
+        } else {
+            "Conservative planning allowance: up to one text request per page before repairs. Internal grouping and cache reuse can reduce actual requests; image counts are provisional. Repairs and later reviews share the task limit. Token and cost limits still apply."
+        },
+        if estimate.scripted {
+            "طلب نص لكل PAGE؛ حصة الصور تقديرية. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية."
+        } else {
+            "حصة تخطيط تحفظية: حتى طلب نص لكل صفحة قبل الإصلاحات. قد يقل العدد الفعلي بالتجميع الداخلي وإعادة استخدام المخزن؛ وعدد الصور تقديري. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية."
+        },
+    );
+    if estimate.vision_allowance > 0 {
         label(
             ui,
             a,
-            "Template styles use the model for content; native drawing and formatting commands are assembled locally.",
-            "أنماط القوالب تستخدم النموذج للمحتوى؛ أوامر الرسم والتنسيق تُركّب وتُنفّذ محلياً بالمحرك.",
+            "Image inspection adds one billed text request per uncached generated source; this estimate assumes no cached reuse.",
+            "يضيف فحص الصور طلب نص مدفوعاً لكل مصدر مولد غير مخزن؛ يفترض هذا التقدير عدم إعادة استخدام صور مخزنة.",
         );
-        if let Some(cost) = s.settings.budget.max_cost_usd {
-            rtl::label(
+    }
+}
+
+fn show_review_limit_warnings_and_buttons(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    estimate: &RequestEstimate,
+    targets: &BudgetTargets,
+    requests: &mut Vec<AiRequest>,
+) {
+    if s.settings.budget.max_requests < targets.min_text_requests {
+        rtl::label(ui, format_request_limit_warning(a, s.settings.budget.max_requests, estimate.scripted, targets));
+    }
+    if s.settings.budget.max_requests < targets.review_requests {
+        if ui
+            .add_enabled(
+                targets.review_requests <= MAX_REQUEST_ALLOWANCE,
+                egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for this review", "ضبط حصة الطلبات لهذه المراجعة"))),
+            )
+            .clicked()
+        {
+            s.settings.budget.max_requests = targets.review_requests;
+            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
+        }
+        if targets.review_requests > MAX_REQUEST_ALLOWANCE {
+            label(
                 ui,
-                if a {
-                    format!("سقف كلفة المهمة (تقديري): {}", rtl::ltr(format!("${cost:.2}")))
-                } else {
-                    format!("Task cost ceiling (estimate): ${cost:.2}")
-                },
+                a,
+                "This provisional estimate exceeds the 10,000-request task ceiling.",
+                "يتجاوز هذا التقدير الأولي سقف المهمة البالغ ١٠٬٠٠٠ طلب.",
             );
         }
-        match s.settings.execution_pacing {
-            ExecutionPacing::AutoContinue => label(
-                ui,
-                a,
-                "Continuous production: batches publish live to the document and continue automatically until the book finishes (or you click Pause).",
-                "توليد مستمر تلقائياً: تُنشر كل دفعة مباشرة في المستند وتستمر الدفعات تلقائياً حتى اكتمال الكتاب (أو الضغط على إيقاف مؤقت).",
-            ),
-            ExecutionPacing::StopAfterFirstBatch => label(
-                ui,
-                a,
-                "First-batch proof: stops once after batch 1 for your visual review, then continues the remaining book automatically.",
-                "اعتماد الدفعة الأولى فقط: يتوقف مرة واحدة بعد الدفعة الأولى لمراجعتك البصرية، ثم يكمل بقية الكتاب تلقائياً.",
-            ),
-            ExecutionPacing::ReviewEveryBatch => label(
-                ui,
-                a,
-                "Your review page count stays unchanged. Internal requests build this group, then stop for your approval before the next review group.",
-                "يبقى عدد صفحات مراجعتك كما اخترته. تُنفّذ المجموعة بطلبات داخلية، ثم تتوقف لاعتمادك قبل مجموعة المراجعة التالية.",
-            ),
+    }
+    if let Some(target) = targets.review_tokens
+        && s.settings.budget.token_limit < target
+    {
+        rtl::label(
+            ui,
+            egui::RichText::new(if a {
+                format!("سقف الرموز الحالي ({}) أقل من التقدير التحفظي لهذه المراجعة ({}).", s.settings.budget.token_limit, target)
+            } else {
+                format!("Configured token limit ({}) is below the conservative estimate for this review ({}).", s.settings.budget.token_limit, target)
+            })
+            .color(ui.visuals().warn_fg_color),
+        );
+        if ui.button(rtl::widget(ui, text(a, "Set token limit for this review", "ضبط سقف الرموز لهذه المراجعة"))).clicked() {
+            s.settings.budget.token_limit = target;
+            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
         }
-        if let Some(estimate) = s.request_estimate(documents, *activate_document) {
-            let tokens = s.token_estimate(documents, *activate_document);
-            let targets = budget_targets_for_estimate(s, documents, *activate_document, &estimate, tokens);
-            if estimate.remaining_pages > estimate.review_pages {
-                rtl::label(ui, format!("{}: {} · {} {} · {} {}", text(a, "Remaining book requests (estimate, before repairs)", "طلبات بقية الكتاب (تقدير قبل الإصلاحات)"),
-                    estimate.book_allowance, estimate.remaining_pages, text(a, "pages", "صفحة"), estimate.remaining_groups, text(a, "review groups", "مجموعات مراجعة")));
-                let need_book_requests = s.settings.budget.max_requests < targets.book_requests;
-                let need_book_tokens = targets.book_tokens.is_some_and(|target| s.settings.budget.token_limit < target);
-                if need_book_requests || need_book_tokens {
-                    ui.horizontal_wrapped(|ui| {
-                        if need_book_requests
-                            && ui
-                                .add_enabled(
-                                    targets.book_requests <= MAX_REQUEST_ALLOWANCE,
-                                    egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for remaining book", "ضبط حصة الطلبات لبقية الكتاب"))),
-                                )
-                                .clicked()
-                        {
-                            s.settings.budget.max_requests = targets.book_requests;
-                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-                        }
-                        if let Some(target) = targets.book_tokens
-                            && s.settings.budget.token_limit < target
-                            && ui.button(rtl::widget(ui, text(a, "Set token limit for remaining book", "ضبط سقف الرموز لبقية الكتاب"))).clicked()
-                        {
-                            s.settings.budget.token_limit = target;
-                            requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-                        }
-                    });
-                }
-            }
+    }
+}
+
+fn format_request_limit_warning(a: bool, max_requests: u32, scripted: bool, targets: &BudgetTargets) -> String {
+    if targets.consumed_requests == 0 {
+        format!(
+            "{} {} {} {}.",
+            text(a, "Configured request limit", "حد الطلبات المحدد"),
+            max_requests,
+            if scripted {
+                text(a, "is below the minimum text requests for this review:", "أقل من الحد الأدنى لطلبات نص هذه المراجعة:")
+            } else {
+                text(a, "is below the conservative planning allowance for this review:", "أقل من حصة التخطيط التحفظية لهذه المراجعة:")
+            },
+            targets.min_text_requests
+        )
+    } else if a {
+        format!(
+            "حد الطلبات المحدد {} {} {} (استُخدم منها {}).",
+            max_requests,
+            if scripted {
+                "أقل من الحد الأدنى التراكمي لطلبات النص لإعادة محاولة هذه المراجعة:"
+            } else {
+                "أقل من الحصة التراكمية التحفظية لإعادة محاولة هذه المراجعة:"
+            },
+            targets.min_text_requests,
+            targets.consumed_requests
+        )
+    } else {
+        format!(
+            "Configured request limit {} {} {} ({} already used).",
+            max_requests,
+            if scripted {
+                "is below the minimum cumulative text requests to retry this review:"
+            } else {
+                "is below the conservative cumulative allowance to retry this review:"
+            },
+            targets.min_text_requests,
+            targets.consumed_requests
+        )
+    }
+}
+
+fn show_curriculum_preview_card(ui: &mut egui::Ui, s: &AiUiState, a: bool) {
+    let Some(preview) = &s.snapshot.production_preview else {
+        return;
+    };
+    egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Last local curriculum preview", "آخر معاينة محلية لخطة المنهج"))).default_open(true).show(
+        ui,
+        |ui| {
             rtl::label(
                 ui,
                 format!(
-                    "{}: {}{} {} + {} {}{} = {}",
-                    if estimate.scripted {
-                        text(a, "Requests for this review (estimate)", "طلبات هذه المراجعة (تقدير)")
-                    } else {
-                        text(a, "Requests for this review (conservative estimate)", "طلبات هذه المراجعة (تقدير تحفظي)")
-                    },
-                    if estimate.scripted { "" } else { text(a, "up to ", "حتى ") },
-                    estimate.review_pages,
-                    text(a, "text", "للنص"),
-                    estimate.image_allowance,
-                    text(a, "images", "للصور"),
-                    if estimate.vision_allowance > 0 {
-                        format!(" + {} {}", estimate.vision_allowance, text(a, "vision checks", "لفحص الصور"))
-                    } else {
-                        String::new()
-                    },
-                    estimate.allowance()
+                    "{} · {} · {} · {} {}",
+                    preview["blueprint"]["subject_domain"].as_str().unwrap_or(""),
+                    preview["style"].as_str().unwrap_or(""),
+                    preview["binding"].as_str().unwrap_or(""),
+                    preview["total_pages"],
+                    text(a, "pages", "صفحة")
                 ),
             );
             label(
                 ui,
                 a,
-                if estimate.scripted {
-                    "One text request per PAGE; image allowance is provisional. Repairs and later reviews share the task limit. Token and cost limits still apply."
-                } else {
-                    "Conservative planning allowance: up to one text request per page before repairs. Internal grouping and cache reuse can reduce actual requests; image counts are provisional. Repairs and later reviews share the task limit. Token and cost limits still apply."
-                },
-                if estimate.scripted {
-                    "طلب نص لكل PAGE؛ حصة الصور تقديرية. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية."
-                } else {
-                    "حصة تخطيط تحفظية: حتى طلب نص لكل صفحة قبل الإصلاحات. قد يقل العدد الفعلي بالتجميع الداخلي وإعادة استخدام المخزن؛ وعدد الصور تقديري. تشترك الإصلاحات والمراجعات التالية في حد المهمة. تبقى حدود التوكن والكلفة سارية."
-                },
+                "Suggested family sequence only; refresh after changing the request. Educator review is required.",
+                "تسلسل عائلات مقترح؛ أعد المعاينة بعد تغيير الطلب. يلزم فحص تربوي بشري.",
             );
-            if estimate.vision_allowance > 0 {
-                label(
-                    ui,
-                    a,
-                    "Image inspection adds one billed text request per uncached generated source; this estimate assumes no cached reuse.",
-                    "يضيف فحص الصور طلب نص مدفوعاً لكل مصدر مولد غير مخزن؛ يفترض هذا التقدير عدم إعادة استخدام صور مخزنة.",
-                );
-            }
-            if s.settings.budget.max_requests < targets.min_text_requests {
-                let warning = if targets.consumed_requests == 0 {
-                    format!(
-                        "{} {} {} {}.",
-                        text(a, "Configured request limit", "حد الطلبات المحدد"),
-                        s.settings.budget.max_requests,
-                        if estimate.scripted {
-                            text(a, "is below the minimum text requests for this review:", "أقل من الحد الأدنى لطلبات نص هذه المراجعة:")
+            egui::ScrollArea::vertical().id_salt("ai_curriculum_summary").max_height(100.0).show(ui, |ui| {
+                let has_ar_font = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
+                for page in preview["blueprint"]["scoped_page_plan"].as_array().into_iter().flatten().take(32) {
+                    if let Some(number) = page["page"].as_u64() {
+                        let archetype = if has_ar_font {
+                            page["display_archetype"].as_str().or_else(|| page["recommended_family"].as_str()).unwrap_or("")
                         } else {
-                            text(a, "is below the conservative planning allowance for this review:", "أقل من حصة التخطيط التحفظية لهذه المراجعة:")
-                        },
-                        targets.min_text_requests
-                    )
-                } else if a {
-                    format!(
-                        "حد الطلبات المحدد {} {} {} (استُخدم منها {}).",
-                        s.settings.budget.max_requests,
-                        if estimate.scripted {
-                            "أقل من الحد الأدنى التراكمي لطلبات النص لإعادة محاولة هذه المراجعة:"
+                            page["recommended_family"].as_str().unwrap_or("")
+                        };
+                        let lesson = if has_ar_font { page["chapter_and_lesson"].as_str().unwrap_or("") } else { "" };
+                        let line = if lesson.is_empty() {
+                            format!("{} {}: {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype)
                         } else {
-                            "أقل من الحصة التراكمية التحفظية لإعادة محاولة هذه المراجعة:"
-                        },
-                        targets.min_text_requests,
-                        targets.consumed_requests
-                    )
-                } else {
-                    format!(
-                        "Configured request limit {} {} {} ({} already used).",
-                        s.settings.budget.max_requests,
-                        if estimate.scripted {
-                            "is below the minimum cumulative text requests to retry this review:"
-                        } else {
-                            "is below the conservative cumulative allowance to retry this review:"
-                        },
-                        targets.min_text_requests,
-                        targets.consumed_requests
-                    )
-                };
-                rtl::label(ui, warning);
-            }
-            if s.settings.budget.max_requests < targets.review_requests {
-                if ui
-                    .add_enabled(
-                        targets.review_requests <= MAX_REQUEST_ALLOWANCE,
-                        egui::Button::new(rtl::widget(ui, text(a, "Set request allowance for this review", "ضبط حصة الطلبات لهذه المراجعة"))),
-                    )
-                    .clicked()
-                {
-                    s.settings.budget.max_requests = targets.review_requests;
-                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-                }
-                if targets.review_requests > MAX_REQUEST_ALLOWANCE {
-                    label(ui, a, "This provisional estimate exceeds the 10,000-request task ceiling.", "يتجاوز هذا التقدير الأولي سقف المهمة البالغ ١٠٬٠٠٠ طلب.");
-                }
-            }
-            if let Some(target) = targets.review_tokens
-                && s.settings.budget.token_limit < target
-            {
-                rtl::label(
-                    ui,
-                    egui::RichText::new(if a {
-                        format!(
-                            "سقف الرموز الحالي ({}) أقل من التقدير التحفظي لهذه المراجعة ({}).",
-                            s.settings.budget.token_limit, target
-                        )
-                    } else {
-                        format!(
-                            "Configured token limit ({}) is below the conservative estimate for this review ({}).",
-                            s.settings.budget.token_limit, target
-                        )
-                    })
-                    .color(ui.visuals().warn_fg_color),
-                );
-                if ui
-                    .button(rtl::widget(ui, text(a, "Set token limit for this review", "ضبط سقف الرموز لهذه المراجعة")))
-                    .clicked()
-                {
-                    s.settings.budget.token_limit = target;
-                    requests.push(AiRequest::UpdateSettings(s.settings.clone()));
-                }
-            }
-        }
-        pending_image_approval_card(ui, s, a, requests);
-        let issue = production_blocking_issue(s, available, documents, *activate_document, a);
-        if let Some(reason) = issue {
-            rtl::label(ui, reason);
-        }
-        if ui.add_enabled(issue.is_none(), egui::Button::new(rtl::widget(ui, text(a, "Produce", "إنتاج")))).clicked() {
-            requests.push(AiRequest::Start(s.production_task()));
-        }
-        if (s.new_document || s.continue_book) && ui.add_enabled(available && !s.prompt.trim().is_empty(),
-            egui::Button::new(rtl::widget(ui,text(a,"Preview curriculum locally (no API request)","معاينة خطة المنهج محلياً (دون طلب API)")))).clicked() {
-            requests.push(AiRequest::PreviewProduction(s.production_task()));
-        }
-        ui.separator();
-        arabic_typography_bar(ui, s, a, requests);
-        if let Some(preview)=&s.snapshot.production_preview {
-            egui::CollapsingHeader::new(rtl::widget(ui,text(a,"Last local curriculum preview","آخر معاينة محلية لخطة المنهج"))).default_open(true).show(ui,|ui| {
-                rtl::label(ui,format!("{} · {} · {} · {} {}",preview["blueprint"]["subject_domain"].as_str().unwrap_or(""),
-                    preview["style"].as_str().unwrap_or(""),preview["binding"].as_str().unwrap_or(""),preview["total_pages"],text(a,"pages","صفحة")));
-                label(ui,a,"Suggested family sequence only; refresh after changing the request. Educator review is required.",
-                    "تسلسل عائلات مقترح؛ أعد المعاينة بعد تغيير الطلب. يلزم فحص تربوي بشري.");
-                egui::ScrollArea::vertical().id_salt("ai_curriculum_summary").max_height(100.0).show(ui,|ui| {
-                    let has_ar_font = a || ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("arabic".into())));
-                    for page in preview["blueprint"]["scoped_page_plan"].as_array().into_iter().flatten().take(32) {
-                        if let Some(number)=page["page"].as_u64() {
-                            let archetype = if has_ar_font {
-                                page["display_archetype"].as_str().or_else(|| page["recommended_family"].as_str()).unwrap_or("")
-                            } else {
-                                page["recommended_family"].as_str().unwrap_or("")
-                            };
-                            let lesson = if has_ar_font { page["chapter_and_lesson"].as_str().unwrap_or("") } else { "" };
-                            let line = if lesson.is_empty() {
-                                format!("{} {}: {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype)
-                            } else {
-                                format!("{} {}: {} — {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype, lesson)
-                            };
-                            rtl::label(ui, line);
-                        }
+                            format!("{} {}: {} — {}", text(a, "Page", "الصفحة"), number.saturating_add(1), archetype, lesson)
+                        };
+                        rtl::label(ui, line);
                     }
-                });
+                }
             });
-        }
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).open(s.expand_advanced_settings.take()).show(ui, |ui| {
+        },
+    );
+}
+
+fn show_advanced_and_export_sections(
+    ui: &mut egui::Ui,
+    s: &mut AiUiState,
+    a: bool,
+    available: bool,
+    has_active_document: bool,
+    requests: &mut Vec<AiRequest>,
+) {
+    egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Advanced settings", "إعدادات متقدمة"))).open(s.expand_advanced_settings.take()).show(
+        ui,
+        |ui| {
             budgets(ui, s, a);
             ui.separator();
             ui.checkbox(&mut s.automatic_skills, rtl::widget(ui, text(a, "Automatic skills", "المهارات التلقائية")));
             if s.automatic_skills {
                 egui::CollapsingHeader::new(rtl::widget(
                     ui,
-                    text(
-                        a,
-                        "Pin additional skills alongside automatic selection",
-                        "تثبيت مهارات إضافية مع الاختيار التلقائي",
-                    ),
+                    text(a, "Pin additional skills alongside automatic selection", "تثبيت مهارات إضافية مع الاختيار التلقائي"),
                 ))
                 .show(ui, |ui| {
-                    for card in selectable_skill_cards(&s.snapshot.skills, false, false) {
-                        let mut selected = s.selected_skills.contains(&card.id);
-                        if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
-                            if selected {
-                                s.selected_skills.insert(card.id.clone());
-                            } else {
-                                s.selected_skills.remove(&card.id);
-                            }
-                        }
-                    }
+                    show_skill_selection_checkboxes(ui, s, false, false);
                 });
             } else {
-                for card in selectable_skill_cards(&s.snapshot.skills, true, true) {
-                    let mut selected = s.selected_skills.contains(&card.id);
-                    if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
-                        if selected {
-                            s.selected_skills.insert(card.id.clone());
-                        } else {
-                            s.selected_skills.remove(&card.id);
-                        }
-                    }
-                }
+                show_skill_selection_checkboxes(ui, s, true, true);
             }
             field(ui, a, "Output/sample directory (optional for production)", "مجلد المخرجات والعينة (اختياري للإنتاج)", &mut s.directory);
             if ui
@@ -1443,16 +1581,23 @@ pub(super) fn production(
             {
                 requests.push(AiRequest::CreateScienceSample { directory: s.directory.clone() });
             }
-        });
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save, export and print", "الحفظ والتصدير والطباعة"))).show(ui, |ui| {
-            export_print(ui, s, a, available && activate_document.is_some(), requests);
-        });
+        },
+    );
+    egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Save, export and print", "الحفظ والتصدير والطباعة"))).show(ui, |ui| {
+        export_print(ui, s, a, available && has_active_document, requests);
     });
-    ui.separator();
-    if s.snapshot.batch.as_ref().is_some_and(|batch| matches!(batch.status.as_str(), "running" | "awaiting_human_proof")) {
-        batch_review(ui, s, a, requests);
-    } else if s.snapshot.batch.is_some() {
-        egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Previous task", "المهمة السابقة"))).show(ui, |ui| batch_review(ui, s, a, requests));
+}
+
+fn show_skill_selection_checkboxes(ui: &mut egui::Ui, s: &mut AiUiState, include_design_profiles: bool, require_trusted_or_active: bool) {
+    for card in selectable_skill_cards(&s.snapshot.skills, include_design_profiles, require_trusted_or_active) {
+        let mut selected = s.selected_skills.contains(&card.id);
+        if ui.checkbox(&mut selected, rtl::widget(ui, &card.name)).changed() {
+            if selected {
+                s.selected_skills.insert(card.id.clone());
+            } else {
+                s.selected_skills.remove(&card.id);
+            }
+        }
     }
 }
 
@@ -1568,7 +1713,7 @@ pub(super) fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, reques
             .and_then(|page| {
                 facing_proof_pair(page, s.proof_binding.or(s.settings.right_to_left_binding).unwrap_or_else(|| automatic_proof_binding(&s.prompt, a)))
             });
-        let height = (ui.available_height() - 88.0).clamp(300.0, 480.0);
+        let height = (ui.available_height() - 96.0).clamp(220.0, 480.0);
         let action_width = (ui.available_width() * 0.36).clamp(190.0, 255.0);
         let image_width = (ui.available_width() - action_width - ui.spacing().item_spacing.x).max(100.0);
         ui.horizontal_top(|ui| {
@@ -1699,30 +1844,33 @@ pub(super) fn batch_review(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, reques
                                 select_page = pages.get(index.saturating_add(1)).map(|(path, _)| path.clone());
                             }
                         });
-                        egui::ComboBox::from_id_salt("ai_proof_page")
-                            .selected_text(rtl::widget(
-                                ui,
-                                format!(
-                                    "{} {}",
-                                    text(a, "Page", "الصفحة"),
-                                    u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)
-                                ),
-                            ))
-                            .show_ui(ui, |ui| {
-                                for (page_index, page) in pages.iter().enumerate() {
-                                    let (path, _) = page;
-                                    let reviewed = s.reviewed_proofs.contains(*page);
-                                    let title = format!(
-                                        "{} {}{}",
+                        crate::widgets::name_combo(
+                            craft_ui::ComboBox::from_id_salt("ai_proof_page")
+                                .selected_text(rtl::widget(
+                                    ui,
+                                    format!(
+                                        "{} {}",
                                         text(a, "Page", "الصفحة"),
-                                        u64::from(current.page_start).saturating_add(page_index as u64).saturating_add(1),
-                                        if reviewed { text(a, " · Reviewed", " · تمت المراجعة") } else { "" }
-                                    );
-                                    if ui.selectable_label(page_index == index, rtl::widget(ui, title)).clicked() {
-                                        select_page = Some(path.clone());
+                                        u64::from(current.page_start).saturating_add(index as u64).saturating_add(1)
+                                    ),
+                                ))
+                                .show_ui(ui, |ui| {
+                                    for (page_index, page) in pages.iter().enumerate() {
+                                        let (path, _) = page;
+                                        let reviewed = s.reviewed_proofs.contains(*page);
+                                        let title = format!(
+                                            "{} {}{}",
+                                            text(a, "Page", "الصفحة"),
+                                            u64::from(current.page_start).saturating_add(page_index as u64).saturating_add(1),
+                                            if reviewed { text(a, " · Reviewed", " · تمت المراجعة") } else { "" }
+                                        );
+                                        if ui.selectable_label(page_index == index, rtl::widget(ui, title)).clicked() {
+                                            select_page = Some(path.clone());
+                                        }
                                     }
-                                }
-                            });
+                                }),
+                            "Proof page selector",
+                        );
                     }
                     if batch.status == "awaiting_human_proof" {
                         if pair_visible {
@@ -1913,16 +2061,16 @@ pub(super) fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
     let b = &mut s.settings.budget;
     egui::Grid::new("ai_limits").num_columns(2).show(ui, |ui| {
         label(ui, a, "Total tokens", "مجموع الرموز");
-        ui.add(egui::DragValue::new(&mut b.token_limit).range(256..=MAX_TOKEN_LIMIT));
+        ui.add(egui::DragValue::new(&mut b.token_limit).range(256..=MAX_TOKEN_LIMIT)).accessible_name("Total token limit");
         ui.end_row();
         label(ui, a, "Output tokens per request", "رموز الإخراج لكل طلب");
-        ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=65_536));
+        ui.add(egui::DragValue::new(&mut b.max_output_tokens).range(1..=65_536)).accessible_name("Max output tokens per request");
         ui.end_row();
         label(ui, a, "Maximum requests", "أقصى عدد للطلبات");
-        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=MAX_REQUEST_ALLOWANCE));
+        ui.add(egui::DragValue::new(&mut b.max_requests).range(1..=MAX_REQUEST_ALLOWANCE)).accessible_name("Maximum requests allowance");
         ui.end_row();
         label(ui, a, "Maximum extra planning requests", "أقصى طلبات تخطيط إضافية");
-        ui.add_enabled(repairs, egui::DragValue::new(&mut b.repair_attempts).range(0..=3));
+        ui.add_enabled(repairs, egui::DragValue::new(&mut b.repair_attempts).range(0..=3)).accessible_name("Maximum extra planning requests value");
         ui.end_row();
     });
     let mut cap = b.max_cost_usd.is_some();
@@ -1931,7 +2079,7 @@ pub(super) fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
         b.max_cost_usd = cap.then_some(1.0);
     }
     if let Some(cost) = &mut b.max_cost_usd {
-        ui.add(egui::DragValue::new(cost).range(0.001..=10_000.0).speed(0.01));
+        ui.add(egui::DragValue::new(cost).range(0.001..=10_000.0).speed(0.01)).accessible_name("Estimated cost limit USD value");
         let rates = b.rates.get_or_insert(TokenRates {
             input_per_million: 0.0,
             cached_input_per_million: 0.0,
@@ -1953,7 +2101,7 @@ pub(super) fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
         ] {
             ui.horizontal(|ui| {
                 label(ui, a, en, ar);
-                ui.add(egui::DragValue::new(rate).range(0.0..=100_000.0).speed(0.01));
+                ui.add(egui::DragValue::new(rate).range(0.0..=100_000.0).speed(0.01)).accessible_name(format!("{en} rate value"));
             });
         }
         optional_rate(ui, a, "Cache-write / million", "كتابة التخزين / مليون", &mut rates.cache_write_per_million);
@@ -1975,7 +2123,7 @@ pub(super) fn budgets(ui: &mut egui::Ui, s: &mut AiUiState, a: bool) {
             ] {
                 ui.horizontal(|ui| {
                     label(ui, a, en, ar);
-                    ui.add(egui::DragValue::new(rate).range(0.0..=100_000.0).speed(0.01));
+                    ui.add(egui::DragValue::new(rate).range(0.0..=100_000.0).speed(0.01)).accessible_name(format!("{en} rate value"));
                 });
             }
             optional_rate(ui, a, "Image cache-write / million", "كتابة تخزين الصور / مليون", &mut image.cache_write_per_million);
@@ -2010,7 +2158,7 @@ pub(super) fn optional_rate(ui: &mut egui::Ui, a: bool, en: &str, ar: &str, rate
             *rate = enabled.then_some(0.0);
         }
         if let Some(value) = rate {
-            ui.add(egui::DragValue::new(value).range(0.0..=100_000.0).speed(0.01));
+            ui.add(egui::DragValue::new(value).range(0.0..=100_000.0).speed(0.01)).accessible_name(format!("{en} rate value"));
         }
     });
 }
@@ -2061,11 +2209,14 @@ pub(super) fn export_print(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, enable
         ];
         let duplex_selected =
             duplex_options.iter().find(|(v, _, _)| *v == s.duplex).map(|(_, en, ar)| text(a, en, ar)).unwrap_or(s.duplex.as_str());
-        egui::ComboBox::from_id_salt("ai_duplex").selected_text(rtl::widget(ui, duplex_selected)).show_ui(ui, |ui| {
-            for (v, en, ar) in duplex_options {
-                ui.selectable_value(&mut s.duplex, v.into(), rtl::widget(ui, text(a, en, ar)));
-            }
-        });
+        crate::widgets::name_combo(
+            craft_ui::ComboBox::from_id_salt("ai_duplex").selected_text(rtl::widget(ui, duplex_selected)).show_ui(ui, |ui| {
+                for (v, en, ar) in duplex_options {
+                    ui.selectable_value(&mut s.duplex, v.into(), rtl::widget(ui, text(a, en, ar)));
+                }
+            }),
+            "Print duplex selector",
+        );
         if ui.add_enabled(enabled, egui::Button::new(rtl::widget(ui, text(a, "Prepare frozen print proof", "إعداد بروفة الطباعة")))).clicked() {
             requests.push(AiRequest::PreparePrint { printer: (!s.printer.trim().is_empty()).then(|| s.printer.clone()), grayscale: s.grayscale, duplex: s.duplex.clone() });
         }

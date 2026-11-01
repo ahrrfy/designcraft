@@ -174,5 +174,22 @@ Check (-not (Test-Path -LiteralPath (Join-Path $canonicalDir 'managed-updates'))
 Check ((Get-FileHash -LiteralPath (Join-Path $canonicalDir 'designcraft.exe') -Algorithm SHA256).Hash.ToLowerInvariant() -eq $meta.binaries.'designcraft.exe') 'Canonical designcraft.exe hash mismatch.'
 Check ((Get-Content -LiteralPath (Join-Path $canonicalDir 'SOURCE-COMMIT.txt') -Raw).Trim() -eq $sha) 'Canonical SOURCE-COMMIT.txt mismatch.'
 Check (Test-Path -LiteralPath (Join-Path $canonicalDir 'skills/catalog.json') -PathType Leaf) 'Canonical skills catalog missing after update.'
-Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, canonical in-place single-slot promotion, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
+$lockedOldPath = Join-Path $canonicalDir 'designcraft.exe.old'
+[IO.File]::WriteAllText($lockedOldPath, 'still-running-first-session')
+$lockedOldHandle = [IO.File]::Open($lockedOldPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$runningExeHandle = [IO.File]::Open((Join-Path $canonicalDir 'designcraft.exe'), [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+try {
+    Expand-VerifiedUpdate $archive $canonicalStaged $meta
+    Check ((Install-CanonicalSlotUpdate $canonicalManifest $canonicalStaged $meta) -eq 'installed_for_next_launch') 'Second canonical update failed when designcraft.exe.old remained locked.'
+    $suffixedOld = @(Get-ChildItem -LiteralPath $canonicalDir -Filter 'designcraft.exe.old.*' -Force)
+    Check ($suffixedOld.Count -eq 1) 'Locked designcraft.exe.old did not roll over to a suffixed backup.'
+    Check (Test-Path -LiteralPath $lockedOldPath -PathType Leaf) 'Locked designcraft.exe.old disappeared unexpectedly.'
+} finally {
+    $runningExeHandle.Dispose()
+    $lockedOldHandle.Dispose()
+}
+Remove-UnlockedCanonicalBackups $canonicalDir
+Check (-not (Test-Path -LiteralPath $lockedOldPath)) 'Unlocked designcraft.exe.old remained after cleanup.'
+Check (@(Get-ChildItem -LiteralPath $canonicalDir -Filter 'designcraft.exe.old.*' -Force).Count -eq 0) 'Unlocked suffixed designcraft.exe.old.* remained after cleanup.'
+Write-Output 'Updater tests passed: source/size/digest/path, exact-CI, upstream-sync and commit-status guards, ancestry decisions, persisted live-app staging, canonical in-place single-slot promotion, multi-update locked .old rollover, corrupt/missing EXE/CLI/SOURCE rejection, read-only validation, profile/document preservation and atomic promotion/rollback.'
 # Leave the small synthetic fixture for diagnosis; no recursive deletion of a computed path.

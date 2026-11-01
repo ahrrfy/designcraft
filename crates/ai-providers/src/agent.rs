@@ -1,4 +1,4 @@
-use super::*;
+use super::{AgentMessage, AgentTurnRequest, AgentTurnResponse, AtomicBool, MAX_JSON_BYTES, ModelSelection, ProviderKind, ToolCall, Value};
 use crate::native::{
     LocalOriginLease, Transport, encode_json, gemini_candidate_text, gemini_thinking_config, model_id, parse_usage, sanitize_reason_token,
     validate_value,
@@ -263,210 +263,202 @@ fn validate_agent_request(request: &AgentTurnRequest, include_tool_images: bool)
     Ok(encoded_per_msg)
 }
 
+fn openai_agent_turn_body(model: &str, request: &AgentTurnRequest, encoded_images: &[EncodedMessageImages]) -> Result<Value, String> {
+    let mut input = Vec::new();
+    for (msg, msg_images) in request.messages.iter().zip(encoded_images) {
+        match msg {
+            AgentMessage::User { text, images } => {
+                if images.is_empty() {
+                    input.push(json!({"role": "user", "content": text}));
+                } else {
+                    let mut content = vec![json!({"type": "input_text", "text": text})];
+                    for (img, encoded) in images.iter().zip(&msg_images.user) {
+                        content.push(json!({"type": "input_image", "image_url": format!("data:{};base64,{encoded}", img.mime_type)}));
+                    }
+                    input.push(json!({"role": "user", "content": content}));
+                }
+            }
+            AgentMessage::Assistant { text, tool_calls, raw_provider_turn } => {
+                let sanitized: Vec<Value> = match raw_provider_turn {
+                    Some(Value::Array(items)) => items.iter().filter_map(sanitize_openai_stateless_item).collect(),
+                    _ => Vec::new(),
+                };
+                if !sanitized.is_empty() {
+                    input.extend(sanitized);
+                } else {
+                    if !text.is_empty() {
+                        input.push(json!({"role": "assistant", "content": text}));
+                    }
+                    for tc in tool_calls {
+                        let args_str = serde_json::to_string(&tc.arguments).map_err(|_| "Cannot serialize tool call arguments")?;
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "arguments": args_str,
+                        }));
+                    }
+                }
+            }
+            AgentMessage::ToolResults { results } => {
+                let mut visual_parts = Vec::new();
+                for (res, res_images) in results.iter().zip(&msg_images.tool_results) {
+                    let out_str = serde_json::to_string(&res.output).map_err(|_| "Cannot serialize tool result")?;
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": res.call_id,
+                        "output": out_str,
+                    }));
+                    for (img, encoded) in res.images.iter().zip(res_images) {
+                        visual_parts.push((img.mime_type.as_str(), encoded.as_str()));
+                    }
+                }
+                if !visual_parts.is_empty() {
+                    let mut content = vec![json!({
+                        "type": "input_text",
+                        "text": "Visual render output attached from tool inspection:"
+                    })];
+                    for (mime, encoded) in visual_parts {
+                        content.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{mime};base64,{encoded}"),
+                        }));
+                    }
+                    input.push(json!({"role": "user", "content": content}));
+                }
+            }
+        }
+    }
+    let mut body = json!({
+        "model": model,
+        "instructions": request.system,
+        "input": input,
+        "store": false,
+        "max_output_tokens": request.max_output_tokens,
+    });
+    if openai_supports_encrypted_reasoning(model) {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    if !request.tools.is_empty() {
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                    "strict": false,
+                })
+            })
+            .collect();
+        body["tools"] = Value::Array(tools);
+    }
+    Ok(body)
+}
+
+fn gemini_agent_turn_body(model: &str, request: &AgentTurnRequest, encoded_images: &[EncodedMessageImages]) -> Result<Value, String> {
+    let mut contents = Vec::with_capacity(request.messages.len());
+    for (msg, msg_images) in request.messages.iter().zip(encoded_images) {
+        match msg {
+            AgentMessage::User { text, images } => {
+                let mut parts = vec![json!({"text": text})];
+                for (img, encoded) in images.iter().zip(&msg_images.user) {
+                    parts.push(json!({"inlineData": {"mimeType": img.mime_type, "data": encoded}}));
+                }
+                contents.push(json!({"role": "user", "parts": parts}));
+            }
+            AgentMessage::Assistant { text, tool_calls, raw_provider_turn } => {
+                if let Some(Value::Object(raw_map)) = raw_provider_turn
+                    && raw_map.get("parts").is_some_and(Value::is_array)
+                {
+                    let mut turn = raw_map.clone();
+                    turn.insert("role".into(), json!("model"));
+                    contents.push(Value::Object(turn));
+                } else {
+                    let mut parts = Vec::new();
+                    if !text.is_empty() {
+                        parts.push(json!({"text": text}));
+                    }
+                    for tc in tool_calls {
+                        let mut fc = serde_json::Map::new();
+                        if !tc.id.is_empty() && !tc.id.starts_with("gemini_call_") {
+                            fc.insert("id".into(), json!(tc.id));
+                        }
+                        fc.insert("name".into(), json!(tc.name));
+                        fc.insert("args".into(), tc.arguments.clone());
+                        parts.push(json!({"functionCall": Value::Object(fc)}));
+                    }
+                    contents.push(json!({"role": "model", "parts": parts}));
+                }
+            }
+            AgentMessage::ToolResults { results } => {
+                let nest_media = gemini_supports_nested_function_response_parts(model);
+                let mut parts = Vec::with_capacity(results.len());
+                let mut trailing_media = Vec::new();
+                for (res, res_images) in results.iter().zip(&msg_images.tool_results) {
+                    let response_obj = if res.output.is_object() { res.output.clone() } else { json!({"result": res.output}) };
+                    let mut fr = serde_json::Map::new();
+                    if !res.call_id.is_empty() && !res.call_id.starts_with("gemini_call_") {
+                        fr.insert("id".into(), json!(res.call_id));
+                    }
+                    fr.insert("name".into(), json!(res.name));
+                    fr.insert("response".into(), response_obj);
+                    let media_parts: Vec<Value> = res
+                        .images
+                        .iter()
+                        .zip(res_images)
+                        .map(|(img, encoded)| json!({"inlineData": {"mimeType": img.mime_type, "data": encoded}}))
+                        .collect();
+                    if nest_media {
+                        if !media_parts.is_empty() {
+                            fr.insert("parts".into(), Value::Array(media_parts));
+                        }
+                    } else {
+                        trailing_media.extend(media_parts);
+                    }
+                    parts.push(json!({"functionResponse": Value::Object(fr)}));
+                }
+                if !trailing_media.is_empty() {
+                    parts.extend(trailing_media);
+                }
+                contents.push(json!({"role": "user", "parts": parts}));
+            }
+        }
+    }
+    let mut generation_config = json!({"maxOutputTokens": request.max_output_tokens});
+    if let Some(thinking_config) = gemini_thinking_config(model, request.max_output_tokens)
+        && let Some(cfg) = generation_config.as_object_mut()
+    {
+        cfg.insert("thinkingConfig".into(), thinking_config);
+    }
+    let mut body = json!({
+        "systemInstruction": {"parts": [{"text": request.system}]},
+        "contents": contents,
+        "generationConfig": generation_config,
+    });
+    if !request.tools.is_empty() {
+        let mut decls = Vec::with_capacity(request.tools.len());
+        for t in &request.tools {
+            decls.push(json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": gemini_clean_tool_schema(&t.parameters, 0)?,
+            }));
+        }
+        body["tools"] = json!([{"functionDeclarations": decls}]);
+    }
+    Ok(body)
+}
+
 pub(super) fn agent_turn_body(selection: &ModelSelection, request: &AgentTurnRequest, ollama_json_fallback: bool) -> Result<Value, String> {
     let model = model_id(selection)?;
     let include_tool_images = crate::supports_agent_vision(selection);
     let encoded_images = validate_agent_request(request, include_tool_images)?;
     let body = match selection.provider {
-        ProviderKind::OpenAi => {
-            let mut input = Vec::new();
-            for (msg, msg_images) in request.messages.iter().zip(&encoded_images) {
-                match msg {
-                    AgentMessage::User { text, images } => {
-                        if images.is_empty() {
-                            input.push(json!({"role": "user", "content": text}));
-                        } else {
-                            let mut content = vec![json!({"type": "input_text", "text": text})];
-                            for (img, encoded) in images.iter().zip(&msg_images.user) {
-                                content.push(json!({"type": "input_image", "image_url": format!("data:{};base64,{encoded}", img.mime_type)}));
-                            }
-                            input.push(json!({"role": "user", "content": content}));
-                        }
-                    }
-                    AgentMessage::Assistant { text, tool_calls, raw_provider_turn } => {
-                        if let Some(Value::Array(items)) = raw_provider_turn {
-                            let sanitized: Vec<Value> = items.iter().filter_map(sanitize_openai_stateless_item).collect();
-                            if !sanitized.is_empty() {
-                                input.extend(sanitized);
-                            } else {
-                                if !text.is_empty() {
-                                    input.push(json!({"role": "assistant", "content": text}));
-                                }
-                                for tc in tool_calls {
-                                    let args_str = serde_json::to_string(&tc.arguments).map_err(|_| "Cannot serialize tool call arguments")?;
-                                    input.push(json!({
-                                        "type": "function_call",
-                                        "call_id": tc.id,
-                                        "name": tc.name,
-                                        "arguments": args_str,
-                                    }));
-                                }
-                            }
-                        } else {
-                            if !text.is_empty() {
-                                input.push(json!({"role": "assistant", "content": text}));
-                            }
-                            for tc in tool_calls {
-                                let args_str = serde_json::to_string(&tc.arguments).map_err(|_| "Cannot serialize tool call arguments")?;
-                                input.push(json!({
-                                    "type": "function_call",
-                                    "call_id": tc.id,
-                                    "name": tc.name,
-                                    "arguments": args_str,
-                                }));
-                            }
-                        }
-                    }
-                    AgentMessage::ToolResults { results } => {
-                        let mut visual_parts = Vec::new();
-                        for (res, res_images) in results.iter().zip(&msg_images.tool_results) {
-                            let out_str = serde_json::to_string(&res.output).map_err(|_| "Cannot serialize tool result")?;
-                            input.push(json!({
-                                "type": "function_call_output",
-                                "call_id": res.call_id,
-                                "output": out_str,
-                            }));
-                            for (img, encoded) in res.images.iter().zip(res_images) {
-                                visual_parts.push((img.mime_type.as_str(), encoded.as_str()));
-                            }
-                        }
-                        if !visual_parts.is_empty() {
-                            let mut content = vec![json!({
-                                "type": "input_text",
-                                "text": "Visual render output attached from tool inspection:"
-                            })];
-                            for (mime, encoded) in visual_parts {
-                                content.push(json!({
-                                    "type": "input_image",
-                                    "image_url": format!("data:{mime};base64,{encoded}"),
-                                }));
-                            }
-                            input.push(json!({"role": "user", "content": content}));
-                        }
-                    }
-                }
-            }
-            let mut body = json!({
-                "model": model,
-                "instructions": request.system,
-                "input": input,
-                "store": false,
-                "max_output_tokens": request.max_output_tokens,
-            });
-            if openai_supports_encrypted_reasoning(model) {
-                body["include"] = json!(["reasoning.encrypted_content"]);
-            }
-            if !request.tools.is_empty() {
-                let tools: Vec<Value> = request
-                    .tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "type": "function",
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                            "strict": false,
-                        })
-                    })
-                    .collect();
-                body["tools"] = Value::Array(tools);
-            }
-            body
-        }
-        ProviderKind::Gemini => {
-            let mut contents = Vec::with_capacity(request.messages.len());
-            for (msg, msg_images) in request.messages.iter().zip(&encoded_images) {
-                match msg {
-                    AgentMessage::User { text, images } => {
-                        let mut parts = vec![json!({"text": text})];
-                        for (img, encoded) in images.iter().zip(&msg_images.user) {
-                            parts.push(json!({"inlineData": {"mimeType": img.mime_type, "data": encoded}}));
-                        }
-                        contents.push(json!({"role": "user", "parts": parts}));
-                    }
-                    AgentMessage::Assistant { text, tool_calls, raw_provider_turn } => {
-                        if let Some(Value::Object(raw_map)) = raw_provider_turn
-                            && raw_map.get("parts").is_some_and(Value::is_array)
-                        {
-                            let mut turn = raw_map.clone();
-                            turn.insert("role".into(), json!("model"));
-                            contents.push(Value::Object(turn));
-                        } else {
-                            let mut parts = Vec::new();
-                            if !text.is_empty() {
-                                parts.push(json!({"text": text}));
-                            }
-                            for tc in tool_calls {
-                                let mut fc = serde_json::Map::new();
-                                if !tc.id.is_empty() && !tc.id.starts_with("gemini_call_") {
-                                    fc.insert("id".into(), json!(tc.id));
-                                }
-                                fc.insert("name".into(), json!(tc.name));
-                                fc.insert("args".into(), tc.arguments.clone());
-                                parts.push(json!({"functionCall": Value::Object(fc)}));
-                            }
-                            contents.push(json!({"role": "model", "parts": parts}));
-                        }
-                    }
-                    AgentMessage::ToolResults { results } => {
-                        let nest_media = gemini_supports_nested_function_response_parts(model);
-                        let mut parts = Vec::with_capacity(results.len());
-                        let mut trailing_media = Vec::new();
-                        for (res, res_images) in results.iter().zip(&msg_images.tool_results) {
-                            let response_obj = if res.output.is_object() { res.output.clone() } else { json!({"result": res.output}) };
-                            let mut fr = serde_json::Map::new();
-                            if !res.call_id.is_empty() && !res.call_id.starts_with("gemini_call_") {
-                                fr.insert("id".into(), json!(res.call_id));
-                            }
-                            fr.insert("name".into(), json!(res.name));
-                            fr.insert("response".into(), response_obj);
-                            let media_parts: Vec<Value> = res
-                                .images
-                                .iter()
-                                .zip(res_images)
-                                .map(|(img, encoded)| json!({"inlineData": {"mimeType": img.mime_type, "data": encoded}}))
-                                .collect();
-                            if nest_media {
-                                if !media_parts.is_empty() {
-                                    fr.insert("parts".into(), Value::Array(media_parts));
-                                }
-                            } else {
-                                trailing_media.extend(media_parts);
-                            }
-                            parts.push(json!({"functionResponse": Value::Object(fr)}));
-                        }
-                        if !trailing_media.is_empty() {
-                            parts.extend(trailing_media);
-                        }
-                        contents.push(json!({"role": "user", "parts": parts}));
-                    }
-                }
-            }
-            let mut generation_config = json!({"maxOutputTokens": request.max_output_tokens});
-            if let Some(thinking_config) = gemini_thinking_config(model, request.max_output_tokens)
-                && let Some(cfg) = generation_config.as_object_mut()
-            {
-                cfg.insert("thinkingConfig".into(), thinking_config);
-            }
-            let mut body = json!({
-                "systemInstruction": {"parts": [{"text": request.system}]},
-                "contents": contents,
-                "generationConfig": generation_config,
-            });
-            if !request.tools.is_empty() {
-                let mut decls = Vec::with_capacity(request.tools.len());
-                for t in &request.tools {
-                    decls.push(json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": gemini_clean_tool_schema(&t.parameters, 0)?,
-                    }));
-                }
-                body["tools"] = json!([{"functionDeclarations": decls}]);
-            }
-            body
-        }
+        ProviderKind::OpenAi => openai_agent_turn_body(model, request, &encoded_images)?,
+        ProviderKind::Gemini => gemini_agent_turn_body(model, request, &encoded_images)?,
         ProviderKind::Ollama => {
             request.resources.validate()?;
             if request.max_output_tokens >= request.resources.context_tokens {

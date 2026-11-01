@@ -18,7 +18,6 @@ skrifa = { workspace = true }
 harfrust = { workspace = true }
 unicode-bidi = { workspace = true }
 unicode-script = { workspace = true }
-quick_cache = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -721,7 +721,10 @@ mod native_tests {
             deep = json!({"type": "object", "properties": {"nested": deep}});
         }
         assert!(!crate::native::gemini_supports_json_schema(&deep));
+    }
 
+    #[test]
+    fn ai28_gemini_image_modalities_and_dalle_b64_json() {
         // Mixed-case Gemini print tiers ("Gemini-3.1-Flash-Image" @2K) and ratio validation without @tier; OpenAI DALL-E b64_json.
         assert_eq!(gemini_print_size("Gemini-3.1-Flash-Image", "1:4", [900, 3600]).unwrap(), "1:4@2K");
         assert_eq!(gemini_print_size("MODELS/Gemini-3.1-Flash-Image ", "1:4", [900, 3600]).unwrap(), "1:4@2K");
@@ -1221,9 +1224,8 @@ mod native_tests {
         assert_eq!(resp2.text, "All 32 pages inspected.");
     }
 
-    #[test]
-    fn multimodal_tool_results_serialize_for_vision_models_and_degrade_for_text_only_models() {
-        let req = AgentTurnRequest {
+    fn sample_multimodal_tool_turn_request() -> AgentTurnRequest {
+        AgentTurnRequest {
             system: "Visually verify layout".into(),
             messages: vec![
                 AgentMessage::User { text: "Verify page 1".into(), images: Vec::new() },
@@ -1266,7 +1268,12 @@ mod native_tests {
             ],
             max_output_tokens: 512,
             resources: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn multimodal_tool_results_serialize_for_gemini_vision_models() {
+        let req = sample_multimodal_tool_turn_request();
 
         // Gemini 3 nests inlineData inside functionResponse.parts and keeps parallel functionResponse entries contiguous:
         let gemini3_sel = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
@@ -1315,6 +1322,11 @@ mod native_tests {
         assert_eq!(g25_parts[1]["functionResponse"]["name"], "inspect_pages");
         assert_eq!(g25_parts[2]["inlineData"]["mimeType"], "image/png");
         assert_eq!(g25_parts[2]["inlineData"]["data"], "AQID");
+    }
+
+    #[test]
+    fn multimodal_tool_results_serialize_for_openai_and_ollama_vision_and_text_only_models() {
+        let req = sample_multimodal_tool_turn_request();
 
         // OpenAI attaches input_image on multimodal models and omits it on text-only o3-mini:
         let openai_vis = ModelSelection { provider: ProviderKind::OpenAi, model: "gpt-5.4".into(), endpoint: None };

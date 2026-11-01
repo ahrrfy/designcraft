@@ -1,12 +1,12 @@
-use super::*;
+use super::{AiRequest, AiUiState, OutputMode, ProviderKind, button, label, model, provider_name, rtl, text};
 
 pub(super) fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, requests: &mut Vec<AiRequest>) {
     ui.add_enabled_ui(available && !s.task_active(), |ui| {
         egui::CollapsingHeader::new(rtl::widget(ui, text(a, "Models and credentials", "النماذج ومفاتيح الاتصال"))).default_open(true).show(ui, |ui| {
             label(ui, a, "Text and layout model", "نموذج النص والتخطيط");
-            model(ui, a, "ai_text_provider", &mut s.settings.text_model, false, &mut s.pending_models, &s.discovered_models, requests);
+            model(ui, a, ("ai_text_provider", false), &mut s.settings.text_model, &mut s.pending_models, &s.discovered_models, requests);
             label(ui, a, "Image model (separate)", "نموذج الصور (مستقل)");
-            model(ui, a, "ai_image_provider", &mut s.settings.image_model, true, &mut s.pending_models, &s.discovered_models, requests);
+            model(ui, a, ("ai_image_provider", true), &mut s.settings.image_model, &mut s.pending_models, &s.discovered_models, requests);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut s.settings.output_mode, OutputMode::NativeOnly, rtl::widget(ui, text(a, "Native only", "عناصر أصلية فقط")));
                 ui.selectable_value(
@@ -23,7 +23,11 @@ pub(super) fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available
                     "Use {{prompt}} and {{model}} inside string values; each task fills in its own prompt and model.",
                     "ضع {{prompt}} و{{model}} داخل القيم النصية؛ تُستبدل بتعليمات المهمة ونموذجها.",
                 );
-                if ui.add(egui::TextEdit::multiline(&mut s.workflow_json).desired_rows(3).desired_width(f32::INFINITY)).changed() {
+                if ui
+                    .add(egui::TextEdit::multiline(&mut s.workflow_json).desired_rows(3).desired_width(f32::INFINITY))
+                    .accessible_name("ComfyUI workflow JSON input")
+                    .changed()
+                {
                     s.edit_workflow();
                 }
                 if !s.workflow_error.is_empty() {
@@ -49,7 +53,8 @@ pub(super) fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available
             });
             let selection = if s.key_for_images { s.settings.image_model.clone() } else { s.settings.text_model.clone() };
             rtl::label(ui, format!("{} / {}", provider_name(selection.provider), selection.endpoint.as_deref().unwrap_or("default endpoint")));
-            ui.add(egui::TextEdit::singleline(&mut s.api_key.0).password(true).char_limit(4096).desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::singleline(&mut s.api_key.0).password(true).char_limit(4096).desired_width(f32::INFINITY))
+                .accessible_name("Protected API key input");
             ui.horizontal(|ui| {
                 let remote = matches!(selection.provider, ProviderKind::OpenAi | ProviderKind::Gemini);
                 if ui

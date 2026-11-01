@@ -271,7 +271,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         #[cfg(not(any(windows, unix)))]
         return;
-        let roots = designcraft_engine::file_access::AutomationRoots::new(Some(allowed.path()), None).unwrap().unwrap();
+        let roots = designcraft_engine::file_access::AutomationRoots::new(&[allowed.path()], &[]).unwrap().unwrap();
         let error = designcraft_engine::file_access::confine(Some(&roots), || load(&[link.join("reference.md").to_string_lossy().into_owned()]))
             .err()
             .unwrap();

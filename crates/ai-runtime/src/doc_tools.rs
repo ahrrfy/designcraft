@@ -1036,8 +1036,7 @@ impl DocToolWorkspace {
             &state.doc,
             &self.session.cache,
             &[Placed { spread: SpreadRef::Doc(spread_idx), xf: designcraft_geom::Affine::IDENTITY }],
-            px_w,
-            px_h,
+            (px_w, px_h),
             view,
             &opts,
         );
@@ -1092,8 +1091,7 @@ impl DocToolWorkspace {
                         &state.doc,
                         &self.session.cache,
                         &[Placed { spread: SpreadRef::Doc(spread_idx), xf: designcraft_geom::Affine::IDENTITY }],
-                        half_w,
-                        half_h,
+                        (half_w, half_h),
                         half_view,
                         &opts,
                     );
@@ -1614,6 +1612,11 @@ mod tests {
         assert!(txt_res["inkCoverageRatio"].as_f64().unwrap() > 0.01);
 
         // Hostile / invalid inputs return structured tool errors without panicking:
+        assert_render_visual_check_rejects_bad_inputs(&mut ws, &req);
+        assert_render_visual_check_facing_and_budget(&req);
+    }
+
+    fn assert_render_visual_check_rejects_bad_inputs(ws: &mut DocToolWorkspace, req: &TaskRequest) {
         for bad_args in [
             json!({"page": 0}),
             json!({"page": 99}),
@@ -1621,11 +1624,13 @@ mod tests {
             json!({"page": 1, "rect": [20000, 20000, 20200, 20200]}),
             json!({"page": 1, "coord_space": "invalid"}),
         ] {
-            let (_err_res, err_imgs, is_err) = ws.execute_tool_multimodal("render_visual_check", &bad_args, &req, 5);
+            let (_err_res, err_imgs, is_err) = ws.execute_tool_multimodal("render_visual_check", &bad_args, req, 5);
             assert!(is_err, "expected error for {bad_args}");
             assert!(err_imgs.is_empty());
         }
+    }
 
+    fn assert_render_visual_check_facing_and_budget(req: &TaskRequest) {
         // Multi-page facing spread: passing page-local coords without coord_space:"page" for right-hand page 3
         // (which sits at x=612..1224 on spread 1) must be rejected instead of silently cropping page 2 (x=0..612):
         let mut s_facing = Session::new();
@@ -1633,13 +1638,13 @@ mod tests {
         let facing_base = s_facing.doc().unwrap().clone();
         let mut ws_facing = DocToolWorkspace::new(&facing_base, &s_facing.prefs, designcraft_engine::cmd::production::catalog(), 150.0);
         let (wrong_page_res, wrong_imgs, wrong_err) =
-            ws_facing.execute_tool_multimodal("render_visual_check", &json!({"page": 3, "rect": [48, 48, 300, 300]}), &req, 5);
+            ws_facing.execute_tool_multimodal("render_visual_check", &json!({"page": 3, "rect": [48, 48, 300, 300]}), req, 5);
         assert!(wrong_err, "expected page-bounds mismatch error, got {wrong_page_res}");
         assert!(wrong_imgs.is_empty());
         assert!(wrong_page_res["error"].as_str().unwrap_or_default().contains("coord_space: \"page\""));
 
         let (ok_page_local, ok_imgs, ok_err) =
-            ws_facing.execute_tool_multimodal("render_visual_check", &json!({"page": 3, "rect": [48, 48, 300, 300], "coord_space": "page"}), &req, 5);
+            ws_facing.execute_tool_multimodal("render_visual_check", &json!({"page": 3, "rect": [48, 48, 300, 300], "coord_space": "page"}), req, 5);
         assert!(!ok_err, "{ok_page_local}");
         assert_eq!(ok_imgs.len(), 1);
         assert_eq!(ok_page_local["renderBoundsInSpread"][0], json!(660.0));
@@ -1649,7 +1654,7 @@ mod tests {
         ws_facing.visual_bytes_in_turn = 0;
         ws_facing.max_visual_bytes_per_turn = ok_imgs[0].bytes.len() + 64;
         let (multi_res, multi_imgs, multi_err) =
-            ws_facing.execute_tool_multimodal("render_visual_check", &json!({"pages": [1, 2, 3], "max_side": 512}), &req, 5);
+            ws_facing.execute_tool_multimodal("render_visual_check", &json!({"pages": [1, 2, 3], "max_side": 512}), req, 5);
         assert!(!multi_err, "{multi_res}");
         assert_eq!(
             multi_res["visionAttachedCount"].as_u64().unwrap() as usize,

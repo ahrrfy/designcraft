@@ -250,7 +250,7 @@ mod tests {
         use designcraft_engine::file_access::{self, AutomationRoots};
         let allowed = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let roots = AutomationRoots::new(Some(allowed.path()), None).unwrap();
+        let roots = AutomationRoots::new(&[allowed.path()], &[]).unwrap();
         // The file does not exist: authority must reject it before the missing
         // file probe could replace the containment error with an I/O error.
         let result = file_access::confine(roots.as_ref(), || {

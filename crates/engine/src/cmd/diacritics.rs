@@ -223,11 +223,11 @@ pub(super) fn replace_arabic_in_story(
     original_styles: &designcraft_doc::Styles,
     db: &ScopedFonts<'_>,
     matched: &ArabicFontMatch,
-    source_family_filter: Option<&str>,
-    source_style_filter: Option<&str>,
-    redefined_para_styles: &BTreeSet<String>,
-    redefined_char_styles: &BTreeSet<String>,
+    source_filters: (Option<&str>, Option<&str>),
+    redefined_styles: (&BTreeSet<String>, &BTreeSet<String>),
 ) -> usize {
+    let (source_family_filter, source_style_filter) = source_filters;
+    let (redefined_para_styles, redefined_char_styles) = redefined_styles;
     let mut changed = 0usize;
     let reg_face = db.face(&matched.regular_family, &matched.regular_style);
     let bold_face = db.face(&matched.bold_family, &matched.bold_style);

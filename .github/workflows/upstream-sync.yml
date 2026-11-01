@@ -57,6 +57,11 @@ jobs:
             printf 'short_up=%s\n' "$short_up"
           } >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$upstream" HEAD; then
+            gh pr list --state open --json number,headRefName --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | .number' | while IFS= read -r pr_num; do
+              if [ -n "$pr_num" ]; then
+                gh pr close "$pr_num" --delete-branch --comment "Superseded: upstream main (${short_up}) is already integrated into main." || true
+              fi
+            done
             printf 'state=up_to_date\n' >> "$GITHUB_OUTPUT"
             printf 'Upstream main (%s) is already integrated.\n' "$short_up" >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -74,8 +79,12 @@ jobs:
           git switch -c "$branch"
           git diff --name-status "$base...$upstream" > "$RUNNER_TEMP/upstream-paths.txt"
           if git merge --no-ff --no-commit "$upstream"; then
-            git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
-            printf 'state=ready_for_ci\n' >> "$GITHUB_OUTPUT"
+            if grep -qE '(^|[[:space:]])([^[:space:]]+/)?Cargo\.toml$' "$RUNNER_TEMP/upstream-paths.txt"; then
+              printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
+            else
+              git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
+              printf 'state=ready_for_ci\n' >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
@@ -94,14 +103,18 @@ jobs:
             done < "$RUNNER_TEMP/upstream-conflicts.txt"
             git diff --name-only --diff-filter=U > "$RUNNER_TEMP/upstream-conflicts.txt"
             if [ ! -s "$RUNNER_TEMP/upstream-conflicts.txt" ]; then
-              git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
-              printf 'state=ready_for_ci\n' >> "$GITHUB_OUTPUT"
+              if grep -qE '(^|[[:space:]])([^[:space:]]+/)?Cargo\.toml$' "$RUNNER_TEMP/upstream-paths.txt"; then
+                printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
+              else
+                git commit -m "chore(sync): merge upstream ${short_up} into Smart Design"
+                printf 'state=ready_for_ci\n' >> "$GITHUB_OUTPUT"
+              fi
               exit 0
             fi
           fi
           conflict_count="$(wc -l < "$RUNNER_TEMP/upstream-conflicts.txt" | tr -d '[:space:]')"
           if [ "$conflict_count" = "1" ] && grep -qx 'Cargo.lock' "$RUNNER_TEMP/upstream-conflicts.txt"; then
-            git checkout --ours Cargo.lock
+            git checkout --theirs Cargo.lock
             printf 'state=needs_lock_refresh\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -128,18 +141,38 @@ jobs:
           gh auth setup-git
           git push --set-upstream origin "$branch"
           gh pr create --base main --head "$branch" --draft --title "Review upstream ${short_up} conflicts" --body-file "$report"
+          gh pr list --state open --json number,headRefName --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | "\(.number) \(.headRefName)"' | while IFS=' ' read -r pr_num pr_head; do
+            if [ -n "$pr_num" ] && [ "$pr_head" != "$branch" ]; then
+              gh pr close "$pr_num" --delete-branch --comment "Superseded by newer upstream sync review branch ${branch}." || true
+            fi
+          done
           printf 'state=conflict_pr\n' >> "$GITHUB_OUTPUT"
 
+      - name: Pinned redistributable font collection
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+          path: craft-fonts
+          persist-credentials: false
+      - name: Configure craft-fonts environment
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        shell: bash
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: |
+          printf 'CRAFT_FONTS_DIR=%s\nCRAFT_FONTS_REQUIRED=1\n' "$CRAFT_FONTS_DIR" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.150
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
         with:
@@ -237,6 +270,11 @@ jobs:
           fi
           git fetch --no-tags origin main
           merged_sha="$(git rev-parse FETCH_HEAD)"
+          gh pr list --state open --json number,headRefName --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | .number' | while IFS= read -r pr_num; do
+            if [ -n "$pr_num" ]; then
+              gh pr close "$pr_num" --delete-branch --comment "Superseded by automated upstream integration ${SHORT_UP} (${merged_sha})." || true
+            fi
+          done
           printf 'synced=true\n' >> "$GITHUB_OUTPUT"
           printf 'merged_sha=%s\n' "$merged_sha" >> "$GITHUB_OUTPUT"
           printf 'Auto-merged upstream %s into main (%s).\n' "$SHORT_UP" "$merged_sha" >> "$GITHUB_STEP_SUMMARY"
@@ -265,7 +303,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: storytold/craft-fonts
-          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
           path: craft-fonts
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8

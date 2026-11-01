@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
-$CraftFontsPinnedRef = 'abb83316d96aa59c1cf64784289e378fe9fa5695'
+$CraftFontsPinnedRef = 'b076417b5880bd4154bd22f00695b1d28c6bea83'
 
 function Resolve-UpstreamSyncAction([bool]$UpstreamIsAncestor, [bool]$MainReleaseExists) {
     if (-not $UpstreamIsAncestor) { return 'integrate_upstream_and_publish' }
@@ -217,6 +217,8 @@ try {
                     Push-Location -LiteralPath $worktree
                     try {
                         git checkout -B $syncBranch | Out-Null
+                        $upstreamPaths = @(git diff --name-only "$originMain...$upstreamSha")
+                        $cargoTomlTouched = @($upstreamPaths | Where-Object { $_ -eq 'Cargo.toml' -or $_ -like '*/Cargo.toml' }).Count -gt 0
                         git merge --no-ff --no-commit $upstreamSha
                         if ($LASTEXITCODE -ne 0) {
                             $conflicts = @(git diff --name-only --diff-filter=U)
@@ -232,16 +234,19 @@ try {
                                     }
                                 }
                                 if ($conflicts -contains 'Cargo.lock') {
-                                    git checkout --ours Cargo.lock
-                                    $env:CARGO_TARGET_DIR = $targetDir
-                                    cargo update --workspace
-                                    if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock workspace refresh failed.' }
-                                    git add Cargo.lock
+                                    git checkout --theirs Cargo.lock
+                                    $cargoTomlTouched = $true
                                 }
                             } else {
                                 git merge --abort
                                 throw ("Upstream $shortUp requires manual conflict resolution: " + ($conflicts -join ', '))
                             }
+                        }
+                        if ($cargoTomlTouched) {
+                            $env:CARGO_TARGET_DIR = $targetDir
+                            cargo update --workspace
+                            if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock workspace refresh failed.' }
+                            git add Cargo.lock
                         }
                         git commit -m "chore(sync): merge upstream $shortUp into Smart Design" | Out-Null
                         if ($LASTEXITCODE -ne 0) { throw 'Failed to create upstream merge commit.' }

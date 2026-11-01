@@ -1,4 +1,17 @@
-use super::*;
+use super::{
+    AiSettings, AtomicBool, BTreeMap, BTreeSet, BatchScope, Digest, DocState, EDITORIAL_POLICY, EngineAction, GenerationRequest, GenerationResponse,
+    GeometryCheck, MAX_GROUP_PLAN_BYTES, MAX_IMAGES, MAX_JSON, MAX_PROMPT, MAX_REVIEW_PAGES, MAX_UNIQUE_RASTER_BYTES, Message, ModelSelection,
+    OutputMode, PathBuf, Prefs, Product, ProductionPlan, Provider, ProviderKind, Sender, Session, SessionKey, Sha256, SkillSnapshot, TaskRequest,
+    UsageLedger, Value, Work, auto_preferred_arabic_font_contract, batch_proofs_with_layout, bounded_json, check_cancel, compact_skill_guidance,
+    continuation_style_geometry_differs, declared_image_slot, explicit_arabic_font_contract, filter_discovered_models, generic_page_capacity,
+    guarded, illustration_style, image_command_budget, image_memory_key, image_request_size, image_review_identity, image_source_ratio,
+    internal_template_context, json, model_needs_thinking_margin, opened_document_geometry, parse_json, parse_plan, plan_schema,
+    preflight_profile_image_ratios, prepare_editorial_plan_with_mode, prepare_generated_image, previous_template_family, production_system,
+    project_image_requests, prompt_requests_document_geometry_edit, providers, repair_prompt, resolved_slot_view_rect, review_end, review_proofs,
+    selected_key, simulate_styled_with_ppi, template_repair_prompt, unbound_math_request, validate_actions, validate_batch_plan,
+    validate_batch_result, validate_image, validate_image_dimensions, validate_image_review_settings, validate_monetary_image_rates,
+    validate_previous_body_layout, validate_prompt, validate_template_family_sequence,
+};
 
 pub(crate) struct Runner<'a> {
     pub(super) cache_root: Option<PathBuf>,
@@ -757,93 +770,15 @@ impl Runner<'_> {
         } else {
             profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
         };
-        // Adaptive commands are planned against the actual document, not compiled
-        // from these fixed templates. Keep the host snapshots intact and omit only
-        // their unused executable examples from this model-context copy.
-        let mut planner_skills = skills.to_vec();
-        if adaptive_layout {
-            for skill in &mut planner_skills {
-                skill.templates.clear();
-            }
-        }
-        let mut system =
-            production_system(catalog, &planner_skills, request.settings.output_mode, opened_document || adaptive_layout, adaptive_layout)?;
-        if adaptive_layout {
-            system.push_str("\nADAPTIVE SCRIPT/PRINT LAYOUT: actual document geometry and any explicit page script override profile page_mm, margin_mm and fixed example compositions. Keep the pinned profile's visual identity and complete guidance while constructing the required native page content. Executable template examples remain local host inputs and are not required for this adaptive command planner.");
-        }
-        if let Some(scope) = scope {
-            system.push_str(&format!("\nBATCH SCOPE IS MANDATORY: create only spreads {}..{} (exclusive end); every object needs explicit spread; every object/story reference must name an earlier result created in this batch. No page/global/style/swatches operations. Render every requested page natively before the human proof checkpoint.",scope.start,scope.start.saturating_add(scope.count)));
-        }
-        if context.get("review_scope").is_some() {
-            system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
-        }
-        if crate::script_contract::parse(&request.prompt)?.is_some() {
-            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten/twenty-frame: {page,rect,frame:five|ten|twenty,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
-        }
-        if current_document {
-            system.push_str("\nEXISTING DOCUMENT EDITING CONTRACT: document.objects lists the opened document's existing native items with their numeric id, spread, page, bounds, content (text|graphic|group|unassigned), shape, story (numeric StoryId for text frames), text preview, fillSwatch, fillTint, strokeSwatch, strokeWeight, locked flag, parentGroup, typography, and tables (numeric table ID, rows, cols, cells). When the user asks to modify, restyle, translate, replace, align, transform, or delete existing elements in the opened document, target those existing items directly by their numeric id (e.g. object.fill, object.stroke, object.gradient, object.cornerOptions, object.opacity, object.dropShadow, object.feather, object.gradientFeather, object.effects, object.textWrap, object.arrange, object.align, object.distribute, object.pathfinder, object.makeCompoundPath, object.releaseCompoundPath, object.fit, object.ungroup, edit.stepAndRepeat, transform.set, transform.move, transform.rotate, transform.scale, transform.flip, style.object.apply, edit.clear), target existing text stories by their numeric story ID (story.setText, story.setDirection, text.select + type.char/type.para/style.paragraph.apply/style.character.apply, list.define, text.thread/text.unthread, or find.change), and target existing tables by their numeric story + table IDs (table.setCell, table.insertRow, table.insertColumn, table.deleteRow, table.deleteColumn, table.merge, table.unmerge, table.setRowHeight, table.setColumnWidth, table.distributeColumns, table.distributeRows, table.options, style.table.apply, style.cell.apply). If the user explicitly asks to add pages or adjust margins/page setup, use layout.pages.insert, layout.marginsAndColumns, or layout.documentSetup. To replace or populate an existing graphic frame with a generated illustration in NativeWithImages mode, emit an images[] entry whose page (0-based spread index) and rect match the existing graphic frame's spread and bounds; the host places the generated image directly into that frame. Only create new frames when adding new design elements or replacing deleted ones; never stack duplicate text or graphic frames on top of unchanged existing frames.");
-        }
-        let scoped_prompt =
-            scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
-        let mut document_context = context.clone();
-        if opened_document || adaptive_layout {
-            opened_document_geometry(&mut document_context, base)?;
-        }
-        if adaptive_layout
-            && serde_json::to_vec(&document_context).is_ok_and(|bytes| bytes.len() < MAX_PROMPT / 3)
-            && let Some(object) = document_context.as_object_mut()
-            && !object.contains_key("skill_tool_mastermind")
-        {
-            let eff_scope = scope.unwrap_or(BatchScope { start: 0, count: u32::try_from(base.doc.spreads.len()).unwrap_or(1).max(1) });
-            let total_pages = u32::try_from(base.doc.spreads.len()).unwrap_or(eff_scope.start.saturating_add(eff_scope.count)).max(1);
-            object.insert(
-                "skill_tool_mastermind".into(),
-                crate::template_plan::skill_tool_mastermind_brief(
-                    &request.prompt,
-                    skills,
-                    eff_scope,
-                    total_pages,
-                    Some(crate::runtime::book_binding(&request.settings, &request.prompt)),
-                ),
-            );
-        }
-        if explicit_script && let Some(scope) = scope {
-            document_context
-                .as_object_mut()
-                .ok_or("Invalid explicit-copy context")?
-                .insert("source_copy".into(), crate::script_contract::source_copy_context(&request.prompt, scope)?);
-            system.push_str("\nNATIVE SOURCE COPY BINDINGS: document.source_copy contains immutable print-copy segments and indexed words. Prefer copy_bindings:[{frame:ZERO_BASED_COMMAND_INDEX,copy_id,word_range:[START,EXCLUSIVE_END]}] with an empty text placeholder in each referenced frame.create. The host inserts the exact source words, punctuation and Arabic marks locally. Split a segment across its designed native frames using complete non-overlapping word ranges; this supports bilingual interleaving and separate number-chart cards without retyping or changing copy. Each bound frame must be on the copy segment's page. Bind all words of any segment you bind, exactly once. Do not overwrite bound stories or their reserved provenance labels. Font/direction/alignment commands still apply normally. Unbound copy is checked literally as before.");
-        }
-        if request.settings.facing_pages
-            && let Some(scope) = scope
-        {
-            document_context
-                .as_object_mut()
-                .ok_or("Invalid facing production context")?
-                .insert("facing_page_context".into(), crate::script_contract::facing_context(&request.prompt, scope)?);
-            system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
-        }
-        system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten/twenty-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
-        if request.settings.output_mode == OutputMode::NativeWithImages {
-            system.push('\n');
-            system.push_str(crate::image_repetition::POLICY);
-        }
-        let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
-        let mut schema = plan_schema(catalog, request.settings.output_mode)?;
-        if scope.is_some() {
-            schema["properties"]["activities"] = json!({"type":"array","maxItems":16,"items":crate::script_contract::activity_schema()});
-            if explicit_script {
-                schema["properties"]["copy_bindings"] = json!({"type":"array","maxItems":256,"items":crate::script_contract::copy_binding_schema()});
-            }
-        }
-        let mut generation = GenerationRequest {
-            system,
-            prompt: original.clone(),
-            json_schema: schema,
-            max_output_tokens: request.settings.budget.max_output_tokens,
-            images: Vec::new(),
-            resources: request.settings.resources.clone(),
-        };
+        let (mut generation, original) = Self::build_generic_generation_request(
+            request,
+            context,
+            catalog,
+            skills,
+            base,
+            scope,
+            (current_document, opened_document, explicit_script, adaptive_layout),
+        )?;
         let cache_key = self.plan_key(request, &generation, base)?;
         let required_min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi());
         if let Some(plan) = self.cached_plan(cache_key.as_deref(), request, context, base, prefs, scope, catalog, geometry_profile)? {
@@ -878,69 +813,16 @@ impl Runner<'_> {
         let mut image_bytes = 0usize;
         let repair_attempts = if request.settings.allow_paid_repairs { request.settings.budget.repair_attempts } else { 0 };
         for attempt in 0..=repair_attempts {
-            let stage = match (attempt, scope) {
-                (0, Some(s)) if s.count == 1 => format!("Generating editable native layout for page {}", u64::from(s.start) + 1),
-                (0, Some(s)) => {
-                    format!("Generating editable native layout for pages {}–{}", u64::from(s.start) + 1, u64::from(s.start) + u64::from(s.count))
-                }
-                (0, None) => "Generating editable native layout".into(),
-                (n, Some(s)) if s.count == 1 => {
-                    format!("Repairing native layout validation for page {} (attempt {n} of {repair_attempts})", u64::from(s.start) + 1)
-                }
-                (n, Some(s)) => format!(
-                    "Repairing native layout validation for pages {}–{} (attempt {n} of {repair_attempts})",
-                    u64::from(s.start) + 1,
-                    u64::from(s.start) + u64::from(s.count)
-                ),
-                (n, None) => format!("Repairing native layout validation (attempt {n} of {repair_attempts})"),
-            };
+            let stage = Self::generic_attempt_stage(attempt, repair_attempts, scope);
             self.progress(&stage, 0.15)?;
             let response = self.generate_plan_candidate(&request.settings.text_model, &generation)?;
             let has_provider_error = response.error.is_some();
-            let parsed = if let Some(error) = response.error.clone() {
-                Err(error)
-            } else {
-                let native_text = scope
-                    .map(|scope| {
-                        parse_json::<Value>(&response.text)
-                            .and_then(|value| bounded_json(&value, MAX_JSON))
-                            .and_then(|text| {
-                                if explicit_script {
-                                    crate::script_contract::compile_native_plan_for_brief(&text, scope, &request.prompt)
-                                } else {
-                                    crate::script_contract::compile_native_plan(&text, scope)
-                                }
-                            })
-                            .and_then(|plan| bounded_json(&serde_json::to_value(plan).map_err(|e| e.to_string())?, MAX_JSON))
-                    })
-                    .transpose();
-                native_text.and_then(|text| parse_plan(text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog)).and_then(
-                    |mut plan| {
-                        prepare_editorial_plan_with_mode(&mut plan, &request.prompt, context, None, request.settings.arabic_tashkeel)?;
-                        if let Some(contract) = &self.print {
-                            self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
-                        } else if let Some(explicit_contract) =
-                            explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt)
-                        {
-                            self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, &explicit_contract)?)?;
-                        }
-                        if let Some(scope) = scope {
-                            crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
-                            crate::script_contract::anchor_images(&request.prompt, scope, &mut plan)?;
-                        }
-                        self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
-                        validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
-                        image_command_budget(&plan, geometry_profile)?;
-                        if let Some(profile) = geometry_profile {
-                            crate::design::check_image_slots(base, &plan.images, profile)?;
-                        }
-                        if let Some(scope) = scope {
-                            validate_batch_plan(&plan, scope)?;
-                        }
-                        Ok(plan)
-                    },
-                )
-            };
+            let parsed = self.parse_and_prepare_generic_candidate(
+                &response,
+                (request, context, catalog),
+                (base, prefs),
+                (scope, explicit_script, geometry_profile),
+            );
             let (previous, validation) = match parsed {
                 Ok(raw_plan) => {
                     // Repairs consume the authored envelope, including copy_bindings and
@@ -1001,46 +883,226 @@ impl Runner<'_> {
                 Err(error) => (response.text, error),
             };
             check_cancel(self.cancel)?;
-            // Keep bounded local evidence, never a validated cache entry or
-            // executable input. Large plans expose only bounded native text.
-            let rejected_text =
-                parse_json::<Value>(&previous).ok().and_then(|value| {
-                    let text: Vec<_> = value.get("commands")?.as_array()?.iter().enumerate().filter_map(|(index, action)| {
-                    let command = action.get("command")?.as_str()?;
-                    if !matches!(command, "frame.create" | "story.setText") { return None; }
-                    let params = action.get("params")?;
-                    let text = params.get("text")?.as_str()?;
-                    Some(json!({"command_index":index,"command":command,"spread":params.get("spread"),"story":params.get("story"),"text":text}))
-                }).collect();
-                    bounded_json(&json!(text), 8192).ok()
-                });
-            let rejected_response_path = if let Some(root) = &self.cache_root
-                && !previous.is_empty()
-            {
-                match crate::production_cache::store_rejected_response(root, &previous) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.cache_notice(format!("Could not retain private rejected-response evidence: {error}"))?;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            self.diagnostics(vec![json!({
-                "kind":"nativePlanningValidation", "attempt":attempt.saturating_add(1),
-                "message":validation, "rejected_plan_included":previous.len() <= 8192,
-                "rejected_plan":if previous.len() <= 8192 {Some(previous.as_str())} else {None},
-                "rejected_native_text":if previous.len() > 8192 {rejected_text} else {None},
-                "rejected_response_path":rejected_response_path,
-                "scope":scope,
-            })])?;
+            self.record_rejected_plan_evidence(attempt, &previous, &validation, scope)?;
             if attempt == repair_attempts {
                 return Err(if has_provider_error { validation } else { format!("AI plan rejected: {validation}") });
             }
             generation.prompt = repair_prompt(&original, &previous, &validation)?;
         }
         Err("AI plan was not produced".into())
+    }
+
+    fn generic_attempt_stage(attempt: u32, repair_attempts: u32, scope: Option<BatchScope>) -> String {
+        match (attempt, scope) {
+            (0, Some(s)) if s.count == 1 => format!("Generating editable native layout for page {}", u64::from(s.start) + 1),
+            (0, Some(s)) => {
+                format!("Generating editable native layout for pages {}–{}", u64::from(s.start) + 1, u64::from(s.start) + u64::from(s.count))
+            }
+            (0, None) => "Generating editable native layout".into(),
+            (n, Some(s)) if s.count == 1 => {
+                format!("Repairing native layout validation for page {} (attempt {n} of {repair_attempts})", u64::from(s.start) + 1)
+            }
+            (n, Some(s)) => format!(
+                "Repairing native layout validation for pages {}–{} (attempt {n} of {repair_attempts})",
+                u64::from(s.start) + 1,
+                u64::from(s.start) + u64::from(s.count)
+            ),
+            (n, None) => format!("Repairing native layout validation (attempt {n} of {repair_attempts})"),
+        }
+    }
+
+    fn build_generic_generation_request(
+        request: &TaskRequest,
+        context: &Value,
+        catalog: &Value,
+        skills: &[SkillSnapshot],
+        base: &DocState,
+        scope: Option<BatchScope>,
+        flags: (bool, bool, bool, bool),
+    ) -> Result<(GenerationRequest, String), String> {
+        let (current_document, opened_document, explicit_script, adaptive_layout) = flags;
+        // Adaptive commands are planned against the actual document, not compiled
+        // from these fixed templates. Keep the host snapshots intact and omit only
+        // their unused executable examples from this model-context copy.
+        let mut planner_skills = skills.to_vec();
+        if adaptive_layout {
+            for skill in &mut planner_skills {
+                skill.templates.clear();
+            }
+        }
+        let mut system =
+            production_system(catalog, &planner_skills, request.settings.output_mode, opened_document || adaptive_layout, adaptive_layout)?;
+        if adaptive_layout {
+            system.push_str("\nADAPTIVE SCRIPT/PRINT LAYOUT: actual document geometry and any explicit page script override profile page_mm, margin_mm and fixed example compositions. Keep the pinned profile's visual identity and complete guidance while constructing the required native page content. Executable template examples remain local host inputs and are not required for this adaptive command planner.");
+        }
+        if let Some(scope) = scope {
+            system.push_str(&format!("\nBATCH SCOPE IS MANDATORY: create only spreads {}..{} (exclusive end); every object needs explicit spread; every object/story reference must name an earlier result created in this batch. No page/global/style/swatches operations. Render every requested page natively before the human proof checkpoint.",scope.start,scope.start.saturating_add(scope.count)));
+        }
+        if context.get("review_scope").is_some() {
+            system.push_str("\nINTERNAL REVIEW PART: preserve the entire user's review and brief while producing only document.internal_scope. The document.remainingImageSources field is the upper bound for independent image sources in this part after reserving its text request; token, cost and resource admission still apply. All native words and layout remain editable. Internal parts do not approve or publish pages.");
+        }
+        if explicit_script {
+            system.push_str("\nAUTHORITATIVE NUMBERED PAGE SCRIPT: implement only the scoped PAGE blocks exactly. Their page order, printable English and Arabic copy (including diacritics and quantities) override suggested skill outlines. Preserve designated print copy in final frame.create text or story.setText. Put Arabic and English in separate native frames. Reserve local fitting space; keep at most 400 authored commands. Use optional activities for every five/ten/twenty-frame: {page,rect,frame:five|ten|twenty,quantity,filled}; the host creates exact native cells/counters. Never draw counting grids with arbitrary static template parts or bake numerals/instructions into generated images. Illustrated quantities are assembled with repeat_groups/repeat_rects from ONE isolated subject per generated source. Do not ask diffusion for multiple counted subjects. Native-only plans use editable vector subjects. Leave task labels, headers, footers and answer fields editable. Do not claim pixel-level semantic checks.");
+        }
+        if current_document {
+            system.push_str("\nEXISTING DOCUMENT EDITING CONTRACT: document.objects lists the opened document's existing native items with their numeric id, spread, page, bounds, content (text|graphic|group|unassigned), shape, story (numeric StoryId for text frames), text preview, fillSwatch, fillTint, strokeSwatch, strokeWeight, locked flag, parentGroup, typography, and tables (numeric table ID, rows, cols, cells). When the user asks to modify, restyle, translate, replace, align, transform, or delete existing elements in the opened document, target those existing items directly by their numeric id (e.g. object.fill, object.stroke, object.gradient, object.cornerOptions, object.opacity, object.dropShadow, object.feather, object.gradientFeather, object.effects, object.textWrap, object.arrange, object.align, object.distribute, object.pathfinder, object.makeCompoundPath, object.releaseCompoundPath, object.fit, object.ungroup, edit.stepAndRepeat, transform.set, transform.move, transform.rotate, transform.scale, transform.flip, style.object.apply, edit.clear), target existing text stories by their numeric story ID (story.setText, story.setDirection, text.select + type.char/type.para/style.paragraph.apply/style.character.apply, list.define, text.thread/text.unthread, or find.change), and target existing tables by their numeric story + table IDs (table.setCell, table.insertRow, table.insertColumn, table.deleteRow, table.deleteColumn, table.merge, table.unmerge, table.setRowHeight, table.setColumnWidth, table.distributeColumns, table.distributeRows, table.options, style.table.apply, style.cell.apply). If the user explicitly asks to add pages or adjust margins/page setup, use layout.pages.insert, layout.marginsAndColumns, or layout.documentSetup. To replace or populate an existing graphic frame with a generated illustration in NativeWithImages mode, emit an images[] entry whose page (0-based spread index) and rect match the existing graphic frame's spread and bounds; the host places the generated image directly into that frame. Only create new frames when adding new design elements or replacing deleted ones; never stack duplicate text or graphic frames on top of unchanged existing frames.");
+        }
+        let scoped_prompt =
+            scope.map(|scope| crate::script_contract::scoped_prompt(&request.prompt, scope)).transpose()?.unwrap_or_else(|| request.prompt.clone());
+        let mut document_context = context.clone();
+        if opened_document || adaptive_layout {
+            opened_document_geometry(&mut document_context, base)?;
+        }
+        if adaptive_layout
+            && serde_json::to_vec(&document_context).is_ok_and(|bytes| bytes.len() < MAX_PROMPT / 3)
+            && let Some(object) = document_context.as_object_mut()
+            && !object.contains_key("skill_tool_mastermind")
+        {
+            let eff_scope = scope.unwrap_or(BatchScope { start: 0, count: u32::try_from(base.doc.spreads.len()).unwrap_or(1).max(1) });
+            let total_pages = u32::try_from(base.doc.spreads.len()).unwrap_or(eff_scope.start.saturating_add(eff_scope.count)).max(1);
+            object.insert(
+                "skill_tool_mastermind".into(),
+                crate::template_plan::skill_tool_mastermind_brief(
+                    &request.prompt,
+                    skills,
+                    eff_scope,
+                    total_pages,
+                    Some(crate::runtime::book_binding(&request.settings, &request.prompt)),
+                ),
+            );
+        }
+        if explicit_script && let Some(scope) = scope {
+            document_context
+                .as_object_mut()
+                .ok_or("Invalid explicit-copy context")?
+                .insert("source_copy".into(), crate::script_contract::source_copy_context(&request.prompt, scope)?);
+            system.push_str("\nNATIVE SOURCE COPY BINDINGS: document.source_copy contains immutable print-copy segments and indexed words. Prefer copy_bindings:[{frame:ZERO_BASED_COMMAND_INDEX,copy_id,word_range:[START,EXCLUSIVE_END]}] with an empty text placeholder in each referenced frame.create. The host inserts the exact source words, punctuation and Arabic marks locally. Split a segment across its designed native frames using complete non-overlapping word ranges; this supports bilingual interleaving and separate number-chart cards without retyping or changing copy. Each bound frame must be on the copy segment's page. Bind all words of any segment you bind, exactly once. Do not overwrite bound stories or their reserved provenance labels. Font/direction/alignment commands still apply normally. Unbound copy is checked literally as before.");
+        }
+        if request.settings.facing_pages
+            && let Some(scope) = scope
+        {
+            document_context
+                .as_object_mut()
+                .ok_or("Invalid facing production context")?
+                .insert("facing_page_context".into(), crate::script_contract::facing_context(&request.prompt, scope)?);
+            system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
+        }
+        system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten/twenty-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
+        if request.settings.output_mode == OutputMode::NativeWithImages {
+            system.push('\n');
+            system.push_str(crate::image_repetition::POLICY);
+        }
+        let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
+        let mut schema = plan_schema(catalog, request.settings.output_mode)?;
+        if scope.is_some() {
+            schema["properties"]["activities"] = json!({"type":"array","maxItems":16,"items":crate::script_contract::activity_schema()});
+            if explicit_script {
+                schema["properties"]["copy_bindings"] = json!({"type":"array","maxItems":256,"items":crate::script_contract::copy_binding_schema()});
+            }
+        }
+        let generation = GenerationRequest {
+            system,
+            prompt: original.clone(),
+            json_schema: schema,
+            max_output_tokens: request.settings.budget.max_output_tokens,
+            images: Vec::new(),
+            resources: request.settings.resources.clone(),
+        };
+        Ok((generation, original))
+    }
+
+    fn parse_and_prepare_generic_candidate(
+        &mut self,
+        response: &GenerationResponse,
+        inputs: (&TaskRequest, &Value, &Value),
+        doc_env: (&DocState, &Prefs),
+        scope_flags: (Option<BatchScope>, bool, Option<&designcraft_ai_types::design::DesignProfile>),
+    ) -> Result<ProductionPlan, String> {
+        let (request, context, catalog) = inputs;
+        let (base, prefs) = doc_env;
+        let (scope, explicit_script, geometry_profile) = scope_flags;
+        if let Some(error) = response.error.clone() {
+            return Err(error);
+        }
+        let native_text = scope
+            .map(|scope| {
+                parse_json::<Value>(&response.text)
+                    .and_then(|value| bounded_json(&value, MAX_JSON))
+                    .and_then(|text| {
+                        if explicit_script {
+                            crate::script_contract::compile_native_plan_for_brief(&text, scope, &request.prompt)
+                        } else {
+                            crate::script_contract::compile_native_plan(&text, scope)
+                        }
+                    })
+                    .and_then(|plan| bounded_json(&serde_json::to_value(plan).map_err(|e| e.to_string())?, MAX_JSON))
+            })
+            .transpose()?;
+        let mut plan = parse_plan(native_text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog)?;
+        prepare_editorial_plan_with_mode(&mut plan, &request.prompt, context, None, request.settings.arabic_tashkeel)?;
+        if let Some(contract) = &self.print {
+            self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
+        } else if let Some(explicit_contract) = explicit_arabic_font_contract(base, request.settings.arabic_font.as_deref(), &request.prompt) {
+            self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, &explicit_contract)?)?;
+        }
+        if let Some(scope) = scope {
+            crate::script_contract::validate_plan(&request.prompt, scope, &plan)?;
+            crate::script_contract::anchor_images(&request.prompt, scope, &mut plan)?;
+        }
+        self.diagnostics(crate::native_layout::prepare(&mut plan, base, prefs, self.cancel)?)?;
+        validate_previous_body_layout(&plan, base, prefs, scope, &request.prompt)?;
+        image_command_budget(&plan, geometry_profile)?;
+        if let Some(profile) = geometry_profile {
+            crate::design::check_image_slots(base, &plan.images, profile)?;
+        }
+        if let Some(scope) = scope {
+            validate_batch_plan(&plan, scope)?;
+        }
+        Ok(plan)
+    }
+
+    fn record_rejected_plan_evidence(&mut self, attempt: u32, previous: &str, validation: &str, scope: Option<BatchScope>) -> Result<(), String> {
+        // Keep bounded local evidence, never a validated cache entry or
+        // executable input. Large plans expose only bounded native text.
+        let rejected_text = parse_json::<Value>(previous).ok().and_then(|value| {
+            let text: Vec<_> = value
+                .get("commands")?
+                .as_array()?
+                .iter()
+                .enumerate()
+                .filter_map(|(index, action)| {
+                    let command = action.get("command")?.as_str()?;
+                    if !matches!(command, "frame.create" | "story.setText") {
+                        return None;
+                    }
+                    let params = action.get("params")?;
+                    let text = params.get("text")?.as_str()?;
+                    Some(json!({"command_index":index,"command":command,"spread":params.get("spread"),"story":params.get("story"),"text":text}))
+                })
+                .collect();
+            bounded_json(&json!(text), 8192).ok()
+        });
+        let rejected_response_path = if let Some(root) = &self.cache_root
+            && !previous.is_empty()
+        {
+            match crate::production_cache::store_rejected_response(root, previous) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.cache_notice(format!("Could not retain private rejected-response evidence: {error}"))?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.diagnostics(vec![json!({
+            "kind":"nativePlanningValidation", "attempt":attempt.saturating_add(1),
+            "message":validation, "rejected_plan_included":previous.len() <= 8192,
+            "rejected_plan":if previous.len() <= 8192 {Some(previous)} else {None},
+            "rejected_native_text":if previous.len() > 8192 {rejected_text} else {None},
+            "rejected_response_path":rejected_response_path,
+            "scope":scope,
+        })])
     }
 
     #[allow(clippy::too_many_arguments)]

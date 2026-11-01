@@ -115,282 +115,336 @@ pub(crate) fn map_plan(plan: &ProductionPlan, actual: &DocState) -> Result<Produ
     let mut result_pages: Vec<StepPages> = Vec::with_capacity(plan.commands.len());
     let mut selected: Vec<usize> = Vec::new();
     for (index, action) in mapped.commands.iter_mut().enumerate() {
-        let params = action.params.as_object_mut().ok_or("Facing-page command parameters must be an object")?;
-        let qr_creation = action.command == "object.qrCode" && params.contains_key("rect");
-        let thread_creation = action.command == "text.thread" && params.contains_key("rect");
-        let creation = matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") || qr_creation || thread_creation;
-        let standalone_image = action.command == "file.place" && !params.contains_key("frame");
-        let mut step_pages = StepPages::default();
-        if creation || standalone_image {
-            if thread_creation {
-                match (params.get("from"), params.get("to")) {
-                    (Some(from_val), None) => {
-                        step_pages.from = Some(single_target_page(from_val, &result_pages, index, actual)?);
-                    }
-                    (None, Some(to_val)) => {
-                        step_pages.to = Some(single_target_page(to_val, &result_pages, index, actual)?);
-                    }
-                    _ => return Err("Projected text.thread with rect requires exactly one of from or to".into()),
-                }
-            }
-            let absolute = params.get("spread").and_then(Value::as_u64).ok_or("Every projected object requires an absolute page spread")?;
-            let absolute = usize::try_from(absolute).map_err(|_| "Projected page index is too large")?;
-            let (spread, page) = page_location(actual, absolute)?;
-            params.insert("spread".into(), json!(spread));
-            if let Some(rect) = params.get_mut("rect") {
-                translate_array(rect, 4, &[0, 2], page.x)?;
-            }
-            for key in ["a", "b"] {
-                if let Some(point) = params.get_mut(key) {
-                    translate_array(point, 2, &[0], page.x)?;
-                }
-            }
-            if let Some(anchors) = params.get_mut("anchors") {
-                let anchors = anchors.as_array_mut().ok_or("Projected path anchors must be an array")?;
-                if anchors.len() > 1024 {
-                    return Err("Projected path exceeds the anchor limit".into());
-                }
-                for anchor in anchors {
-                    let anchor = anchor.as_object_mut().ok_or("Projected path anchor must be an object")?;
-                    for key in ["p", "in", "out"] {
-                        if let Some(point) = anchor.get_mut(key) {
-                            translate_array(point, 2, &[0], page.x)?;
-                        }
-                    }
-                }
-            }
-            if standalone_image {
-                let x = params.entry("x").or_insert(json!(0));
-                translate_number(x, page.x)?;
-            }
-            selected = vec![absolute];
-            if thread_creation {
-                if step_pages.from.is_some() {
-                    step_pages.to = Some(absolute);
-                } else {
-                    step_pages.from = Some(absolute);
-                }
-            } else {
-                step_pages.id = Some(absolute);
-            }
-        } else if action.command == "file.place" {
-            let frame_val = params.get("frame").ok_or("Projected file.place requires frame")?;
-            let page = single_target_page(frame_val, &result_pages, index, actual)?;
-            selected = vec![page];
-            step_pages.id = Some(page);
-        } else if action.command == "text.thread" {
-            let from_val = params.get("from").ok_or("Projected text.thread requires from")?;
-            let to_val = params.get("to").ok_or("Projected text.thread requires to")?;
-            let from_page = single_target_page(from_val, &result_pages, index, actual)?;
-            let to_page = single_target_page(to_val, &result_pages, index, actual)?;
-            selected = vec![to_page];
-            step_pages.from = Some(from_page);
-            step_pages.to = Some(to_page);
-        } else if action.command == "selection.set" {
-            let pages = target_pages(params.get("ids"), &result_pages, index, actual)?;
-            if params.get("add").and_then(Value::as_bool) != Some(true) {
-                selected.clear();
-            }
-            for page in pages {
-                if !selected.contains(&page) {
-                    selected.push(page);
-                }
-            }
-        } else if matches!(action.command.as_str(), "object.group" | "object.pathfinder" | "object.makeCompoundPath") {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if pages.len() != 1 {
-                return Err("Projected groups must remain on one absolute page".into());
-            }
-            selected = pages.clone();
-            step_pages.id = pages.first().copied();
-        } else if action.command == "object.ungroup" {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if pages.len() != 1 {
-                return Err("Projected ungrouped objects must remain on one absolute page".into());
-            }
-            selected = pages;
-        } else if matches!(action.command.as_str(), "object.releaseCompoundPath" | "edit.stepAndRepeat") {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if pages.len() != 1 {
-                return Err("Projected compound or repeated objects must remain on one absolute page".into());
-            }
-            selected = pages.clone();
-            step_pages.ids = pages.first().copied();
-        } else if action.command == "object.altText" {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if pages.is_empty() {
-                return Err("Projected object.altText requires a target object".into());
-            }
-        } else if action.command == "object.caption" {
-            let mut pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if let Some(cf) = params.get("captionFrame").filter(|v| !v.is_null()) {
-                let cf_page = single_target_page(cf, &result_pages, index, actual)?;
-                if !pages.contains(&cf_page) {
-                    pages.push(cf_page);
-                }
-            }
-            if pages.len() != 1 {
-                return Err("Projected captions must remain on one absolute page".into());
-            }
-            selected = pages.clone();
-            step_pages.ids = pages.first().copied();
-            if params.get("group").and_then(Value::as_bool) == Some(true) {
-                step_pages.groups = pages.first().copied();
-            }
-        } else if action.command == "layout.section" {
-            let page_1 = params.get("page").and_then(Value::as_u64).ok_or("Projected layout.section requires a 1-based page")?;
-            let abs = usize::try_from(page_1).ok().and_then(|n| n.checked_sub(1)).ok_or("Projected layout.section page is out of range")?;
-            page_location(actual, abs)?;
-        } else if action.command == "layout.pages.applyParent" {
-            let arr =
-                params.get("pages").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or("Projected layout.pages.applyParent requires pages")?;
-            for v in arr {
-                let page_0 = v.as_u64().ok_or("Projected layout.pages.applyParent page must be a 0-based integer")?;
-                let abs = usize::try_from(page_0).map_err(|_| "Projected layout.pages.applyParent page is out of range")?;
-                page_location(actual, abs)?;
-            }
-        } else if action.command == "object.qrCode" {
-            params.remove("spread");
-            let page = *selected.first().ok_or("Projected object.qrCode without rect requires a selected target")?;
-            selected = vec![page];
-            step_pages.id = Some(page);
-        } else if matches!(action.command.as_str(), "object.align" | "object.distribute") {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if pages.len() != 1 {
-                return Err("Projected alignment or distribution cannot combine different pages".into());
-            }
-            if action.command == "object.align" && params.get("to").and_then(Value::as_str) == Some("spread") {
-                params.insert("to".into(), json!("page"));
-            }
-        } else if action.command == "transform.move" {
-            if params.contains_key("toSpread") {
-                return Err("Projected transform.move cannot move objects across spreads".into());
-            }
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if pages.len() == 1 {
-                step_pages.ids = pages.first().copied();
-            }
-            if params.get("copy").and_then(Value::as_bool) == Some(true) {
-                selected = pages;
-            }
-        } else if action.command == "transform.set" {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            if params.contains_key("x") || params.contains_key("bounds") {
-                let absolute = *pages.first().ok_or("Absolute transform has no projected target page")?;
-                if pages.iter().any(|page| *page != absolute) {
-                    return Err("Absolute transforms cannot combine different projected pages".into());
-                }
-                let (spread, page) = page_location(actual, absolute)?;
-                // transform.set x is measured from the document ruler origin. Page rulers
-                // already include the page offset; spread and spine rulers need compensation.
-                let base =
-                    actual.doc.ruler_base(doc::SpreadRef::Doc(spread), page.x + page.width / 2.0).ok_or("Transform ruler origin is missing")?;
-                let canonical_base = match actual.doc.settings.ruler_origin {
-                    doc::RulerOrigin::Spine => match page.side {
-                        doc::PageSide::Left => page.width,
-                        doc::PageSide::Right => 0.0,
-                        doc::PageSide::Single => page.width / 2.0,
-                    },
-                    _ => 0.0,
-                };
-                if let Some(x) = params.get_mut("x") {
-                    translate_number(x, page.x + canonical_base - base.x)?;
-                }
-                if let Some(bounds) = params.get_mut("bounds") {
-                    translate_array(bounds, 4, &[0, 2], page.x)?;
-                }
-            }
-        } else if matches!(action.command.as_str(), "object.gradient" | "object.gradientFeather")
-            && (params.contains_key("from") || params.contains_key("to"))
-        {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            let absolute = *pages.first().ok_or("Projected gradient vector has no target page")?;
-            if pages.iter().any(|page| *page != absolute) {
-                return Err("Projected gradient vectors cannot combine different projected pages".into());
-            }
-            let (_, page) = page_location(actual, absolute)?;
-            for key in ["from", "to"] {
-                if let Some(point) = params.get_mut(key) {
-                    translate_array(point, 2, &[0], page.x)?;
-                }
-            }
-        } else if action.command == "object.effects"
-            && params
-                .get("effects")
-                .and_then(|e| e.get("gradientFeather"))
-                .and_then(Value::as_object)
-                .is_some_and(|gf| gf.contains_key("from") || gf.contains_key("to") || gf.get("vector").is_some_and(|v| !v.is_null()))
-        {
-            let pages = match params.get("ids") {
-                Some(ids) => target_pages(Some(ids), &result_pages, index, actual)?,
-                None => selected.clone(),
-            };
-            let absolute = *pages.first().ok_or("Projected effects gradientFeather vector has no target page")?;
-            if pages.iter().any(|page| *page != absolute) {
-                return Err("Projected effects gradientFeather vectors cannot combine different projected pages".into());
-            }
-            let (_, page) = page_location(actual, absolute)?;
-            if let Some(gf) =
-                params.get_mut("effects").and_then(Value::as_object_mut).and_then(|e| e.get_mut("gradientFeather")).and_then(Value::as_object_mut)
-            {
-                if let Some(mut vec_val) = gf.remove("vector")
-                    && !vec_val.is_null()
-                {
-                    translate_array(&mut vec_val, 4, &[], 0.0)?;
-                    if let Some([x0, y0, x1, y1]) = vec_val.as_array().map(Vec::as_slice) {
-                        gf.entry("from").or_insert_with(|| json!([x0.clone(), y0.clone()]));
-                        gf.entry("to").or_insert_with(|| json!([x1.clone(), y1.clone()]));
-                    }
-                }
-                if gf.contains_key("from") != gf.contains_key("to") {
-                    return Err("Projected effects gradientFeather requires both from and to endpoints".into());
-                }
-                for key in ["from", "to"] {
-                    if let Some(point) = gf.get_mut(key) {
-                        translate_array(point, 2, &[0], page.x)?;
-                    }
-                }
-            }
-        } else if matches!(action.command.as_str(), "style.object.create" | "style.object.edit")
-            && [params.get("effects").and_then(|e| e.get("gradientFeather")), params.get("gradientFeather")].into_iter().flatten().any(|gf| {
-                gf.as_object().is_some_and(|o| o.contains_key("from") || o.contains_key("to") || o.get("vector").is_some_and(|v| !v.is_null()))
-            })
-        {
-            return Err(
-                "Projected object styles cannot bind page-local gradientFeather endpoints across facing pages; use angle or object.gradientFeather"
-                    .into(),
-            );
-        }
+        let step_pages = map_single_action(action, index, &result_pages, &mut selected, actual)?;
         result_pages.push(step_pages);
     }
     Ok(mapped)
+}
+
+fn map_single_action(
+    action: &mut designcraft_ai_types::EngineAction,
+    index: usize,
+    result_pages: &[StepPages],
+    selected: &mut Vec<usize>,
+    actual: &DocState,
+) -> Result<StepPages, String> {
+    let command = action.command.clone();
+    let params = action.params.as_object_mut().ok_or("Facing-page command parameters must be an object")?;
+    let qr_creation = command == "object.qrCode" && params.contains_key("rect");
+    let thread_creation = command == "text.thread" && params.contains_key("rect");
+    let creation = matches!(command.as_str(), "frame.create" | "line.create" | "path.create") || qr_creation || thread_creation;
+    let standalone_image = command == "file.place" && !params.contains_key("frame");
+    if creation || standalone_image {
+        return map_creation_step(params, index, result_pages, selected, actual, (thread_creation, standalone_image));
+    }
+    if let Some(step_pages) = map_selection_or_structure_step(&command, params, index, result_pages, selected, actual)? {
+        return Ok(step_pages);
+    }
+    map_geometry_or_gradient_step(&command, params, index, result_pages, selected, actual)
+}
+
+fn map_creation_step(
+    params: &mut serde_json::Map<String, Value>,
+    index: usize,
+    result_pages: &[StepPages],
+    selected: &mut Vec<usize>,
+    actual: &DocState,
+    flags: (bool, bool),
+) -> Result<StepPages, String> {
+    let (thread_creation, standalone_image) = flags;
+    let mut step_pages = StepPages::default();
+    if thread_creation {
+        match (params.get("from"), params.get("to")) {
+            (Some(from_val), None) => {
+                step_pages.from = Some(single_target_page(from_val, result_pages, index, actual)?);
+            }
+            (None, Some(to_val)) => {
+                step_pages.to = Some(single_target_page(to_val, result_pages, index, actual)?);
+            }
+            _ => return Err("Projected text.thread with rect requires exactly one of from or to".into()),
+        }
+    }
+    let absolute = params.get("spread").and_then(Value::as_u64).ok_or("Every projected object requires an absolute page spread")?;
+    let absolute = usize::try_from(absolute).map_err(|_| "Projected page index is too large")?;
+    let (spread, page) = page_location(actual, absolute)?;
+    params.insert("spread".into(), json!(spread));
+    if let Some(rect) = params.get_mut("rect") {
+        translate_array(rect, 4, &[0, 2], page.x)?;
+    }
+    for key in ["a", "b"] {
+        if let Some(point) = params.get_mut(key) {
+            translate_array(point, 2, &[0], page.x)?;
+        }
+    }
+    if let Some(anchors) = params.get_mut("anchors") {
+        let anchors = anchors.as_array_mut().ok_or("Projected path anchors must be an array")?;
+        if anchors.len() > 1024 {
+            return Err("Projected path exceeds the anchor limit".into());
+        }
+        for anchor in anchors {
+            let anchor = anchor.as_object_mut().ok_or("Projected path anchor must be an object")?;
+            for key in ["p", "in", "out"] {
+                if let Some(point) = anchor.get_mut(key) {
+                    translate_array(point, 2, &[0], page.x)?;
+                }
+            }
+        }
+    }
+    if standalone_image {
+        let x = params.entry("x").or_insert(json!(0));
+        translate_number(x, page.x)?;
+    }
+    *selected = vec![absolute];
+    if thread_creation {
+        if step_pages.from.is_some() {
+            step_pages.to = Some(absolute);
+        } else {
+            step_pages.from = Some(absolute);
+        }
+    } else {
+        step_pages.id = Some(absolute);
+    }
+    Ok(step_pages)
+}
+
+fn map_selection_or_structure_step(
+    command: &str,
+    params: &mut serde_json::Map<String, Value>,
+    index: usize,
+    result_pages: &[StepPages],
+    selected: &mut Vec<usize>,
+    actual: &DocState,
+) -> Result<Option<StepPages>, String> {
+    let mut step_pages = StepPages::default();
+    if command == "file.place" {
+        let frame_val = params.get("frame").ok_or("Projected file.place requires frame")?;
+        let page = single_target_page(frame_val, result_pages, index, actual)?;
+        *selected = vec![page];
+        step_pages.id = Some(page);
+    } else if command == "text.thread" {
+        let from_val = params.get("from").ok_or("Projected text.thread requires from")?;
+        let to_val = params.get("to").ok_or("Projected text.thread requires to")?;
+        let from_page = single_target_page(from_val, result_pages, index, actual)?;
+        let to_page = single_target_page(to_val, result_pages, index, actual)?;
+        *selected = vec![to_page];
+        step_pages.from = Some(from_page);
+        step_pages.to = Some(to_page);
+    } else if command == "selection.set" {
+        let pages = target_pages(params.get("ids"), result_pages, index, actual)?;
+        if params.get("add").and_then(Value::as_bool) != Some(true) {
+            selected.clear();
+        }
+        for page in pages {
+            if !selected.contains(&page) {
+                selected.push(page);
+            }
+        }
+    } else if matches!(command, "object.group" | "object.pathfinder" | "object.makeCompoundPath") {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if pages.len() != 1 {
+            return Err("Projected groups must remain on one absolute page".into());
+        }
+        *selected = pages.clone();
+        step_pages.id = pages.first().copied();
+    } else if command == "object.ungroup" {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if pages.len() != 1 {
+            return Err("Projected ungrouped objects must remain on one absolute page".into());
+        }
+        *selected = pages;
+    } else if matches!(command, "object.releaseCompoundPath" | "edit.stepAndRepeat") {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if pages.len() != 1 {
+            return Err("Projected compound or repeated objects must remain on one absolute page".into());
+        }
+        *selected = pages.clone();
+        step_pages.ids = pages.first().copied();
+    } else if command == "object.altText" {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if pages.is_empty() {
+            return Err("Projected object.altText requires a target object".into());
+        }
+    } else if command == "object.caption" {
+        let mut pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if let Some(cf) = params.get("captionFrame").filter(|v| !v.is_null()) {
+            let cf_page = single_target_page(cf, result_pages, index, actual)?;
+            if !pages.contains(&cf_page) {
+                pages.push(cf_page);
+            }
+        }
+        if pages.len() != 1 {
+            return Err("Projected captions must remain on one absolute page".into());
+        }
+        *selected = pages.clone();
+        step_pages.ids = pages.first().copied();
+        if params.get("group").and_then(Value::as_bool) == Some(true) {
+            step_pages.groups = pages.first().copied();
+        }
+    } else if command == "layout.section" {
+        let page_1 = params.get("page").and_then(Value::as_u64).ok_or("Projected layout.section requires a 1-based page")?;
+        let abs = usize::try_from(page_1).ok().and_then(|n| n.checked_sub(1)).ok_or("Projected layout.section page is out of range")?;
+        page_location(actual, abs)?;
+    } else if command == "layout.pages.applyParent" {
+        let arr =
+            params.get("pages").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or("Projected layout.pages.applyParent requires pages")?;
+        for v in arr {
+            let page_0 = v.as_u64().ok_or("Projected layout.pages.applyParent page must be a 0-based integer")?;
+            let abs = usize::try_from(page_0).map_err(|_| "Projected layout.pages.applyParent page is out of range")?;
+            page_location(actual, abs)?;
+        }
+    } else if command == "object.qrCode" {
+        params.remove("spread");
+        let page = *selected.first().ok_or("Projected object.qrCode without rect requires a selected target")?;
+        *selected = vec![page];
+        step_pages.id = Some(page);
+    } else {
+        return Ok(None);
+    }
+    Ok(Some(step_pages))
+}
+
+fn map_geometry_or_gradient_step(
+    command: &str,
+    params: &mut serde_json::Map<String, Value>,
+    index: usize,
+    result_pages: &[StepPages],
+    selected: &mut Vec<usize>,
+    actual: &DocState,
+) -> Result<StepPages, String> {
+    let mut step_pages = StepPages::default();
+    if matches!(command, "object.align" | "object.distribute") {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if pages.len() != 1 {
+            return Err("Projected alignment or distribution cannot combine different pages".into());
+        }
+        if command == "object.align" && params.get("to").and_then(Value::as_str) == Some("spread") {
+            params.insert("to".into(), json!("page"));
+        }
+    } else if command == "transform.move" {
+        if params.contains_key("toSpread") {
+            return Err("Projected transform.move cannot move objects across spreads".into());
+        }
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if pages.len() == 1 {
+            step_pages.ids = pages.first().copied();
+        }
+        if params.get("copy").and_then(Value::as_bool) == Some(true) {
+            *selected = pages;
+        }
+    } else if command == "transform.set" {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        if params.contains_key("x") || params.contains_key("bounds") {
+            let absolute = *pages.first().ok_or("Absolute transform has no projected target page")?;
+            if pages.iter().any(|page| *page != absolute) {
+                return Err("Absolute transforms cannot combine different projected pages".into());
+            }
+            let (spread, page) = page_location(actual, absolute)?;
+            // transform.set x is measured from the document ruler origin. Page rulers
+            // already include the page offset; spread and spine rulers need compensation.
+            let base = actual.doc.ruler_base(doc::SpreadRef::Doc(spread), page.x + page.width / 2.0).ok_or("Transform ruler origin is missing")?;
+            let canonical_base = match actual.doc.settings.ruler_origin {
+                doc::RulerOrigin::Spine => match page.side {
+                    doc::PageSide::Left => page.width,
+                    doc::PageSide::Right => 0.0,
+                    doc::PageSide::Single => page.width / 2.0,
+                },
+                _ => 0.0,
+            };
+            if let Some(x) = params.get_mut("x") {
+                translate_number(x, page.x + canonical_base - base.x)?;
+            }
+            if let Some(bounds) = params.get_mut("bounds") {
+                translate_array(bounds, 4, &[0, 2], page.x)?;
+            }
+        }
+    } else if matches!(command, "object.gradient" | "object.gradientFeather") && (params.contains_key("from") || params.contains_key("to")) {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        let absolute = *pages.first().ok_or("Projected gradient vector has no target page")?;
+        if pages.iter().any(|page| *page != absolute) {
+            return Err("Projected gradient vectors cannot combine different projected pages".into());
+        }
+        let (_, page) = page_location(actual, absolute)?;
+        for key in ["from", "to"] {
+            if let Some(point) = params.get_mut(key) {
+                translate_array(point, 2, &[0], page.x)?;
+            }
+        }
+    } else if command == "object.effects"
+        && params
+            .get("effects")
+            .and_then(|e| e.get("gradientFeather"))
+            .and_then(Value::as_object)
+            .is_some_and(|gf| gf.contains_key("from") || gf.contains_key("to") || gf.get("vector").is_some_and(|v| !v.is_null()))
+    {
+        let pages = match params.get("ids") {
+            Some(ids) => target_pages(Some(ids), result_pages, index, actual)?,
+            None => selected.clone(),
+        };
+        let absolute = *pages.first().ok_or("Projected effects gradientFeather vector has no target page")?;
+        if pages.iter().any(|page| *page != absolute) {
+            return Err("Projected effects gradientFeather vectors cannot combine different projected pages".into());
+        }
+        let (_, page) = page_location(actual, absolute)?;
+        if let Some(gf) =
+            params.get_mut("effects").and_then(Value::as_object_mut).and_then(|e| e.get_mut("gradientFeather")).and_then(Value::as_object_mut)
+        {
+            if let Some(mut vec_val) = gf.remove("vector")
+                && !vec_val.is_null()
+            {
+                translate_array(&mut vec_val, 4, &[], 0.0)?;
+                if let Some([x0, y0, x1, y1]) = vec_val.as_array().map(Vec::as_slice) {
+                    gf.entry("from").or_insert_with(|| json!([x0.clone(), y0.clone()]));
+                    gf.entry("to").or_insert_with(|| json!([x1.clone(), y1.clone()]));
+                }
+            }
+            if gf.contains_key("from") != gf.contains_key("to") {
+                return Err("Projected effects gradientFeather requires both from and to endpoints".into());
+            }
+            for key in ["from", "to"] {
+                if let Some(point) = gf.get_mut(key) {
+                    translate_array(point, 2, &[0], page.x)?;
+                }
+            }
+        }
+    } else if matches!(command, "style.object.create" | "style.object.edit")
+        && [params.get("effects").and_then(|e| e.get("gradientFeather")), params.get("gradientFeather")]
+            .into_iter()
+            .flatten()
+            .any(|gf| gf.as_object().is_some_and(|o| o.contains_key("from") || o.contains_key("to") || o.get("vector").is_some_and(|v| !v.is_null())))
+    {
+        return Err(
+            "Projected object styles cannot bind page-local gradientFeather endpoints across facing pages; use angle or object.gradientFeather"
+                .into(),
+        );
+    }
+    Ok(step_pages)
 }
 
 fn mirror_facing_footer_outer(commands: &mut [designcraft_ai_types::EngineAction], actual: &DocState) -> Result<(), String> {

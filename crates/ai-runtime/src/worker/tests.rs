@@ -2252,7 +2252,7 @@ fn spawned_reference_reader_retains_thread_confined_roots() {
     let outside = tempfile::tempdir().unwrap();
     let source = outside.path().join("reference.md");
     std::fs::write(&source, "private reference").unwrap();
-    let roots = designcraft_engine::file_access::AutomationRoots::new(Some(allowed.path()), Some(allowed.path())).unwrap().unwrap();
+    let roots = designcraft_engine::file_access::AutomationRoots::new(&[allowed.path()], &[allowed.path()]).unwrap().unwrap();
     let work = Work::Skill {
         design_style: false,
         prompt: "Analyze references".into(),
@@ -4487,11 +4487,7 @@ fn gemini_discovery_excludes_non_generate_content_models_while_preserving_comfyu
     assert_eq!(run_discovery(ProviderKind::OpenAi), vec!["gpt-4.1-mini".to_owned()]);
 }
 
-#[test]
-fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards() {
-    let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _memory = crate::resources::TestAdmissionGuard::healthy();
-
+fn assert_worker_sizing_and_thinking_margin_contracts() {
     // 1. Placed asset names preserve WebP, PNG, and JPEG extensions.
     assert_eq!(generated_asset_name("image/webp"), "generated.webp");
     assert_eq!(generated_asset_name("image/png"), "generated.png");
@@ -4538,6 +4534,14 @@ fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards()
     ] {
         assert_eq!(model_needs_thinking_margin(&ModelSelection { provider, model: model.into(), endpoint: None }), expected, "{model}");
     }
+}
+
+#[test]
+fn ai28_worker_sizing_asset_names_thinking_margin_and_upfront_admission_guards() {
+    let _serial = LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+
+    assert_worker_sizing_and_thinking_margin_contracts();
 
     // 4. Upfront admission guards reject before spending Request #1.
     struct ZeroCallProvider {
