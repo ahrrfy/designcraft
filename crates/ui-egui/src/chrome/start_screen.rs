@@ -15,9 +15,11 @@ pub fn start_screen(app: &mut DesignApp, ui: &mut egui::Ui) {
                 ui.label(crate::rtl::widget(
                     ui,
                     egui::RichText::new(if app.ui.language == "ar" {
-                        "مرحباً بك في التصميم الذكي (Smart Design)"
+                        "مرحباً بك في التصميم الذكي (Smart Design)".to_string()
                     } else {
-                        "Welcome to Smart Design"
+                        crate::i18n::tr(&app.ui.language, "Welcome to DesignCraft")
+                            .replace("DesignCraftu", "Smart Design")
+                            .replace("DesignCraft", crate::about::fork_name(&app.ui.language))
                     })
                     .font(semibold(28.0))
                     .color(t.text_strong),

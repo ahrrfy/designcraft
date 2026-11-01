@@ -357,7 +357,7 @@ pub fn app_bar(app: &mut DesignApp, ui: &mut egui::Ui) {
                                 .clicked()
                             {
                                 if app.ui.ai.open {
-                                    app.ui.ai.open = false;
+                                    let _ = app.run("ai.production", json!({"open": false}));
                                 } else {
                                     let _ = app.run("ai.production", json!({}));
                                 }

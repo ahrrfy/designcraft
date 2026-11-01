@@ -954,7 +954,10 @@ fn smart_design_branding_and_ai_controls_work_on_start_screen_and_app_bar() {
     assert!(h.state().app.ui.ai.open, "App bar AI button toggles AI Production open");
 
     // Arabic interface displays Arabic Smart Design branding and Arabic AI controls.
-    h.state_mut().app.ui.ai.open = false;
+    h.state_mut().app.run("ai.production", json!({"open": false})).unwrap();
+    h.state_mut().app.run("app.language", json!({"lang": "de"})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Willkommen bei Smart Design").is_some(), "German localized fork welcome heading is shown");
     h.state_mut().app.run("app.language", json!({"lang": "ar"})).unwrap();
     h.run_steps(3);
     let bar_ar = test_window::panel_rect(&h, "app_bar");

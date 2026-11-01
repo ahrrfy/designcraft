@@ -13,7 +13,7 @@ pub fn shown(app: &DesignApp, id: &str) -> bool {
 /// UI commands: (id, label, shortcut, params).
 pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("app.checkPreviewUpdate", "Check & Stage Preview Update", None, "{} — check verified launcher updates without closing documents"),
-    ("ai.production", "AI Production…", None, "{} — open native AI production"),
+    ("ai.production", "AI Production…", None, "{open?: bool} — open or close native AI production"),
     ("ai.skills", "AI Skills…", None, "{} — review, sample and approve skills"),
     ("ai.usage", "AI Usage…", None, "{} — session task and usage reports"),
     ("ai.providers", "AI Providers and Keys…", None, "{} — configure models and OS-protected credentials"),

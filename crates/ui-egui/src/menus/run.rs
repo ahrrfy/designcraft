@@ -84,7 +84,11 @@ fn flag(b: &mut bool) -> Result<Value, String> {
 fn run_ui_part1(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     Some(match id {
         "ai.production" | "ai.skills" | "ai.usage" | "ai.providers" | "ai.local" => {
-            app.ui.ai.open = true;
+            let open = p.get("open").and_then(Value::as_bool).unwrap_or(true);
+            app.ui.ai.open = open;
+            if !open {
+                return Some(Ok(json!({"open": false, "tab": app.ui.ai.tab, "available": app.services.ai.is_some()})));
+            }
             app.ui.ai.tab = match id {
                 "ai.skills" => 1,
                 "ai.usage" => 2,
