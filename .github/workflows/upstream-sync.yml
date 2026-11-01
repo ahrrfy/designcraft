@@ -148,16 +148,31 @@ jobs:
           done
           printf 'state=conflict_pr\n' >> "$GITHUB_OUTPUT"
 
+      - name: Pinned redistributable font collection
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: storytold/craft-fonts
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+          path: craft-fonts
+          persist-credentials: false
+      - name: Configure craft-fonts environment
+        if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
+        shell: bash
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: |
+          printf 'CRAFT_FONTS_DIR=%s\nCRAFT_FONTS_REQUIRED=1\n' "$CRAFT_FONTS_DIR" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.150
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.prep.outputs.state == 'ready_for_ci' || steps.prep.outputs.state == 'needs_lock_refresh'
         with:
