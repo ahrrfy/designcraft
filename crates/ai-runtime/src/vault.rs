@@ -198,7 +198,7 @@ struct NativeBackend;
 
 #[cfg(windows)]
 mod windows {
-    use super::*;
+    use super::{Backend, NativeBackend, SERVICE, STORE_ERROR, SecretString};
     use keyring::{credential::CredentialApi, windows::WinCredential};
 
     fn entry(target: &str) -> Result<WinCredential, String> {

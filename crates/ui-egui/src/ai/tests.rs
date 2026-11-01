@@ -1,8 +1,18 @@
+use super::panel_production::{
+    batch_review, budget_targets, export_print, image_inspection_setting, render_diagnostic_alert_banner, saved_book_document,
+};
+use super::state::{BatchReviewKey, classify_diagnostic_alert};
 use super::*;
 use crate::Services;
 use designcraft_engine::Session;
 use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
+
+fn harness_builder<State>() -> egui_kittest::HarnessBuilder<State> {
+    egui_kittest::HarnessBuilder::default().with_context_setup(|ctx| {
+        crate::theme::install_fonts(ctx, "");
+    })
+}
 
 #[test]
 fn ai23_remaining_book_allowance_is_explicit_and_does_not_change_review_size() {
@@ -10,7 +20,7 @@ fn ai23_remaining_book_allowance_is_explicit_and_does_not_change_review_size() {
     state.settings.text_model.model = "fixture".into();
     state.settings.pages_per_batch = 2;
     state.settings.output_mode = OutputMode::NativeWithImages;
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1200.0, 1600.0))
         .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
     panel.run_steps(3);
@@ -101,7 +111,7 @@ fn ai20_ui_completed_discovery_stays_selectable_for_its_provider_and_endpoint() 
     state.pending_models = Some(selection.clone());
     state.accept(AiSnapshot { available: true, busy: true, stage: "discovering".into(), ..Default::default() });
     state.accept(AiSnapshot { available: true, stage: "completed".into(), models: vec!["text-a".into(), "text-b".into()], ..Default::default() });
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1200.0, 1200.0))
         .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
     panel.run_steps(3);
@@ -135,7 +145,7 @@ fn ai20_ui_natural_book_estimates_preserve_review_size_remaining_pages_and_expli
     assert_eq!(estimate.review_pages, 6);
     assert_eq!(estimate.allowance(), 6);
     let original_tokens = state.settings.budget.token_limit;
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1200.0, 1200.0))
         .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
     panel.run_steps(3);
@@ -176,7 +186,7 @@ fn ai20_ui_binding_choices_are_visible_and_existing_book_binding_is_authoritativ
     state.settings.text_model.model = "fixture".into();
     state.settings.facing_pages = true;
     state.settings.right_to_left_binding = Some(false);
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1300.0, 1400.0))
         .build_ui_state(|ui, (state, requests)| production(ui, state, false, true, &[], &mut None, requests), (state, Vec::new()));
     panel.run_steps(3);
@@ -200,7 +210,7 @@ fn ai20_ui_binding_choices_are_visible_and_existing_book_binding_is_authoritativ
     let documents = vec![OpenDocument::from_document(0, session.active().unwrap())];
     let mut state = AiUiState { prompt: "Continue this existing book.".into(), new_document: false, continue_book: true, ..Default::default() };
     state.settings.right_to_left_binding = Some(false);
-    let mut existing = egui_kittest::Harness::builder()
+    let mut existing = harness_builder()
         .with_size(egui::vec2(1300.0, 1400.0))
         .build_ui_state(move |ui, state| production(ui, state, false, true, &documents, &mut Some(0), &mut Vec::new()), state);
     existing.run_steps(3);
@@ -228,7 +238,7 @@ fn ai20_ui_document_and_skill_export_destinations_are_independent_and_session_on
         sample_valid: false,
         files: Vec::new(),
     });
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1800.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1300.0, 1800.0)).build_ui_state(
         |ui, (state, requests, skill_tab)| {
             if *skill_tab {
                 skills(ui, state, false, true, false, requests);
@@ -344,7 +354,7 @@ fn continuation_ui_explicit_action_keeps_current_document_edits_separate() {
         filled_ranges: vec![[1, 1]],
         blank_ranges: vec![[2, 4]],
     }];
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
         move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
         (state, Vec::new(), Some(0)),
     );
@@ -370,7 +380,7 @@ fn continuation_ui_busy_one_shot_keeps_failed_book_in_previous_task() {
         snapshot: AiSnapshot { busy: true, batch: Some(BatchSnapshot { status: "failed".into(), ..Default::default() }), ..Default::default() },
         ..Default::default()
     };
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1200.0, 1200.0))
         .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
     panel.run_steps(3);
@@ -395,7 +405,7 @@ fn continuation_ui_saved_book_preparation_requires_a_fresh_produce() {
         }
         snapshot.clone()
     }));
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 1200.0)).build_ui_state(|ui, app| show(app, ui.ctx()), app);
+    let mut panel = harness_builder().with_size(egui::vec2(1400.0, 1200.0)).build_ui_state(|ui, app| show(app, ui.ctx()), app);
     panel.run_steps(3);
     panel.get_by_label("Prepare saved book continuation").click();
     panel.run_steps(3);
@@ -468,7 +478,7 @@ fn continuation_ui_retry_requires_live_retryability_and_exact_selected_document(
     let mut state = AiUiState::default();
     state.accept(snapshot);
     let documents = vec![OpenDocument::from_document(0, document)];
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1200.0, 1200.0)).build_ui_state(
         |ui, (state, requests, selected, documents)| production(ui, state, false, true, documents, selected, requests),
         (state, Vec::new(), Some(0), documents),
     );
@@ -507,7 +517,7 @@ fn continuation_ui_unpublished_new_book_retry_does_not_require_an_open_document(
     snapshot.batch = Some(BatchSnapshot { job_id: "saved-book".into(), status: "failed".into(), retryable: true, ..Default::default() });
     let mut state = AiUiState::default();
     state.accept(snapshot);
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1200.0, 1200.0))
         .build_ui_state(|ui, (state, requests)| production(ui, state, false, true, &[], &mut None, requests), (state, Vec::new()));
     panel.run_steps(3);
@@ -666,7 +676,7 @@ fn explicit_page_review_estimate_changes_request_allowance_only_after_the_button
     state.settings.pages_per_batch = 6;
     state.settings.text_model.model = "fixture-model".into();
     let token_limit = state.settings.budget.token_limit;
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1000.0, 1100.0))
         .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
     panel.run_steps(3);
@@ -702,7 +712,7 @@ fn explicit_page_review_estimate_changes_request_allowance_only_after_the_button
 
 #[test]
 fn image_inspection_requires_explicit_gemini_choice_and_can_be_disabled_after_provider_change() {
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(900.0, 400.0))
         .build_ui_state(|ui, state| image_inspection_setting(ui, state, false), AiUiState::default());
     let label = "Inspect generated images with Gemini (extra billed vision requests)";
@@ -759,7 +769,7 @@ fn continuation_request_estimate_counts_only_remaining_pages_and_ignores_fenced_
 #[test]
 fn facing_page_choice_preserves_automatic_binding_without_another_direction_prompt() {
     let state = AiUiState::default();
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1000.0, 1100.0))
         .build_ui_state(|ui, state| production(ui, state, false, true, &[], &mut None, &mut Vec::new()), state);
     panel.run_steps(3);
@@ -1023,7 +1033,7 @@ fn ai24_failed_unpublished_group_explains_why_there_are_no_proofs_to_approve() {
     batch.batches[0].proof_paths.clear();
     batch.batches[0].proof_sha256.clear();
     fixture.app.ui.ai.accept(fixture.checkpoint);
-    let mut panel = egui_kittest::Harness::builder().build_ui_state(|ui, state| batch_review(ui, state, false, &mut Vec::new()), fixture.app.ui.ai);
+    let mut panel = harness_builder().build_ui_state(|ui, state| batch_review(ui, state, false, &mut Vec::new()), fixture.app.ui.ai);
     panel.run_steps(3);
     assert!(panel.query_by_label("This group has no complete published page proofs. Resolve the reported error and retry the unfinished pages; there is nothing new to approve.").is_some());
     assert!(panel.query_by_label("Approve and generate next review group").is_none());
@@ -1097,7 +1107,7 @@ impl ProofFixture {
     fn panel(mut self) -> egui_kittest::Harness<'static, DesignApp> {
         self.app.ui.ai.open = true;
         self.app.ui.ai.prompt = "A long production request\n".repeat(1000);
-        egui_kittest::Harness::builder().with_size(egui::vec2(1024.0, 768.0)).build_ui_state(|ui, app| show(app, ui.ctx()), self.app)
+        harness_builder().with_size(egui::vec2(1024.0, 768.0)).build_ui_state(|ui, app| show(app, ui.ctx()), self.app)
     }
 }
 
@@ -1650,7 +1660,7 @@ fn live_status_page_map_and_script_conflict_actions_work_without_starting_produc
             blank_ranges: vec![[23, 48]],
         },
     ];
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
         move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
         (state, Vec::new(), Some(0)),
     );
@@ -1721,7 +1731,7 @@ fn diagnostic_alert_banner_displays_cause_solution_and_executes_recovery_actions
         blank_ranges: vec![[1, 8]],
     }];
 
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
         move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
         (state, Vec::new(), Some(0)),
     );
@@ -1760,28 +1770,32 @@ fn production_panel_open_file_to_edit_switches_target_to_current_document() {
         .unwrap();
     author.run("file.save", serde_json::json!({"path": file_path.to_string_lossy()})).unwrap();
 
-    let observed_purpose = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
-    let seen_purpose = observed_purpose.clone();
+    let observed_filter = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let seen_filter = observed_filter.clone();
     let mut app = DesignApp::new(
         Session::new(),
         Services {
             read: Some(Box::new(|path| std::fs::read(path).map_err(|e| e.to_string()))),
-            pick_open: Some(Box::new(move |purpose| {
-                *seen_purpose.borrow_mut() = purpose.to_string();
-                None
-            })),
             ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })),
             ..Default::default()
         },
     );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.answer_dialogs(move |request| {
+        if let craft_dialogs::Request::File(dialog) = request
+            && let Some(first) = dialog.filters.first()
+        {
+            *seen_filter.lock().unwrap() = first.name.clone();
+        }
+        craft_dialogs::Answer::Cancelled
+    });
     app.ui.ai.open = true;
     app.ui.ai.new_document = true;
     app.ui.ai.continue_book = true;
     app.ui.ai.open_document_path = file_path.to_string_lossy().into_owned();
     app.ui.ai.open_target_document_requested = true;
 
-    let mut harness =
-        egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 900.0)).build_ui_state(|ui, app: &mut DesignApp| show(app, ui.ctx()), app);
+    let mut harness = harness_builder().with_size(egui::vec2(1300.0, 900.0)).build_ui_state(|ui, app: &mut DesignApp| show(app, ui.ctx()), app);
     harness.run_steps(3);
 
     assert!(!harness.state().ui.ai.new_document, "opening a file to edit switches target mode to CurrentDocument");
@@ -1796,8 +1810,11 @@ fn production_panel_open_file_to_edit_switches_target_to_current_document() {
     harness.state_mut().ui.ai.new_document = true;
     harness.state_mut().ui.ai.pick_target_document = true;
     harness.run_steps(3);
+    #[cfg(not(target_arch = "wasm32"))]
+    harness.state_mut().settle_dialogs();
     assert!(harness.state().ui.ai.new_document, "cancelled picker must preserve new_document mode");
-    assert_eq!(observed_purpose.borrow().as_str(), "ai_target_document");
+    #[cfg(not(target_arch = "wasm32"))]
+    assert_eq!(observed_filter.lock().unwrap().as_str(), "Editable & Importable Documents");
 
     assert_eq!(sanitize_pdf_page_size(Some((420.0, 595.0))), (420.0, 595.0));
     assert_eq!(sanitize_pdf_page_size(Some((f64::NAN, 595.0))), (595.27559, 841.88976));
@@ -1910,7 +1927,7 @@ fn selectable_skills_and_new_diagnostic_quick_fixes_operate_cleanly() {
     state.snapshot.message = "Script defines 4 explicit PAGE blocks, but target page count differs".into();
 
     let documents = Vec::new();
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
         move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
         (state, Vec::new(), None),
     );
@@ -1958,7 +1975,7 @@ fn model_validation_retired_404_quick_fixes_and_per_provider_discovery_operate_c
     assert_eq!(state.active_diagnostic_alert().map(|alert| alert.kind), Some(DiagnosticAlertKind::InvalidModel));
 
     let documents = Vec::new();
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
         move |ui, (state, requests, selected)| production(ui, state, false, true, &documents, selected, requests),
         (state, Vec::new(), None),
     );
@@ -2015,7 +2032,7 @@ fn model_validation_retired_404_quick_fixes_and_per_provider_discovery_operate_c
     img_state.snapshot.stage = "failed".into();
     img_state.snapshot.message = "AI provider HTTP 404: request, model, schema, or endpoint not supported".into();
     let docs = Vec::new();
-    let mut img_panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
+    let mut img_panel = harness_builder().with_size(egui::vec2(1300.0, 1200.0)).build_ui_state(
         move |ui, (state, requests, selected)| production(ui, state, false, true, &docs, selected, requests),
         (img_state, Vec::new(), None),
     );
@@ -2106,7 +2123,7 @@ fn ai27_preflight_natural_arabic_pages_retired_gemini_token_limits_and_persisted
     state.settings.budget.token_limit = 32_000;
     assert_eq!(state.settings.budget.max_requests, 4);
 
-    let mut panel = egui_kittest::Harness::builder()
+    let mut panel = harness_builder()
         .with_size(egui::vec2(1300.0, 1400.0))
         .build_ui_state(|ui, (state, requests)| production(ui, state, false, true, &[], &mut None, requests), (state, Vec::new()));
     panel.run_steps(3);
@@ -2177,10 +2194,7 @@ fn ai27_preflight_natural_arabic_pages_retired_gemini_token_limits_and_persisted
     assert!(matches!(panel.state().1.last(), Some(AiRequest::Start(TaskRequest { target: TaskTarget::NewA4 { pages: 48 }, .. }))));
 }
 
-#[test]
-fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natural_pages_edges() {
-    use egui_kittest::kittest::Queryable;
-
+fn assert_natural_prompt_pages_and_kg_estimates() {
     // 1. Fix 5: natural_prompt_pages edge cases (harakat/tatweel, attached units, brackets, singular "page", and negative rejections).
     assert_eq!(natural_prompt_pages("٤٨صفحة"), Some(48));
     assert_eq!(natural_prompt_pages("48صفحة"), Some(48));
@@ -2276,10 +2290,6 @@ fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natura
     single_generic.settings.pages_per_batch = 1;
     single_generic.settings.budget.max_output_tokens = 8192;
     let tok_est = single_generic.token_estimate(&[], None).unwrap();
-    // Exact worst-case ledger `reserve_with_output` sum for 1-page generic multi-skill + 1 image + 1 vision review:
-    // text call (up to 176 KiB context + prompt): (180_224 + prompt.len()).div_ceil(3) + 1024 + 8192
-    // image call (~6 KiB prompt/style, image_call=true -> 0 attachment/output tokens): 2000 + 1024 = 3_024
-    // vision review call (~6 KiB prompt/schema, 1 image, max_output=4096): 2000 + 1024 + 8192 + 4096 = 15_312
     let text_reserved = (176 * 1024u64 + single_generic.prompt.len() as u64).div_ceil(3) + 1024 + 8192;
     let image_reserved = 2000u64 + 1024;
     let review_reserved = 2000u64 + 1024 + 8192 + 4096;
@@ -2289,6 +2299,13 @@ fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natura
         tok_est.review_tokens,
         text_reserved + image_reserved + review_reserved
     );
+}
+
+#[test]
+fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natural_pages_edges() {
+    use egui_kittest::kittest::Queryable;
+
+    assert_natural_prompt_pages_and_kg_estimates();
 
     // 4. Fix 4: Bound failed batch with `completed_pages > 0` shows saved book instructions + accurate Retry/Continue copy (EN + AR).
     let mut session = Session::new();
@@ -2311,7 +2328,7 @@ fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natura
     let mut rec_state = AiUiState::default();
     rec_state.accept(snap);
     let docs = vec![OpenDocument::from_document(0, doc)];
-    let mut en_panel = egui_kittest::Harness::builder()
+    let mut en_panel = harness_builder()
         .with_size(egui::vec2(1300.0, 1000.0))
         .build_ui_state(|ui, (s, reqs)| production(ui, s, false, true, &docs, &mut Some(0), reqs), (rec_state.clone(), Vec::new()));
     en_panel.run_steps(3);
@@ -2326,7 +2343,7 @@ fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natura
 
     let docs_ar = vec![OpenDocument::from_document(0, doc)];
     let mut ar_fonts_ready = false;
-    let mut ar_panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1000.0)).build_ui_state(
+    let mut ar_panel = harness_builder().with_size(egui::vec2(1300.0, 1000.0)).build_ui_state(
         move |ui, (s, reqs)| {
             if !ar_fonts_ready {
                 crate::theme::install_fonts(ui.ctx(), "ar");
@@ -2358,7 +2375,7 @@ fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natura
     let mut unpub_state = AiUiState::default();
     unpub_state.accept(unpub_snap);
     let docs_restored = vec![OpenDocument::from_document(0, doc)];
-    let mut unpub_panel = egui_kittest::Harness::builder()
+    let mut unpub_panel = harness_builder()
         .with_size(egui::vec2(1300.0, 1000.0))
         .build_ui_state(|ui, (s, reqs)| production(ui, s, false, true, &docs_restored, &mut Some(0), reqs), (unpub_state, Vec::new()));
     unpub_panel.run_steps(3);
@@ -2376,7 +2393,7 @@ fn ai27_round1_audit_auto_style_estimates_vision_tokens_recovery_copy_and_natura
     restored_cont_state.accept(restored_cont_snap);
     assert!(restored_cont_state.restored_target_unconfirmed);
     let docs_cont = vec![OpenDocument::from_document(0, doc)];
-    let mut cont_panel = egui_kittest::Harness::builder()
+    let mut cont_panel = harness_builder()
         .with_size(egui::vec2(1300.0, 1000.0))
         .build_ui_state(|ui, (s, reqs)| production(ui, s, false, true, &docs_cont, &mut Some(0), reqs), (restored_cont_state, Vec::new()));
     cont_panel.run_steps(3);
@@ -2435,7 +2452,7 @@ fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens
     let expected_review_tokens = 120_000u64.saturating_add(fresh_tokens.review_tokens).clamp(256, MAX_TOKEN_LIMIT);
     let expected_book_tokens = 120_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256, MAX_TOKEN_LIMIT);
 
-    let mut panel = egui_kittest::Harness::builder().with_size(egui::vec2(1300.0, 1400.0)).build_ui_state(
+    let mut panel = harness_builder().with_size(egui::vec2(1300.0, 1400.0)).build_ui_state(
         |ui, (s, reqs, selected, docs)| production(ui, s, false, true, docs, selected, reqs),
         (state, Vec::new(), Some(0usize), docs),
     );
@@ -2473,6 +2490,16 @@ fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens
     assert_eq!(panel.state().0.settings.budget.token_limit, expected_book_tokens);
     assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == expected_book_tokens));
 
+    assert_diagnostic_quick_fixes_and_mid_book_newa4(&mut panel, fresh_tokens.book_tokens);
+    assert_non_retryable_and_edge_case_allowances(&mut panel, (fresh_tokens.review_tokens, fresh_tokens.book_tokens));
+}
+
+fn assert_diagnostic_quick_fixes_and_mid_book_newa4(
+    panel: &mut egui_kittest::Harness<'_, (AiUiState, Vec<AiRequest>, Option<usize>, Vec<OpenDocument>)>,
+    fresh_book_tokens: u64,
+) {
+    use egui_kittest::kittest::Queryable;
+
     // Diagnostic alert quick fixes ("Raise Request Allowance" and "Raise Token Limit") also include consumed + estimated_tokens.
     panel.state_mut().1.clear();
     panel.state_mut().0.settings.budget.max_requests = 8;
@@ -2493,7 +2520,7 @@ fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens
     panel.run_steps(3);
     panel.get_by_label("Raise Token Limit").click();
     panel.run_steps(3);
-    let expected_raised_tokens = 210_000u64.saturating_add(fresh_tokens.book_tokens).clamp(256_000, MAX_TOKEN_LIMIT);
+    let expected_raised_tokens = 210_000u64.saturating_add(fresh_book_tokens).clamp(256_000, MAX_TOKEN_LIMIT);
     assert_eq!(panel.state().0.settings.budget.token_limit, expected_raised_tokens);
     assert!(matches!(panel.state().1.last(), Some(AiRequest::UpdateSettings(s)) if s.budget.token_limit == expected_raised_tokens));
 
@@ -2508,7 +2535,16 @@ fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens
     panel.get_by_label("Set request allowance for remaining book").click();
     panel.run_steps(3);
     assert_eq!(panel.state().0.settings.budget.max_requests, 20, "8 consumed + 12 remaining = 20 without double-counting pages 1..8");
+}
 
+fn assert_non_retryable_and_edge_case_allowances(
+    panel: &mut egui_kittest::Harness<'_, (AiUiState, Vec<AiRequest>, Option<usize>, Vec<OpenDocument>)>,
+    fresh_tokens: (u64, u64),
+) {
+    use designcraft_ai_types::protocol::UsageSummary;
+    use egui_kittest::kittest::Queryable;
+
+    let (fresh_review_tokens, fresh_book_tokens) = fresh_tokens;
     // 4. Once retryable becomes false (fresh task with new ledger), targets revert to 2 / 12 and fresh token estimates.
     panel.state_mut().1.clear();
     panel.state_mut().0.new_document = false;
@@ -2527,10 +2563,10 @@ fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens
 
     panel.get_by_label("Set token limit for this review").click();
     panel.run_steps(3);
-    assert_eq!(panel.state().0.settings.budget.token_limit, fresh_tokens.review_tokens);
+    assert_eq!(panel.state().0.settings.budget.token_limit, fresh_review_tokens);
     panel.get_by_label("Set token limit for remaining book").click();
     panel.run_steps(3);
-    assert_eq!(panel.state().0.settings.budget.token_limit, fresh_tokens.book_tokens);
+    assert_eq!(panel.state().0.settings.budget.token_limit, fresh_book_tokens);
 
     // 5. Edge case A: When budget_targets is None (e.g. CurrentDocument mode) and consumed_tokens >= token_limit * 2,
     //    "Raise Token Limit" grants 256,000 fresh tokens of headroom above consumed_tokens.
@@ -2583,7 +2619,6 @@ fn retryable_failed_batch_allowance_buttons_include_consumed_requests_and_tokens
 
 #[test]
 fn ai28_ui_refresh_edited_proofs_retired_gemini_and_bound_draft_pages() {
-    use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
     // 1. Expanded retired Gemini detection (gemini-3-pro-preview, imagen-3.0, gemini-2.5-flash).
@@ -2630,7 +2665,7 @@ fn ai28_ui_refresh_edited_proofs_retired_gemini_and_bound_draft_pages() {
     fixture.app.ui.ai.sync_proof_document(Some((document.0, document.1 + 1)));
     assert!(!fixture.app.ui.ai.proof_document_matches);
 
-    let mut harness = Harness::new_ui_state(
+    let mut harness = harness_builder().build_ui_state(
         |ui, (s, reqs): &mut (AiUiState, Vec<AiRequest>)| {
             batch_review(ui, s, false, reqs);
         },
@@ -2647,7 +2682,6 @@ fn ai28_ui_refresh_edited_proofs_retired_gemini_and_bound_draft_pages() {
 
 #[test]
 fn ai28_round1_review_fixes_16m_tokens_spread_aligned_estimates_and_http_alerts() {
-    use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
     // 1. HTTP 504 / 429 / 400 / 422 diagnostic alert classifications.
@@ -2732,7 +2766,7 @@ fn ai28_round1_review_fixes_16m_tokens_spread_aligned_estimates_and_http_alerts(
 
     s.snapshot.stage = "failed".into();
     s.snapshot.message = "Token budget cannot admit another request".into();
-    let mut harness = Harness::builder().with_size(egui::vec2(1200.0, 900.0)).build_ui_state(
+    let mut harness = harness_builder().with_size(egui::vec2(1200.0, 900.0)).build_ui_state(
         |ui, (st, reqs): &mut (AiUiState, Vec<AiRequest>)| {
             render_diagnostic_alert_banner(ui, st, false, &[], None, reqs);
         },
@@ -3013,8 +3047,7 @@ fn ai_run_prompt_auto_dispatches_when_ready_and_opens_panel_when_unconfigured() 
     app.run("file.new", json!({"pages": 2})).unwrap();
     app.ui.palette = Some("اربط كل صورة بتسمية حية مجمعة أسفلها".into());
 
-    let mut h =
-        egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 600.0)).build_ui_state(|ui, app| crate::menus::palette(app, ui.ctx()), app);
+    let mut h = harness_builder().with_size(egui::vec2(900.0, 600.0)).build_ui_state(|ui, app| crate::menus::palette(app, ui.ctx()), app);
     h.run_steps(3);
     assert!(h.query_by_label_contains("Run with AI…").is_some(), "Quick Apply must show Run with AI… for natural-language queries");
     h.get_by_label_contains("Run with AI…").click();
@@ -3095,7 +3128,7 @@ fn ai33_ui_large_script_card_slicing_scoped_skill_errors_and_blank_planner_conti
     state.snapshot.message = "skill I/O: The filename, directory name, or volume label syntax is incorrect. (os error 123)".into();
     assert!(state.active_diagnostic_alert().is_none(), "Skill-tab I/O errors must not lock an AI Production Alert onto Tab 0");
 
-    let mut prod_panel = egui_kittest::Harness::builder()
+    let mut prod_panel = harness_builder()
         .with_size(egui::vec2(1280.0, 960.0))
         .build_ui_state(|ui, (st, reqs)| production(ui, st, false, true, &[], &mut None, reqs), (state, Vec::<AiRequest>::new()));
     prod_panel.run_steps(3);
@@ -3108,7 +3141,7 @@ fn ai33_ui_large_script_card_slicing_scoped_skill_errors_and_blank_planner_conti
         AiUiState { import_path: "  \"C:\\Users\\alara\\Desktop\\planners-journals-notebooks-studio\"  ".into(), ..Default::default() };
     skill_state.snapshot.stage = "failed".into();
     skill_state.snapshot.message = "skill I/O: quoted path failed".into();
-    let mut skill_panel = egui_kittest::Harness::builder()
+    let mut skill_panel = harness_builder()
         .with_size(egui::vec2(1100.0, 800.0))
         .build_ui_state(|ui, (st, reqs)| skills(ui, st, false, true, true, reqs), (skill_state, Vec::<AiRequest>::new()));
     skill_panel.run_steps(2);
@@ -3131,7 +3164,7 @@ fn ai33_ui_large_script_card_slicing_scoped_skill_errors_and_blank_planner_conti
         ..Default::default()
     };
     cont_state.settings.text_model.model = "gemini-3.8-flash".into();
-    let mut cont_panel = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 960.0)).build_ui_state(
+    let mut cont_panel = harness_builder().with_size(egui::vec2(1280.0, 960.0)).build_ui_state(
         move |ui, (st, reqs, sel)| production(ui, st, false, true, &open_docs, sel, reqs),
         (cont_state, Vec::<AiRequest>::new(), Some(0usize)),
     );

@@ -18,12 +18,17 @@ $taskLauncherLibraryOnly = $LibraryOnly
 . (Join-Path $PSScriptRoot 'update-native-preview.ps1') -ManifestPath $ManifestPath -LibraryOnly
 $LibraryOnly = $taskLauncherLibraryOnly
 
-function Resolve-PreviewLaunch([string]$Path, [string]$OverrideExecutable, [switch]$ValidateOnly, [bool]$AppRunning = $false) {
+function Resolve-PreviewLaunch([string]$Path, [string]$OverrideExecutable, [switch]$ValidateOnly, [bool]$AppRunning = $false, [switch]$RequireControlPort) {
     if (-not [IO.Path]::IsPathRooted($Path)) { throw 'An absolute launcher manifest is required.' }
     $record = Read-UpdateJson $Path
     Assert-PreviewProtectedPaths $record
-    $port = 0
-    if (-not [int]::TryParse([string]$record.port, [ref]$port) -or $port -lt 1 -or $port -gt 65535) { throw 'Invalid preview control port.' }
+    $canonical = Test-IsCanonicalManifest $record $Path
+    $hasPort = ($null -ne $record.PSObject.Properties['port']) -and ($null -ne $record.port) -and (-not [string]::IsNullOrWhiteSpace([string]$record.port))
+    $controlConfigured = $RequireControlPort.IsPresent -or ($null -ne $record.PSObject.Properties['enable_control'] -and [bool]$record.enable_control)
+    if ($hasPort -or $controlConfigured -or (-not $canonical)) {
+        $port = 0
+        if (-not [int]::TryParse([string]$record.port, [ref]$port) -or $port -lt 1 -or $port -gt 65535) { throw 'Invalid preview control port.' }
+    }
     if (-not $ValidateOnly -and $AppRunning) { throw 'Smart Design is already open. Save your work and close that window before relaunching.' }
     if ($record.update_status -eq 'staged_waiting_for_app_close') {
         if ($OverrideExecutable) { throw 'An executable override cannot bypass a staged update.' }
@@ -48,9 +53,22 @@ function Get-PreviewUpdateTaskDefinition([string]$Path, [string]$TaskName = 'Sma
     if ($IntervalMinutes -lt 15 -or $IntervalMinutes -gt 1440) { throw 'Scheduled update interval must be between 15 and 1440 minutes.' }
     if ($ScriptName -notin @('update-native-preview.ps1', 'sync-upstream-local.ps1')) { throw 'Untrusted scheduled task script name.' }
     Resolve-PreviewLaunch $Path -ValidateOnly | Out-Null
-    $scriptFile = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $ScriptName))
-    $updater = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))
     $fullManifest = [IO.Path]::GetFullPath($Path)
+    $manifestDir = Split-Path $fullManifest -Parent
+    $manifestRecord = Read-UpdateJson $fullManifest
+    $canonical = Test-IsCanonicalManifest $manifestRecord $fullManifest
+    $adjacentUpdater = Join-Path $manifestDir 'update-native-preview.ps1'
+    $updater = if ($canonical -and (Test-Path -LiteralPath $adjacentUpdater -PathType Leaf)) {
+        [IO.Path]::GetFullPath($adjacentUpdater)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))
+    }
+    $adjacentTarget = Join-Path $manifestDir $ScriptName
+    $scriptFile = if ($canonical -and (Test-Path -LiteralPath $adjacentTarget -PathType Leaf)) {
+        [IO.Path]::GetFullPath($adjacentTarget)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $ScriptName))
+    }
     $powershellExe = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
     $arguments = '-NoProfile -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File ' + (Format-QuotedWinArg $scriptFile) + ' -ManifestPath ' + (Format-QuotedWinArg $fullManifest)
     if ($ScriptName -eq 'sync-upstream-local.ps1' -and $RepoPath) {
@@ -113,28 +131,46 @@ function Install-PreviewLauncherShortcuts([string]$Path, [string]$ShortcutDirect
 
 if ($LibraryOnly) { return }
 if ($ValidateOnly) {
-    $taskRecord = Resolve-PreviewLaunch $ManifestPath $ExecutablePath -ValidateOnly
+    $taskRecord = Resolve-PreviewLaunch $ManifestPath $ExecutablePath -ValidateOnly -RequireControlPort:$EnableControl
     $taskBook = if ($taskRecord.document_path) { $taskRecord.document_path } else { $taskRecord.repaired_native_book }
     $taskExecutable = if ($ExecutablePath) { $ExecutablePath } else { $taskRecord.executable }
-    $taskUseControl = $EnableControl.IsPresent -or ($taskRecord.PSObject.Properties['enable_control'] -and [bool]$taskRecord.enable_control)
+    $taskUseControl = $EnableControl.IsPresent -or ($null -ne $taskRecord.PSObject.Properties['enable_control'] -and [bool]$taskRecord.enable_control)
     [pscustomobject]@{profile=$taskRecord.profile; document=$taskBook; executable=$taskExecutable; port=$taskRecord.port; control_enabled=$taskUseControl; validation_only=$true}
     return
 }
 # Share the updater lock through promotion and process creation. A concurrent
 # update fails safely rather than overwriting a newly published pointer.
 if (-not [IO.Path]::IsPathRooted($ManifestPath) -or -not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw 'An existing absolute launcher manifest is required.' }
-$taskRoot = Join-Path (Split-Path $ManifestPath -Parent) 'managed-updates'
-[IO.Directory]::CreateDirectory($taskRoot) | Out-Null
+$taskInitialRecord = Read-UpdateJson $ManifestPath
+$taskCanonical = Test-IsCanonicalManifest $taskInitialRecord $ManifestPath
+$taskInstallDir = Split-Path ([IO.Path]::GetFullPath($ManifestPath)) -Parent
+$taskLockPath = if ($taskCanonical) {
+    Join-Path $taskInstallDir '.update.lock'
+} else {
+    $taskRoot = Join-Path $taskInstallDir 'managed-updates'
+    [IO.Directory]::CreateDirectory($taskRoot) | Out-Null
+    Join-Path $taskRoot 'update.lock'
+}
 $taskLock = $null
 try {
-    $taskLock = [IO.File]::Open((Join-Path $taskRoot 'update.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $taskLock = [IO.File]::Open($taskLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     $taskRecord = Read-UpdateJson $ManifestPath
+    $taskUseControl = $EnableControl.IsPresent -or ($null -ne $taskRecord.PSObject.Properties['enable_control'] -and [bool]$taskRecord.enable_control)
+    $taskHasPort = ($null -ne $taskRecord.PSObject.Properties['port']) -and ($null -ne $taskRecord.port) -and (-not [string]::IsNullOrWhiteSpace([string]$taskRecord.port))
     $taskPort = 0
-    if (-not [int]::TryParse([string]$taskRecord.port, [ref]$taskPort) -or $taskPort -lt 1 -or $taskPort -gt 65535) { throw 'Invalid preview control port.' }
-    $taskRunning = (Test-PreviewProcessRunning $taskRecord $ManifestPath) -or
-        ($null -ne (Get-NetTCPConnection -LocalPort $taskPort -State Listen -ErrorAction SilentlyContinue))
-    $taskRecord = Resolve-PreviewLaunch $ManifestPath $ExecutablePath -AppRunning:$taskRunning
-    $taskRecord | Add-Member -NotePropertyName update_script_path -NotePropertyValue ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))) -Force
+    if ($taskHasPort -or $taskUseControl -or (-not $taskCanonical)) {
+        if (-not [int]::TryParse([string]$taskRecord.port, [ref]$taskPort) -or $taskPort -lt 1 -or $taskPort -gt 65535) { throw 'Invalid preview control port.' }
+    }
+    $portListening = ($taskPort -ge 1) -and ($null -ne (Get-NetTCPConnection -LocalPort $taskPort -State Listen -ErrorAction SilentlyContinue))
+    $taskRunning = (Test-PreviewProcessRunning $taskRecord $ManifestPath) -or $portListening
+    $taskRecord = Resolve-PreviewLaunch $ManifestPath $ExecutablePath -AppRunning:$taskRunning -RequireControlPort:$taskUseControl
+    $adjacentUpdater = Join-Path $taskInstallDir 'update-native-preview.ps1'
+    $resolvedUpdater = if ($taskCanonical -and (Test-Path -LiteralPath $adjacentUpdater -PathType Leaf)) {
+        [IO.Path]::GetFullPath($adjacentUpdater)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'update-native-preview.ps1'))
+    }
+    $taskRecord | Add-Member -NotePropertyName update_script_path -NotePropertyValue $resolvedUpdater -Force
     Write-UpdateManifest $ManifestPath $taskRecord
     $taskExecutable = if ($ExecutablePath) { $ExecutablePath } else { $taskRecord.executable }
     $taskBook = if ($taskRecord.document_path) { $taskRecord.document_path } else { $taskRecord.repaired_native_book }
@@ -171,4 +207,9 @@ try {
     foreach ($taskField in $taskFields.GetEnumerator()) { $taskRecord | Add-Member -NotePropertyName $taskField.Key -NotePropertyValue $taskField.Value -Force }
     Write-UpdateManifest $ManifestPath $taskRecord
     $taskProcess
-} finally { if ($null -ne $taskLock) { $taskLock.Dispose() } }
+} finally {
+    if ($null -ne $taskLock) { $taskLock.Dispose() }
+    if ($taskCanonical -and (Test-Path -LiteralPath $taskLockPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $taskLockPath -Force -ErrorAction SilentlyContinue
+    }
+}

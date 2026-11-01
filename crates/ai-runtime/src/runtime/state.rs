@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    AiSettings, AiSnapshot, BTreeMap, BTreeSet, CredentialStatus, EngineAction, Instant, Path, PathBuf, PendingImageApproval, Prefs, ProductionDraft,
+    ProductionRunner, Provenance, ProviderKind, SecretString, SessionKey, SkillRegistry, TaskReport, TaskRequest, UsageLedger, Vault,
+    apply_execution_settings_to_draft, batch, file_access, read_json, validate_endpoint, validate_production_draft, validate_settings, worker,
+};
 
 pub(super) struct Pending {
     pub(super) roots: Option<std::sync::Arc<file_access::AutomationRoots>>,
@@ -36,7 +40,7 @@ impl ProductionRunner {
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         // Pin the host's private profile independently of command automation roots.
         // Every profile access resolves links against these canonical boundaries.
-        let profile_access = file_access::AutomationRoots::new(Some(&root), Some(&root))?.ok_or("Missing AI profile boundary")?;
+        let profile_access = file_access::AutomationRoots::new(&[root.as_path()], &[root.as_path()])?.ok_or("Missing AI profile boundary")?;
         let vault = Vault::for_profile(&root)?;
         let mut registry = SkillRegistry::open(root.join("skills")).map_err(|e| e.to_string())?;
         registry.install_builtin_drafts().map_err(|e| e.to_string())?;

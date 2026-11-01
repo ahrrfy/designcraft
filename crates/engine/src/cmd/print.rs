@@ -10,7 +10,7 @@ use crate::{Result, Session};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(query "file.preparePrint","Prepare Frozen Print",[],None,
-            "{printer?, copies?: 1, pages?: string | [n], spreads?: bool, marks?: bool | object, bleed?: bool, standard?: none|x4|a2b, scaling?: exact|shrinkToFit, duplex?: off|longEdge|shortEdge, grayscale?: bool, minPpi?: 150, created?: int} → {token, sha256, bytes, pages, manifest}; freezes one preflighted PDF with printer settings, replacing the previous artifact",has_doc,prepare_command),
+            "{printer?, copies?: 1, pages?: string | [n], spreads?: bool, marks?: bool | object, bleed?: bool, standard?: none|x4|x1a|a2b, scaling?: exact|shrinkToFit, duplex?: off|longEdge|shortEdge, grayscale?: bool, minPpi?: 150, created?: int, …the PDF settings of file.exportPdf} → {token, sha256, bytes, pages, manifest}; freezes one preflighted PDF with printer settings, replacing the previous artifact",has_doc,prepare_command),
         cmd!(noundo "file.printPrepared","Print Frozen PDF",[],None,
             "{token, dryRun?: bool} → submission evidence for the exact engine-owned PDF and frozen printer settings; no document re-export",super::always,print_prepared_command),
         cmd!(query "file.savePreparedPrint","Save Frozen Print PDF",[],None,
@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Print…",
             ["File"],
             Some("Cmd+P"),
-            "{printer?, copies?: 1, pages?: \"1-3,5\", spreads?, marks?, bleed?, standard?: none|x4|a2b, minPpi?: 150, scaling?: exact|shrinkToFit (default exact: preserve physical dimensions), duplex?: off|longEdge|shortEdge (default off), grayscale?: bool, dryRun?: bool (prepare and preview submission without printing), created?: int (Unix seconds, as file.exportPdf)} → {printer, copies, pages, scaling, duplex, grayscale, command, bytes, token, sha256, manifest}",
+            "{printer?, copies?: 1, pages?: \"1-3,5\", spreads?, marks?, bleed?, standard?: none|x4|x1a|a2b, minPpi?: 150, scaling?: exact|shrinkToFit (default exact: preserve physical dimensions), duplex?: off|longEdge|shortEdge (default off), grayscale?: bool, dryRun?: bool (prepare and preview submission without printing), created?: int, …the PDF settings of file.exportPdf} → {printer, copies, pages, scaling, duplex, grayscale, command, bytes, warnings, token, sha256, manifest}",
             has_doc,
             print
         ),
@@ -113,8 +113,32 @@ pub fn prepare(s: &Session, p: &Value) -> Result<PreparedPrint> {
 }
 
 fn prepare_with_printers(s: &Session, p: &Value, printers: impl FnOnce() -> Vec<craft_print::Printer>) -> Result<PreparedPrint> {
-    let allowed =
-        ["printer", "copies", "pages", "spreads", "marks", "bleed", "standard", "minPpi", "scaling", "duplex", "grayscale", "dryRun", "created"];
+    let allowed = [
+        "printer",
+        "copies",
+        "pages",
+        "spreads",
+        "marks",
+        "bleed",
+        "standard",
+        "minPpi",
+        "scaling",
+        "duplex",
+        "grayscale",
+        "dryRun",
+        "created",
+        "compressImages",
+        "title",
+        "author",
+        "tagged",
+        "media",
+        "flatten",
+        "advanceSeconds",
+        "fullScreen",
+        "bookmarksPanel",
+        "pageLayout",
+        "view",
+    ];
     let object = p.as_object().ok_or_else(|| bad("file.preparePrint", "parameters must be an object"))?;
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(bad("file.preparePrint", "unsupported preparation parameter"));
@@ -222,7 +246,7 @@ fn prepare_with_printers(s: &Session, p: &Value, printers: impl FnOnce() -> Vec<
     let color_state =
         json!({"rgb":color.rgb,"cmyk":color.cmyk,"intent":color.intent.id(),"blackPointCompensation":color.bpc,"blendSpace":d.settings.blend_space});
     let fonts = serde_json::to_value(super::fonts::used_fonts(d)).map_err(|e| bad("file.preparePrint", e.to_string()))?;
-    let pdf = super::export::pdf_report(s, p)?;
+    let pdf = super::export::pdf_export(s, p)?;
     if pdf.bytes.len() > 128 * 1024 * 1024 {
         return Err(bad("file.preparePrint", "prepared PDF exceeds 128 MiB"));
     }
@@ -336,7 +360,8 @@ fn submit_with(
         craft_print::Duplex::LongEdge => "longEdge",
         craft_print::Duplex::ShortEdge => "shortEdge",
     };
-    let out = json!({"printer": job.printer, "copies": job.copies, "pages": prepared.pages, "scaling": scaling_name, "duplex": duplex_name, "grayscale": job.grayscale, "dryRun": dry, "command": command, "bytes": prepared.bytes.len(),"token":prepared.token,"sha256":prepared.sha256,"manifest":prepared.manifest});
+    let warnings = prepared.manifest.get("pdf").and_then(|pdf| pdf.get("exportWarnings")).cloned().unwrap_or_else(|| json!([]));
+    let out = json!({"printer": job.printer, "copies": job.copies, "pages": prepared.pages, "scaling": scaling_name, "duplex": duplex_name, "grayscale": job.grayscale, "dryRun": dry, "command": command, "bytes": prepared.bytes.len(), "warnings": warnings, "token": prepared.token, "sha256": prepared.sha256, "manifest": prepared.manifest});
     if !dry {
         submit(&prepared.bytes, job).map_err(|e| bad("file.printPrepared", e.to_string()))?;
     }
@@ -359,7 +384,9 @@ mod tests {
             assert!(command.contains(&"fit-to-page=false"));
             assert!(command.contains(&"sides=one-sided"));
         } else {
-            assert_eq!(command[0], "powershell");
+            assert_eq!(&command[..4], ["xps-print", "printer=Office", "copies=2", "collate=true"]);
+            assert!(command.iter().any(|arg| arg.starts_with("duplex=")), "{command:?}");
+            assert!(command.iter().any(|arg| arg.starts_with("scaling=")), "{command:?}");
         }
         assert!(r["bytes"].as_u64().unwrap() > 500);
         assert!(s.execute("file.print", &json!({"pages": "9", "dryRun": true})).is_err());
@@ -372,11 +399,7 @@ mod tests {
         s.execute("file.new", &json!({"pages": 4})).unwrap();
         // A fixed creation date: both exports would otherwise take the clock's second.
         let params = json!({"printer": "Office (east)", "copies": 2, "pages": "2-3", "marks": true, "bleed": true, "created": 1_700_000_000});
-        let expected = {
-            let d = &s.doc().unwrap().doc;
-            let options = super::super::export::options(&params, d.page_count()).unwrap();
-            designcraft_pdf::export_pdf(&super::super::interchange::with_pdf_boxes(d), &s.cache, &options).unwrap()
-        };
+        let expected = super::super::export::pdf_export(&s, &params).unwrap().bytes;
         let r = print_with(&mut s, &params, |pdf, job| {
             // The production export options and full bytes reach the shared spooler boundary.
             assert_eq!(pdf, expected);
@@ -384,6 +407,7 @@ mod tests {
             assert_eq!(job.printer.as_deref(), Some("Office (east)"));
             assert_eq!(job.copies, 2);
             assert_eq!(job.duplex, Some(craft_print::Duplex::Off));
+            assert!(!job.grayscale);
             assert_eq!(job.scaling, craft_print::Scaling::Exact);
             assert!(!job.title.is_empty());
             Ok("request id is Office-1".into())
@@ -503,9 +527,10 @@ mod tests {
     fn default_queue_is_resolved_during_preparation_and_never_during_submission() {
         let mut s = Session::new();
         s.execute("file.new", &json!({})).unwrap();
-        let prepared =
-            prepare_with_printers(&s, &json!({}), || vec![craft_print::Printer { name: "Original default".into(), default: true, two_sided: None }])
-                .unwrap();
+        let prepared = prepare_with_printers(&s, &json!({}), || {
+            vec![craft_print::Printer { name: "Original default".into(), description: String::new(), default: true, two_sided: None }]
+        })
+        .unwrap();
         assert_eq!(prepared.manifest["job"]["printer"], "Original default");
         // The submit boundary receives the stored explicit queue, regardless of what a later
         // operating-system default would be; it has no access to a printer-discovery callback.
@@ -516,5 +541,36 @@ mod tests {
         .unwrap();
         assert!(prepare_with_printers(&s, &json!({}), Vec::new).is_err());
         prepare_with_printers(&s, &json!({"printer":"Explicit queue"}), || panic!("an explicit queue needs no discovery")).unwrap();
+    }
+
+    /// File › Print spools the PDF that File › Export PDF writes with the same settings: soft
+    /// effects as images, CMYK print color, the same warnings.
+    #[test]
+    fn print_spools_what_export_pdf_writes() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let id = s.execute("frame.create", &json!({"rect": [72, 72, 200, 200]})).unwrap()["id"].clone();
+        s.execute("object.fill", &json!({"ids": [id], "swatch": "C=100 M=0 Y=0 K=0"})).unwrap();
+        s.execute("object.dropShadow", &json!({"ids": [id], "on": true, "distance": 8, "size": 6})).unwrap();
+        let export_params = json!({"standard": "x4"});
+        let print_params = json!({"printer": "Office", "standard": "x4"});
+        // The creation date is in whole seconds: an attempt can straddle a second boundary.
+        let mut matched = false;
+        for _ in 0..3 {
+            let exported = s.execute("file.exportPdf", &export_params).unwrap();
+            let mut printed = Vec::new();
+            let r = print_with(&mut s, &print_params, |pdf, _| {
+                printed = pdf.to_vec();
+                Ok("request id is Office-1".into())
+            })
+            .unwrap();
+            assert_eq!(r["warnings"], exported["warnings"]);
+            assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("soft effects")), "{r}");
+            if printed == super::super::file::base64_decode(exported["base64"].as_str().unwrap()) {
+                matched = true;
+                break;
+            }
+        }
+        assert!(matched, "File › Print spools Export PDF's bytes");
     }
 }

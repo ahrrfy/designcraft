@@ -1,4 +1,5 @@
 use super::*;
+use designcraft_ai_types::protocol::*;
 
 #[test]
 fn ai23_native_only_ignores_unused_invalid_image_endpoint_in_settings_and_batch_admission() {
@@ -826,7 +827,7 @@ fn confined_requests_reject_external_paths_before_side_effects_or_workers() {
     let profile = tempfile::tempdir().unwrap();
     let allowed = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let roots = file_access::AutomationRoots::new(Some(allowed.path()), Some(allowed.path())).unwrap().unwrap();
+    let roots = file_access::AutomationRoots::new(&[allowed.path()], &[allowed.path()]).unwrap().unwrap();
     let mut runner = ProductionRunner::open(profile.path()).unwrap();
     let mut session = Session::new();
     let outside_path = outside.path().join("not-created").to_string_lossy().into_owned();
@@ -866,7 +867,7 @@ fn launch_retains_roots_when_completion_is_polled_unconfined() {
     let profile = tempfile::tempdir().unwrap();
     let allowed = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let roots = file_access::AutomationRoots::new(Some(allowed.path()), Some(allowed.path())).unwrap().unwrap();
+    let roots = file_access::AutomationRoots::new(&[allowed.path()], &[allowed.path()]).unwrap().unwrap();
     let mut runner = ProductionRunner::open(profile.path()).unwrap();
     let mut session = Session::new();
     session.execute("file.new", &new_a4(1)).unwrap();
@@ -914,10 +915,9 @@ fn launch_retains_roots_when_completion_is_polled_unconfined() {
     assert!(!outside.path().join("output").exists());
 }
 
-#[test]
-fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
-    let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _memory = crate::resources::TestAdmissionGuard::healthy();
+fn spawn_single_ollama_chat_mock(
+    reply: String,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<Result<String, String>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -929,19 +929,6 @@ fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
     let endpoint = format!("http://{}/", listener.local_addr().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let server_stop = stop.clone();
-    let plan = json!({
-        "title":"Local native production regression",
-        "commands":[
-            {"command":"frame.create","params":{"rect":[50,60,200,180],"content":"unassigned"}},
-            {"command":"object.label","params":{"ids":["$0.id"],"label":"integration.editable-frame"}}
-        ],
-        "images":[]
-    });
-    let reply = json!({
-        "done":true,"message":{"role":"assistant","content":plan.to_string()},
-        "prompt_eval_count":321,"eval_count":45,"prompt_eval_cached_count":17
-    })
-    .to_string();
     let server = std::thread::spawn(move || -> Result<String, String> {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut socket = loop {
@@ -985,6 +972,29 @@ fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
             .map_err(|error| error.to_string())?;
         String::from_utf8(bytes).map_err(|error| error.to_string())
     });
+    (endpoint, stop, server)
+}
+
+#[test]
+fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
+    let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+    use std::time::Duration;
+
+    let plan = json!({
+        "title":"Local native production regression",
+        "commands":[
+            {"command":"frame.create","params":{"rect":[50,60,200,180],"content":"unassigned"}},
+            {"command":"object.label","params":{"ids":["$0.id"],"label":"integration.editable-frame"}}
+        ],
+        "images":[]
+    });
+    let reply = json!({
+        "done":true,"message":{"role":"assistant","content":plan.to_string()},
+        "prompt_eval_count":321,"eval_count":45,"prompt_eval_cached_count":17
+    })
+    .to_string();
+    let (endpoint, stop, server) = spawn_single_ollama_chat_mock(reply);
 
     let dir = tempfile::tempdir().unwrap();
     let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -1032,6 +1042,18 @@ fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
     assert_eq!(submitted["options"]["num_predict"], 512);
     assert_eq!(submitted["format"]["properties"]["images"]["maxItems"], 0);
 
+    assert_ollama_published_trace_and_undo(&mut session, &previous, &snapshot, dir.path(), &plan);
+}
+
+fn assert_ollama_published_trace_and_undo(
+    session: &mut Session,
+    previous: &designcraft_engine::DocState,
+    snapshot: &designcraft_ai_types::protocol::AiSnapshot,
+    root: &std::path::Path,
+    plan: &Value,
+) {
+    use std::sync::Arc;
+
     assert_eq!(session.documents().len(), 2);
     assert_eq!(session.active_index(), Some(1));
     let retained = &session.documents()[0];
@@ -1049,7 +1071,20 @@ fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
     let item = generated.doc.spreads[0].items[0].id.0;
     let initial_x = generated.doc.spreads[0].items[0].bounds().x0;
 
-    let report = snapshot.reports.last().unwrap();
+    assert_ollama_report_and_trace_files(snapshot.reports.last().unwrap(), root, plan);
+
+    // A native command can still edit the generated item. Undoing that edit restores
+    // the single production undo step, which then removes both frame and label together.
+    session.execute("transform.move", &json!({"ids":[item],"dx":10,"dy":0})).unwrap();
+    assert_eq!(session.doc().unwrap().doc.spreads[0].items[0].bounds().x0, initial_x + 10.0);
+    session.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(session.doc().unwrap().history.undo.len(), 1);
+    session.execute("edit.undo", &json!({})).unwrap();
+    assert!(session.doc().unwrap().doc.spreads[0].items.is_empty());
+    assert!(Arc::ptr_eq(&session.documents()[0].doc, &previous.doc));
+}
+
+fn assert_ollama_report_and_trace_files(report: &TaskReport, root: &std::path::Path, plan: &Value) {
     assert_eq!(report.status, "completed");
     assert_eq!(report.provider, ProviderKind::Ollama);
     assert_eq!(report.model, "local-regression");
@@ -1062,26 +1097,16 @@ fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
     assert_eq!(report.usage.estimated_cost_usd, Some(0.0));
     assert!(!report.usage.has_unreported_usage);
     assert!(report.skills.is_empty());
-    let trace_path = dir.path().join("runs").join(format!("{}.json", report.id));
+    let trace_path = root.join("runs").join(format!("{}.json", report.id));
     assert!(report.artifacts.contains(&trace_path.to_string_lossy().into_owned()));
     let trace: Value = serde_json::from_slice(&std::fs::read(trace_path).unwrap()).unwrap();
     assert_eq!(trace["taskId"], report.id);
     assert_eq!(trace["base"]["newA4Pages"], 1);
-    assert_eq!(trace["plan"], plan);
-    let history: Vec<TaskReport> = serde_json::from_slice(&std::fs::read(dir.path().join("history.json")).unwrap()).unwrap();
+    assert_eq!(trace["plan"], *plan);
+    let history: Vec<TaskReport> = serde_json::from_slice(&std::fs::read(root.join("history.json")).unwrap()).unwrap();
     assert_eq!(history.last().unwrap().id, report.id);
     assert_eq!(history.last().unwrap().status, "completed");
     assert_eq!(history.last().unwrap().usage.input_tokens, 321);
-
-    // A native command can still edit the generated item. Undoing that edit restores
-    // the single production undo step, which then removes both frame and label together.
-    session.execute("transform.move", &json!({"ids":[item],"dx":10,"dy":0})).unwrap();
-    assert_eq!(session.doc().unwrap().doc.spreads[0].items[0].bounds().x0, initial_x + 10.0);
-    session.execute("edit.undo", &json!({})).unwrap();
-    assert_eq!(session.doc().unwrap().history.undo.len(), 1);
-    session.execute("edit.undo", &json!({})).unwrap();
-    assert!(session.doc().unwrap().doc.spreads[0].items.is_empty());
-    assert!(Arc::ptr_eq(&session.documents()[0].doc, &previous.doc));
 }
 
 #[test]

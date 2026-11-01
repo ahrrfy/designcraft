@@ -8,10 +8,11 @@ use std::fmt::Write as _;
 use designcraft_doc::{Document, FieldKind, FormField, Item, MediaOptions};
 
 use crate::export::Sheet;
-use crate::transitions::{int_after, object, rfind};
+use crate::transitions::{bracketed, int_after, object, rfind};
 
-/// A field placed on an output page: (page index, PDF rectangle, field).
-pub(crate) type Placed = (usize, [f64; 4], FormField);
+/// A field placed on an output page: (page index, PDF rectangle, field, border width, 0 when the
+/// item has no stroke).
+pub(crate) type Placed = (usize, [f64; 4], FormField, f64);
 
 /// A placed video or sound on an output page: (page index, PDF rectangle, file name, MIME type,
 /// bytes, options).
@@ -37,7 +38,8 @@ pub(crate) fn collect(doc: &Document, sheets: &[Sheet]) -> Vec<Placed> {
     let mut out = Vec::new();
     visit(doc, sheets, |pi, r, it| {
         if let Some(f) = &it.form_field {
-            out.push((pi, r, f.clone()));
+            let bw = if it.stroke.is_none() || !it.stroke.weight.is_finite() { 0.0 } else { it.stroke.weight };
+            out.push((pi, r, f.clone(), bw));
         }
     });
     out
@@ -54,6 +56,25 @@ pub(crate) fn collect_media(doc: &Document, sheets: &[Sheet]) -> Vec<PlacedMedia
         }
     });
     out
+}
+
+/// A PDF name's characters, with everything outside the regular set written `#xx`.
+///
+/// ISO 32000-1 7.3.5: a name may hold only the regular characters, and `#` introduces a two-digit
+/// hex escape. A media type comes from a placed file's own metadata, and only `/` was escaped, so
+/// a type holding a space, a delimiter or `#` -- `video/mp4;x=(a)` -- wrote a name that ends
+/// early and leaves the rest as stray tokens in the PDF's structure (#1582).
+fn pdf_name(s: &str) -> String {
+    let regular = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_' | b'~' | b'*' | b'@' | b'$' | b'&' | b'!' | b'^' | b'|');
+    let mut o = String::new();
+    for b in s.bytes() {
+        if regular(b) {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("#{b:02X}"));
+        }
+    }
+    o
 }
 
 /// A PDF text string: literal for ASCII, UTF-16BE otherwise.
@@ -77,18 +98,14 @@ fn pdf_string(s: &str) -> String {
     o
 }
 
-/// Body of a PDF Name object (without the leading `/`), with `#XX` escapes for non-graphic bytes,
-/// whitespace and PDF delimiters (`#`, `(`, `)`, `<`, `>`, `[`, `]`, `{`, `}`, `/`, `%`).
-fn pdf_name_body(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if !b.is_ascii_graphic() || b"#()<>[]{}/%".contains(&b) {
-            let _ = write!(out, "#{b:02X}");
-        } else {
-            out.push(char::from(b));
-        }
+/// A checkbox appearance's border: the item's stroke weight, inset by half of it so it stays
+/// inside the box; nothing for an unstroked item.
+fn checkbox_border(bw: f64, w: f64, h: f64) -> String {
+    if bw > 0.0 {
+        format!("0.45 G {bw:.2} w {i:.2} {i:.2} {:.2} {:.2} re S", (w - bw).max(0.0), (h - bw).max(0.0), i = bw / 2.0)
+    } else {
+        String::new()
     }
-    out
 }
 
 /// Add `fields` and `media` to `pdf` (page indices in output order). `None` when the file's
@@ -108,7 +125,7 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
     let pages_id = int_after(&cat, "/Pages")?;
     let pages = String::from_utf8_lossy(&pdf[object(pdf, pages_id)?]).to_string();
     let kids_str = &pages[pages.find("/Kids")? + 5..];
-    let kids_str = &kids_str[kids_str.find('[')? + 1..kids_str.find(']')?];
+    let kids_str = bracketed(kids_str)?;
     let nums: Vec<usize> = kids_str.split_whitespace().filter_map(|t| t.parse().ok()).collect();
     let kids: Vec<usize> = nums.chunks(2).map(|c| c[0]).collect();
 
@@ -131,7 +148,7 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
         let Some(&page_ref) = kids.get(*page) else { continue };
         let (file, spec, rendition, screen) = (next, next + 1, next + 2, next + 3);
         next += 4;
-        let mut body = format!("<</Type/EmbeddedFile/Subtype/{}/Length {}>>\nstream\n", pdf_name_body(mime), data.len()).into_bytes();
+        let mut body = format!("<</Type/EmbeddedFile/Subtype/{}/Length {}>>\nstream\n", pdf_name(mime), data.len()).into_bytes();
         body.extend_from_slice(data);
         body.extend_from_slice(b"\nendstream");
         put(&mut out, file, &body);
@@ -172,13 +189,14 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
         put(&mut out, font, b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica/Encoding/WinAnsiEncoding>>");
     }
     let mut all = Vec::new();
-    for (page, r, f) in fields {
+    for (page, r, f, bw) in fields {
         let Some(&page_ref) = kids.get(*page) else { continue };
         let rect = format!("[{:.2} {:.2} {:.2} {:.2}]", r[0], r[1], r[2], r[3]);
         let (w, h) = (r[2] - r[0], r[3] - r[1]);
         let fs = if f.font_size > 0.0 { f.font_size } else { 0.0 };
+        let (bc, bs) = if *bw > 0.0 { ("/BC[0.45 0.45 0.45]", format!("/BS<</W {bw:.2}>>")) } else { ("", "/BS<</W 0>>".to_string()) };
         let common = format!(
-            "/Type/Annot/Subtype/Widget/T{}/Rect{rect}/F 4/P {page_ref} 0 R/MK<</BC[0.45 0.45 0.45]/BG[1 1 1]>>/DA(/Helv {fs:.1} Tf 0 g)",
+            "/Type/Annot/Subtype/Widget/T{}/Rect{rect}/F 4/P {page_ref} 0 R/MK<<{bc}/BG[1 1 1]>>{bs}/DA(/Helv {fs:.1} Tf 0 g)",
             pdf_string(&f.name)
         );
         let req = if f.required { 2 } else { 0 };
@@ -189,7 +207,7 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
             }
             FieldKind::CheckBox => {
                 // Appearances: an empty box, and a box with a check mark.
-                let border = format!("0.45 G 1 w 0.5 0.5 {:.2} {:.2} re S", (w - 1.0).max(0.0), (h - 1.0).max(0.0));
+                let border = checkbox_border(*bw, w, h);
                 let check = format!(
                     "{border} 0 g {:.2} w 1 J 1 j {:.2} {:.2} m {:.2} {:.2} l {:.2} {:.2} l S",
                     (w.min(h) * 0.12).max(0.8),
@@ -274,12 +292,19 @@ pub(crate) fn add_fields(pdf: &[u8], fields: &[Placed], media: &[PlacedMedia]) -
 mod tests {
     use super::*;
 
+    /// A media type comes from a placed file's own metadata and was written into a PDF name with
+    /// only `/` escaped, so a type holding a delimiter ended the name early and left the rest as
+    /// tokens in the file's structure (#1582).
     #[test]
-    fn pdf_name_body_escapes_delimiters_whitespace_and_hash() {
-        assert_eq!(pdf_name_body("video/mp4"), "video#2Fmp4");
-        let hostile = "video/mp4>>/Launch(cmd)<< #%\n\x00";
-        let escaped = pdf_name_body(hostile);
-        assert_eq!(escaped, "video#2Fmp4#3E#3E#2FLaunch#28cmd#29#3C#3C#20#23#25#0A#00");
-        assert!(!escaped.bytes().any(|b| !b.is_ascii_graphic() || b"()<>[]{}/%".contains(&b)));
+    fn a_pdf_name_escapes_every_irregular_byte() {
+        assert_eq!(pdf_name("video/mp4"), "video#2Fmp4");
+        assert_eq!(pdf_name("a b"), "a#20b");
+        assert_eq!(pdf_name("x<</Type/Catalog>>"), "x#3C#3C#2FType#2FCatalog#3E#3E");
+        assert_eq!(pdf_name("a%comment"), "a#25comment");
+        assert_eq!(pdf_name("a#1"), "a#231");
+        assert_eq!(pdf_name("a(b)"), "a#28b#29");
+        assert_eq!(pdf_name("[1 0 R]"), "#5B1#200#20R#5D");
+        assert_eq!(pdf_name("application-x_test.v2"), "application-x_test.v2");
+        assert_eq!(pdf_name("\u{e9}"), "#C3#A9");
     }
 }

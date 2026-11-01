@@ -587,7 +587,7 @@ mod tests {
     fn permissions_and_invalid_keys_cannot_write_outside_the_cache() {
         let allowed = temporary_root();
         let outside = temporary_root();
-        let roots = file_access::AutomationRoots::new(Some(allowed.path()), Some(allowed.path())).unwrap().unwrap();
+        let roots = file_access::AutomationRoots::new(&[allowed.path()], &[allowed.path()]).unwrap().unwrap();
         file_access::confine(Some(&roots), || {
             assert!(store_plan(outside.path(), &key(), &plan()).is_err());
             assert!(load_plan(outside.path(), &key()).is_err());
@@ -597,7 +597,7 @@ mod tests {
             }
             store_plan(allowed.path(), &key(), &plan()).unwrap();
         });
-        let read_only = file_access::AutomationRoots::new(Some(allowed.path()), None).unwrap().unwrap();
+        let read_only = file_access::AutomationRoots::new(&[allowed.path()], &[]).unwrap().unwrap();
         file_access::confine(Some(&read_only), || assert!(store_plan(allowed.path(), &key(), &plan()).is_err()));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         assert!(store_plan(&allowed.path().join(".."), &key(), &plan()).is_err());

@@ -29,7 +29,9 @@ impl FamilyBuilder {
         Self { actions: Vec::new(), slots: Vec::new() }
     }
 
-    fn card(&mut self, rect: [f64; 4], fill_swatch: &str, fill_tint: f64, stroke_swatch: &str, stroke_tint: f64, weight: f64, label: &str) {
+    fn card(&mut self, rect: [f64; 4], fill: (&str, f64), stroke: (&str, f64, f64), label: &str) {
+        let (fill_swatch, fill_tint) = fill;
+        let (stroke_swatch, stroke_tint, weight) = stroke;
         let [x0, y0, x1, y1] = rect;
         let r = ((x1 - x0).min(y1 - y0) * 0.18).clamp(3.0, 8.0);
         let k = r * 0.552;
@@ -388,7 +390,7 @@ pub(crate) fn style_package() -> Result<PackageFiles> {
 
 fn build_cover() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 379.0, 74.0], BLOSSOM, 0.14, NAVY, 0.3, 0.7, "part.cover.ribbon");
+    b.card([40.0, 42.0, 379.0, 74.0], (BLOSSOM, 0.14), (NAVY, 0.3, 0.7), "part.cover.ribbon");
     b.slot(
         "edition-badge",
         "Top collection or seasonal edition badge",
@@ -400,7 +402,7 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         64,
     );
-    b.card([40.0, 82.0, 379.0, 174.0], "[Paper]", 1.0, ROSE, 0.4, 0.85, "part.cover.title-card");
+    b.card([40.0, 82.0, 379.0, 174.0], ("[Paper]", 1.0), (ROSE, 0.4, 0.85), "part.cover.title-card");
     b.slot(
         "book-title",
         "Main planner, journal, or notebook cover title",
@@ -424,7 +426,7 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         96,
     );
     b.graphic_slot_frame([56.0, 184.0, 363.0, 382.0], ROSE, "part.art.cover-emblem");
-    b.card([40.0, 392.0, 205.0, 434.0], SKY, 0.12, NAVY, 0.25, 0.6, "part.cover.pillar-1");
+    b.card([40.0, 392.0, 205.0, 434.0], (SKY, 0.12), (NAVY, 0.25, 0.6), "part.cover.pillar-1");
     b.slot(
         "pillar-1",
         "First planner feature highlight",
@@ -436,7 +438,7 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         56,
     );
-    b.card([214.0, 392.0, 379.0, 434.0], SAGE, 0.12, NAVY, 0.25, 0.6, "part.cover.pillar-2");
+    b.card([214.0, 392.0, 379.0, 434.0], (SAGE, 0.12), (NAVY, 0.25, 0.6), "part.cover.pillar-2");
     b.slot(
         "pillar-2",
         "Second planner feature highlight",
@@ -448,7 +450,7 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         56,
     );
-    b.card([40.0, 442.0, 379.0, 524.0], GOLD, 0.10, NAVY, 0.3, 0.7, "part.cover.owner-box");
+    b.card([40.0, 442.0, 379.0, 524.0], (GOLD, 0.10), (NAVY, 0.3, 0.7), "part.cover.owner-box");
     b.slot(
         "owner-line",
         "Personal ownership and year inscription",
@@ -489,7 +491,7 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 278.0, 92.0], BLOSSOM, 0.12, NAVY, 0.28, 0.65, "part.wheel.header");
+    b.card([40.0, 42.0, 278.0, 92.0], (BLOSSOM, 0.12), (NAVY, 0.28, 0.65), "part.wheel.header");
     b.slot(
         "page-title",
         "Front-matter or vision page heading",
@@ -521,7 +523,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
     b.rule([209.5, 120.0], [209.5, 304.0], NAVY, 0.28, 0.55, None);
     b.rule([144.5, 147.0], [274.5, 277.0], NAVY, 0.24, 0.5, None);
     b.rule([144.5, 277.0], [274.5, 147.0], NAVY, 0.24, 0.5, None);
-    b.card([40.0, 318.0, 205.0, 392.0], SAGE, 0.10, NAVY, 0.25, 0.6, "part.wheel.domain-1");
+    b.card([40.0, 318.0, 205.0, 392.0], (SAGE, 0.10), (NAVY, 0.25, 0.6), "part.wheel.domain-1");
     b.slot(
         "domain-1",
         "First two life/goal domains & target habit",
@@ -533,7 +535,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         96,
     );
-    b.card([214.0, 318.0, 379.0, 392.0], SKY, 0.10, NAVY, 0.25, 0.6, "part.wheel.domain-2");
+    b.card([214.0, 318.0, 379.0, 392.0], (SKY, 0.10), (NAVY, 0.25, 0.6), "part.wheel.domain-2");
     b.slot(
         "domain-2",
         "Second two life/goal domains & target habit",
@@ -545,7 +547,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         96,
     );
-    b.card([40.0, 400.0, 205.0, 474.0], ROSE, 0.10, NAVY, 0.25, 0.6, "part.wheel.domain-3");
+    b.card([40.0, 400.0, 205.0, 474.0], (ROSE, 0.10), (NAVY, 0.25, 0.6), "part.wheel.domain-3");
     b.slot(
         "domain-3",
         "Third two life/goal domains & target habit",
@@ -557,7 +559,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         96,
     );
-    b.card([214.0, 400.0, 379.0, 474.0], GOLD, 0.12, NAVY, 0.25, 0.6, "part.wheel.domain-4");
+    b.card([214.0, 400.0, 379.0, 474.0], (GOLD, 0.12), (NAVY, 0.25, 0.6), "part.wheel.domain-4");
     b.slot(
         "domain-4",
         "Fourth two life/goal domains & target habit",
@@ -569,7 +571,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         96,
     );
-    b.card([40.0, 482.0, 379.0, 526.0], BLOSSOM, 0.09, NAVY, 0.28, 0.6, "part.wheel.motto");
+    b.card([40.0, 482.0, 379.0, 526.0], (BLOSSOM, 0.09), (NAVY, 0.28, 0.6), "part.wheel.motto");
     b.slot(
         "guiding-word",
         "Personal word of the year or guiding compass",
@@ -599,7 +601,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 266.0, 96.0], ROSE, 0.13, NAVY, 0.3, 0.7, "part.month.banner");
+    b.card([40.0, 42.0, 266.0, 96.0], (ROSE, 0.13), (NAVY, 0.3, 0.7), "part.month.banner");
     b.slot(
         "month-name",
         "Month title and seasonal theme",
@@ -624,7 +626,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
     );
     b.graphic_slot_frame([274.0, 42.0, 379.0, 96.0], BLOSSOM, "part.art.monthly-header-art");
     // Calendar header strip + 5x7 calendar grid (x: 40..379, y: 104..364)
-    b.card([40.0, 104.0, 379.0, 128.0], NAVY, 0.88, NAVY, 0.9, 0.6, "part.month.weekdays");
+    b.card([40.0, 104.0, 379.0, 128.0], (NAVY, 0.88), (NAVY, 0.9, 0.6), "part.month.weekdays");
     b.slot(
         "weekdays-bar",
         "Seven weekday column labels",
@@ -636,7 +638,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
         "[Paper]",
         72,
     );
-    b.card([40.0, 130.0, 379.0, 360.0], "[Paper]", 1.0, NAVY, 0.3, 0.7, "part.month.grid");
+    b.card([40.0, 130.0, 379.0, 360.0], ("[Paper]", 1.0), (NAVY, 0.3, 0.7), "part.month.grid");
     let mut grid_lines = Vec::new();
     for col in 1..7 {
         let x = 40.0 + f64::from(col) * (339.0 / 7.0);
@@ -647,7 +649,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
         grid_lines.push([[40.0, y], [379.0, y]]);
     }
     b.rules(&grid_lines, NAVY, 0.18, 0.45);
-    b.card([40.0, 370.0, 205.0, 456.0], SAGE, 0.11, NAVY, 0.25, 0.6, "part.month.goals");
+    b.card([40.0, 370.0, 205.0, 456.0], (SAGE, 0.11), (NAVY, 0.25, 0.6), "part.month.goals");
     b.slot(
         "monthly-goals",
         "Top 3 monthly goals or intentions",
@@ -659,7 +661,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         110,
     );
-    b.card([214.0, 370.0, 379.0, 456.0], GOLD, 0.12, NAVY, 0.25, 0.6, "part.month.habits");
+    b.card([214.0, 370.0, 379.0, 456.0], (GOLD, 0.12), (NAVY, 0.25, 0.6), "part.month.habits");
     b.slot(
         "habit-rituals",
         "3 core monthly habits to cultivate",
@@ -671,7 +673,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         110,
     );
-    b.card([40.0, 464.0, 379.0, 526.0], SKY, 0.10, NAVY, 0.25, 0.6, "part.month.celebrate");
+    b.card([40.0, 464.0, 379.0, 526.0], (SKY, 0.10), (NAVY, 0.25, 0.6), "part.month.celebrate");
     b.slot(
         "month-reward",
         "Key dates, birthdays, and end-of-month celebration",
@@ -701,7 +703,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 282.0, 88.0], SKY, 0.14, NAVY, 0.28, 0.65, "part.week.header");
+    b.card([40.0, 42.0, 282.0, 88.0], (SKY, 0.14), (NAVY, 0.28, 0.65), "part.week.header");
     b.slot(
         "week-title",
         "Week number, season, and date span",
@@ -733,7 +735,7 @@ fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
         ("day-sun-reset", "Sunday reset & weekly prep", "Sunday Reset • Tidy space, meal prep & rest", [214.0, 206.0, 379.0, 308.0], GOLD),
     ];
     for (id, purpose, sample, rect, swatch) in cards {
-        b.card(rect, swatch, 0.09, NAVY, 0.25, 0.6, &format!("part.week.{id}"));
+        b.card(rect, (swatch, 0.09), (NAVY, 0.25, 0.6), &format!("part.week.{id}"));
         b.slot(id, purpose, sample, [rect[0] + 8.0, rect[1] + 6.0, rect[2] - 8.0, rect[3] - 48.0], 8.5, true, "left", NAVY, 96);
         b.rules(
             &[
@@ -745,7 +747,7 @@ fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
             0.45,
         );
     }
-    b.card([40.0, 318.0, 379.0, 422.0], "[Paper]", 1.0, NAVY, 0.28, 0.65, "part.week.priorities");
+    b.card([40.0, 318.0, 379.0, 422.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.week.priorities");
     b.slot(
         "top-three-week",
         "Weekly top-3 outcomes & habit tracker prompt",
@@ -759,7 +761,7 @@ fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
     );
     b.rule([48.0, 374.0], [371.0, 374.0], NAVY, 0.2, 0.5, None);
     b.rule([48.0, 398.0], [371.0, 398.0], NAVY, 0.2, 0.5, None);
-    b.card([40.0, 430.0, 379.0, 526.0], BLOSSOM, 0.08, NAVY, 0.25, 0.6, "part.week.gratitude");
+    b.card([40.0, 430.0, 379.0, 526.0], (BLOSSOM, 0.08), (NAVY, 0.25, 0.6), "part.week.gratitude");
     b.slot(
         "weekly-win",
         "Weekly gratitude, joy jar & reflection prompt",
@@ -790,7 +792,7 @@ fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 286.0, 88.0], ROSE, 0.12, NAVY, 0.28, 0.65, "part.daily.header");
+    b.card([40.0, 42.0, 286.0, 88.0], (ROSE, 0.12), (NAVY, 0.28, 0.65), "part.daily.header");
     b.slot(
         "day-header",
         "Day number, date/season label, and weekday",
@@ -816,7 +818,7 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
     b.graphic_slot_frame([294.0, 42.0, 379.0, 88.0], SAGE, "part.art.daily-botanical");
 
     // Left column: Top 3 Priorities + Micro-Joy (x: 40..204)
-    b.card([40.0, 96.0, 204.0, 250.0], GOLD, 0.11, NAVY, 0.26, 0.6, "part.daily.top3");
+    b.card([40.0, 96.0, 204.0, 250.0], (GOLD, 0.11), (NAVY, 0.26, 0.6), "part.daily.top3");
     b.slot(
         "priority-heading",
         "Top 3 Must-Do Focus Cards heading & prompt",
@@ -840,7 +842,7 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
         120,
     );
 
-    b.card([40.0, 258.0, 204.0, 386.0], BLOSSOM, 0.10, NAVY, 0.25, 0.6, "part.daily.microjoy");
+    b.card([40.0, 258.0, 204.0, 386.0], (BLOSSOM, 0.10), (NAVY, 0.25, 0.6), "part.daily.microjoy");
     b.slot(
         "micro-joy",
         "Unique daily micro-joy or mindfulness activity",
@@ -854,7 +856,7 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
     );
 
     // Right column: Time-Block Rhythm (x: 212..379, y: 96..386)
-    b.card([212.0, 96.0, 379.0, 386.0], "[Paper]", 1.0, NAVY, 0.28, 0.65, "part.daily.timeline");
+    b.card([212.0, 96.0, 379.0, 386.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.daily.timeline");
     b.slot(
         "schedule-heading",
         "Daily time-blocking column heading",
@@ -870,7 +872,7 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
     b.rules(&timeline, NAVY, 0.18, 0.45);
 
     // Bottom sanctuary: Gratitude + Evening Reflection + Wellness drops
-    b.card([40.0, 396.0, 379.0, 526.0], SAGE, 0.10, NAVY, 0.28, 0.65, "part.daily.gratitude");
+    b.card([40.0, 396.0, 379.0, 526.0], (SAGE, 0.10), (NAVY, 0.28, 0.65), "part.daily.gratitude");
     b.slot(
         "gratitude-prompt",
         "Unique evening gratitude & reflection question",
@@ -913,7 +915,7 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 379.0, 90.0], BLOSSOM, 0.14, NAVY, 0.3, 0.7, "part.escape.header");
+    b.card([40.0, 42.0, 379.0, 90.0], (BLOSSOM, 0.14), (NAVY, 0.3, 0.7), "part.escape.header");
     b.slot(
         "escape-title",
         "Entertainment, brain game, coloring, or bingo challenge title",
@@ -941,14 +943,14 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
     b.graphic_slot_frame([48.0, 98.0, 371.0, 272.0], BLOSSOM, "part.art.escape-canvas");
 
     // Lower 4x4 interactive Bingo / Mini-Sudoku / Challenge Grid (x: 40..232, y: 282..466) + Reflection Side Card
-    b.card([40.0, 282.0, 232.0, 466.0], "[Paper]", 1.0, NAVY, 0.32, 0.75, "part.escape.grid");
+    b.card([40.0, 282.0, 232.0, 466.0], ("[Paper]", 1.0), (NAVY, 0.32, 0.75), "part.escape.grid");
     for i in 1..4 {
         let x = 40.0 + f64::from(i) * (192.0 / 4.0);
         let y = 282.0 + f64::from(i) * (184.0 / 4.0);
         b.rule([x, 282.0], [x, 466.0], NAVY, 0.24, 0.55, None);
         b.rule([40.0, y], [232.0, y], NAVY, 0.24, 0.55, None);
     }
-    b.card([240.0, 282.0, 379.0, 466.0], GOLD, 0.12, NAVY, 0.28, 0.65, "part.escape.clues");
+    b.card([240.0, 282.0, 379.0, 466.0], (GOLD, 0.12), (NAVY, 0.28, 0.65), "part.escape.clues");
     b.slot(
         "challenge-prompts",
         "Clues, Happiness Bingo prompts, riddle, or 4-step doodle guide",
@@ -961,7 +963,7 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
         150,
     );
 
-    b.card([40.0, 474.0, 379.0, 526.0], SAGE, 0.11, NAVY, 0.26, 0.6, "part.escape.spark");
+    b.card([40.0, 474.0, 379.0, 526.0], (SAGE, 0.11), (NAVY, 0.26, 0.6), "part.escape.spark");
     b.slot(
         "creative-spark",
         "Takeaway spark, riddle hint, or mood check after completing the page",
@@ -991,7 +993,7 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 288.0, 88.0], SAGE, 0.13, NAVY, 0.28, 0.65, "part.notes.header");
+    b.card([40.0, 42.0, 288.0, 88.0], (SAGE, 0.13), (NAVY, 0.28, 0.65), "part.notes.header");
     b.slot(
         "notes-title",
         "Cornell / Dot-Grid studio topic heading",
@@ -1017,9 +1019,9 @@ fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
     b.graphic_slot_frame([296.0, 42.0, 379.0, 88.0], GOLD, "part.art.notes-motif");
 
     // Cue column (x: 40..136) + Main capture zone (x: 144..379), y: 96..444
-    b.card([40.0, 96.0, 136.0, 444.0], SKY, 0.08, NAVY, 0.25, 0.6, "part.notes.cues");
+    b.card([40.0, 96.0, 136.0, 444.0], (SKY, 0.08), (NAVY, 0.25, 0.6), "part.notes.cues");
     b.slot("cue-heading", "Left cue/questions column prompt", "Key Cues &\nQuestions", [46.0, 102.0, 130.0, 142.0], 8.5, true, "left", NAVY, 48);
-    b.card([144.0, 96.0, 379.0, 444.0], "[Paper]", 1.0, NAVY, 0.28, 0.65, "part.notes.body");
+    b.card([144.0, 96.0, 379.0, 444.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.notes.body");
     b.slot(
         "capture-heading",
         "Main notes & sketches column prompt",
@@ -1035,7 +1037,7 @@ fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
     b.rules(&capture_lines, NAVY, 0.16, 0.45);
 
     // Bottom synthesis summary
-    b.card([40.0, 452.0, 379.0, 526.0], GOLD, 0.11, NAVY, 0.28, 0.65, "part.notes.summary");
+    b.card([40.0, 452.0, 379.0, 526.0], (GOLD, 0.11), (NAVY, 0.28, 0.65), "part.notes.summary");
     b.slot(
         "summary-prompt",
         "Bottom Cornell synthesis & next action prompt",
@@ -1066,7 +1068,7 @@ fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 379.0, 86.0], ROSE, 0.14, NAVY, 0.28, 0.65, "part.scrap.header");
+    b.card([40.0, 42.0, 379.0, 86.0], (ROSE, 0.14), (NAVY, 0.28, 0.65), "part.scrap.header");
     b.slot(
         "scrapbook-title",
         "Monthly memory scrapbook or gallery heading",
@@ -1091,7 +1093,7 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
     );
 
     // Polaroid outer frame (x: 40..226, y: 96..344) + photo image_slot inside + caption strip
-    b.card([40.0, 96.0, 226.0, 344.0], "[Paper]", 1.0, NAVY, 0.35, 0.85, "part.scrap.polaroid");
+    b.card([40.0, 96.0, 226.0, 344.0], ("[Paper]", 1.0), (NAVY, 0.35, 0.85), "part.scrap.polaroid");
     b.graphic_slot_frame([50.0, 106.0, 216.0, 294.0], ROSE, "part.art.memory-photo");
     b.slot(
         "polaroid-caption",
@@ -1106,7 +1108,7 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
     );
 
     // Right keepsake cards (x: 236..379)
-    b.card([236.0, 96.0, 379.0, 216.0], GOLD, 0.12, NAVY, 0.25, 0.6, "part.scrap.favorites");
+    b.card([236.0, 96.0, 379.0, 216.0], (GOLD, 0.12), (NAVY, 0.25, 0.6), "part.scrap.favorites");
     b.slot(
         "favorites-box",
         "Book, film, song, or cafe of the month",
@@ -1118,7 +1120,7 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
         NAVY,
         120,
     );
-    b.card([236.0, 224.0, 379.0, 344.0], SKY, 0.11, NAVY, 0.25, 0.6, "part.scrap.lesson");
+    b.card([236.0, 224.0, 379.0, 344.0], (SKY, 0.11), (NAVY, 0.25, 0.6), "part.scrap.lesson");
     b.slot(
         "proud-moment",
         "Proudest win and lesson learned this month",
@@ -1132,7 +1134,7 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
     );
 
     // Bottom journaling & next month bridge
-    b.card([40.0, 354.0, 379.0, 526.0], BLOSSOM, 0.09, NAVY, 0.28, 0.65, "part.scrap.story");
+    b.card([40.0, 354.0, 379.0, 526.0], (BLOSSOM, 0.09), (NAVY, 0.28, 0.65), "part.scrap.story");
     b.slot(
         "memory-story",
         "Gratitude letter or story from the month",

@@ -55,11 +55,24 @@ fn cleanup_previous_canonical_binaries(exe_dir: &std::path::Path) {
     if !exe_dir.join("install-manifest.json").is_file() {
         return;
     }
-    for old_name in ["designcraft.exe.old", "designcraft-cli.exe.old", "SOURCE-COMMIT.txt.old", "BUILD-IDENTITY.txt.old"] {
+    const OLD_FILE_PREFIXES: &[&str] = &["designcraft.exe.old", "designcraft-cli.exe.old", "SOURCE-COMMIT.txt.old", "BUILD-IDENTITY.txt.old"];
+    const OLD_DIR_PREFIXES: &[&str] = &[".skills.old", ".font-licenses.old"];
+    for old_name in OLD_FILE_PREFIXES {
         let _ = std::fs::remove_file(exe_dir.join(old_name));
     }
-    for old_dir in [".skills.old", ".font-licenses.old"] {
+    for old_dir in OLD_DIR_PREFIXES {
         let _ = std::fs::remove_dir_all(exe_dir.join(old_dir));
+    }
+    if let Ok(entries) = std::fs::read_dir(exe_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else { continue };
+            if OLD_FILE_PREFIXES.iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'))) {
+                let _ = std::fs::remove_file(entry.path());
+            } else if OLD_DIR_PREFIXES.iter().any(|prefix| name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'))) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 }
 
@@ -218,6 +231,10 @@ pub(crate) struct PreviewUpdate {
     manifest_path: Option<PathBuf>,
     manifest: Option<Manifest>,
     exe_commit: Option<String>,
+    startup_check_pending: bool,
+    pending_notice_commit: Option<String>,
+    #[cfg(any(target_os = "windows", test))]
+    last_notified_commit: Option<String>,
     #[cfg(target_os = "windows")]
     fingerprint: Option<(SystemTime, u64)>,
     #[cfg(target_os = "windows")]
@@ -232,7 +249,73 @@ pub(crate) struct PreviewUpdate {
     manifest_error: Option<String>,
 }
 
+impl crate::DesignApp {
+    /// Enable one non-blocking verified update check against `ahrrfy/designcraft` when the
+    /// installed launcher manifest is present.
+    pub fn enable_preview_startup_check(&mut self) {
+        self.ui.ai.preview_update.enable_startup_check();
+    }
+}
+
 impl PreviewUpdate {
+    pub(crate) fn enable_startup_check(&mut self) {
+        self.startup_check_pending = true;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_configured(&mut self) -> bool {
+        if designcraft_engine::file_access::current().is_some() {
+            return false;
+        }
+        self.poll();
+        cfg!(target_os = "windows") && self.manifest_path.is_some() && self.manifest.is_some()
+    }
+
+    pub(crate) fn poll_background(&mut self, ctx: &egui::Context) -> bool {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = ctx;
+            false
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if designcraft_engine::file_access::current().is_some() {
+                return false;
+            }
+            if !self.initialized || self.startup_check_pending || self.is_running() {
+                self.poll();
+            }
+            if self.is_running() {
+                ctx.request_repaint_after(POLL_INTERVAL);
+            }
+            self.pending_notice_commit.is_some()
+        }
+    }
+
+    pub(crate) fn take_status_notice(&mut self, arabic: bool) -> Option<String> {
+        let commit = self.pending_notice_commit.take()?;
+        let short = short_commit(&commit);
+        Some(if arabic {
+            format!("تم تجهيز تحديث موثق ({short}) من المستودع — احفظ عملك وأعد تشغيل البرنامج لتفعيله بأمان.")
+        } else {
+            format!("Verified update ({short}) is ready — save your work and restart Smart Design to apply it safely.")
+        })
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn note_ready_commit(&mut self, commit: Option<&str>) {
+        let Some(commit) = commit.filter(|c| valid_commit(c)) else { return };
+        if self.last_notified_commit.as_deref() != Some(commit) {
+            self.last_notified_commit = Some(commit.to_owned());
+            self.pending_notice_commit = Some(commit.to_owned());
+        }
+    }
+
     #[cfg(any(target_os = "windows", test))]
     fn reserve(&self) -> Result<(), String> {
         self.running
@@ -252,11 +335,17 @@ impl PreviewUpdate {
 
     #[cfg(target_os = "windows")]
     fn poll(&mut self) {
+        if designcraft_engine::file_access::current().is_some() {
+            return;
+        }
         let completed = self.completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(completed) = completed {
             self.running.store(false, Ordering::Release);
             match completed {
                 Ok(result) => {
+                    if matches!(result.status.as_str(), "installed_for_next_launch" | "staged_waiting_for_app_close") {
+                        self.note_ready_commit(result.commit.as_deref());
+                    }
                     self.result = Some(result);
                     self.error = None;
                 }
@@ -295,6 +384,9 @@ impl PreviewUpdate {
                 }
             }
         }
+        if self.manifest_path.is_none() {
+            self.startup_check_pending = false;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = self.manifest_path.clone() {
             let loaded = (|| -> Result<Option<Manifest>, String> {
@@ -320,13 +412,19 @@ impl PreviewUpdate {
                         && manifest.staged()
                         && path.file_name().and_then(|n| n.to_str()) == Some("install-manifest.json")
                         && path.parent().is_some_and(|d| d.join(".staged-update").join("designcraft.exe").is_file());
+                    let should_startup_check =
+                        std::mem::take(&mut self.startup_check_pending) && designcraft_engine::file_access::current().is_none() && !manifest.staged();
+                    if manifest.staged() {
+                        self.note_ready_commit(manifest.staged_commit.as_deref());
+                    }
                     let script_path = manifest.script.clone();
                     self.manifest = Some(manifest);
                     self.manifest_error = None;
-                    if should_auto_promote && self.reserve().is_ok() {
+                    if (should_auto_promote || should_startup_check) && self.reserve().is_ok() {
                         let completion = self.completion.clone();
+                        let thread_name = if should_auto_promote { "preview-update-promote" } else { "preview-update-startup" };
                         if std::thread::Builder::new()
-                            .name("preview-update-promote".into())
+                            .name(thread_name.into())
                             .spawn(move || {
                                 let result = execute_updater(&path, &script_path);
                                 *completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
@@ -337,8 +435,27 @@ impl PreviewUpdate {
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if std::mem::take(&mut self.startup_check_pending)
+                        && let Some(manifest) = self.manifest.clone().filter(|m| !m.staged())
+                        && self.reserve().is_ok()
+                    {
+                        let completion = self.completion.clone();
+                        let script_path = manifest.script;
+                        if std::thread::Builder::new()
+                            .name("preview-update-startup".into())
+                            .spawn(move || {
+                                let result = execute_updater(&path, &script_path);
+                                *completion.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                            })
+                            .is_err()
+                        {
+                            self.running.store(false, Ordering::Release);
+                        }
+                    }
+                }
                 Err(error) => {
+                    self.startup_check_pending = false;
                     self.manifest = None;
                     self.manifest_error = Some(error);
                     self.result = None;
@@ -675,7 +792,7 @@ mod tests {
     #[test]
     fn ai24_preview_update_rejects_confined_automation_before_manifest_or_worker_access() {
         let directory = tempfile::tempdir().unwrap();
-        let roots = designcraft_engine::file_access::AutomationRoots::new(Some(directory.path()), None).unwrap();
+        let roots = designcraft_engine::file_access::AutomationRoots::new(&[directory.path()], &[]).unwrap();
         let mut state = super::PreviewUpdate::default();
         let error = designcraft_engine::file_access::confine(roots.as_ref(), || state.command(&json!({}))).unwrap_err();
         assert!(error.contains("automation confinement"));
@@ -783,9 +900,30 @@ mod tests {
         std::fs::write(canonical_dir.join("designcraft.exe.old"), b"old").unwrap();
         std::fs::write(canonical_dir.join("designcraft-cli.exe.old"), b"old").unwrap();
         assert_eq!(super::discover_adjacent_launcher_layout(&canonical_exe), (Some(ACTIVE.to_string()), Some(canonical_manifest)));
+        std::fs::write(canonical_dir.join("designcraft.exe.old.a1b2c3d4"), b"older").unwrap();
+        std::fs::write(canonical_dir.join("designcraft-cli.exe.old.a1b2c3d4"), b"older").unwrap();
+        std::fs::create_dir_all(canonical_dir.join(".skills.old.a1b2c3d4")).unwrap();
         super::cleanup_previous_canonical_binaries(&canonical_dir);
         assert!(!canonical_dir.join("designcraft.exe.old").exists());
         assert!(!canonical_dir.join("designcraft-cli.exe.old").exists());
+        assert!(!canonical_dir.join("designcraft.exe.old.a1b2c3d4").exists());
+        assert!(!canonical_dir.join("designcraft-cli.exe.old.a1b2c3d4").exists());
+        assert!(!canonical_dir.join(".skills.old.a1b2c3d4").exists());
+    }
+
+    #[test]
+    fn ai34_preview_update_status_notice_fires_once_per_commit_in_selected_language() {
+        let mut state = super::PreviewUpdate::default();
+        assert!(state.take_status_notice(false).is_none());
+        state.note_ready_commit(Some(STAGED));
+        let ar = state.take_status_notice(true).expect("first ready commit emits Arabic notice");
+        assert!(ar.contains("abcdef01"), "ar={ar}");
+        assert!(state.take_status_notice(true).is_none(), "notice must only fire once until commit changes");
+        state.note_ready_commit(Some(STAGED));
+        assert!(state.take_status_notice(false).is_none(), "duplicate commit must not re-spam notice");
+        state.note_ready_commit(Some(ACTIVE));
+        let en = state.take_status_notice(false).expect("newer commit emits fresh notice");
+        assert!(en.contains("01234567"), "en={en}");
     }
 
     #[cfg(target_os = "windows")]

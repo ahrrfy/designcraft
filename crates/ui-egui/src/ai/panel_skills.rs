@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    AiRequest, AiUiState, SkillCard, bidi_layouter, button, field, is_non_text_model, is_skill_scoped_error, label, named_rtl_text_edit, rtl,
+    sanitize_user_path, text,
+};
 
 pub(super) fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: bool, document: bool, requests: &mut Vec<AiRequest>) {
     ui.add_enabled_ui(available && !s.task_active(), |ui| {
@@ -202,12 +205,14 @@ pub(super) fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: b
             }
             label(ui, a, "SKILL.md — edits create a new draft", "SKILL.md — التعديل ينشئ مسودة جديدة");
             let mut skill_md_layouter = bidi_layouter(true);
-            rtl::show_text_edit(
+            named_rtl_text_edit(
                 ui,
                 egui::TextEdit::multiline(&mut s.skill_md).desired_rows(8).desired_width(f32::INFINITY).layouter(&mut skill_md_layouter),
+                "SKILL.md draft editor",
             );
             label(ui, a, "Manifest JSON", "ملف الوصف JSON");
-            ui.add(egui::TextEdit::multiline(&mut s.manifest_json).code_editor().desired_rows(5).desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::multiline(&mut s.manifest_json).code_editor().desired_rows(5).desired_width(f32::INFINITY))
+                .accessible_name("Manifest JSON editor");
             let clean = s.skill_md == r.skill_md && s.manifest_json == r.manifest_json;
             ui.horizontal_wrapped(|ui| {
                 if button(ui, a, "Save as draft", "حفظ كمسودة") {
@@ -268,19 +273,21 @@ pub(super) fn skills(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available: b
         );
         let skill_rtl = if s.skill_prompt.trim().is_empty() { a } else { rtl::has_rtl(&s.skill_prompt) };
         let mut skill_layouter = bidi_layouter(true);
-        rtl::show_text_edit(
+        named_rtl_text_edit(
             ui,
             egui::TextEdit::multiline(&mut s.skill_prompt)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
-                .horizontal_align(if skill_rtl { egui::Align::Max } else { egui::Align::Min })
+                .align(if skill_rtl { egui::Align2::RIGHT_TOP } else { egui::Align2::LEFT_TOP })
                 .layouter(&mut skill_layouter),
+            "Skill draft instructions input",
         );
         label(ui, a, "Reference paths (one per line)", "مسارات المراجع (مسار في كل سطر)");
         let mut references_layouter = bidi_layouter(true);
-        rtl::show_text_edit(
+        named_rtl_text_edit(
             ui,
             egui::TextEdit::multiline(&mut s.references).desired_rows(3).desired_width(f32::INFINITY).layouter(&mut references_layouter),
+            "Skill reference paths input",
         );
         ui.horizontal_wrapped(|ui| {
             let ready = !s.skill_prompt.trim().is_empty()

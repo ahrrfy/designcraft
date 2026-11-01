@@ -1,4 +1,4 @@
-use super::*;
+use super::{AiUiState, label, provider_name, rtl, text};
 
 pub(super) fn usage(ui: &mut egui::Ui, s: &AiUiState, a: bool) {
     label(

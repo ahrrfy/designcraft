@@ -496,7 +496,7 @@ mod tests {
     fn forbidden_output_root_is_rejected_before_audit_or_staging() {
         let allowed = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let roots = file_access::AutomationRoots::new(Some(allowed.path()), Some(allowed.path())).unwrap();
+        let roots = file_access::AutomationRoots::new(&[allowed.path()], &[allowed.path()]).unwrap();
         let mut session = Session::new();
         let result = file_access::confine(roots.as_ref(), || prepare(&mut session, &outside.path().join("forbidden.indd")));
         assert!(result.is_err());

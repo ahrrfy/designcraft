@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    AiSettings, Arc, AtomicBool, BTreeMap, BTreeSet, BatchScope, DocState, Engine, EngineAction, GeometryCheck, MAX_ACTIONS, MAX_GROUP_PLAN_BYTES,
+    MAX_PROOF_BYTES, MAX_PROOFS_BYTES, MAX_REVIEW_PAGES, ModelSelection, OutputMode, Prefs, ProductionPlan, ProofArtifact, ProviderKind, Session,
+    SkillSnapshot, TaskRequest, Value, batch_command, bounded_json, check_cancel, json, reference_source,
+};
 
 pub(super) fn model_needs_thinking_margin(selection: &ModelSelection) -> bool {
     let normalized = selection.model.trim().trim_start_matches("models/").to_ascii_lowercase();
@@ -517,6 +521,21 @@ pub(super) fn prepare_editorial_plan_with_mode(
     tashkeel_mode: designcraft_ai_types::ArabicTashkeelMode,
 ) -> Result<(), String> {
     let lower = prompt.to_lowercase();
+    if should_strip_arabic_vowels(prompt, &lower, context, tashkeel_mode)? {
+        strip_arabic_vowels_from_plan(plan);
+    }
+    if scope.is_none_or(|scope| scope.count < 2) || identical_layout_requested(&lower) {
+        return Ok(());
+    }
+    verify_non_repeated_body_layouts(plan, prompt)
+}
+
+fn should_strip_arabic_vowels(
+    prompt: &str,
+    lower: &str,
+    context: &Value,
+    tashkeel_mode: designcraft_ai_types::ArabicTashkeelMode,
+) -> Result<bool, String> {
     let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
     let explicit_removal = has(&[
         "ازل التشكيل",
@@ -599,129 +618,142 @@ pub(super) fn prepare_editorial_plan_with_mode(
     } else {
         explicitly_plain || (!prompt.chars().any(arabic_vowel_mark) && !context_has_vocalized_copy(context) && !has_vocalization_request)
     };
-    if plain {
-        plan.title.retain(|c| !arabic_vowel_mark(c));
-        let mut story_maps: BTreeMap<StoryKey, Vec<usize>> = BTreeMap::new();
-        let mut active_text_story: Option<StoryKey> = None;
-        for (idx, action) in plan.commands.iter_mut().enumerate() {
-            match action.command.as_str() {
-                "frame.create" if action.params.get("content").and_then(Value::as_str) == Some("text") => {
-                    if let Some(Value::String(text)) = action.params.get_mut("text") {
-                        if let Some(map) = strip_arabic_vowels_with_byte_map(text) {
-                            story_maps.insert(StoryKey::Step(idx), map);
-                        } else {
-                            story_maps.remove(&StoryKey::Step(idx));
-                        }
-                    }
-                    active_text_story =
-                        if action.params.get("caret").and_then(Value::as_bool) == Some(false) { None } else { Some(StoryKey::Step(idx)) };
+    Ok(plain)
+}
+
+fn strip_arabic_vowels_from_plan(plan: &mut ProductionPlan) {
+    plan.title.retain(|c| !arabic_vowel_mark(c));
+    let mut story_maps: BTreeMap<StoryKey, Vec<usize>> = BTreeMap::new();
+    let mut active_text_story: Option<StoryKey> = None;
+    for (idx, action) in plan.commands.iter_mut().enumerate() {
+        strip_arabic_vowels_in_action(idx, action, &mut story_maps, &mut active_text_story);
+    }
+}
+
+fn strip_arabic_vowels_in_action(
+    idx: usize,
+    action: &mut EngineAction,
+    story_maps: &mut BTreeMap<StoryKey, Vec<usize>>,
+    active_text_story: &mut Option<StoryKey>,
+) {
+    match action.command.as_str() {
+        "frame.create" if action.params.get("content").and_then(Value::as_str) == Some("text") => {
+            if let Some(Value::String(text)) = action.params.get_mut("text") {
+                if let Some(map) = strip_arabic_vowels_with_byte_map(text) {
+                    story_maps.insert(StoryKey::Step(idx), map);
+                } else {
+                    story_maps.remove(&StoryKey::Step(idx));
                 }
-                "story.setText" => {
-                    let key = resolve_story_key(action.params.get("story"), idx);
-                    let maybe_map =
-                        if let Some(Value::String(text)) = action.params.get_mut("text") { strip_arabic_vowels_with_byte_map(text) } else { None };
-                    if let Some(key) = key {
-                        if let Some(map) = maybe_map {
-                            story_maps.insert(key, map);
-                        } else {
-                            story_maps.remove(&key);
-                        }
-                    }
+            }
+            *active_text_story = if action.params.get("caret").and_then(Value::as_bool) == Some(false) { None } else { Some(StoryKey::Step(idx)) };
+        }
+        "story.setText" => {
+            let key = resolve_story_key(action.params.get("story"), idx);
+            let maybe_map =
+                if let Some(Value::String(text)) = action.params.get_mut("text") { strip_arabic_vowels_with_byte_map(text) } else { None };
+            if let Some(key) = key {
+                if let Some(map) = maybe_map {
+                    story_maps.insert(key, map);
+                } else {
+                    story_maps.remove(&key);
                 }
-                "text.thread" => {
-                    if let Some(from_str) = action.params.get("from").and_then(Value::as_str)
-                        && let Some(src) = reference_source(from_str, idx)
-                        && let Some(existing) = story_maps.get(&StoryKey::Step(src)).cloned()
+            }
+        }
+        "text.thread" => {
+            if let Some(from_str) = action.params.get("from").and_then(Value::as_str)
+                && let Some(src) = reference_source(from_str, idx)
+                && let Some(existing) = story_maps.get(&StoryKey::Step(src)).cloned()
+            {
+                story_maps.insert(StoryKey::Step(idx), existing);
+            }
+            *active_text_story = None;
+        }
+        "story.replaceRange" => {
+            remap_story_replace_range_vowels(idx, action, story_maps);
+        }
+        "text.select" => {
+            let key = resolve_story_key(action.params.get("story"), idx);
+            *active_text_story = key;
+            if let Some(map) = key.and_then(|k| story_maps.get(&k)) {
+                for field in ["anchor", "focus"] {
+                    if let Some(slot) = action.params.get_mut(field)
+                        && let Some(old_offset) = slot.as_u64()
                     {
-                        story_maps.insert(StoryKey::Step(idx), existing);
-                    }
-                    active_text_story = None;
-                }
-                "story.replaceRange" => {
-                    let key = resolve_story_key(action.params.get("story"), idx);
-                    let old_start = action.params.get("start").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok());
-                    let old_end = action.params.get("end").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok()).or(old_start);
-                    let orig_repl_len = action.params.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0);
-                    let repl_map = if let Some(Value::String(text)) = action.params.get_mut("text") {
-                        strip_arabic_vowels_with_byte_map(text).unwrap_or_else(|| (0..=text.len()).collect())
-                    } else {
-                        vec![0usize]
-                    };
-                    let stripped_repl_len = repl_map.last().copied().unwrap_or(0);
-                    if let Some(key) = key {
-                        if let Some(map) = story_maps.get(&key).cloned() {
-                            let map_offset = |pos: usize| map.get(pos).copied().unwrap_or_else(|| map.last().copied().unwrap_or(0));
-                            if let Some(s) = old_start {
-                                action.params["start"] = json!(map_offset(s));
-                            }
-                            if action.params.get("end").is_some()
-                                && let Some(e) = old_end
-                            {
-                                action.params["end"] = json!(map_offset(e));
-                            }
-                            if let (Some(s), Some(e)) = (old_start, old_end)
-                                && s <= e
-                                && e < map.len()
-                            {
-                                let mapped_start = map_offset(s);
-                                let mapped_end = map_offset(e);
-                                let mut next_map = Vec::with_capacity(s.saturating_add(orig_repl_len).saturating_add(map.len().saturating_sub(e)));
-                                if let Some(prefix) = map.get(..s) {
-                                    next_map.extend_from_slice(prefix);
-                                }
-                                for r in &repl_map {
-                                    next_map.push(mapped_start.saturating_add(*r));
-                                }
-                                if let Some(suffix) = map.get(e.saturating_add(1)..) {
-                                    for tail in suffix {
-                                        next_map.push(mapped_start.saturating_add(stripped_repl_len).saturating_add(tail.saturating_sub(mapped_end)));
-                                    }
-                                }
-                                story_maps.insert(key, next_map);
-                            } else {
-                                story_maps.remove(&key);
-                            }
-                        } else if orig_repl_len != stripped_repl_len {
-                            story_maps.remove(&key);
-                        }
-                    }
-                }
-                "text.select" => {
-                    let key = resolve_story_key(action.params.get("story"), idx);
-                    active_text_story = key;
-                    if let Some(map) = key.and_then(|k| story_maps.get(&k)) {
-                        for field in ["anchor", "focus"] {
-                            if let Some(slot) = action.params.get_mut(field)
-                                && let Some(old_offset) = slot.as_u64()
-                            {
-                                let mapped = usize::try_from(old_offset)
-                                    .ok()
-                                    .and_then(|pos| map.get(pos).copied())
-                                    .unwrap_or_else(|| map.last().copied().unwrap_or(0));
-                                *slot = json!(mapped);
-                            }
-                        }
-                    }
-                }
-                "text.insert" | "table.insert" => {
-                    if let Some(Value::String(text)) = action.params.get_mut("text") {
-                        text.retain(|c| !arabic_vowel_mark(c));
-                    }
-                    if let Some(key) = active_text_story {
-                        story_maps.remove(&key);
-                    }
-                }
-                _ => {
-                    if let Some(Value::String(text)) = action.params.get_mut("text") {
-                        text.retain(|c| !arabic_vowel_mark(c));
+                        let mapped = usize::try_from(old_offset)
+                            .ok()
+                            .and_then(|pos| map.get(pos).copied())
+                            .unwrap_or_else(|| map.last().copied().unwrap_or(0));
+                        *slot = json!(mapped);
                     }
                 }
             }
         }
+        "text.insert" | "table.insert" => {
+            if let Some(Value::String(text)) = action.params.get_mut("text") {
+                text.retain(|c| !arabic_vowel_mark(c));
+            }
+            if let Some(key) = *active_text_story {
+                story_maps.remove(&key);
+            }
+        }
+        _ => {
+            if let Some(Value::String(text)) = action.params.get_mut("text") {
+                text.retain(|c| !arabic_vowel_mark(c));
+            }
+        }
     }
-    if scope.is_none_or(|scope| scope.count < 2) || identical_layout_requested(&lower) {
-        return Ok(());
+}
+
+fn remap_story_replace_range_vowels(idx: usize, action: &mut EngineAction, story_maps: &mut BTreeMap<StoryKey, Vec<usize>>) {
+    let key = resolve_story_key(action.params.get("story"), idx);
+    let old_start = action.params.get("start").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok());
+    let old_end = action.params.get("end").and_then(Value::as_u64).and_then(|v| usize::try_from(v).ok()).or(old_start);
+    let orig_repl_len = action.params.get("text").and_then(Value::as_str).map(str::len).unwrap_or(0);
+    let repl_map = if let Some(Value::String(text)) = action.params.get_mut("text") {
+        strip_arabic_vowels_with_byte_map(text).unwrap_or_else(|| (0..=text.len()).collect())
+    } else {
+        vec![0usize]
+    };
+    let stripped_repl_len = repl_map.last().copied().unwrap_or(0);
+    let Some(key) = key else { return };
+    if let Some(map) = story_maps.get(&key).cloned() {
+        let map_offset = |pos: usize| map.get(pos).copied().unwrap_or_else(|| map.last().copied().unwrap_or(0));
+        if let Some(s) = old_start {
+            action.params["start"] = json!(map_offset(s));
+        }
+        if action.params.get("end").is_some()
+            && let Some(e) = old_end
+        {
+            action.params["end"] = json!(map_offset(e));
+        }
+        if let (Some(s), Some(e)) = (old_start, old_end)
+            && s <= e
+            && e < map.len()
+        {
+            let mapped_start = map_offset(s);
+            let mapped_end = map_offset(e);
+            let mut next_map = Vec::with_capacity(s.saturating_add(orig_repl_len).saturating_add(map.len().saturating_sub(e)));
+            if let Some(prefix) = map.get(..s) {
+                next_map.extend_from_slice(prefix);
+            }
+            for r in &repl_map {
+                next_map.push(mapped_start.saturating_add(*r));
+            }
+            if let Some(suffix) = map.get(e.saturating_add(1)..) {
+                for tail in suffix {
+                    next_map.push(mapped_start.saturating_add(stripped_repl_len).saturating_add(tail.saturating_sub(mapped_end)));
+                }
+            }
+            story_maps.insert(key, next_map);
+        } else {
+            story_maps.remove(&key);
+        }
+    } else if orig_repl_len != stripped_repl_len {
+        story_maps.remove(&key);
     }
+}
+
+fn verify_non_repeated_body_layouts(plan: &ProductionPlan, prompt: &str) -> Result<(), String> {
     let authored_layouts = crate::script_contract::authored_layout_signatures(prompt)?;
     let mut pages: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
     for action in &plan.commands {

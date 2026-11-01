@@ -1,4 +1,4 @@
-use super::*;
+use super::{Affine, AtomicBool, BTreeMap, DocState, ItemId, Ordering, ProductionPlan, Rect, TextPosition};
 
 pub(super) struct FittingObstacle {
     pub(super) id: ItemId,

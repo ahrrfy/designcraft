@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    AiRequest, AiSettings, AiSnapshot, ApprovalEvidence, EngineAction, Instant, MAX_BRIEF_BYTES, MAX_REPORTS, Ordering, Path, Pending,
+    PendingImageApproval, PendingImageRegen, ProductionRunner, Provenance, ProviderKind, SecretString, Session, SystemTime, TaskReport, TaskRequest,
+    TaskTarget, TryRecvError, UNIX_EPOCH, UsageSummary, Value, VisualDensityMode, apply_execution_settings_to_draft, batch, book_binding,
+    bounded_task_skills, compact_context, corrected_design_context, enrich_production_context, ensure_preflight, ensure_preflight_at,
+    ensure_publication_idle, file_access, initialize_facing_document, initialize_print_document, is_publication_temporarily_busy, json,
+    merge_pinned_and_automatic_skills, production_document_params, require_generation_models, require_text_model, science, selected_skill_references,
+    skill_is_compatible, supported_commands, task_document_context, validate_endpoint, validate_production_draft, validate_settings,
+    validate_skill_templates, worker, write_json,
+};
 
 impl ProductionRunner {
     pub fn handle(&mut self, session: &mut Session, request: AiRequest) -> AiSnapshot {
@@ -908,329 +917,344 @@ impl ProductionRunner {
                 report.message = "Skill generated as a draft; review instructions, native sample and output before approval".into();
             }
             worker::Product::Plan(plan) => {
-                let task = task.as_ref().ok_or("Production result has no originating task")?;
-                ensure_publication_idle(session)?;
-                if let Some(directory) = &task.export_directory {
-                    file_access::check_write(directory)?;
-                    for extension in ["designcraft", "pdf"] {
-                        file_access::check_write(Path::new(directory).join(format!("production-{}.{}", report.id, extension)))?;
-                    }
-                }
-                let previous_active = session.active_index();
-                let mut switched_tab = false;
-                if let Some((uid, revision)) = expected {
-                    let Some(target_index) = session.documents().iter().position(|doc| doc.uid == uid) else {
-                        return Err(
-                            "The document changed during generation; result was not applied. Run the task again against the current document".into(),
-                        );
-                    };
-                    let target = session.documents().get(target_index).ok_or("Target document disappeared")?;
-                    if target.interaction.is_some() || target.preview_stash.is_some() {
-                        return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
-                    }
-                    let doc_unchanged = match expected_doc {
-                        Some(pinned_doc) => std::sync::Arc::ptr_eq(&target.doc, pinned_doc),
-                        None => target.revision == revision,
-                    };
-                    if !doc_unchanged {
-                        return Err(
-                            "The document changed during generation; result was not applied. Run the task again against the current document".into(),
-                        );
-                    }
-                    if session.active_index() != Some(target_index) {
-                        session.set_active(target_index);
-                        switched_tab = true;
-                    }
-                }
-                let runs = self.root.join("runs");
-                self.profile_access.check(&runs, file_access::Access::Write)?;
-                std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
-                let trace = runs.join(format!("{}.json", report.id));
-                let (page_params, pinned_profile) = match task.target {
-                    TaskTarget::NewA4 { pages } => {
-                        let prof = self.pinned_design_profile(&report.skills)?;
-                        let params = production_document_params(prof.as_ref(), pages, &task.settings, &task.prompt)?;
-                        (Some(params), prof)
-                    }
-                    _ => (None, None),
-                };
-                let context = match task.target {
-                    TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
-                    TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages,"documentParams":page_params}),
-                };
-                if let Err(err) = write_json(
-                    &self.profile_access,
-                    &trace,
-                    &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"designStyle":report.design_style,"base":context,"plan":plan}),
-                ) {
-                    if switched_tab && let Some(index) = previous_active {
-                        session.set_active(index);
-                    }
-                    return Err(err);
-                }
-                report.artifacts.push(trace.to_string_lossy().into_owned());
-                let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
-                let min_ppi =
-                    crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
-                let mut created = false;
-                let published = (|| {
-                    if let Some(params) = page_params {
-                        session.execute("file.new", &params).map_err(|e| e.to_string())?;
-                        created = true;
-                        initialize_print_document(session, &task.prompt)?;
-                        crate::template_plan::initialize_relational_book_master(session, pinned_profile.as_ref(), &task.settings, &task.prompt)?;
-                        initialize_facing_document(session, &task.settings, &task.prompt)?;
-                        // Creation settings form the empty document's baseline.
-                        // Only the production edit belongs in the user's undo history.
-                        let baseline = session.doc_mut().map_err(|e| e.to_string())?;
-                        baseline.history.undo.clear();
-                        baseline.history.redo.clear();
-                    }
-                    let current = session.doc().map_err(|e| e.to_string())?;
-                    let mapped = if new_document && task.settings.facing_pages { Some(crate::facing_pages::map_plan(&plan, current)?) } else { None };
-                    let applied = mapped.as_ref().unwrap_or(&plan);
-                    let params = json!({"commands":applied.commands,"outputMode":task.settings.output_mode,"label":applied.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true,"minPpi":min_ppi});
-                    session.execute("production.apply", &params).map_err(|e| e.to_string())?;
-                    Ok::<_, String>((applied.commands.len(), applied.title.clone()))
-                })();
-                let (actions, title) = match published {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if created {
-                            session
-                                .execute("file.close", &json!({}))
-                                .map_err(|e| format!("{error}; could not close the failed new document: {e}"))?;
-                            if let Some(index) = previous_active {
-                                session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
-                            }
-                        } else if switched_tab && let Some(index) = previous_active {
-                            session.set_active(index);
-                        }
-                        return Err(error);
-                    }
-                };
-                report.actions = actions;
-                report.title = title;
-                if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
-                    self.print_contracts.insert(session.doc().map_err(|e| e.to_string())?.uid, contract);
-                }
-                let preflight = ensure_preflight_at(session, min_ppi)?;
-                report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
-                if let Some(directory) = &task.export_directory {
-                    file_access::check_write(directory)?;
-                    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-                    for (extension, command) in [("designcraft", "file.saveAs"), ("pdf", "file.exportPdf")] {
-                        let path = Path::new(directory).join(format!("production-{}.{}", report.id, extension));
-                        let args = if extension == "pdf" {
-                            match crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
-                                Some(contract) => contract.pdf_export_params(Some(path.to_str().ok_or("PDF export path is not valid Unicode")?))?,
-                                None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
-                            }
-                        } else {
-                            json!({"path":path})
-                        };
-                        session.execute(command, &args).map_err(|e| e.to_string())?;
-                        report.artifacts.push(path.to_string_lossy().into_owned());
-                    }
-                }
-                report.message = format!("Created {} editable native actions; {} preflight notices", report.actions, report.issues.len());
+                self.publish_plan_product(session, task, expected, expected_doc, plan, report)?;
             }
             worker::Product::Agentic { title, summary, chunks, deferred_images } => {
-                let task = task.as_ref().ok_or("Production result has no originating task")?;
-                ensure_publication_idle(session)?;
-                if let Some(directory) = &task.export_directory {
-                    file_access::check_write(directory)?;
-                    for extension in ["designcraft", "pdf"] {
-                        file_access::check_write(Path::new(directory).join(format!("production-{}.{}", report.id, extension)))?;
-                    }
-                }
-                let previous_active = session.active_index();
-                let mut switched_tab = false;
-                if let Some((uid, revision)) = expected {
-                    let Some(target_index) = session.documents().iter().position(|doc| doc.uid == uid) else {
-                        return Err(
-                            "The document changed during generation; result was not applied. Run the task again against the current document".into(),
-                        );
-                    };
-                    let target = session.documents().get(target_index).ok_or("Target document disappeared")?;
-                    if target.interaction.is_some() || target.preview_stash.is_some() {
-                        return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
-                    }
-                    let doc_unchanged = match expected_doc {
-                        Some(pinned_doc) => std::sync::Arc::ptr_eq(&target.doc, pinned_doc),
-                        None => target.revision == revision,
-                    };
-                    if !doc_unchanged {
-                        return Err(
-                            "The document changed during generation; result was not applied. Run the task again against the current document".into(),
-                        );
-                    }
-                    if session.active_index() != Some(target_index) {
-                        session.set_active(target_index);
-                        switched_tab = true;
-                    }
-                }
-                let runs = self.root.join("runs");
-                self.profile_access.check(&runs, file_access::Access::Write)?;
-                std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
-                let trace = runs.join(format!("{}.json", report.id));
-                let context = compact_context(session)?;
-                let deferred_count: usize = deferred_images.iter().map(|b| b.images.len()).sum();
-                if let Err(err) = write_json(
-                    &self.profile_access,
-                    &trace,
-                    &json!({
-                        "schemaVersion": 1,
-                        "taskId": report.id,
-                        "settings": task.settings,
-                        "skills": report.skills,
-                        "designStyle": report.design_style,
-                        "base": context,
-                        "agentic": {
-                            "title": &title,
-                            "summary": &summary,
-                            "chunks": &chunks,
-                            "deferredImageCount": deferred_count,
-                        }
-                    }),
-                ) {
-                    if switched_tab && let Some(index) = previous_active {
-                        session.set_active(index);
-                    }
-                    return Err(err);
-                }
-                report.artifacts.push(trace.to_string_lossy().into_owned());
-                let min_ppi =
-                    crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
-                let total_actions: usize = chunks.iter().map(Vec::len).sum();
-                let has_placed_images = chunks.iter().flatten().any(|a| matches!(a.command.as_str(), "frame.placeImage" | "file.place"));
-                let apply_mode = if has_placed_images { designcraft_ai_types::OutputMode::NativeWithImages } else { task.settings.output_mode };
-                let non_empty_chunks: Vec<&Vec<EngineAction>> = chunks.iter().filter(|c| !c.is_empty()).collect();
-                let published = (|| {
-                    if let [single] = non_empty_chunks.as_slice() {
-                        let current = session.doc().map_err(|e| e.to_string())?;
-                        let params = json!({
-                            "commands": single,
-                            "outputMode": apply_mode,
-                            "label": &title,
-                            "expectedDocumentUid": current.uid,
-                            "expectedRevision": current.revision,
-                            "requirePreflight": true,
-                            "minPpi": min_ppi,
-                        });
-                        session.execute("production.apply", &params).map_err(|e| e.to_string())?;
-                    } else if non_empty_chunks.len() >= 2 {
-                        let current = session.doc().map_err(|e| e.to_string())?;
-                        let group_chunks: Vec<Value> = non_empty_chunks
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, cmds)| json!({"commands": cmds, "label": format!("{} ({})", title, idx + 1)}))
-                            .collect();
-                        let params = json!({
-                            "chunks": group_chunks,
-                            "outputMode": apply_mode,
-                            "label": &title,
-                            "expectedDocumentUid": current.uid,
-                            "expectedRevision": current.revision,
-                            "requirePreflight": true,
-                            "minPpi": min_ppi,
-                        });
-                        session.execute("production.applyGroup", &params).map_err(|e| e.to_string())?;
-                    }
-                    Ok::<_, String>(())
-                })();
-                if let Err(error) = published {
-                    if switched_tab && let Some(index) = previous_active {
-                        session.set_active(index);
-                    }
-                    return Err(error);
-                }
-                report.actions = total_actions;
-                report.title = title;
-                if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
-                    self.print_contracts.insert(session.doc().map_err(|e| e.to_string())?.uid, contract);
-                }
-                let preflight = ensure_preflight_at(session, min_ppi)?;
-                report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
-                if let Some(directory) = &task.export_directory {
-                    file_access::check_write(directory)?;
-                    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-                    for (extension, command) in [("designcraft", "file.saveAs"), ("pdf", "file.exportPdf")] {
-                        let path = Path::new(directory).join(format!("production-{}.{}", report.id, extension));
-                        let args = if extension == "pdf" {
-                            match crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
-                                Some(contract) => contract.pdf_export_params(Some(path.to_str().ok_or("PDF export path is not valid Unicode")?))?,
-                                None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
-                            }
-                        } else {
-                            json!({"path":path})
-                        };
-                        session.execute(command, &args).map_err(|e| e.to_string())?;
-                        report.artifacts.push(path.to_string_lossy().into_owned());
-                    }
-                }
-                if !deferred_images.is_empty() && deferred_count > 0 {
-                    let current = session.doc().map_err(|e| e.to_string())?;
-                    let img_sel = if task.settings.image_model.provider == ProviderKind::ComfyUi || !task.settings.image_model.model.trim().is_empty()
-                    {
-                        &task.settings.image_model
-                    } else {
-                        &self.snapshot.settings.image_model
-                    };
-                    let estimated_cost_usd = if matches!(img_sel.provider, ProviderKind::ComfyUi | ProviderKind::Ollama) {
-                        Some(0.0)
-                    } else {
-                        task.settings
-                            .image_rates
-                            .as_ref()
-                            .or(self.snapshot.settings.image_rates.as_ref())
-                            .or(task.settings.budget.rates.as_ref())
-                            .and_then(|r| r.image_per_request.or(r.image_reserve_usd))
-                            .map(|unit| unit * (deferred_count as f64))
-                    };
-                    let style_profile = report.skills.iter().find_map(|(id, _)| self.registry.snapshot(id, &[]).ok().and_then(|s| s.design_profile));
-                    let joined_summary = deferred_images.iter().map(|b| b.summary.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" • ");
-                    let approval_summary = if joined_summary.is_empty() {
-                        format!("{deferred_count} damaged or composite illustrations ready to regenerate")
-                    } else {
-                        joined_summary
-                    };
-                    let approval = PendingImageApproval {
-                        job_id: report.id.clone(),
-                        document_uid: current.uid,
-                        count: deferred_count,
-                        provider: img_sel.provider,
-                        model: img_sel.model.clone(),
-                        estimated_cost_usd,
-                        summary: approval_summary,
-                    };
-                    self.pending_image_regen = Some(PendingImageRegen {
-                        approval: approval.clone(),
-                        task: task.clone(),
-                        skills: report.skills.clone(),
-                        style_profile,
-                        batches: deferred_images,
-                        min_ppi,
-                        expected_doc: current.doc.clone(),
-                    });
-                    self.snapshot.pending_image_approval = Some(approval);
-                    let lead = if summary.trim().is_empty() {
-                        format!("Applied {} editable native actions", report.actions)
-                    } else {
-                        summary.trim().to_string()
-                    };
-                    report.message = format!(
-                        "{lead} ({} actions; {} preflight notices). Confirm below to regenerate {deferred_count} illustration(s) via {:?}.",
-                        report.actions,
-                        report.issues.len(),
-                        img_sel.provider
-                    );
-                } else if summary.trim().is_empty() {
-                    report.message = format!("Applied {} editable native actions; {} preflight notices", report.actions, report.issues.len());
-                } else {
-                    report.message = format!("{} ({} native actions; {} preflight notices)", summary.trim(), report.actions, report.issues.len());
-                }
+                self.publish_agentic_product(session, task, expected, expected_doc, (title, summary, chunks, deferred_images), report)?;
             }
+        }
+        Ok(())
+    }
+
+    fn publish_plan_product(
+        &mut self,
+        session: &mut Session,
+        task: &Option<TaskRequest>,
+        expected: Option<(u64, u64)>,
+        expected_doc: Option<&std::sync::Arc<designcraft_engine::doc::Document>>,
+        plan: super::ProductionPlan,
+        report: &mut TaskReport,
+    ) -> Result<(), String> {
+        let task = task.as_ref().ok_or("Production result has no originating task")?;
+        ensure_publication_idle(session)?;
+        if let Some(directory) = &task.export_directory {
+            file_access::check_write(directory)?;
+            for extension in ["designcraft", "pdf"] {
+                file_access::check_write(Path::new(directory).join(format!("production-{}.{}", report.id, extension)))?;
+            }
+        }
+        let previous_active = session.active_index();
+        let mut switched_tab = false;
+        if let Some((uid, revision)) = expected {
+            let Some(target_index) = session.documents().iter().position(|doc| doc.uid == uid) else {
+                return Err("The document changed during generation; result was not applied. Run the task again against the current document".into());
+            };
+            let target = session.documents().get(target_index).ok_or("Target document disappeared")?;
+            if target.interaction.is_some() || target.preview_stash.is_some() {
+                return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
+            }
+            let doc_unchanged = match expected_doc {
+                Some(pinned_doc) => std::sync::Arc::ptr_eq(&target.doc, pinned_doc),
+                None => target.revision == revision,
+            };
+            if !doc_unchanged {
+                return Err("The document changed during generation; result was not applied. Run the task again against the current document".into());
+            }
+            if session.active_index() != Some(target_index) {
+                session.set_active(target_index);
+                switched_tab = true;
+            }
+        }
+        let runs = self.root.join("runs");
+        self.profile_access.check(&runs, file_access::Access::Write)?;
+        std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
+        let trace = runs.join(format!("{}.json", report.id));
+        let (page_params, pinned_profile) = match task.target {
+            TaskTarget::NewA4 { pages } => {
+                let prof = self.pinned_design_profile(&report.skills)?;
+                let params = production_document_params(prof.as_ref(), pages, &task.settings, &task.prompt)?;
+                (Some(params), prof)
+            }
+            _ => (None, None),
+        };
+        let context = match task.target {
+            TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
+            TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages,"documentParams":page_params}),
+        };
+        if let Err(err) = write_json(
+            &self.profile_access,
+            &trace,
+            &json!({"schemaVersion":1,"taskId":report.id,"settings":task.settings,"skills":report.skills,"designStyle":report.design_style,"base":context,"plan":plan}),
+        ) {
+            if switched_tab && let Some(index) = previous_active {
+                session.set_active(index);
+            }
+            return Err(err);
+        }
+        report.artifacts.push(trace.to_string_lossy().into_owned());
+        let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
+        let min_ppi = crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+        let mut created = false;
+        let published = (|| {
+            if let Some(params) = page_params {
+                session.execute("file.new", &params).map_err(|e| e.to_string())?;
+                created = true;
+                initialize_print_document(session, &task.prompt)?;
+                crate::template_plan::initialize_relational_book_master(session, pinned_profile.as_ref(), &task.settings, &task.prompt)?;
+                initialize_facing_document(session, &task.settings, &task.prompt)?;
+                // Creation settings form the empty document's baseline.
+                // Only the production edit belongs in the user's undo history.
+                let baseline = session.doc_mut().map_err(|e| e.to_string())?;
+                baseline.history.undo.clear();
+                baseline.history.redo.clear();
+            }
+            let current = session.doc().map_err(|e| e.to_string())?;
+            let mapped = if new_document && task.settings.facing_pages { Some(crate::facing_pages::map_plan(&plan, current)?) } else { None };
+            let applied = mapped.as_ref().unwrap_or(&plan);
+            let params = json!({"commands":applied.commands,"outputMode":task.settings.output_mode,"label":applied.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true,"minPpi":min_ppi});
+            session.execute("production.apply", &params).map_err(|e| e.to_string())?;
+            Ok::<_, String>((applied.commands.len(), applied.title.clone()))
+        })();
+        let (actions, title) = match published {
+            Ok(value) => value,
+            Err(error) => {
+                if created {
+                    session.execute("file.close", &json!({})).map_err(|e| format!("{error}; could not close the failed new document: {e}"))?;
+                    if let Some(index) = previous_active {
+                        session.execute("file.activate", &json!({"index":index})).map_err(|e| e.to_string())?;
+                    }
+                } else if switched_tab && let Some(index) = previous_active {
+                    session.set_active(index);
+                }
+                return Err(error);
+            }
+        };
+        report.actions = actions;
+        report.title = title;
+        self.finalize_published_artifacts(session, task, min_ppi, report)?;
+        report.message = format!("Created {} editable native actions; {} preflight notices", report.actions, report.issues.len());
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn publish_agentic_product(
+        &mut self,
+        session: &mut Session,
+        task: &Option<TaskRequest>,
+        expected: Option<(u64, u64)>,
+        expected_doc: Option<&std::sync::Arc<designcraft_engine::doc::Document>>,
+        agentic: (String, String, Vec<Vec<EngineAction>>, Vec<crate::doc_tools::DeferredImagePlan>),
+        report: &mut TaskReport,
+    ) -> Result<(), String> {
+        let (title, summary, chunks, deferred_images) = agentic;
+        let task = task.as_ref().ok_or("Production result has no originating task")?;
+        ensure_publication_idle(session)?;
+        if let Some(directory) = &task.export_directory {
+            file_access::check_write(directory)?;
+            for extension in ["designcraft", "pdf"] {
+                file_access::check_write(Path::new(directory).join(format!("production-{}.{}", report.id, extension)))?;
+            }
+        }
+        let previous_active = session.active_index();
+        let mut switched_tab = false;
+        if let Some((uid, revision)) = expected {
+            let Some(target_index) = session.documents().iter().position(|doc| doc.uid == uid) else {
+                return Err("The document changed during generation; result was not applied. Run the task again against the current document".into());
+            };
+            let target = session.documents().get(target_index).ok_or("Target document disappeared")?;
+            if target.interaction.is_some() || target.preview_stash.is_some() {
+                return Err("Finish the current interaction, IME composition or preview before publishing AI production".into());
+            }
+            let doc_unchanged = match expected_doc {
+                Some(pinned_doc) => std::sync::Arc::ptr_eq(&target.doc, pinned_doc),
+                None => target.revision == revision,
+            };
+            if !doc_unchanged {
+                return Err("The document changed during generation; result was not applied. Run the task again against the current document".into());
+            }
+            if session.active_index() != Some(target_index) {
+                session.set_active(target_index);
+                switched_tab = true;
+            }
+        }
+        let runs = self.root.join("runs");
+        self.profile_access.check(&runs, file_access::Access::Write)?;
+        std::fs::create_dir_all(&runs).map_err(|e| e.to_string())?;
+        let trace = runs.join(format!("{}.json", report.id));
+        let context = compact_context(session)?;
+        let deferred_count: usize = deferred_images.iter().map(|b| b.images.len()).sum();
+        if let Err(err) = write_json(
+            &self.profile_access,
+            &trace,
+            &json!({
+                "schemaVersion": 1,
+                "taskId": report.id,
+                "settings": task.settings,
+                "skills": report.skills,
+                "designStyle": report.design_style,
+                "base": context,
+                "agentic": {
+                    "title": &title,
+                    "summary": &summary,
+                    "chunks": &chunks,
+                    "deferredImageCount": deferred_count,
+                }
+            }),
+        ) {
+            if switched_tab && let Some(index) = previous_active {
+                session.set_active(index);
+            }
+            return Err(err);
+        }
+        report.artifacts.push(trace.to_string_lossy().into_owned());
+        let min_ppi = crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+        let total_actions: usize = chunks.iter().map(Vec::len).sum();
+        let has_placed_images = chunks.iter().flatten().any(|a| matches!(a.command.as_str(), "frame.placeImage" | "file.place"));
+        let apply_mode = if has_placed_images { designcraft_ai_types::OutputMode::NativeWithImages } else { task.settings.output_mode };
+        let non_empty_chunks: Vec<&Vec<EngineAction>> = chunks.iter().filter(|c| !c.is_empty()).collect();
+        let published = (|| {
+            if let [single] = non_empty_chunks.as_slice() {
+                let current = session.doc().map_err(|e| e.to_string())?;
+                let params = json!({
+                    "commands": single,
+                    "outputMode": apply_mode,
+                    "label": &title,
+                    "expectedDocumentUid": current.uid,
+                    "expectedRevision": current.revision,
+                    "requirePreflight": true,
+                    "minPpi": min_ppi,
+                });
+                session.execute("production.apply", &params).map_err(|e| e.to_string())?;
+            } else if non_empty_chunks.len() >= 2 {
+                let current = session.doc().map_err(|e| e.to_string())?;
+                let group_chunks: Vec<Value> = non_empty_chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, cmds)| json!({"commands": cmds, "label": format!("{} ({})", title, idx + 1)}))
+                    .collect();
+                let params = json!({
+                    "chunks": group_chunks,
+                    "outputMode": apply_mode,
+                    "label": &title,
+                    "expectedDocumentUid": current.uid,
+                    "expectedRevision": current.revision,
+                    "requirePreflight": true,
+                    "minPpi": min_ppi,
+                });
+                session.execute("production.applyGroup", &params).map_err(|e| e.to_string())?;
+            }
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = published {
+            if switched_tab && let Some(index) = previous_active {
+                session.set_active(index);
+            }
+            return Err(error);
+        }
+        report.actions = total_actions;
+        report.title = title;
+        self.finalize_published_artifacts(session, task, min_ppi, report)?;
+        self.record_deferred_image_regen(session, task, &summary, (deferred_images, deferred_count), min_ppi, report)
+    }
+
+    fn finalize_published_artifacts(
+        &mut self,
+        session: &mut Session,
+        task: &TaskRequest,
+        min_ppi: f64,
+        report: &mut TaskReport,
+    ) -> Result<(), String> {
+        if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+            self.print_contracts.insert(session.doc().map_err(|e| e.to_string())?.uid, contract);
+        }
+        let preflight = ensure_preflight_at(session, min_ppi)?;
+        report.issues.extend(preflight.get("issues").and_then(Value::as_array).into_iter().flatten().cloned());
+        if let Some(directory) = &task.export_directory {
+            file_access::check_write(directory)?;
+            std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+            for (extension, command) in [("designcraft", "file.saveAs"), ("pdf", "file.exportPdf")] {
+                let path = Path::new(directory).join(format!("production-{}.{}", report.id, extension));
+                let args = if extension == "pdf" {
+                    match crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
+                        Some(contract) => contract.pdf_export_params(Some(path.to_str().ok_or("PDF export path is not valid Unicode")?))?,
+                        None => json!({"path":path,"spreads":false,"bleed":false,"marks":false}),
+                    }
+                } else {
+                    json!({"path":path})
+                };
+                session.execute(command, &args).map_err(|e| e.to_string())?;
+                report.artifacts.push(path.to_string_lossy().into_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn record_deferred_image_regen(
+        &mut self,
+        session: &Session,
+        task: &TaskRequest,
+        summary: &str,
+        deferred: (Vec<crate::doc_tools::DeferredImagePlan>, usize),
+        min_ppi: f64,
+        report: &mut TaskReport,
+    ) -> Result<(), String> {
+        let (deferred_images, deferred_count) = deferred;
+        if !deferred_images.is_empty() && deferred_count > 0 {
+            let current = session.doc().map_err(|e| e.to_string())?;
+            let img_sel = if task.settings.image_model.provider == ProviderKind::ComfyUi || !task.settings.image_model.model.trim().is_empty() {
+                &task.settings.image_model
+            } else {
+                &self.snapshot.settings.image_model
+            };
+            let estimated_cost_usd = if matches!(img_sel.provider, ProviderKind::ComfyUi | ProviderKind::Ollama) {
+                Some(0.0)
+            } else {
+                task.settings
+                    .image_rates
+                    .as_ref()
+                    .or(self.snapshot.settings.image_rates.as_ref())
+                    .or(task.settings.budget.rates.as_ref())
+                    .and_then(|r| r.image_per_request.or(r.image_reserve_usd))
+                    .map(|unit| unit * (deferred_count as f64))
+            };
+            let style_profile = report.skills.iter().find_map(|(id, _)| self.registry.snapshot(id, &[]).ok().and_then(|s| s.design_profile));
+            let joined_summary = deferred_images.iter().map(|b| b.summary.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" • ");
+            let approval_summary = if joined_summary.is_empty() {
+                format!("{deferred_count} damaged or composite illustrations ready to regenerate")
+            } else {
+                joined_summary
+            };
+            let approval = PendingImageApproval {
+                job_id: report.id.clone(),
+                document_uid: current.uid,
+                count: deferred_count,
+                provider: img_sel.provider,
+                model: img_sel.model.clone(),
+                estimated_cost_usd,
+                summary: approval_summary,
+            };
+            self.pending_image_regen = Some(PendingImageRegen {
+                approval: approval.clone(),
+                task: task.clone(),
+                skills: report.skills.clone(),
+                style_profile,
+                batches: deferred_images,
+                min_ppi,
+                expected_doc: current.doc.clone(),
+            });
+            self.snapshot.pending_image_approval = Some(approval);
+            let lead =
+                if summary.trim().is_empty() { format!("Applied {} editable native actions", report.actions) } else { summary.trim().to_string() };
+            report.message = format!(
+                "{lead} ({} actions; {} preflight notices). Confirm below to regenerate {deferred_count} illustration(s) via {:?}.",
+                report.actions,
+                report.issues.len(),
+                img_sel.provider
+            );
+        } else if summary.trim().is_empty() {
+            report.message = format!("Applied {} editable native actions; {} preflight notices", report.actions, report.issues.len());
+        } else {
+            report.message = format!("{} ({} native actions; {} preflight notices)", summary.trim(), report.actions, report.issues.len());
         }
         Ok(())
     }

@@ -49,7 +49,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     }
     let t = Tokens::get(ctx);
     let mut open: Option<&'static str> = None;
-    let area = egui::Id::new("about");
+    let area = egui::Id::unique("about");
     let instance = area.with("placement");
     let resp = crate::modal_drag::modal(ctx, area, instance).show(ctx, |ui| {
         ui.set_width(if app.ui.about_tab == 0 { 460.0 } else { 640.0 });

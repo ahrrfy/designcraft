@@ -1,5 +1,10 @@
 //! Human-gated book production. Persisted snapshots are evidence, never resumable authority.
-use super::*;
+use super::{
+    AiSettings, BatchReport, BatchSnapshot, ExecutionPacing, Instant, MAX_REPORTS, Ordering, Path, Pending, ProductionPlan, ProductionRunner,
+    Session, SystemTime, TaskReport, TaskRequest, TaskTarget, UNIX_EPOCH, UsageLedger, UsageSummary, Value, book_binding, compact_context,
+    enrich_production_context, ensure_publication_idle, file_access, initialize_print_document, json, production_document_params, read_json,
+    task_document_context, worker, write_json, write_profile,
+};
 use designcraft_ai_skills::SkillSnapshot;
 use designcraft_engine::{DocState, Prefs};
 use sha2::{Digest, Sha256};
@@ -989,7 +994,7 @@ impl ProductionRunner {
                         worker::Product::BatchPlan { plan, proofs } => (vec![plan], proofs),
                         _ => return Err("Batch worker did not return native proof evidence".into()),
                     };
-                    self.publish_batch(session, &mut job, &plans, proofs, scope, &mut batch_report, &mut report)
+                    self.publish_batch(session, &mut job, &plans, proofs, scope, (&mut batch_report, &mut report))
                 })
             })
         };
@@ -1128,9 +1133,9 @@ impl ProductionRunner {
         plans: &[ProductionPlan],
         proofs: Vec<worker::ProofArtifact>,
         scope: worker::BatchScope,
-        batch_report: &mut BatchReport,
-        report: &mut TaskReport,
+        reports: (&mut BatchReport, &mut TaskReport),
     ) -> Result<(), String> {
+        let (batch_report, report) = reports;
         ensure_publication_idle(session)?;
         if !Arc::ptr_eq(&job.publication_cache, &session.cache) {
             return Err("Font cache changed during generation; proof no longer matches publication".into());
@@ -1834,9 +1839,11 @@ fn limited_text(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::*;
     use super::*;
     use designcraft_ai_providers::Usage;
     use designcraft_ai_types::ModelSelection;
+    use designcraft_ai_types::protocol::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicU32;
@@ -2089,35 +2096,13 @@ mod tests {
         synthetic_facing_publication(false, true);
     }
 
-    fn synthetic_facing_publication(continuing: bool, baseline: bool) {
+    fn build_synthetic_facing_proofs(
+        session: &Session,
+        canonical: DocState,
+        start: u32,
+        count: u32,
+    ) -> (Vec<ProductionPlan>, Vec<worker::ProofArtifact>) {
         use base64::Engine as _;
-        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = tempfile::tempdir().unwrap();
-        let mut runner = ProductionRunner::open(directory.path()).unwrap();
-        let mut session = Session::new();
-        session.execute("file.new", &new_a4(if continuing { 6 } else { 1 })).unwrap();
-        let prefix = if continuing { 2 } else { 1 };
-        for page in 0..prefix {
-            let created = session.execute("frame.create", &json!({"spread":page,"rect":[60,60,160,160]})).unwrap();
-            session.execute("object.label", &json!({"ids":[created["id"]],"label":format!("Preserved prefix {}",page+1)})).unwrap();
-        }
-        let before = session.doc().unwrap().clone();
-        let previous_index = session.active_index().unwrap();
-        let document_count = session.documents().len();
-        let mut request = task("http://127.0.0.1:9/".into(), 1);
-        request.prompt = "Content Copy Language: Arabic\nSix-page editable book with independently reviewed native pages.".into();
-        if baseline {
-            request.prompt.push_str("\nGrid System: 8 mm baseline grid.");
-        }
-        request.settings.facing_pages = true;
-        request.settings.right_to_left_binding = Some(true);
-        request.settings.pages_per_batch = if continuing { 2 } else { 3 };
-        request.target = if continuing { TaskTarget::ContinueBook } else { TaskTarget::NewA4 { pages: 6 } };
-        let start = if continuing { 2 } else { 0 };
-        let count = request.settings.pages_per_batch;
-        let (canonical, _) = task_document_context(&session, &request.target, None, &request.prompt, &request.settings).unwrap();
-        assert_eq!(canonical.doc.spreads.len(), 6);
-        assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc), "Private planning cannot reformat the live book");
         let plans: Vec<_> = (start..start + count)
             .map(|page| ProductionPlan {
                 title: format!("Absolute page {}", page + 1),
@@ -2153,6 +2138,58 @@ mod tests {
                 .unwrap();
             proofs.push(worker::ProofArtifact { name: format!("page-{}.png", page + 1), bytes: image.to_png() });
         }
+        (plans, proofs)
+    }
+
+    fn assert_synthetic_facing_proof_files(proof_paths: &[String], count: u32) {
+        assert_eq!(proof_paths.len(), (count + 2) as usize);
+        for path in proof_paths {
+            let bytes = std::fs::read(path).unwrap();
+            match Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap() {
+                "designcraft" => {
+                    let proof = designcraft_format::load(&bytes).unwrap();
+                    assert!(proof.settings.facing_pages && proof.settings.right_to_left_binding);
+                    assert_eq!((proof.page_count(), proof.spreads.len()), (6, 4));
+                }
+                "pdf" => assert!(bytes.starts_with(b"%PDF-")),
+                "png" => {
+                    let image = image::load_from_memory(&bytes).unwrap();
+                    assert!(image.width() < image.height(), "Each PNG must show one absolute portrait page, not a facing spread");
+                }
+                other => panic!("Unexpected proof format {other}"),
+            }
+        }
+    }
+
+    fn synthetic_facing_publication(continuing: bool, baseline: bool) {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directory = tempfile::tempdir().unwrap();
+        let mut runner = ProductionRunner::open(directory.path()).unwrap();
+        let mut session = Session::new();
+        session.execute("file.new", &new_a4(if continuing { 6 } else { 1 })).unwrap();
+        let prefix = if continuing { 2 } else { 1 };
+        for page in 0..prefix {
+            let created = session.execute("frame.create", &json!({"spread":page,"rect":[60,60,160,160]})).unwrap();
+            session.execute("object.label", &json!({"ids":[created["id"]],"label":format!("Preserved prefix {}",page+1)})).unwrap();
+        }
+        let before = session.doc().unwrap().clone();
+        let previous_index = session.active_index().unwrap();
+        let document_count = session.documents().len();
+        let mut request = task("http://127.0.0.1:9/".into(), 1);
+        request.prompt = "Content Copy Language: Arabic\nSix-page editable book with independently reviewed native pages.".into();
+        if baseline {
+            request.prompt.push_str("\nGrid System: 8 mm baseline grid.");
+        }
+        request.settings.facing_pages = true;
+        request.settings.right_to_left_binding = Some(true);
+        request.settings.pages_per_batch = if continuing { 2 } else { 3 };
+        request.target = if continuing { TaskTarget::ContinueBook } else { TaskTarget::NewA4 { pages: 6 } };
+        let start = if continuing { 2 } else { 0 };
+        let count = request.settings.pages_per_batch;
+        let (canonical, _) = task_document_context(&session, &request.target, None, &request.prompt, &request.settings).unwrap();
+        assert_eq!(canonical.doc.spreads.len(), 6);
+        assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc), "Private planning cannot reformat the live book");
+        let (plans, proofs) = build_synthetic_facing_proofs(&session, canonical, start, count);
         let ledger = UsageLedger::new(request.settings.budget.clone()).unwrap();
         let snapshot = BatchSnapshot {
             job_id: if continuing { "synthetic-facing-continue" } else { "synthetic-facing-new" }.into(),
@@ -2203,19 +2240,47 @@ mod tests {
         });
         let completed = runner.handle(&mut session, AiRequest::Poll);
         assert_eq!(completed.stage, "awaiting_human_proof", "{}", completed.message);
-        assert!(!completed.busy);
-        assert!(runner.pending.is_none());
-        assert!(runner.batch.is_some(), "Human proof authority must remain unconsumed");
+        assert!(!completed.busy && runner.pending.is_none() && runner.batch.is_some());
         let checkpoint = completed.batch.as_ref().unwrap();
-        assert_eq!((checkpoint.completed_pages, checkpoint.checkpoint), (start + count, 1));
-        assert_eq!(checkpoint.cumulative_usage.requests, 0, "Synthetic completion must not call any provider");
+        assert_eq!((checkpoint.completed_pages, checkpoint.checkpoint, checkpoint.cumulative_usage.requests), (start + count, 1, 0));
         let published = session.doc().unwrap().clone();
         assert!(published.doc.settings.facing_pages && published.doc.settings.right_to_left_binding);
         if baseline {
             assert!((published.doc.settings.baseline_grid.increment - 8.0 * 72.0 / 25.4).abs() < 0.001);
         }
         assert_eq!((published.doc.page_count(), published.doc.spreads.len()), (6, 4));
-        let local = crate::facing_pages::canonicalize(&published, &session.prefs).unwrap();
+        assert_synthetic_facing_local_spreads(&published, &session.prefs, &before, continuing, prefix, start, count);
+        assert_eq!(
+            published.history.undo.len(),
+            if continuing { before.history.undo.len() + 1 } else { 1 },
+            "One reviewed batch must produce one undo entry"
+        );
+        if !continuing {
+            assert_eq!(session.documents().len(), document_count + 1);
+            assert!(Arc::ptr_eq(&session.documents()[previous_index].doc, &before.doc), "Creating a book must preserve the former document");
+        }
+        let evidence = &checkpoint.batches[0];
+        assert_eq!(evidence.status, "awaiting_human_proof");
+        assert_synthetic_facing_proof_files(&evidence.proof_paths, count);
+        assert_synthetic_facing_undo(published, &before, continuing, baseline);
+        for _ in 0..3 {
+            let unchanged = runner.handle(&mut session, AiRequest::Poll);
+            assert_eq!(unchanged.stage, "awaiting_human_proof");
+            assert_eq!(unchanged.batch.unwrap().checkpoint, 1);
+            assert!(runner.pending.is_none(), "Polling cannot send another request before human approval");
+        }
+    }
+
+    fn assert_synthetic_facing_local_spreads(
+        published: &DocState,
+        prefs: &designcraft_engine::Prefs,
+        before: &DocState,
+        continuing: bool,
+        prefix: usize,
+        start: u32,
+        count: u32,
+    ) {
+        let local = crate::facing_pages::canonicalize(published, prefs).unwrap();
         for page in 0..6 {
             let spread = &local.doc.spreads[page];
             if (start..start + count).contains(&(page as u32)) {
@@ -2230,34 +2295,9 @@ mod tests {
                 assert!(spread.items.is_empty(), "Future absolute pages must stay blank");
             }
         }
-        assert_eq!(
-            published.history.undo.len(),
-            if continuing { before.history.undo.len() + 1 } else { 1 },
-            "One reviewed batch must produce one undo entry"
-        );
-        if !continuing {
-            assert_eq!(session.documents().len(), document_count + 1);
-            assert!(Arc::ptr_eq(&session.documents()[previous_index].doc, &before.doc), "Creating a book must preserve the former document");
-        }
-        let evidence = &checkpoint.batches[0];
-        assert_eq!(evidence.status, "awaiting_human_proof");
-        assert_eq!(evidence.proof_paths.len(), (count + 2) as usize);
-        for path in &evidence.proof_paths {
-            let bytes = std::fs::read(path).unwrap();
-            match Path::new(path).extension().and_then(|extension| extension.to_str()).unwrap() {
-                "designcraft" => {
-                    let proof = designcraft_format::load(&bytes).unwrap();
-                    assert!(proof.settings.facing_pages && proof.settings.right_to_left_binding);
-                    assert_eq!((proof.page_count(), proof.spreads.len()), (6, 4));
-                }
-                "pdf" => assert!(bytes.starts_with(b"%PDF-")),
-                "png" => {
-                    let image = image::load_from_memory(&bytes).unwrap();
-                    assert!(image.width() < image.height(), "Each PNG must show one absolute portrait page, not a facing spread");
-                }
-                other => panic!("Unexpected proof format {other}"),
-            }
-        }
+    }
+
+    fn assert_synthetic_facing_undo(published: DocState, before: &DocState, continuing: bool, baseline: bool) {
         let mut undo = Session::new();
         undo.add_document(published);
         undo.execute("edit.undo", &json!({})).unwrap();
@@ -2269,12 +2309,6 @@ mod tests {
             if baseline {
                 assert!((undo.doc().unwrap().doc.settings.baseline_grid.increment - 8.0 * 72.0 / 25.4).abs() < 0.001);
             }
-        }
-        for _ in 0..3 {
-            let unchanged = runner.handle(&mut session, AiRequest::Poll);
-            assert_eq!(unchanged.stage, "awaiting_human_proof");
-            assert_eq!(unchanged.batch.unwrap().checkpoint, 1);
-            assert!(runner.pending.is_none(), "Polling cannot send another request before human approval");
         }
     }
 
@@ -2446,9 +2480,11 @@ mod tests {
         server.join().unwrap().unwrap();
     }
 
-    fn reviewed_http_batches(initial_completed: u32, fail_first: bool) {
-        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _memory = crate::resources::TestAdmissionGuard::healthy();
+    #[allow(clippy::type_complexity)]
+    fn spawn_reviewed_http_batches_server(
+        initial_completed: u32,
+        fail_first: bool,
+    ) -> (String, Arc<AtomicU32>, Arc<AtomicBool>, std::thread::JoinHandle<Result<(), String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/", listener.local_addr().unwrap());
@@ -2506,6 +2542,13 @@ mod tests {
             }
             Ok(())
         });
+        (endpoint, calls, stop, server)
+    }
+
+    fn reviewed_http_batches(initial_completed: u32, fail_first: bool) {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let (endpoint, calls, stop, server) = spawn_reviewed_http_batches_server(initial_completed, fail_first);
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
@@ -2552,27 +2595,50 @@ mod tests {
         assert_eq!(checkpoint.completed_pages, initial_completed + 1);
         assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         assert_eq!(checkpoint.batches[0].proof_paths.len(), 3);
+        assert_reviewed_http_second_batch(
+            &mut runner,
+            &mut session,
+            (dir.path(), &calls),
+            (initial_completed, prior_requests, prior_undo),
+            &prefix,
+            &first,
+        );
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    fn assert_reviewed_http_second_batch(
+        runner: &mut ProductionRunner,
+        session: &mut Session,
+        env: (&std::path::Path, &Arc<AtomicU32>),
+        counts: (u32, u32, usize),
+        prefix: &[Arc<designcraft_engine::doc::Spread>],
+        first: &AiSnapshot,
+    ) {
+        let (root, calls) = env;
+        let (initial_completed, prior_requests, prior_undo) = counts;
+        let checkpoint = first.batch.as_ref().unwrap();
         let approved_page = session.doc().unwrap().doc.spreads[initial_completed as usize].clone();
-        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
+        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix);
         for _ in 0..8 {
-            runner.handle(&mut session, AiRequest::Poll);
+            runner.handle(session, AiRequest::Poll);
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests, "Polling must never prefetch the next batch");
-        let wrong = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint + 1 });
+        let wrong = runner.handle(session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint + 1 });
         assert!(!wrong.busy);
         assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
-        let mut reopened = ProductionRunner::open(dir.path()).unwrap();
+        let mut reopened = ProductionRunner::open(root).unwrap();
         assert_eq!(reopened.snapshot.batch.as_ref().unwrap().status, "interrupted");
         assert!(reopened.pending.is_none());
         assert!(reopened.batch.is_none());
-        let denied = reopened.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
+        let denied = reopened.handle(session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
         assert!(!denied.busy);
         assert_eq!(calls.load(Ordering::Relaxed), 1 + prior_requests);
         drop(reopened);
-        let approved = runner.handle(&mut session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
+        let approved = runner.handle(session, AiRequest::ApproveBatch { job_id: checkpoint.job_id.clone(), checkpoint: checkpoint.checkpoint });
         assert!(approved.busy, "{}", approved.message);
-        let second = wait(&mut runner, &mut session);
+        let second = wait(runner, session);
         assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
         let final_checkpoint = second.batch.as_ref().unwrap();
         assert_eq!(final_checkpoint.completed_pages, initial_completed + 2);
@@ -2582,20 +2648,18 @@ mod tests {
         assert!(final_checkpoint.batches.iter().all(|batch| batch.usage.requests == 1));
         assert_eq!(session.doc().unwrap().doc.spreads[initial_completed as usize], approved_page);
         assert_eq!(session.doc().unwrap().doc.spreads[(initial_completed + 1) as usize].items[0].label, format!("page-{}", initial_completed + 2));
-        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix.as_slice());
+        assert_eq!(&session.doc().unwrap().doc.spreads[..initial_completed as usize], prefix);
         assert_eq!(session.doc().unwrap().history.undo.len(), prior_undo + 2);
         let completed =
-            runner.handle(&mut session, AiRequest::ApproveBatch { job_id: final_checkpoint.job_id.clone(), checkpoint: final_checkpoint.checkpoint });
+            runner.handle(session, AiRequest::ApproveBatch { job_id: final_checkpoint.job_id.clone(), checkpoint: final_checkpoint.checkpoint });
         assert_eq!(completed.batch.as_ref().unwrap().status, "completed");
         assert!(runner.pending.is_none());
         assert!(runner.batch.is_none());
-        runner.handle(&mut session, AiRequest::ApproveBatch { job_id: final_checkpoint.job_id.clone(), checkpoint: final_checkpoint.checkpoint });
+        runner.handle(session, AiRequest::ApproveBatch { job_id: final_checkpoint.job_id.clone(), checkpoint: final_checkpoint.checkpoint });
         for _ in 0..4 {
-            runner.handle(&mut session, AiRequest::Poll);
+            runner.handle(session, AiRequest::Poll);
         }
         assert_eq!(calls.load(Ordering::Relaxed), 2 + prior_requests, "Final or repeated approval cannot issue another request");
-        stop.store(true, Ordering::Relaxed);
-        server.join().unwrap().unwrap();
     }
 
     #[test]
@@ -2812,8 +2876,7 @@ mod tests {
                 &[plan],
                 proofs,
                 worker::BatchScope { start: target_page, count: 1 },
-                &mut BatchReport::default(),
-                &mut report,
+                (&mut BatchReport::default(), &mut report),
             )
             .unwrap_err();
         let expected = if change == "preferences" {
@@ -2878,8 +2941,7 @@ mod tests {
                         std::slice::from_ref(&plan),
                         proofs,
                         worker::BatchScope { start: 1, count: 1 },
-                        &mut BatchReport::default(),
-                        &mut report
+                        (&mut BatchReport::default(), &mut report),
                     )
                     .is_err()
             );
@@ -2945,8 +3007,7 @@ mod tests {
                 &[plan],
                 proofs,
                 worker::BatchScope { start: 0, count: 1 },
-                &mut BatchReport::default(),
-                &mut report,
+                (&mut BatchReport::default(), &mut report),
             )
             .unwrap_err();
         assert!(error.contains("preview"), "{error}");
@@ -3107,8 +3168,7 @@ mod tests {
                 &[plan],
                 proofs,
                 worker::BatchScope { start: 1, count: 1 },
-                &mut BatchReport::default(),
-                &mut report,
+                (&mut BatchReport::default(), &mut report),
             )
             .unwrap();
         assert_eq!(session.doc().unwrap().uid, book_uid);
@@ -3248,10 +3308,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn failed_batch_syncs_updated_budget_and_model_on_retry_while_retaining_cumulative_usage() {
-        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _memory = crate::resources::TestAdmissionGuard::healthy();
+    #[allow(clippy::type_complexity)]
+    fn spawn_budget_retry_mock_server() -> (String, Arc<AtomicU32>, Arc<AtomicBool>, std::thread::JoinHandle<Result<(), String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/", listener.local_addr().unwrap());
@@ -3318,6 +3376,14 @@ mod tests {
             }
             Ok(())
         });
+        (endpoint, calls, stop, server)
+    }
+
+    #[test]
+    fn failed_batch_syncs_updated_budget_and_model_on_retry_while_retaining_cumulative_usage() {
+        let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _memory = crate::resources::TestAdmissionGuard::healthy();
+        let (endpoint, calls, stop, server) = spawn_budget_retry_mock_server();
 
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
@@ -3375,41 +3441,53 @@ mod tests {
         assert_eq!(after_token_blocked.batch.as_ref().unwrap().cumulative_usage.input_tokens, 18_000);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
+        assert_model_readiness_and_retry_recovery(&mut runner, &mut session, &request.settings, job_id, &calls);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+    }
+
+    fn assert_model_readiness_and_retry_recovery(
+        runner: &mut ProductionRunner,
+        session: &mut Session,
+        base_settings: &AiSettings,
+        job_id: String,
+        calls: &Arc<AtomicU32>,
+    ) {
         // Saving an empty or incompatible model via UpdateSettings must be rejected on RetryBatch without losing retryability!
-        let mut empty_model_settings = request.settings.clone();
+        let mut empty_model_settings = base_settings.clone();
         empty_model_settings.budget.max_requests = 2;
         empty_model_settings.budget.token_limit = 64_000;
         empty_model_settings.text_model.model.clear();
-        runner.handle(&mut session, AiRequest::UpdateSettings(empty_model_settings));
-        let empty_retry = runner.handle(&mut session, AiRequest::RetryBatch { job_id: job_id.clone() });
+        runner.handle(session, AiRequest::UpdateSettings(empty_model_settings));
+        let empty_retry = runner.handle(session, AiRequest::RetryBatch { job_id: job_id.clone() });
         assert_eq!(empty_retry.stage, "failed");
         assert!(empty_retry.message.contains("Choose a text model"), "msg={}", empty_retry.message);
         assert!(empty_retry.batch.as_ref().unwrap().retryable, "model readiness rejection must keep failed batch retryable");
 
-        let mut incompatible_img_settings = request.settings.clone();
+        let mut incompatible_img_settings = base_settings.clone();
         incompatible_img_settings.budget.max_requests = 2;
         incompatible_img_settings.budget.token_limit = 64_000;
         incompatible_img_settings.text_model.model = "gemini-3.8-flash".into();
         incompatible_img_settings.output_mode = designcraft_ai_types::OutputMode::NativeWithImages;
         incompatible_img_settings.image_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
-        runner.handle(&mut session, AiRequest::UpdateSettings(incompatible_img_settings));
-        let incompatible_retry = runner.handle(&mut session, AiRequest::RetryBatch { job_id: job_id.clone() });
+        runner.handle(session, AiRequest::UpdateSettings(incompatible_img_settings));
+        let incompatible_retry = runner.handle(session, AiRequest::RetryBatch { job_id: job_id.clone() });
         assert_eq!(incompatible_retry.stage, "failed");
         assert!(incompatible_retry.message.contains("non-image model"), "msg={}", incompatible_retry.message);
         assert!(incompatible_retry.batch.as_ref().unwrap().retryable);
 
         // Raising token_limit + max_requests and switching model (while passing a different pages_per_batch) recovers cleanly.
-        let mut recovered_settings = request.settings.clone();
+        let mut recovered_settings = base_settings.clone();
         recovered_settings.budget.max_requests = 2;
         recovered_settings.budget.token_limit = 64_000;
         recovered_settings.text_model.model = "gemini-3.8-flash".into();
         recovered_settings.pages_per_batch = 8;
-        runner.handle(&mut session, AiRequest::UpdateSettings(recovered_settings));
+        runner.handle(session, AiRequest::UpdateSettings(recovered_settings));
         assert_eq!(runner.batch.as_ref().unwrap().task.settings.pages_per_batch, 1, "active job pagination must stay unchanged");
 
-        let retried = runner.handle(&mut session, AiRequest::RetryBatch { job_id });
+        let retried = runner.handle(session, AiRequest::RetryBatch { job_id });
         assert!(retried.busy, "{}", retried.message);
-        let second = wait(&mut runner, &mut session);
+        let second = wait(runner, session);
         assert_eq!(second.stage, "awaiting_human_proof", "{}", second.message);
         let done_batch = second.batch.as_ref().unwrap();
         assert_eq!(done_batch.completed_pages, 2);
@@ -3417,9 +3495,6 @@ mod tests {
         assert_eq!(done_batch.cumulative_usage.input_tokens, 22_000);
         assert_eq!(done_batch.cumulative_usage.output_tokens, 3_000);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
-
-        stop.store(true, Ordering::Relaxed);
-        server.join().unwrap().unwrap();
     }
 
     #[test]
@@ -3738,71 +3813,129 @@ mod tests {
         assert_eq!(batch2_refreshed.batch.as_ref().unwrap().checkpoint, batch2_checkpoint + 1);
     }
 
+    fn spawn_facing_slice_server(slices: Vec<Vec<usize>>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for spreads in slices {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if complete_http_body(&bytes).ok().flatten().is_some() {
+                        break;
+                    }
+                }
+                let commands: Vec<Value> = spreads
+                    .into_iter()
+                    .map(|page_idx| {
+                        json!({
+                            "command": "frame.create",
+                            "params": {
+                                "spread": page_idx,
+                                "rect": [60, 60, 220, 160],
+                                "content": "text",
+                                "text": format!("Facing page {}", page_idx + 1)
+                            }
+                        })
+                    })
+                    .collect();
+                let plan = json!({
+                    "title": "Facing slice",
+                    "commands": commands
+                });
+                let body = json!({
+                    "message": {"content": plan.to_string()},
+                    "done": true,
+                    "done_reason": "stop",
+                    "prompt_eval_count": 40,
+                    "eval_count": 25
+                })
+                .to_string();
+                let resp =
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn assert_transitive_sub_story_refs() {
+        let mut scratch_session = Session::new();
+        scratch_session.execute("file.new", &json!({"pages": 1})).unwrap();
+        scratch_session.execute("frame.create", &json!({"spread": 0, "rect": [50, 50, 120, 120]})).unwrap();
+        let template_item = scratch_session.doc().unwrap().doc.spreads[0].items[0].as_ref().clone();
+        let mut doc = scratch_session.doc().unwrap().doc.as_ref().clone();
+
+        let linked_sid = designcraft_engine::doc::StoryId(701);
+        let cell_linked_sid = designcraft_engine::doc::StoryId(704);
+        let endnote_linked_sid = designcraft_engine::doc::StoryId(705);
+        let root_sid = designcraft_engine::doc::StoryId(700);
+        let note_asset = designcraft_engine::doc::AssetId(801);
+        let cell_asset = designcraft_engine::doc::AssetId(802);
+
+        let make_graphic = |asset: designcraft_engine::doc::AssetId| -> designcraft_engine::doc::Graphic {
+            serde_json::from_value(json!({
+                "asset": asset,
+                "size": [20.0, 20.0],
+                "xf": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+            }))
+            .unwrap()
+        };
+
+        let linked_story = designcraft_engine::doc::Story::new(linked_sid);
+        let cell_linked_story = designcraft_engine::doc::Story::new(cell_linked_sid);
+        let endnote_linked_story = designcraft_engine::doc::Story::new(endnote_linked_sid);
+        let mut root_story = designcraft_engine::doc::Story::new(root_sid);
+        root_story.link = Some((linked_sid, 1));
+
+        let mut note_story = designcraft_engine::doc::Story::new(designcraft_engine::doc::StoryId(702));
+        let mut anchored_graphic = template_item;
+        anchored_graphic.id = designcraft_engine::doc::ItemId(901);
+        anchored_graphic.content = designcraft_engine::doc::Content::Graphic(make_graphic(note_asset));
+        note_story.objects.push(Arc::new(designcraft_engine::doc::AnchoredObject { item: anchored_graphic, ..Default::default() }));
+        root_story.notes.push(Arc::new(designcraft_engine::doc::Footnote { id: 1, text: note_story }));
+
+        let mut endnote_story = designcraft_engine::doc::Story::new(designcraft_engine::doc::StoryId(703));
+        endnote_story.link = Some((endnote_linked_sid, 1));
+        root_story.endnotes.push(Arc::new(designcraft_engine::doc::Footnote { id: 2, text: endnote_story }));
+
+        let mut table = designcraft_engine::doc::Table::new(1, 1, 1, 0, 0, 100.0);
+        table.cells[0].graphic = Some(make_graphic(cell_asset));
+        table.cells[0].text.link = Some((cell_linked_sid, 1));
+        root_story.tables.insert(1, Arc::new(table));
+
+        doc.stories.insert(linked_sid, Arc::new(linked_story));
+        doc.stories.insert(cell_linked_sid, Arc::new(cell_linked_story));
+        doc.stories.insert(endnote_linked_sid, Arc::new(endnote_linked_story));
+        doc.stories.insert(root_sid, Arc::new(root_story));
+
+        let mut stories = std::collections::BTreeSet::from([root_sid]);
+        let mut assets = std::collections::BTreeSet::new();
+        expand_story_transitive_refs(&doc, &mut stories, &mut assets).unwrap();
+        assert!(stories.contains(&linked_sid));
+        assert!(stories.contains(&cell_linked_sid));
+        assert!(stories.contains(&endnote_linked_sid));
+        assert!(assets.contains(&note_asset));
+        assert!(assets.contains(&cell_asset));
+    }
+
     #[test]
     fn ai28_facing_pages_refresh_batch_proofs_spine_bleed_and_sealed_definitions() {
         let _serial = worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let spawn_slice_server = |slices: Vec<Vec<usize>>| -> (String, std::thread::JoinHandle<()>) {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let handle = std::thread::spawn(move || {
-                for spreads in slices {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-                    let mut bytes = Vec::new();
-                    let mut chunk = [0_u8; 4096];
-                    loop {
-                        let n = stream.read(&mut chunk).unwrap();
-                        if n == 0 {
-                            break;
-                        }
-                        bytes.extend_from_slice(&chunk[..n]);
-                        if complete_http_body(&bytes).ok().flatten().is_some() {
-                            break;
-                        }
-                    }
-                    let commands: Vec<Value> = spreads
-                        .into_iter()
-                        .map(|page_idx| {
-                            json!({
-                                "command": "frame.create",
-                                "params": {
-                                    "spread": page_idx,
-                                    "rect": [60, 60, 220, 160],
-                                    "content": "text",
-                                    "text": format!("Facing page {}", page_idx + 1)
-                                }
-                            })
-                        })
-                        .collect();
-                    let plan = json!({
-                        "title": "Facing slice",
-                        "commands": commands
-                    });
-                    let body = json!({
-                        "message": {"content": plan.to_string()},
-                        "done": true,
-                        "done_reason": "stop",
-                        "prompt_eval_count": 40,
-                        "eval_count": 25
-                    })
-                    .to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(resp.as_bytes()).unwrap();
-                }
-            });
-            (format!("http://{addr}"), handle)
-        };
 
         // Part A: 4-page facing_pages=true, pages_per_batch=2 (spread_aligned: Batch 1 = Page 1, Batch 2 = Pages 2-3, Batch 3 = Page 4).
         let dir = tempfile::tempdir().unwrap();
         let mut runner = ProductionRunner::open(dir.path()).unwrap();
         let mut session = Session::new();
-        let (endpoint, server_a) = spawn_slice_server(vec![vec![0], vec![1, 2], vec![3]]);
+        let (endpoint, server_a) = spawn_facing_slice_server(vec![vec![0], vec![1, 2], vec![3]]);
         let mut req = task(endpoint, 16);
         req.target = TaskTarget::NewA4 { pages: 4 };
         req.settings.facing_pages = true;
@@ -3895,10 +4028,17 @@ mod tests {
         server_a.join().unwrap();
 
         // Part B: Shared facing spread with pages_per_batch=1 (Page 2 sealed, Page 3 in-scope on spread 1) rejects spine-bleed overlap!
+        assert_shared_facing_spread_spine_bleed_guard();
+
+        // Part C: Transitive sub-story references (story.link, footnotes, endnotes, and table cell stories/graphics).
+        assert_transitive_sub_story_refs();
+    }
+
+    fn assert_shared_facing_spread_spine_bleed_guard() {
         let dir_b = tempfile::tempdir().unwrap();
         let mut runner_b = ProductionRunner::open(dir_b.path()).unwrap();
         let mut session_b = Session::new();
-        let (endpoint_b, server_b) = spawn_slice_server(vec![vec![0], vec![1], vec![2]]);
+        let (endpoint_b, server_b) = spawn_facing_slice_server(vec![vec![0], vec![1], vec![2]]);
         let mut req_b = task(endpoint_b, 16);
         req_b.target = TaskTarget::NewA4 { pages: 4 };
         req_b.settings.facing_pages = true;
@@ -3941,65 +4081,6 @@ mod tests {
         let p3_refreshed = runner_b.handle(&mut session_b, AiRequest::RefreshBatchProofs { job_id: job_b });
         assert_eq!(p3_refreshed.stage, "awaiting_human_proof", "msg={}", p3_refreshed.message);
         assert_eq!(p3_refreshed.batch.as_ref().unwrap().checkpoint, cp_p3 + 1);
-
-        // Part C: Transitive sub-story references (story.link, footnotes, endnotes, and table cell stories/graphics).
-        let mut scratch_session = Session::new();
-        scratch_session.execute("file.new", &json!({"pages": 1})).unwrap();
-        scratch_session.execute("frame.create", &json!({"spread": 0, "rect": [50, 50, 120, 120]})).unwrap();
-        let template_item = scratch_session.doc().unwrap().doc.spreads[0].items[0].as_ref().clone();
-        let mut doc = scratch_session.doc().unwrap().doc.as_ref().clone();
-
-        let linked_sid = designcraft_engine::doc::StoryId(701);
-        let cell_linked_sid = designcraft_engine::doc::StoryId(704);
-        let endnote_linked_sid = designcraft_engine::doc::StoryId(705);
-        let root_sid = designcraft_engine::doc::StoryId(700);
-        let note_asset = designcraft_engine::doc::AssetId(801);
-        let cell_asset = designcraft_engine::doc::AssetId(802);
-
-        let make_graphic = |asset: designcraft_engine::doc::AssetId| -> designcraft_engine::doc::Graphic {
-            serde_json::from_value(json!({
-                "asset": asset,
-                "size": [20.0, 20.0],
-                "xf": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-            }))
-            .unwrap()
-        };
-
-        let linked_story = designcraft_engine::doc::Story::new(linked_sid);
-        let cell_linked_story = designcraft_engine::doc::Story::new(cell_linked_sid);
-        let endnote_linked_story = designcraft_engine::doc::Story::new(endnote_linked_sid);
-        let mut root_story = designcraft_engine::doc::Story::new(root_sid);
-        root_story.link = Some((linked_sid, 1));
-
-        let mut note_story = designcraft_engine::doc::Story::new(designcraft_engine::doc::StoryId(702));
-        let mut anchored_graphic = template_item;
-        anchored_graphic.id = designcraft_engine::doc::ItemId(901);
-        anchored_graphic.content = designcraft_engine::doc::Content::Graphic(make_graphic(note_asset));
-        note_story.objects.push(Arc::new(designcraft_engine::doc::AnchoredObject { item: anchored_graphic, ..Default::default() }));
-        root_story.notes.push(Arc::new(designcraft_engine::doc::Footnote { id: 1, text: note_story }));
-
-        let mut endnote_story = designcraft_engine::doc::Story::new(designcraft_engine::doc::StoryId(703));
-        endnote_story.link = Some((endnote_linked_sid, 1));
-        root_story.endnotes.push(Arc::new(designcraft_engine::doc::Footnote { id: 2, text: endnote_story }));
-
-        let mut table = designcraft_engine::doc::Table::new(1, 1, 1, 0, 0, 100.0);
-        table.cells[0].graphic = Some(make_graphic(cell_asset));
-        table.cells[0].text.link = Some((cell_linked_sid, 1));
-        root_story.tables.insert(1, Arc::new(table));
-
-        doc.stories.insert(linked_sid, Arc::new(linked_story));
-        doc.stories.insert(cell_linked_sid, Arc::new(cell_linked_story));
-        doc.stories.insert(endnote_linked_sid, Arc::new(endnote_linked_story));
-        doc.stories.insert(root_sid, Arc::new(root_story));
-
-        let mut stories = std::collections::BTreeSet::from([root_sid]);
-        let mut assets = std::collections::BTreeSet::new();
-        expand_story_transitive_refs(&doc, &mut stories, &mut assets).unwrap();
-        assert!(stories.contains(&linked_sid));
-        assert!(stories.contains(&cell_linked_sid));
-        assert!(stories.contains(&endnote_linked_sid));
-        assert!(assets.contains(&note_asset));
-        assert!(assets.contains(&cell_asset));
     }
 
     #[test]

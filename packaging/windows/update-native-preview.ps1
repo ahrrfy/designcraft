@@ -238,6 +238,32 @@ function Test-IsCanonicalManifest($Record, [string]$ManifestPath) {
     return ([IO.Path]::GetFileName($ManifestPath) -ieq 'install-manifest.json')
 }
 
+function Resolve-UnlockedBackupPath([string]$BaseOldPath, [switch]$IsDirectory) {
+    if (Test-Path -LiteralPath $BaseOldPath) {
+        Remove-Item -LiteralPath $BaseOldPath -Recurse:$IsDirectory -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $BaseOldPath) {
+        return ($BaseOldPath + '.' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    }
+    return $BaseOldPath
+}
+
+function Remove-UnlockedCanonicalBackups([string]$InstallDir) {
+    foreach ($oldName in @('designcraft.exe.old', 'designcraft-cli.exe.old', 'SOURCE-COMMIT.txt.old', 'BUILD-IDENTITY.txt.old')) {
+        Remove-Item -LiteralPath (Join-Path $InstallDir $oldName) -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($oldDir in @('.skills.old', '.font-licenses.old')) {
+        Remove-Item -LiteralPath (Join-Path $InstallDir $oldDir) -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue)) {
+        if ($entry.Name -cmatch '^(?:designcraft(?:-cli)?\.exe|SOURCE-COMMIT\.txt|BUILD-IDENTITY\.txt)\.old\.[0-9a-f]{8}$') {
+            Remove-Item -LiteralPath $entry.FullName -Force -ErrorAction SilentlyContinue
+        } elseif ($entry.PSIsContainer -and $entry.Name -cmatch '^\.(?:skills|font-licenses)\.old\.[0-9a-f]{8}$') {
+            Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Install-CanonicalSlotUpdate([string]$Path, [string]$StagedDir, $Metadata) {
     $record = Read-UpdateJson $Path
     Assert-PreviewProtectedPaths $record
@@ -256,11 +282,8 @@ function Install-CanonicalSlotUpdate([string]$Path, [string]$StagedDir, $Metadat
     try {
         foreach ($bin in @('designcraft.exe', 'designcraft-cli.exe')) {
             $target = Join-Path $installDir $bin
-            $old = $target + '.old'
+            $old = Resolve-UnlockedBackupPath ($target + '.old')
             $stagedBin = Join-Path $StagedDir $bin
-            if (Test-Path -LiteralPath $old -PathType Leaf) {
-                Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
-            }
             if (Test-Path -LiteralPath $target -PathType Leaf) {
                 Move-Item -LiteralPath $target -Destination $old -Force
                 $movedOld += @{ target = $target; old = $old; staged = $stagedBin }
@@ -273,8 +296,7 @@ function Install-CanonicalSlotUpdate([string]$Path, [string]$StagedDir, $Metadat
             $srcSub = Join-Path $StagedDir $subDir
             if (Test-Path -LiteralPath $srcSub -PathType Container) {
                 $dstSub = Join-Path $installDir $subDir
-                $oldSub = Join-Path $installDir ('.' + $subDir + '.old')
-                if (Test-Path -LiteralPath $oldSub) { Remove-Item -LiteralPath $oldSub -Recurse -Force }
+                $oldSub = Resolve-UnlockedBackupPath (Join-Path $installDir ('.' + $subDir + '.old')) -IsDirectory
                 if (Test-Path -LiteralPath $dstSub) {
                     Move-Item -LiteralPath $dstSub -Destination $oldSub -Force
                     $movedSubDirs += @{ dst = $dstSub; old = $oldSub; staged = $srcSub }
@@ -288,10 +310,7 @@ function Install-CanonicalSlotUpdate([string]$Path, [string]$StagedDir, $Metadat
             if ($entry.Name -ieq 'portable.txt') { continue }
             if ($entry.PSIsContainer) { continue }
             $dstEntry = Join-Path $installDir $entry.Name
-            $oldEntry = $dstEntry + '.old'
-            if (Test-Path -LiteralPath $oldEntry -PathType Leaf) {
-                Remove-Item -LiteralPath $oldEntry -Force -ErrorAction SilentlyContinue
-            }
+            $oldEntry = Resolve-UnlockedBackupPath ($dstEntry + '.old')
             if (Test-Path -LiteralPath $dstEntry -PathType Leaf) {
                 Move-Item -LiteralPath $dstEntry -Destination $oldEntry -Force
                 $movedExtraFiles += @{ dst = $dstEntry; old = $oldEntry; staged = $entry.FullName }
@@ -353,9 +372,7 @@ function Install-CanonicalSlotUpdate([string]$Path, [string]$StagedDir, $Metadat
         }
     }
     Remove-Item -LiteralPath $StagedDir -Recurse -Force -ErrorAction SilentlyContinue
-    foreach ($oldName in @('designcraft.exe.old', 'designcraft-cli.exe.old')) {
-        Remove-Item -LiteralPath (Join-Path $installDir $oldName) -Force -ErrorAction SilentlyContinue
-    }
+    Remove-UnlockedCanonicalBackups $installDir
     $canonicalExe = Join-Path $installDir 'designcraft.exe'
     $fields = @{
         install_mode = 'canonical_inplace'
@@ -391,9 +408,7 @@ try {
     $record = Read-UpdateJson $ManifestPath
     Assert-PreviewProtectedPaths $record
     if ($canonicalMode) {
-        foreach ($oldName in @('designcraft.exe.old', 'designcraft-cli.exe.old')) {
-            Remove-Item -LiteralPath (Join-Path $installDir $oldName) -Force -ErrorAction SilentlyContinue
-        }
+        Remove-UnlockedCanonicalBackups $installDir
     }
     # A verified pending update remains actionable until activated.
     if ($record.update_status -eq 'staged_waiting_for_app_close') {

@@ -124,7 +124,7 @@ fn shape_mark(face: FaceRef, text: &str, m: &KentenMark, b: &PlacedGlyph) -> Vec
         let adv = f64::from(sg.x_advance) * sx;
         out.push(PlacedGlyph {
             rendered_char: ch,
-            face: face.clone(),
+            face,
             gid: sg.gid,
             x: x + f64::from(sg.x_offset) * sx,
             y: -f64::from(sg.y_offset) * sy,
@@ -151,7 +151,7 @@ fn shape_mark(face: FaceRef, text: &str, m: &KentenMark, b: &PlacedGlyph) -> Vec
 fn marks(db: &ScopedFonts<'_>, b: &PlacedGlyph, m: &KentenMark, fallback: bool) -> Vec<PlacedGlyph> {
     let mut face = match &m.font {
         Some((family, style)) => FaceRef::of(&db.face(family, style)),
-        None => b.face.clone(),
+        None => b.face,
     };
     if fallback
         && let Some(c) = m.text.chars().next()
@@ -162,7 +162,7 @@ fn marks(db: &ScopedFonts<'_>, b: &PlacedGlyph, m: &KentenMark, fallback: bool) 
     }
     let mut glyphs = shape_mark(face, &m.text, m, b);
     if fallback && glyphs.first().is_some_and(|d| d.gid == 0) {
-        glyphs = shape_mark(b.face.clone(), "\u{2022}", m, b);
+        glyphs = shape_mark(b.face, "\u{2022}", m, b);
     }
     // The character's em box across the line (y down from the line's baseline).
     let (em_top, em_bottom) = b.face.em_box();

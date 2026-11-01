@@ -2,7 +2,11 @@ use crate::vault::{SessionKey, Vault};
 use crate::{ledger::UsageLedger, science, worker};
 use designcraft_ai_providers::{SecretString, validate_endpoint};
 use designcraft_ai_skills::{ApprovalEvidence, Provenance, RevisionStatus, SkillRegistry, SkillSnapshot};
-use designcraft_ai_types::protocol::*;
+use designcraft_ai_types::protocol::{
+    AiRequest, AiSettings, AiSnapshot, BatchReport, BatchSnapshot, CredentialStatus, ExecutionPacing, LocalServerStatus, MAX_BRIEF_BYTES,
+    PendingImageApproval, PrintProof, ProductionDraft, ProductionPlan, SkillCard, SkillReview, TaskReport, TaskRequest, TaskTarget, UsageSummary,
+    VisualDensityMode,
+};
 use designcraft_ai_types::{EngineAction, ProviderKind};
 use designcraft_engine::{DocState, Prefs, Session, file_access};
 use serde_json::{Value, json};

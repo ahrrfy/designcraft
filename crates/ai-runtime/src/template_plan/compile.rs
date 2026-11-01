@@ -187,53 +187,12 @@ pub(super) fn compile_inner(
     let use_relational_master = ctx.and_then(|c| c.base).is_some_and(super::relational::has_relational_master_footer);
     let has_unit_heading_style = ctx.and_then(|c| c.base).is_some_and(super::relational::base_has_unit_heading_style);
     let soft_fit = ctx.is_some_and(|c| c.soft_fit_slots && !c.explicit_script);
+    let pure_native_vector = ctx.is_some_and(|c| c.visual_density == designcraft_ai_types::VisualDensityMode::PureNativeVector);
     for page_number in scope.start..end {
         let mut page = pages.remove(&page_number).ok_or("Template content is missing a requested page")?;
         let family = profile.page_families.iter().find(|family| family.id == page.family).ok_or("Unknown content page family")?;
         let raw_template = skill.templates.get(&family.template).ok_or("Missing native page template")?;
-        if soft_fit {
-            page.text.retain(|key, _| family.text_slots.iter().any(|slot| &slot.id == key));
-            let authored_non_empty =
-                family.text_slots.iter().filter(|slot| page.text.get(&slot.id).is_some_and(|val| !val.trim().is_empty())).count();
-            if authored_non_empty > 0 && family.text_slots.len() > 1 {
-                for slot in &family.text_slots {
-                    if !page.text.contains_key(&slot.id) {
-                        let fallback = raw_template
-                            .get(slot.command)
-                            .and_then(|act| act.params.get("text"))
-                            .and_then(Value::as_str)
-                            .map(|t| t.replace("{{page}}", &u64::from(page_number).saturating_add(1).to_string()))
-                            .filter(|t| !t.trim().is_empty())
-                            .unwrap_or_else(|| "—".to_owned());
-                        page.text.insert(slot.id.clone(), fallback);
-                    }
-                }
-            }
-            if mode == OutputMode::NativeOnly {
-                page.illustrations.clear();
-            }
-        } else if ctx.is_some_and(|c| c.visual_density == designcraft_ai_types::VisualDensityMode::PureNativeVector) && mode == OutputMode::NativeOnly
-        {
-            page.illustrations.clear();
-        }
-        for slot in &family.text_slots {
-            let location = format!("Page {} ({}) / text slot {}", u64::from(page_number) + 1, family.id, slot.id);
-            let value = page.text.get(&slot.id).ok_or_else(|| format!("{location} is missing"))?;
-            if value.trim().is_empty() {
-                return Err(format!("{location} is empty"));
-            }
-            if value.contains('\0') {
-                return Err(format!("{location} contains a null character"));
-            }
-            let base_count = base_char_count(value);
-            let raw_count = value.chars().count();
-            if base_count > MAX_SLOT_CHARS || raw_count > MAX_SLOT_CHARS.saturating_mul(3) {
-                return Err(format!("{location} contains {base_count} characters; the safety limit is {MAX_SLOT_CHARS}"));
-            }
-        }
-        if page.text.len() != family.text_slots.len() {
-            return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
-        }
+        prepare_and_validate_page_slots(&mut page, page_number, family, raw_template, mode, (soft_fit, pure_native_vector))?;
         let template = raw_template;
         let bindable = counting_family(family, template) && bindable_counting_family(family, template);
         let quantities = if bindable {
@@ -284,211 +243,323 @@ pub(super) fn compile_inner(
             })
         });
         let even_facing_rtl = mirror_rtl && ctx.is_some_and(|c| c.facing_pages) && page_number % 2 == 1;
-        let offset = plan.commands.len();
-        if offset.checked_add(template.len()).is_none_or(|count| count > MAX_ACTIONS) {
-            return Err("Compiled template exceeds 512 commands".into());
-        }
-        let mut section_marker_for_page: Option<String> = None;
-        for (index, action) in template.iter().enumerate() {
-            if !allowed.contains(&action.command) {
-                return Err(format!("Template command {} is not page-isolated", action.command));
-            }
-            let mut budget = 65_536;
-            validate_tree(&action.params, 0, &mut budget)?;
-            let orig_rect = action_rect_array(action);
-            let frame_label = template
-                .get(index.saturating_add(3))
-                .filter(|next| next.command == "object.label")
-                .and_then(|next| next.params.get("label"))
-                .and_then(Value::as_str);
-            let path_label = template
-                .get(index.saturating_add(2))
-                .filter(|next| next.command == "object.label")
-                .and_then(|next| next.params.get("label"))
-                .and_then(Value::as_str);
-            let linked_caption_txt = if action.command == "object.altText" {
-                super::relational::linked_caption_slot_text(template, index, &slot_cmds, &page.text)
-            } else {
-                None
-            };
-            let mut action: EngineAction = action.clone();
-            let params = action.params.as_object_mut().ok_or("Native template parameters must be an object")?;
-            for (key, value) in params.iter_mut() {
-                if key == "text" && action.command == "frame.create" {
-                    let raw = value.as_str().ok_or("Native frame text must be a string")?;
-                    let supplied = slot_cmds.iter().find(|(_, cmd_idx)| **cmd_idx == index).and_then(|(slot_id, _)| page.text.get(slot_id));
-                    let text = if let Some(supplied) = supplied {
-                        supplied.clone()
-                    } else if frame_label == Some("part.ui.header.unit-num")
-                        && let Some(unit_no) = resolved_unit_badge
-                    {
-                        section_marker_for_page = Some(unit_no.to_string());
-                        "\u{E001}".to_string()
-                    } else if frame_label == Some("part.listen.sample-tick") {
-                        " ".to_string()
-                    } else {
-                        let resolved = raw.replace("{{page}}", &u64::from(page_number).saturating_add(1).to_string());
-                        if matches!(frame_label, Some("part.skills.listen-checks" | "part.lab.steps-txt")) {
-                            resolved.replace("[v]", "( )")
-                        } else if mirror_rtl {
-                            resolved.replace("[v]", "✓")
-                        } else {
-                            resolved
-                        }
-                    };
-                    // script::resolve consumes $$ into $, preventing text from becoming a native result reference.
-                    *value = Value::String(text.replace('$', "$$"));
-                } else if key == "text"
-                    && action.command == "object.altText"
-                    && let Some(caption_txt) = linked_caption_txt
-                {
-                    *value = Value::String(caption_txt.replace('$', "$$"));
-                } else {
-                    rebase(value, index, offset)?;
-                }
-            }
-            if action.command == "frame.create"
-                && params.get("content").and_then(Value::as_str) == Some("graphic")
-                && let Some(r) = orig_rect
-                && let Some(slot) = family.image_slots.iter().find(|slot| rect_approx_eq(r, slot.rect))
-                && (mode == OutputMode::NativeOnly || !page.illustrations.iter().any(|img| img.slot == slot.id))
-            {
-                params.insert("content".into(), json!("unassigned"));
-            }
-            if mirror_rtl {
-                let keep_outer_right_footer =
-                    even_facing_rtl && (frame_label == Some("part.ui.footer.page") || path_label == Some("part.ui.footer.bar"));
-                if !keep_outer_right_footer {
-                    mirror_template_action_x(&action.command, params, page_w);
-                }
-                if action.command == "object.stroke"
-                    && template.get(index.saturating_add(1)).is_some_and(|next| {
-                        next.command == "object.label"
-                            && next.params.get("label").and_then(Value::as_str).is_some_and(|lbl| lbl.starts_with("part.wb.cw.col-"))
-                    })
-                {
-                    params.insert("weight".into(), json!(0.0));
-                    params.insert("swatch".into(), json!("[None]"));
-                }
-                if action.command == "type.para"
-                    && template.get(index.saturating_add(1)).is_some_and(|next| {
-                        next.command == "object.label" && next.params.get("label").and_then(Value::as_str) == Some("part.ui.footer.page")
-                    })
-                    && let Some(attrs) = params.get_mut("attrs").and_then(Value::as_object_mut)
-                {
-                    attrs.insert("direction".into(), json!("rightToLeft"));
-                    attrs.insert("align".into(), json!(if even_facing_rtl { "right" } else { "left" }));
-                }
-            }
-            if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") || params.contains_key("spread") {
-                params.insert("spread".into(), json!(page_number));
-            }
-            plan.commands.push(action);
-        }
-        // Adapt language/direction without silently shrinking the approved typography.
-        // Actual shaping and overset are checked by the native engine before images are bought.
-        for slot in &family.text_slots {
-            let text = page.text.get(&slot.id).ok_or("Missing validated text slot")?;
-            let has_arabic_script = text.chars().any(|c| {
-                ('\u{0600}'..='\u{06ff}').contains(&c)
-                    && (c.is_alphabetic() || ('\u{0660}'..='\u{0669}').contains(&c) || ('\u{06f0}'..='\u{06f9}').contains(&c))
-            });
-            let has_latin_alpha = text.chars().any(|c| c.is_ascii_alphabetic());
-            let has_arabic = has_arabic_script || (mirror_rtl && !has_latin_alpha && text.chars().any(|c| c.is_ascii_digit()));
-            let latin_only =
-                !has_arabic && text.chars().any(|c| c.is_ascii_alphanumeric()) && !text.chars().any(|c| c.is_alphabetic() && !c.is_ascii());
-            let slot_cmd = *slot_cmds.get(&slot.id).ok_or("Missing mapped text slot command")?;
-            let target = offset.checked_add(slot_cmd).ok_or("Text slot target overflow")?;
-            let char_idx = target.checked_add(1);
-            let para_idx = target.checked_add(2);
-            let inplace_pair = char_idx.is_some_and(|i| plan.commands.get(i).is_some_and(|a| a.command == "type.char"))
-                && para_idx.is_some_and(|i| plan.commands.get(i).is_some_and(|a| a.command == "type.para"));
-            if inplace_pair {
-                if let Some(c_idx) = char_idx
-                    && let Some(attrs) = plan.commands.get_mut(c_idx).and_then(|a| a.params.get_mut("attrs")).and_then(Value::as_object_mut)
-                {
-                    if has_arabic {
-                        attrs.insert("language".into(), json!("ar"));
-                    } else if latin_only {
-                        attrs.insert("language".into(), json!("en"));
-                    }
-                }
-                if let Some(p_idx) = para_idx
-                    && let Some(attrs) = plan.commands.get_mut(p_idx).and_then(|a| a.params.get_mut("attrs")).and_then(Value::as_object_mut)
-                {
-                    let is_center = matches!(attrs.get("align").and_then(Value::as_str), Some("center" | "centerJustified"));
-                    if has_arabic {
-                        attrs.insert("direction".into(), json!("rightToLeft"));
-                        if !is_center {
-                            attrs.insert("align".into(), json!("right"));
-                        }
-                    } else if latin_only {
-                        attrs.insert("direction".into(), json!("leftToRight"));
-                        if !is_center {
-                            attrs.insert("align".into(), json!("left"));
-                        }
-                    }
-                }
-            } else if has_arabic || latin_only {
-                if plan.commands.len().checked_add(3).is_none_or(|count| count > MAX_ACTIONS) {
-                    return Err("Compiled text directions exceed 512 commands".into());
-                }
-                let (language, direction, default_align) = if has_arabic { ("ar", "rightToLeft", "right") } else { ("en", "leftToRight", "left") };
-                let align = authored_center_alignment(template, slot_cmd).unwrap_or(default_align);
-                plan.commands.push(EngineAction { command: "selection.set".into(), params: json!({"ids":[format!("${target}.id")]}) });
-                plan.commands.push(EngineAction { command: "type.char".into(), params: json!({"attrs":{"language":language}}) });
-                plan.commands.push(EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":direction,"align":align}}) });
-            }
-        }
-        let wb_cap_ids: Vec<String> = template
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, act)| {
-                if act.command != "frame.create" {
-                    return None;
-                }
-                let lbl = template
-                    .get(idx.saturating_add(3))
-                    .filter(|next| next.command == "object.label")
-                    .and_then(|next| next.params.get("label"))
-                    .and_then(Value::as_str)?;
-                matches!(lbl, "part.wb.cap-1" | "part.wb.cap-2").then(|| format!("${}.id", offset.saturating_add(idx)))
-            })
-            .collect();
-        if !wb_cap_ids.is_empty() && plan.commands.len() < MAX_ACTIONS {
-            plan.commands.push(EngineAction { command: "object.fill".into(), params: json!({"ids": wb_cap_ids, "swatch": "[Paper]", "tint": 0.92}) });
-        }
-        if let Some(marker) = section_marker_for_page {
-            if plan.commands.len() >= MAX_ACTIONS {
-                return Err("Compiled template exceeds 512 commands".into());
-            }
-            plan.commands
-                .push(EngineAction { command: "layout.section".into(), params: json!({"page": u64::from(page_number) + 1, "marker": marker}) });
-        }
-        if use_relational_master {
-            if family.id.contains("cover") {
-                if plan.commands.len() >= MAX_ACTIONS {
-                    return Err("Compiled template exceeds 512 commands".into());
-                }
-                plan.commands
-                    .push(EngineAction { command: "layout.pages.applyParent".into(), params: json!({"pages": [page_number], "parent": null}) });
-            } else if has_unit_heading_style && let Some(&title_cmd) = slot_cmds.get("title-main") {
-                let title_target = offset.checked_add(title_cmd).ok_or("Title slot target overflow")?;
-                if plan.commands.len().checked_add(2).is_none_or(|count| count > MAX_ACTIONS) {
-                    return Err("Compiled template exceeds 512 commands".into());
-                }
-                plan.commands.push(EngineAction {
-                    command: "text.select".into(),
-                    params: json!({"story": format!("${title_target}.story"), "anchor": 0, "focus": 0}),
-                });
-                plan.commands
-                    .push(EngineAction { command: "style.paragraph.apply".into(), params: json!({"name": super::relational::UNIT_HEADING_STYLE}) });
-            }
-        }
+        let (offset, section_marker_for_page) = emit_template_page_actions(
+            &mut plan,
+            template,
+            &allowed,
+            &slot_cmds,
+            (&page, family, mode),
+            (page_number, resolved_unit_badge, mirror_rtl, even_facing_rtl, page_w),
+        )?;
+        apply_compiled_slot_directions(&mut plan, template, family, &page.text, &slot_cmds, offset, mirror_rtl)?;
+        finalize_template_page_chrome(
+            &mut plan,
+            template,
+            family,
+            &slot_cmds,
+            offset,
+            (page_number, section_marker_for_page, use_relational_master, has_unit_heading_style),
+        )?;
         append_images(&mut plan, &skill.skill_id, &page, family, mode, quantities, &profile.illustration, mirror_rtl.then_some(page_w), ctx)?;
     }
     crate::worker::validate_batch_plan(&plan, scope)?;
     Ok(plan)
+}
+
+fn prepare_and_validate_page_slots(
+    page: &mut ContentPage,
+    page_number: u32,
+    family: &designcraft_ai_types::PageFamily,
+    raw_template: &[EngineAction],
+    mode: OutputMode,
+    flags: (bool, bool),
+) -> Result<(), String> {
+    let (soft_fit, pure_native_vector) = flags;
+    if soft_fit {
+        page.text.retain(|key, _| family.text_slots.iter().any(|slot| &slot.id == key));
+        let authored_non_empty = family.text_slots.iter().filter(|slot| page.text.get(&slot.id).is_some_and(|val| !val.trim().is_empty())).count();
+        if authored_non_empty > 0 && family.text_slots.len() > 1 {
+            for slot in &family.text_slots {
+                if !page.text.contains_key(&slot.id) {
+                    let fallback = raw_template
+                        .get(slot.command)
+                        .and_then(|act| act.params.get("text"))
+                        .and_then(Value::as_str)
+                        .map(|t| t.replace("{{page}}", &u64::from(page_number).saturating_add(1).to_string()))
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| "—".to_owned());
+                    page.text.insert(slot.id.clone(), fallback);
+                }
+            }
+        }
+        if mode == OutputMode::NativeOnly {
+            page.illustrations.clear();
+        }
+    } else if pure_native_vector && mode == OutputMode::NativeOnly {
+        page.illustrations.clear();
+    }
+    for slot in &family.text_slots {
+        let location = format!("Page {} ({}) / text slot {}", u64::from(page_number) + 1, family.id, slot.id);
+        let value = page.text.get(&slot.id).ok_or_else(|| format!("{location} is missing"))?;
+        if value.trim().is_empty() {
+            return Err(format!("{location} is empty"));
+        }
+        if value.contains('\0') {
+            return Err(format!("{location} contains a null character"));
+        }
+        let base_count = base_char_count(value);
+        let raw_count = value.chars().count();
+        if base_count > MAX_SLOT_CHARS || raw_count > MAX_SLOT_CHARS.saturating_mul(3) {
+            return Err(format!("{location} contains {base_count} characters; the safety limit is {MAX_SLOT_CHARS}"));
+        }
+    }
+    if page.text.len() != family.text_slots.len() {
+        return Err(format!("Page {} ({}): content text includes undeclared slot IDs", u64::from(page_number) + 1, family.id));
+    }
+    Ok(())
+}
+
+fn emit_template_page_actions(
+    plan: &mut ProductionPlan,
+    template: &[EngineAction],
+    allowed: &BTreeSet<String>,
+    slot_cmds: &BTreeMap<String, usize>,
+    page_ctx: (&ContentPage, &designcraft_ai_types::PageFamily, OutputMode),
+    rtl_ctx: (u32, Option<u32>, bool, bool, f64),
+) -> Result<(usize, Option<String>), String> {
+    let (page, family, mode) = page_ctx;
+    let (page_number, resolved_unit_badge, mirror_rtl, even_facing_rtl, page_w) = rtl_ctx;
+    let offset = plan.commands.len();
+    if offset.checked_add(template.len()).is_none_or(|count| count > MAX_ACTIONS) {
+        return Err("Compiled template exceeds 512 commands".into());
+    }
+    let mut section_marker_for_page: Option<String> = None;
+    for (index, action) in template.iter().enumerate() {
+        if !allowed.contains(&action.command) {
+            return Err(format!("Template command {} is not page-isolated", action.command));
+        }
+        let mut budget = 65_536;
+        validate_tree(&action.params, 0, &mut budget)?;
+        let orig_rect = action_rect_array(action);
+        let frame_label = template
+            .get(index.saturating_add(3))
+            .filter(|next| next.command == "object.label")
+            .and_then(|next| next.params.get("label"))
+            .and_then(Value::as_str);
+        let path_label = template
+            .get(index.saturating_add(2))
+            .filter(|next| next.command == "object.label")
+            .and_then(|next| next.params.get("label"))
+            .and_then(Value::as_str);
+        let linked_caption_txt = if action.command == "object.altText" {
+            super::relational::linked_caption_slot_text(template, index, slot_cmds, &page.text)
+        } else {
+            None
+        };
+        let mut action: EngineAction = action.clone();
+        let params = action.params.as_object_mut().ok_or("Native template parameters must be an object")?;
+        for (key, value) in params.iter_mut() {
+            if key == "text" && action.command == "frame.create" {
+                let raw = value.as_str().ok_or("Native frame text must be a string")?;
+                let supplied = slot_cmds.iter().find(|(_, cmd_idx)| **cmd_idx == index).and_then(|(slot_id, _)| page.text.get(slot_id));
+                let text = if let Some(supplied) = supplied {
+                    supplied.clone()
+                } else if frame_label == Some("part.ui.header.unit-num")
+                    && let Some(unit_no) = resolved_unit_badge
+                {
+                    section_marker_for_page = Some(unit_no.to_string());
+                    "\u{E001}".to_string()
+                } else if frame_label == Some("part.listen.sample-tick") {
+                    " ".to_string()
+                } else {
+                    let resolved = raw.replace("{{page}}", &u64::from(page_number).saturating_add(1).to_string());
+                    if matches!(frame_label, Some("part.skills.listen-checks" | "part.lab.steps-txt")) {
+                        resolved.replace("[v]", "( )")
+                    } else if mirror_rtl {
+                        resolved.replace("[v]", "✓")
+                    } else {
+                        resolved
+                    }
+                };
+                *value = Value::String(text.replace('$', "$$"));
+            } else if key == "text"
+                && action.command == "object.altText"
+                && let Some(caption_txt) = linked_caption_txt
+            {
+                *value = Value::String(caption_txt.replace('$', "$$"));
+            } else {
+                rebase(value, index, offset)?;
+            }
+        }
+        if action.command == "frame.create"
+            && params.get("content").and_then(Value::as_str) == Some("graphic")
+            && let Some(r) = orig_rect
+            && let Some(slot) = family.image_slots.iter().find(|slot| rect_approx_eq(r, slot.rect))
+            && (mode == OutputMode::NativeOnly || !page.illustrations.iter().any(|img| img.slot == slot.id))
+        {
+            params.insert("content".into(), json!("unassigned"));
+        }
+        if mirror_rtl {
+            apply_rtl_template_mirroring(&action.command, params, template, index, (even_facing_rtl, frame_label, path_label, page_w));
+        }
+        if matches!(action.command.as_str(), "frame.create" | "line.create" | "path.create") || params.contains_key("spread") {
+            params.insert("spread".into(), json!(page_number));
+        }
+        plan.commands.push(action);
+    }
+    Ok((offset, section_marker_for_page))
+}
+
+fn apply_rtl_template_mirroring(
+    command: &str,
+    params: &mut Map<String, Value>,
+    template: &[EngineAction],
+    index: usize,
+    rtl_info: (bool, Option<&str>, Option<&str>, f64),
+) {
+    let (even_facing_rtl, frame_label, path_label, page_w) = rtl_info;
+    let keep_outer_right_footer = even_facing_rtl && (frame_label == Some("part.ui.footer.page") || path_label == Some("part.ui.footer.bar"));
+    if !keep_outer_right_footer {
+        mirror_template_action_x(command, params, page_w);
+    }
+    if command == "object.stroke"
+        && template.get(index.saturating_add(1)).is_some_and(|next| {
+            next.command == "object.label" && next.params.get("label").and_then(Value::as_str).is_some_and(|lbl| lbl.starts_with("part.wb.cw.col-"))
+        })
+    {
+        params.insert("weight".into(), json!(0.0));
+        params.insert("swatch".into(), json!("[None]"));
+    }
+    if command == "type.para"
+        && template
+            .get(index.saturating_add(1))
+            .is_some_and(|next| next.command == "object.label" && next.params.get("label").and_then(Value::as_str) == Some("part.ui.footer.page"))
+        && let Some(attrs) = params.get_mut("attrs").and_then(Value::as_object_mut)
+    {
+        attrs.insert("direction".into(), json!("rightToLeft"));
+        attrs.insert("align".into(), json!(if even_facing_rtl { "right" } else { "left" }));
+    }
+}
+
+fn apply_compiled_slot_directions(
+    plan: &mut ProductionPlan,
+    template: &[EngineAction],
+    family: &designcraft_ai_types::PageFamily,
+    page_text: &BTreeMap<String, String>,
+    slot_cmds: &BTreeMap<String, usize>,
+    offset: usize,
+    mirror_rtl: bool,
+) -> Result<(), String> {
+    // Adapt language/direction without silently shrinking the approved typography.
+    // Actual shaping and overset are checked by the native engine before images are bought.
+    for slot in &family.text_slots {
+        let text = page_text.get(&slot.id).ok_or("Missing validated text slot")?;
+        let has_arabic_script = text.chars().any(|c| {
+            ('\u{0600}'..='\u{06ff}').contains(&c)
+                && (c.is_alphabetic() || ('\u{0660}'..='\u{0669}').contains(&c) || ('\u{06f0}'..='\u{06f9}').contains(&c))
+        });
+        let has_latin_alpha = text.chars().any(|c| c.is_ascii_alphabetic());
+        let has_arabic = has_arabic_script || (mirror_rtl && !has_latin_alpha && text.chars().any(|c| c.is_ascii_digit()));
+        let latin_only = !has_arabic && text.chars().any(|c| c.is_ascii_alphanumeric()) && !text.chars().any(|c| c.is_alphabetic() && !c.is_ascii());
+        let slot_cmd = *slot_cmds.get(&slot.id).ok_or("Missing mapped text slot command")?;
+        let target = offset.checked_add(slot_cmd).ok_or("Text slot target overflow")?;
+        let char_idx = target.checked_add(1);
+        let para_idx = target.checked_add(2);
+        let inplace_pair = char_idx.is_some_and(|i| plan.commands.get(i).is_some_and(|a| a.command == "type.char"))
+            && para_idx.is_some_and(|i| plan.commands.get(i).is_some_and(|a| a.command == "type.para"));
+        if inplace_pair {
+            if let Some(c_idx) = char_idx
+                && let Some(attrs) = plan.commands.get_mut(c_idx).and_then(|a| a.params.get_mut("attrs")).and_then(Value::as_object_mut)
+            {
+                if has_arabic {
+                    attrs.insert("language".into(), json!("ar"));
+                } else if latin_only {
+                    attrs.insert("language".into(), json!("en"));
+                }
+            }
+            if let Some(p_idx) = para_idx
+                && let Some(attrs) = plan.commands.get_mut(p_idx).and_then(|a| a.params.get_mut("attrs")).and_then(Value::as_object_mut)
+            {
+                let is_center = matches!(attrs.get("align").and_then(Value::as_str), Some("center" | "centerJustified"));
+                if has_arabic {
+                    attrs.insert("direction".into(), json!("rightToLeft"));
+                    if !is_center {
+                        attrs.insert("align".into(), json!("right"));
+                    }
+                } else if latin_only {
+                    attrs.insert("direction".into(), json!("leftToRight"));
+                    if !is_center {
+                        attrs.insert("align".into(), json!("left"));
+                    }
+                }
+            }
+        } else if has_arabic || latin_only {
+            if plan.commands.len().checked_add(3).is_none_or(|count| count > MAX_ACTIONS) {
+                return Err("Compiled text directions exceed 512 commands".into());
+            }
+            let (language, direction, default_align) = if has_arabic { ("ar", "rightToLeft", "right") } else { ("en", "leftToRight", "left") };
+            let align = authored_center_alignment(template, slot_cmd).unwrap_or(default_align);
+            plan.commands.push(EngineAction { command: "selection.set".into(), params: json!({"ids":[format!("${target}.id")]}) });
+            plan.commands.push(EngineAction { command: "type.char".into(), params: json!({"attrs":{"language":language}}) });
+            plan.commands.push(EngineAction { command: "type.para".into(), params: json!({"attrs":{"direction":direction,"align":align}}) });
+        }
+    }
+    Ok(())
+}
+
+fn finalize_template_page_chrome(
+    plan: &mut ProductionPlan,
+    template: &[EngineAction],
+    family: &designcraft_ai_types::PageFamily,
+    slot_cmds: &BTreeMap<String, usize>,
+    offset: usize,
+    chrome_opts: (u32, Option<String>, bool, bool),
+) -> Result<(), String> {
+    let (page_number, section_marker_for_page, use_relational_master, has_unit_heading_style) = chrome_opts;
+    let wb_cap_ids: Vec<String> = template
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, act)| {
+            if act.command != "frame.create" {
+                return None;
+            }
+            let lbl = template
+                .get(idx.saturating_add(3))
+                .filter(|next| next.command == "object.label")
+                .and_then(|next| next.params.get("label"))
+                .and_then(Value::as_str)?;
+            matches!(lbl, "part.wb.cap-1" | "part.wb.cap-2").then(|| format!("${}.id", offset.saturating_add(idx)))
+        })
+        .collect();
+    if !wb_cap_ids.is_empty() && plan.commands.len() < MAX_ACTIONS {
+        plan.commands.push(EngineAction { command: "object.fill".into(), params: json!({"ids": wb_cap_ids, "swatch": "[Paper]", "tint": 0.92}) });
+    }
+    if let Some(marker) = section_marker_for_page {
+        if plan.commands.len() >= MAX_ACTIONS {
+            return Err("Compiled template exceeds 512 commands".into());
+        }
+        plan.commands.push(EngineAction { command: "layout.section".into(), params: json!({"page": u64::from(page_number) + 1, "marker": marker}) });
+    }
+    if use_relational_master {
+        if family.id.contains("cover") {
+            if plan.commands.len() >= MAX_ACTIONS {
+                return Err("Compiled template exceeds 512 commands".into());
+            }
+            plan.commands.push(EngineAction { command: "layout.pages.applyParent".into(), params: json!({"pages": [page_number], "parent": null}) });
+        } else if has_unit_heading_style && let Some(&title_cmd) = slot_cmds.get("title-main") {
+            let title_target = offset.checked_add(title_cmd).ok_or("Title slot target overflow")?;
+            if plan.commands.len().checked_add(2).is_none_or(|count| count > MAX_ACTIONS) {
+                return Err("Compiled template exceeds 512 commands".into());
+            }
+            plan.commands.push(EngineAction {
+                command: "text.select".into(),
+                params: json!({"story": format!("${title_target}.story"), "anchor": 0, "focus": 0}),
+            });
+            plan.commands
+                .push(EngineAction { command: "style.paragraph.apply".into(), params: json!({"name": super::relational::UNIT_HEADING_STYLE}) });
+        }
+    }
+    Ok(())
 }
 
 fn mirror_template_action_x(command: &str, params: &mut Map<String, Value>, page_w: f64) {

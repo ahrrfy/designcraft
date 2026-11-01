@@ -22,13 +22,16 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use panel_local::*;
-use panel_production::*;
-use panel_providers::*;
-use panel_skills::*;
-use panel_usage::*;
+use panel_local::local_ai;
+use panel_production::{elapsed, production, production_blocking_issue, selectable_skill_cards};
+use panel_providers::providers;
+use panel_skills::skills;
+use panel_usage::usage;
 pub use state::AiUiState;
-use state::*;
+use state::{
+    CompanionProof, DiagnosticAlertKind, MAX_REQUEST_ALLOWANCE, MAX_TOKEN_LIMIT, OpenDocument, PromptAnalysisCache, RequestEstimate, TokenEstimate,
+    automatic_proof_binding, explicit_script_pages, facing_proof_pair, has_configured_rates, is_skill_scoped_error, natural_prompt_pages,
+};
 pub(crate) use state::{is_non_text_model, is_retired_gemini_text_model};
 
 /// Typed UI path shared by all panel buttons. Credentials move directly to the host without JSON,
@@ -152,93 +155,133 @@ pub(super) fn ensure_ceiling_initialized(app: &mut DesignApp) {
     }
 }
 
-pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
-    let field = |name: &str| p.get(name).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| format!("missing string: {name}"));
-    let decode = |name: &str| p.get(name).cloned().ok_or_else(|| format!("missing {name}"));
-    let request = match field("method")?.as_str() {
-        "poll" => AiRequest::Poll,
-        "cancel" => AiRequest::Cancel,
-        "start" => {
-            ensure_ceiling_initialized(app);
-            let mut req: TaskRequest = serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?;
-            clamp_control_settings(&app.ui.ai.settings, &mut req.settings);
-            AiRequest::Start(req)
-        }
-        "preview_production" => AiRequest::PreviewProduction(serde_json::from_value(decode("request")?).map_err(|e| e.to_string())?),
-        "update_settings" => {
-            ensure_ceiling_initialized(app);
-            AiRequest::UpdateSettings(clamped_settings(&app.ui.ai.settings, decode("settings")?)?)
-        }
-        "list_models" => AiRequest::ListModels { selection: serde_json::from_value(decode("selection")?).map_err(|e| e.to_string())? },
-        "import_skill" => AiRequest::ImportSkill { path: field("path")? },
-        "inspect_skill" => AiRequest::InspectSkill { id: field("id")?, revision: field("revision")? },
-        "prepare_skills" => AiRequest::PrepareSkills { prompt: field("prompt")? },
-        "save_skill_draft" => AiRequest::SaveSkillDraft { id: field("id")?, skill_md: field("skill_md")?, manifest_json: field("manifest_json")? },
+fn req_str_field(p: &Value, name: &str) -> Result<String, String> {
+    p.get(name).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| format!("missing string: {name}"))
+}
+
+fn req_value_field(p: &Value, name: &str) -> Result<Value, String> {
+    p.get(name).cloned().ok_or_else(|| format!("missing {name}"))
+}
+
+fn decode_skill_or_batch_request(app: &mut DesignApp, method: &str, p: &Value) -> Result<Option<AiRequest>, String> {
+    let req = match method {
+        "import_skill" => AiRequest::ImportSkill { path: req_str_field(p, "path")? },
+        "inspect_skill" => AiRequest::InspectSkill { id: req_str_field(p, "id")?, revision: req_str_field(p, "revision")? },
+        "prepare_skills" => AiRequest::PrepareSkills { prompt: req_str_field(p, "prompt")? },
+        "save_skill_draft" => AiRequest::SaveSkillDraft {
+            id: req_str_field(p, "id")?,
+            skill_md: req_str_field(p, "skill_md")?,
+            manifest_json: req_str_field(p, "manifest_json")?,
+        },
         "add_design_correction" => AiRequest::AddDesignCorrection {
-            id: field("id")?,
-            revision: field("revision")?,
-            correction: serde_json::from_value(decode("correction")?).map_err(|e| e.to_string())?,
+            id: req_str_field(p, "id")?,
+            revision: req_str_field(p, "revision")?,
+            correction: serde_json::from_value(req_value_field(p, "correction")?).map_err(|e| e.to_string())?,
         },
         "generate_skill" => {
             ensure_ceiling_initialized(app);
             AiRequest::GenerateSkill {
                 design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
-                prompt: field("prompt")?,
-                reference_paths: serde_json::from_value(decode("reference_paths")?).map_err(|e| e.to_string())?,
-                settings: clamped_settings(&app.ui.ai.settings, decode("settings")?)?,
+                prompt: req_str_field(p, "prompt")?,
+                reference_paths: serde_json::from_value(req_value_field(p, "reference_paths")?).map_err(|e| e.to_string())?,
+                settings: clamped_settings(&app.ui.ai.settings, req_value_field(p, "settings")?)?,
             }
         }
         "generate_skill_from_document" => {
             ensure_ceiling_initialized(app);
             AiRequest::GenerateSkillFromDocument {
                 design_style: p.get("design_style").map(|v| v.as_bool().ok_or("design_style must be boolean")).transpose()?.unwrap_or(false),
-                prompt: field("prompt")?,
-                settings: clamped_settings(&app.ui.ai.settings, decode("settings")?)?,
+                prompt: req_str_field(p, "prompt")?,
+                settings: clamped_settings(&app.ui.ai.settings, req_value_field(p, "settings")?)?,
             }
         }
-        "run_skill_sample" => AiRequest::RunSkillSample { id: field("id")?, revision: field("revision")? },
-        "run_design_template" => AiRequest::RunDesignTemplate { id: field("id")?, revision: field("revision")?, template: field("template")? },
-        "refresh_batch_proofs" => AiRequest::RefreshBatchProofs { job_id: field("job_id")? },
-        "pause_batch" => AiRequest::PauseBatch { job_id: field("job_id")? },
+        "run_skill_sample" => AiRequest::RunSkillSample { id: req_str_field(p, "id")?, revision: req_str_field(p, "revision")? },
+        "run_design_template" => AiRequest::RunDesignTemplate {
+            id: req_str_field(p, "id")?,
+            revision: req_str_field(p, "revision")?,
+            template: req_str_field(p, "template")?,
+        },
+        "refresh_batch_proofs" => AiRequest::RefreshBatchProofs { job_id: req_str_field(p, "job_id")? },
+        "pause_batch" => AiRequest::PauseBatch { job_id: req_str_field(p, "job_id")? },
         "resume_batch" => {
             ensure_ceiling_initialized(app);
             if app.ui.ai.settings.execution_pacing == ExecutionPacing::ReviewEveryBatch {
                 return Err("Approval requires the human review button in the desktop panel.".into());
             }
-            AiRequest::ResumeBatch { job_id: field("job_id")? }
+            AiRequest::ResumeBatch { job_id: req_str_field(p, "job_id")? }
         }
-        "dismiss_image_regeneration" => AiRequest::DismissImageRegeneration { job_id: field("job_id")? },
+        "dismiss_image_regeneration" => AiRequest::DismissImageRegeneration { job_id: req_str_field(p, "job_id")? },
+        "set_skill_enabled" => {
+            AiRequest::SetSkillEnabled { id: req_str_field(p, "id")?, enabled: p.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")? }
+        }
+        "rollback_skill" => AiRequest::RollbackSkill { id: req_str_field(p, "id")?, revision: req_str_field(p, "revision")? },
+        "export_skill" => {
+            AiRequest::ExportSkill { id: req_str_field(p, "id")?, revision: req_str_field(p, "revision")?, path: req_str_field(p, "path")? }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(req))
+}
+
+fn decode_export_or_print_request(method: &str, p: &Value) -> Result<AiRequest, String> {
+    match method {
         "approve_skill" | "approve_batch" | "confirm_image_regeneration" => {
-            return Err("Approval requires the human review button in the desktop panel.".into());
+            Err("Approval requires the human review button in the desktop panel.".into())
         }
         "save_api_key" | "remove_api_key" | "refresh_credentials" => {
-            return Err("Credential actions require the masked human controls in Providers and keys.".into());
+            Err("Credential actions require the masked human controls in Providers and keys.".into())
         }
-        "refresh_resources" => AiRequest::RefreshResources,
-        "set_skill_enabled" => {
-            AiRequest::SetSkillEnabled { id: field("id")?, enabled: p.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")? }
+        "create_science_sample" => Ok(AiRequest::CreateScienceSample { directory: req_str_field(p, "directory")? }),
+        "export_document" => {
+            Ok(AiRequest::ExportDocument { path: req_str_field(p, "path")?, pdf: p.get("pdf").and_then(Value::as_bool).ok_or("missing pdf")? })
         }
-        "rollback_skill" => AiRequest::RollbackSkill { id: field("id")?, revision: field("revision")? },
-        "export_skill" => AiRequest::ExportSkill { id: field("id")?, revision: field("revision")?, path: field("path")? },
-        "create_science_sample" => AiRequest::CreateScienceSample { directory: field("directory")? },
-        "export_document" => AiRequest::ExportDocument { path: field("path")?, pdf: p.get("pdf").and_then(Value::as_bool).ok_or("missing pdf")? },
-        "export_idml" => AiRequest::ExportIdml { path: field("path")? },
-        "export_indd" => AiRequest::ExportIndd { path: field("path")? },
-        "prepare_print" => AiRequest::PreparePrint {
+        "export_idml" => Ok(AiRequest::ExportIdml { path: req_str_field(p, "path")? }),
+        "export_indd" => Ok(AiRequest::ExportIndd { path: req_str_field(p, "path")? }),
+        "prepare_print" => Ok(AiRequest::PreparePrint {
             printer: p.get("printer").and_then(Value::as_str).map(str::to_owned),
             grayscale: p.get("grayscale").and_then(Value::as_bool).unwrap_or(false),
-            duplex: field("duplex")?,
-        },
-        "save_prepared_print" => AiRequest::SavePreparedPrint { token: field("token")?, path: field("path")? },
+            duplex: req_str_field(p, "duplex")?,
+        }),
+        "save_prepared_print" => Ok(AiRequest::SavePreparedPrint { token: req_str_field(p, "token")?, path: req_str_field(p, "path")? }),
         "print_document" | "submit_prepared_print" | "open_print_proof" | "start_local_ollama" | "stop_local_ollama" => {
-            return Err("Printing and local service launch require the explicit human controls in the desktop panel.".into());
+            Err("Printing and local service launch require the explicit human controls in the desktop panel.".into())
         }
-        _ => return Err("Unknown AI request method; human-only actions require desktop controls.".into()),
+        _ => Err("Unknown AI request method; human-only actions require desktop controls.".into()),
+    }
+}
+
+pub fn request_command(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
+    let method = req_str_field(p, "method")?;
+    let request = match method.as_str() {
+        "poll" => AiRequest::Poll,
+        "cancel" => AiRequest::Cancel,
+        "refresh_resources" => AiRequest::RefreshResources,
+        "start" => {
+            ensure_ceiling_initialized(app);
+            let mut req: TaskRequest = serde_json::from_value(req_value_field(p, "request")?).map_err(|e| e.to_string())?;
+            clamp_control_settings(&app.ui.ai.settings, &mut req.settings);
+            AiRequest::Start(req)
+        }
+        "preview_production" => AiRequest::PreviewProduction(serde_json::from_value(req_value_field(p, "request")?).map_err(|e| e.to_string())?),
+        "update_settings" => {
+            ensure_ceiling_initialized(app);
+            AiRequest::UpdateSettings(clamped_settings(&app.ui.ai.settings, req_value_field(p, "settings")?)?)
+        }
+        "list_models" => AiRequest::ListModels { selection: serde_json::from_value(req_value_field(p, "selection")?).map_err(|e| e.to_string())? },
+        other => match decode_skill_or_batch_request(app, other, p)? {
+            Some(req) => req,
+            None => decode_export_or_print_request(other, p)?,
+        },
     };
     dispatch(app, request)
 }
 
 pub fn poll(app: &mut DesignApp, ctx: &egui::Context) {
+    if app.ui.ai.preview_update.poll_background(ctx)
+        && let Some(notice) = app.ui.ai.preview_update.take_status_notice(app.ui.language == "ar")
+    {
+        app.status(notice);
+    }
     if !app.ui.ai.snapshot.busy {
         return;
     }
@@ -266,16 +309,21 @@ pub(super) fn bidi_layouter(multiline: bool) -> impl FnMut(&egui::Ui, &dyn egui:
         rtl::editable_layout(ui, buf.as_str(), wrap_width, font_id, color, multiline)
     }
 }
+pub(super) fn named_rtl_text_edit(ui: &mut egui::Ui, edit: egui::TextEdit<'_>, name: impl Into<String>) -> egui::Response {
+    rtl::show_text_edit(ui, edit).response.response.accessible_name(name)
+}
 pub(super) fn field(ui: &mut egui::Ui, arabic: bool, en: &str, ar: &str, value: &mut String) {
+    let caption = text(arabic, en, ar);
     label(ui, arabic, en, ar);
     let field_rtl = if value.trim().is_empty() { arabic } else { rtl::has_rtl(value) };
     let mut layouter = bidi_layouter(false);
-    rtl::show_text_edit(
+    named_rtl_text_edit(
         ui,
         egui::TextEdit::singleline(value)
             .desired_width(f32::INFINITY)
-            .horizontal_align(if field_rtl { egui::Align::Max } else { egui::Align::Min })
+            .align(if field_rtl { egui::Align2::RIGHT_CENTER } else { egui::Align2::LEFT_CENTER })
             .layouter(&mut layouter),
+        format!("{caption} input"),
     );
 }
 pub(super) fn provider_name(p: ProviderKind) -> &'static str {
@@ -287,26 +335,29 @@ pub(super) fn provider_name(p: ProviderKind) -> &'static str {
     }
 }
 pub(super) fn provider(ui: &mut egui::Ui, id: &str, selected: &mut ProviderKind, images: bool) {
-    egui::ComboBox::from_id_salt(id).selected_text(provider_name(*selected)).show_ui(ui, |ui| {
-        for p in [ProviderKind::OpenAi, ProviderKind::Gemini, if images { ProviderKind::ComfyUi } else { ProviderKind::Ollama }] {
-            ui.selectable_value(selected, p, provider_name(p));
-        }
-    });
+    crate::widgets::name_combo(
+        craft_ui::ComboBox::from_id_salt(id).selected_text(provider_name(*selected)).show_ui(ui, |ui| {
+            for p in [ProviderKind::OpenAi, ProviderKind::Gemini, if images { ProviderKind::ComfyUi } else { ProviderKind::Ollama }] {
+                ui.selectable_value(selected, p, provider_name(p));
+            }
+        }),
+        format!("{id} selector"),
+    );
 }
 pub(super) fn model(
     ui: &mut egui::Ui,
     a: bool,
-    id: &str,
+    spec: (&str, bool),
     m: &mut ModelSelection,
-    images: bool,
     pending_models: &mut Option<ModelSelection>,
     discovered: &BTreeMap<(ProviderKind, Option<String>), Vec<String>>,
     requests: &mut Vec<AiRequest>,
 ) {
+    let (id, images) = spec;
     ui.horizontal_wrapped(|ui| {
         provider(ui, id, &mut m.provider, images);
         label(ui, a, "Model", "النموذج");
-        ui.add(egui::TextEdit::singleline(&mut m.model).desired_width(240.0));
+        ui.add(egui::TextEdit::singleline(&mut m.model).desired_width(240.0)).accessible_name(format!("{id} model input"));
         if button(ui, a, "Discover", "اكتشاف") {
             *pending_models = Some(m.clone());
             requests.push(AiRequest::ListModels { selection: m.clone() });
@@ -321,17 +372,20 @@ pub(super) fn model(
             } else {
                 text(a, "Available models", "النماذج المتاحة")
             };
-            egui::ComboBox::from_id_salt((id, "discovered_models")).selected_text(rtl::widget(ui, picker_label)).show_ui(ui, |ui| {
-                for name in filtered {
-                    ui.selectable_value(&mut m.model, name.clone(), name);
-                }
-            });
+            crate::widgets::name_combo(
+                craft_ui::ComboBox::from_id_salt((id, "discovered_models")).selected_text(rtl::widget(ui, picker_label)).show_ui(ui, |ui| {
+                    for name in filtered {
+                        ui.selectable_value(&mut m.model, name.clone(), name);
+                    }
+                }),
+                format!("{id} available models"),
+            );
         }
     }
     let mut endpoint = m.endpoint.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         label(ui, a, "Endpoint (optional)", "عنوان الخدمة (اختياري)");
-        if ui.add(egui::TextEdit::singleline(&mut endpoint).desired_width(350.0)).changed() {
+        if ui.add(egui::TextEdit::singleline(&mut endpoint).desired_width(350.0)).accessible_name(format!("{id} endpoint input")).changed() {
             m.endpoint = (!endpoint.trim().is_empty()).then_some(endpoint);
         }
     });
@@ -379,7 +433,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     let mut activate_document = app.session.active_index();
     let original_document = activate_document;
     egui::Window::new(rtl::widget_ctx(ctx, text(a, "AI Production and Skills", "الذكاء")))
-        .id(egui::Id::new("ai_production"))
+        .id(egui::Id::unique("ai_production"))
         .open(&mut open)
         .default_size(egui::vec2(720.0, 720.0))
         .min_width(540.0)
@@ -478,7 +532,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                     1 => skills(ui, &mut state, a, available, app.session.active().is_some(), &mut requests),
                     2 => usage(ui, &state, a),
                     3 => providers(ui, &mut state, a, available, &mut requests),
-                    4 => local_ai(ui, &mut state, a, available, app.services.pick_open.is_some(), &mut requests),
+                    4 => local_ai(ui, &mut state, a, available, cfg!(not(target_arch = "wasm32")), &mut requests),
                     _ => production(ui, &mut state, a, available, &documents, &mut activate_document, &mut requests),
                 });
             }
@@ -558,58 +612,32 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
     }
     if std::mem::take(&mut app.ui.ai.pick_ollama)
-        && let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ollama_executable"))
+        && let Err(error) = app.ask_open("ollama_executable", crate::app::file_dialogs::Bound::App, |app, path| {
+            app.ui.ai.ollama_executable = path;
+            Ok(Value::Null)
+        })
     {
-        app.ui.ai.ollama_executable = path;
-        ctx.request_repaint();
+        app.ui.ai.error = error;
     }
     if std::mem::take(&mut app.ui.ai.pick_script_file) {
-        if let Some(picked) = app.services.pick_open.as_mut().and_then(|pick| pick("ai_script")) {
-            let clean = sanitize_user_path(&picked);
-            let max_bytes = designcraft_ai_types::protocol::MAX_BRIEF_BYTES as u64;
-            let loaded = if let Some(read) = app.services.read.as_mut() {
-                read(&clean)
-            } else {
-                designcraft_engine::io::read_capped(&clean, max_bytes).map_err(|e| format!("{clean}: {e}"))
-            };
-            match loaded {
-                Ok(bytes) if bytes.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES => {
-                    app.ui.ai.error = text(
-                        a,
-                        "Script file exceeds 1 MiB. Split or move static reference text into a skill package.",
-                        "يتجاوز ملف السكربت 1 ميبيبايت. قسّم الملف أو انقل المراجع الثابتة إلى مهارة.",
-                    )
-                    .into();
-                }
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(script) if !script.contains('\0') => {
-                        if let Some(detected) = explicit_script_pages(&script).or_else(|| natural_prompt_pages(&script))
-                            && app.ui.ai.new_document
-                        {
-                            app.ui.ai.pages = detected;
-                        }
-                        app.ui.ai.prompt = script;
-                        app.ui.ai.edit_large_script_inline = false;
-                        app.ui.ai.clear_failure_alert();
-                        ctx.request_repaint();
-                    }
-                    _ => {
-                        app.ui.ai.error = text(
-                            a,
-                            "Script file must be valid UTF-8 plain text or Markdown (.md / .txt).",
-                            "يجب أن يكون ملف السكربت نصاً صالحاً بترميز UTF-8 (.md أو .txt).",
-                        )
-                        .into();
-                    }
-                },
-                Err(error) => app.ui.ai.error = error,
-            }
+        let pick_res = if app.services.open_async.is_some() {
+            app.pick_and_open("ai_script")
+        } else {
+            app.ask_open("ai_script", crate::app::file_dialogs::Bound::App, |app, picked| {
+                load_script_path_into_prompt(app, &picked);
+                Ok(Value::Null)
+            })
+        };
+        if let Err(error) = pick_res {
+            app.ui.ai.error = error;
         }
         requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
     }
     if std::mem::take(&mut app.ui.ai.pick_target_document) {
-        if app.services.pick_open.is_some() {
-            if let Some(path) = app.services.pick_open.as_mut().and_then(|pick| pick("ai_target_document")) {
+        let pick_res = if app.services.open_async.is_some() {
+            app.pick_and_open("ai_target_document")
+        } else {
+            app.ask_open("ai_target_document", crate::app::file_dialogs::Bound::App, |app, path| {
                 app.ui.ai.open_document_path = path.clone();
                 match open_target_document_path(app, &path) {
                     Ok(_) => {
@@ -617,12 +645,13 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         app.ui.ai.continue_book = false;
                         app.ui.ai.restored_target_unconfirmed = false;
                         app.ui.ai.error.clear();
-                        ctx.request_repaint();
                     }
                     Err(error) => app.ui.ai.error = error,
                 }
-            }
-        } else if let Err(error) = app.pick_and_open("ai_target_document") {
+                Ok(Value::Null)
+            })
+        };
+        if let Err(error) = pick_res {
             app.ui.ai.error = error;
         }
         requests.retain(|request| !matches!(request, AiRequest::Start(_) | AiRequest::RetryBatch { .. }));
@@ -657,6 +686,54 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
     load_preview(app, ctx);
     load_proof_preview(app, ctx);
     load_companion_proof(app, ctx);
+}
+
+fn load_script_path_into_prompt(app: &mut DesignApp, picked: &str) {
+    let clean = sanitize_user_path(picked);
+    let max_bytes = designcraft_ai_types::protocol::MAX_BRIEF_BYTES as u64;
+    let loaded = if let Some(read) = app.services.read.as_mut() {
+        read(&clean)
+    } else {
+        designcraft_engine::io::read_capped(&clean, max_bytes).map_err(|e| format!("{clean}: {e}"))
+    };
+    match loaded {
+        Ok(bytes) => load_script_bytes_into_prompt(app, bytes),
+        Err(error) => app.ui.ai.error = error,
+    }
+}
+
+pub(crate) fn load_script_bytes_into_prompt(app: &mut DesignApp, bytes: Vec<u8>) {
+    let a = app.ui.language == "ar";
+    if bytes.len() > designcraft_ai_types::protocol::MAX_BRIEF_BYTES {
+        app.ui.ai.error = text(
+            a,
+            "Script file exceeds 1 MiB. Split or move static reference text into a skill package.",
+            "يتجاوز ملف السكربت 1 ميبيبايت. قسّم الملف أو انقل المراجع الثابتة إلى مهارة.",
+        )
+        .into();
+        return;
+    }
+    match String::from_utf8(bytes) {
+        Ok(script) if !script.contains('\0') => {
+            if let Some(detected) = explicit_script_pages(&script).or_else(|| natural_prompt_pages(&script))
+                && app.ui.ai.new_document
+            {
+                app.ui.ai.pages = detected;
+            }
+            app.ui.ai.prompt = script;
+            app.ui.ai.edit_large_script_inline = false;
+            app.ui.ai.clear_failure_alert();
+            app.ui.ai.error.clear();
+        }
+        _ => {
+            app.ui.ai.error = text(
+                a,
+                "Script file must be valid UTF-8 plain text or Markdown (.md / .txt).",
+                "يجب أن يكون ملف السكربت نصاً صالحاً بترميز UTF-8 (.md أو .txt).",
+            )
+            .into();
+        }
+    }
 }
 
 pub(super) const MAX_AI_TARGET_PDF_BYTES: u64 = 64 * 1024 * 1024;

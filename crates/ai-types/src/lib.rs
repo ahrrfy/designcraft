@@ -395,7 +395,10 @@ mod tests {
         assert!(!is_non_image_model(ProviderKind::ComfyUi, "juggernautXL_v9"));
         assert!(!is_non_image_model(ProviderKind::Gemini, "image-model"));
         assert!(!is_non_image_model(ProviderKind::Gemini, "test-image"));
+    }
 
+    #[test]
+    fn non_text_model_guards_classify_embed_audio_video_and_gemma_families() {
         for non_gen in [
             "gemini-tuned-embed-only",
             "nomic-embed-text",
@@ -423,7 +426,10 @@ mod tests {
         }
         assert!(!is_non_text_model("embedded-layout-helper"));
         assert!(!is_non_text_model("imaginative-writer-7b"));
+    }
 
+    #[test]
+    fn retired_gemini_and_image_review_model_guards_classify_families() {
         for retired in [
             "gemini-2.0-flash",
             "gemini-1.5-pro",

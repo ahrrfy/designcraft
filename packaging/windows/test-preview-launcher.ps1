@@ -36,6 +36,14 @@ try {
         try { & (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $taskManifest -ValidateOnly | Out-Null } catch { $taskRejected = $true }
         if (-not $taskRejected) { throw "Missing $taskField was accepted." }
     }
+    $canonicalManifest = Join-Path $taskFixture 'install-manifest.json'
+    $canonicalRecord = @{install_mode='canonical_inplace';profile=$taskProfile;executable=$taskExe;executable_sha256=(Get-FileHash -LiteralPath $taskExe -Algorithm SHA256).Hash.ToLowerInvariant()}
+    [System.IO.File]::WriteAllText($canonicalManifest, ($canonicalRecord | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+    $canonicalValidated = & (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $canonicalManifest -ValidateOnly
+    if ($canonicalValidated.profile -ne $taskProfile -or $canonicalValidated.control_enabled) { throw 'Canonical manifest without port failed read-only validation.' }
+    $missingPortControlRejected = $false
+    try { & (Join-Path $PSScriptRoot 'start-native-preview.ps1') -ManifestPath $canonicalManifest -EnableControl -ValidateOnly | Out-Null } catch { $missingPortControlRejected = $true }
+    if (-not $missingPortControlRejected) { throw 'Canonical manifest without port accepted -EnableControl.' }
 } finally {
     if (Test-Path -LiteralPath $taskFixture) { Remove-Item -LiteralPath $taskFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
