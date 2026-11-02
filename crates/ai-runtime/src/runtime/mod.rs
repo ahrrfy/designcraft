@@ -69,7 +69,7 @@ pub struct ProductionRunner {
     print_contracts: BTreeMap<u64, crate::print_contract::PrintContract>,
     local_server: crate::localserver::LocalOllama,
     design_memory: BTreeMap<u64, crate::brief_planner::SessionDesignMemory>,
-    failed_cloud_task: Option<TaskRequest>,
+    failed_cloud_task: Option<(TaskRequest, Option<u64>)>,
 }
 
 impl Drop for ProductionRunner {

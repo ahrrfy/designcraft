@@ -12,6 +12,12 @@ use serde_json::{Value, json};
 const MAX_AGENT_TURNS: usize = 20;
 
 pub(crate) fn has_configured_image_model(settings: &AiSettings) -> bool {
+    if settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::LocalOnly && !settings.image_model.provider.is_local() {
+        return false;
+    }
+    if settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::CloudOnly && settings.image_model.provider.is_local() {
+        return false;
+    }
     if validate_endpoint(&settings.image_model).is_err() {
         return false;
     }
@@ -62,8 +68,11 @@ pub(crate) fn run_open_document_agent_loop(
     let overview = workspace.inspect_document_overview(request)?;
 
     let system = build_agent_system_prompt(catalog, skills, allow_image_queue, supports_vision)?;
-    let initial_user = build_initial_user_message(request, context, &overview)?;
-    let mut messages = vec![AgentMessage::User { text: initial_user, images: Vec::new() }];
+    let mut prompt_context = context.clone();
+    let initial_images = crate::rag::resolve_scanned_attachment_images(&mut prompt_context, request);
+    workspace.scanned_images_delivered = !initial_images.is_empty();
+    let initial_user = build_initial_user_message(request, &prompt_context, &overview)?;
+    let mut messages = vec![AgentMessage::User { text: initial_user, images: initial_images }];
 
     let style_profile = skills.iter().find_map(|s| s.design_profile.as_ref());
 
@@ -144,7 +153,7 @@ pub(crate) fn run_open_document_agent_loop(
 
     // If the model ran out of turns after applying edits without calling `complete_task`, rescue only if preflight has no blocking errors.
     if workspace.completed_title.is_none() {
-        if workspace.applied_chunks.is_empty() && workspace.deferred_images.is_empty() {
+        if workspace.applied_chunks.is_empty() && workspace.deferred_images.is_empty() && workspace.scheduled_formats.is_none() {
             return Err("AI agent finished without applying any native document commands or queueing illustrations".into());
         }
         let mut preflight = workspace.preflight_summary()?;
@@ -171,6 +180,7 @@ pub(crate) fn run_open_document_agent_loop(
     let mut summary = workspace.completed_summary.unwrap_or_else(|| title.clone());
     let mut chunks = workspace.applied_chunks;
     let mut deferred_batches = workspace.deferred_images;
+    let scheduled_formats = workspace.scheduled_formats;
 
     if !deferred_batches.is_empty() {
         let total_imgs: usize = deferred_batches.iter().map(|b| b.images.len()).sum();
@@ -191,7 +201,7 @@ pub(crate) fn run_open_document_agent_loop(
                     chunks.extend(expanded_chunks);
                     deferred_batches.clear();
                 }
-                Err(budget_reason) if !chunks.is_empty() => {
+                Err(budget_reason) if !chunks.is_empty() || scheduled_formats.is_some() => {
                     summary = format!("{summary} ({total_imgs} illustration(s) staged for confirmation — {budget_reason})");
                 }
                 Err(err) => return Err(err),
@@ -201,12 +211,12 @@ pub(crate) fn run_open_document_agent_loop(
         }
     }
 
-    if chunks.is_empty() && deferred_batches.is_empty() {
+    if chunks.is_empty() && deferred_batches.is_empty() && scheduled_formats.is_none() {
         return Err("No native document actions or queued illustrations were produced".into());
     }
 
     runner.progress("Finalizing verified native document update", 0.96)?;
-    Ok(Product::Agentic { title, summary, chunks, deferred_images: deferred_batches })
+    Ok(Product::Agentic { title, summary, chunks, deferred_images: deferred_batches, scheduled_formats })
 }
 
 /// Retain raw visual render bytes only on recent `ToolResults` turns within the 8-image / 2 MiB
@@ -365,10 +375,12 @@ fn try_apply_json_fallback(
     let saved_doc = workspace.session.doc().ok().cloned();
     let saved_chunks_len = workspace.applied_chunks.len();
     let saved_images_len = workspace.deferred_images.len();
+    let saved_sched = workspace.scheduled_formats.clone();
 
     let rollback = |ws: &mut DocToolWorkspace, doc_opt: Option<DocState>| {
         ws.applied_chunks.truncate(saved_chunks_len);
         ws.deferred_images.truncate(saved_images_len);
+        ws.scheduled_formats = saved_sched;
         ws.completed_title = None;
         ws.completed_summary = None;
         if let Some(prev_doc) = doc_opt {

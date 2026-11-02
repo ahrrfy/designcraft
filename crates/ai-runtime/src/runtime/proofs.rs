@@ -1274,12 +1274,37 @@ pub(super) fn enrich_production_context_with_memory(
     }
     if !task.attachments.is_empty() || !pack_ids.is_empty() {
         let profile_roots = file_access::AutomationRoots::new(&[root], &[root]).ok().flatten();
-        let (rag_idx, _, _) = crate::rag::build_task_knowledge_index(profile_roots.as_deref(), Some(root), &task.attachments, &pack_ids, &[]);
+        let (rag_idx, scanned_images, _) =
+            crate::rag::build_task_knowledge_index(profile_roots.as_deref(), Some(root), &task.attachments, &pack_ids, &[]);
         let hits = rag_idx.search(&task.prompt, 6);
         if !hits.is_empty()
             && let Ok(hits_val) = serde_json::to_value(&hits)
         {
             context.insert("rag_grounding_hits".into(), hits_val);
+        }
+        if !scanned_images.is_empty() && designcraft_ai_providers::supports_agent_vision(&task.settings.text_model) {
+            use base64::Engine as _;
+            let mut encoded_imgs = Vec::new();
+            let mut total_bytes = 0usize;
+            for img in scanned_images.into_iter().take(4) {
+                if total_bytes.saturating_add(img.bytes.len()) > 1024 * 1024 {
+                    continue;
+                }
+                total_bytes = total_bytes.saturating_add(img.bytes.len());
+                encoded_imgs.push(json!({
+                    "mediaType": img.mime_type,
+                    "base64": base64::engine::general_purpose::STANDARD.encode(&img.bytes),
+                }));
+            }
+            if !encoded_imgs.is_empty() {
+                context.insert("_scanned_attachment_images".into(), Value::Array(encoded_imgs));
+                context.insert(
+                    "scanned_attachment_notice".into(),
+                    json!(
+                        "Attached scanned document page image(s) are included in your multimodal visual input; read and ground your output in them."
+                    ),
+                );
+            }
         }
     }
     let uses_facing =

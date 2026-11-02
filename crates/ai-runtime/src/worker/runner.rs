@@ -108,7 +108,21 @@ impl Runner<'_> {
             }
             strip(&mut prompt, 0);
         }
-        crate::production_cache::digest(&json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"arabicTashkeel":request.settings.arabic_tashkeel,"arabicFont":request.settings.arabic_font,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id})).map(Some)
+        let image_digests: Vec<String> = generation
+            .images
+            .iter()
+            .map(|img| {
+                let d: [u8; 32] = Sha256::digest(&img.bytes).into();
+                d.iter().map(|b| format!("{b:02x}")).collect()
+            })
+            .collect();
+        let mut key_obj = json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"arabicTashkeel":request.settings.arabic_tashkeel,"arabicFont":request.settings.arabic_font,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id});
+        if !image_digests.is_empty()
+            && let Some(map) = key_obj.as_object_mut()
+        {
+            map.insert("attachmentImages".into(), json!(image_digests));
+        }
+        crate::production_cache::digest(&key_obj).map(Some)
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn cached_plan(
@@ -386,6 +400,7 @@ impl Runner<'_> {
                     summary: format!("Generated and placed {total_imgs} confirmed illustration(s) in 1 Undo step"),
                     chunks,
                     deferred_images: Vec::new(),
+                    scheduled_formats: None,
                 })
             }
             Work::Skill { prompt, reference_paths, context, settings, catalog, registry_root, design_style } => {
@@ -1123,6 +1138,7 @@ impl Runner<'_> {
             system.push('\n');
             system.push_str(crate::image_repetition::POLICY);
         }
+        let scanned_images = crate::rag::resolve_scanned_attachment_images(&mut document_context, request);
         let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
         let mut schema = plan_schema(catalog, request.settings.output_mode)?;
         if scope.is_some() {
@@ -1136,7 +1152,7 @@ impl Runner<'_> {
             prompt: original.clone(),
             json_schema: schema,
             max_output_tokens: request.settings.budget.max_output_tokens,
-            images: Vec::new(),
+            images: scanned_images,
             resources: request.settings.resources.clone(),
         };
         Ok((generation, original))

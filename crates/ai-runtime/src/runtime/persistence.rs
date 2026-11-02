@@ -189,6 +189,10 @@ pub(crate) fn enforce_execution_mode(settings: &mut AiSettings) -> Result<(), St
             {
                 return Err("LocalOnly execution mode forbids cloud image providers; select ComfyUI or switch Output Mode to Native Only".into());
             }
+            if !settings.image_model.provider.is_local() {
+                settings.image_model = designcraft_ai_types::ModelSelection { provider: ProviderKind::ComfyUi, model: String::new(), endpoint: None };
+                settings.comfy_workflow = None;
+            }
             if !designcraft_ai_types::supports_gemini_image_review(settings.text_model.provider, &settings.text_model.model) {
                 settings.verify_generated_images = false;
             }

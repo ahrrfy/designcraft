@@ -474,7 +474,17 @@ impl ProductionRunner {
             return self.retry_batch(session, &target_id);
         }
 
-        if let Some(mut task) = self.failed_cloud_task.take() {
+        if let Some((mut task, failed_uid)) = self.failed_cloud_task.take() {
+            if let Some(uid) = failed_uid {
+                let Some(target_idx) = session.documents().iter().position(|doc| doc.uid == uid) else {
+                    self.failed_cloud_task = Some((task, failed_uid));
+                    return Err("The document targeted by the failed cloud task is no longer open; open it or start a fresh task".into());
+                };
+                session.set_active(target_idx);
+                if matches!(task.target, TaskTarget::NewDocument { .. }) {
+                    task.target = TaskTarget::CurrentDocument;
+                }
+            }
             task.settings.text_model = resolved;
             task.settings.execution_mode = designcraft_ai_types::protocol::AiExecutionMode::LocalOnly;
             task.settings.verify_generated_images = false;
@@ -484,11 +494,16 @@ impl ProductionRunner {
             if task.settings.budget.max_output_tokens >= task.settings.resources.context_tokens {
                 task.settings.resources.context_tokens = task.settings.budget.max_output_tokens.saturating_add(4096).min(131_072);
             }
-            if matches!(task.target, TaskTarget::NewDocument { .. }) && session.doc().is_ok() {
-                task.target = TaskTarget::CurrentDocument;
-            }
+            let backup = (task.clone(), failed_uid);
             self.snapshot.can_continue_locally = false;
-            return self.start(session, task);
+            if let Err(err) = self.start(session, task) {
+                if self.pending.is_none() {
+                    self.failed_cloud_task = Some(backup);
+                    self.snapshot.can_continue_locally = self.compute_can_continue_locally();
+                }
+                return Err(err);
+            }
+            return Ok(());
         }
 
         Err("No failed cloud job or task is available to continue locally".into())
@@ -537,7 +552,13 @@ impl ProductionRunner {
         let target_revision = target.revision;
         let expected_doc = pending_regen.expected_doc.clone();
         let mut effective_settings = pending_regen.task.settings.clone();
-        if (self.snapshot.settings.image_model.provider == ProviderKind::ComfyUi || !self.snapshot.settings.image_model.model.trim().is_empty())
+        let snap_img_compatible = match effective_settings.execution_mode {
+            designcraft_ai_types::protocol::AiExecutionMode::LocalOnly => self.snapshot.settings.image_model.provider.is_local(),
+            designcraft_ai_types::protocol::AiExecutionMode::CloudOnly => !self.snapshot.settings.image_model.provider.is_local(),
+            _ => true,
+        };
+        if snap_img_compatible
+            && (self.snapshot.settings.image_model.provider == ProviderKind::ComfyUi || !self.snapshot.settings.image_model.model.trim().is_empty())
             && validate_endpoint(&self.snapshot.settings.image_model).is_ok()
         {
             effective_settings.image_model = self.snapshot.settings.image_model.clone();
@@ -550,6 +571,7 @@ impl ProductionRunner {
         let per_image_reqs = if effective_settings.verify_generated_images { 4u32 } else { 1u32 };
         let needed_reqs = u32::try_from(pending_regen.approval.count).unwrap_or(u32::MAX).saturating_mul(per_image_reqs).clamp(1, 10_000);
         effective_settings.budget.max_requests = effective_settings.budget.max_requests.max(needed_reqs);
+        enforce_execution_mode(&mut effective_settings)?;
         validate_settings(&effective_settings)?;
         require_generation_models(&effective_settings)?;
         let mut task = pending_regen.task.clone();
@@ -1156,7 +1178,8 @@ impl ProductionRunner {
                 report.message = error;
                 self.snapshot.stage = report.status.clone();
                 if !cancelled && !pending.executed_model.0.is_local() && pending.task.is_some() {
-                    self.failed_cloud_task = pending.task.clone();
+                    let failed_uid = pending.expected.map(|(uid, _)| uid);
+                    self.failed_cloud_task = pending.task.clone().map(|t| (t, failed_uid));
                 } else if cancelled {
                     self.failed_cloud_task = None;
                 }
@@ -1230,8 +1253,15 @@ impl ProductionRunner {
             worker::Product::Plan(plan) => {
                 self.publish_plan_product(session, task, expected, expected_doc, plan, report)?;
             }
-            worker::Product::Agentic { title, summary, chunks, deferred_images } => {
-                self.publish_agentic_product(session, task, expected, expected_doc, (title, summary, chunks, deferred_images), report)?;
+            worker::Product::Agentic { title, summary, chunks, deferred_images, scheduled_formats } => {
+                self.publish_agentic_product(
+                    session,
+                    task,
+                    expected,
+                    expected_doc,
+                    (title, summary, chunks, deferred_images, scheduled_formats),
+                    report,
+                )?;
             }
         }
         Ok(())
@@ -1343,7 +1373,7 @@ impl ProductionRunner {
         };
         report.actions = actions;
         report.title = title;
-        self.finalize_published_artifacts(session, task, min_ppi, report)?;
+        self.finalize_published_artifacts(session, task, min_ppi, None, report)?;
         report.message = format!("Created {} editable native actions; {} preflight notices", report.actions, report.issues.len());
         Ok(())
     }
@@ -1355,10 +1385,16 @@ impl ProductionRunner {
         task: &Option<TaskRequest>,
         expected: Option<(u64, u64)>,
         expected_doc: Option<&std::sync::Arc<designcraft_engine::doc::Document>>,
-        agentic: (String, String, Vec<Vec<EngineAction>>, Vec<crate::doc_tools::DeferredImagePlan>),
+        agentic: (
+            String,
+            String,
+            Vec<Vec<EngineAction>>,
+            Vec<crate::doc_tools::DeferredImagePlan>,
+            Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
+        ),
         report: &mut TaskReport,
     ) -> Result<(), String> {
-        let (title, summary, chunks, deferred_images) = agentic;
+        let (title, summary, chunks, deferred_images, scheduled_formats) = agentic;
         let task = task.as_ref().ok_or("Production result has no originating task")?;
         ensure_publication_idle(session)?;
         if let Some(directory) = &task.export_directory {
@@ -1465,7 +1501,7 @@ impl ProductionRunner {
         }
         report.actions = total_actions;
         report.title = title;
-        self.finalize_published_artifacts(session, task, min_ppi, report)?;
+        self.finalize_published_artifacts(session, task, min_ppi, scheduled_formats, report)?;
         self.record_deferred_image_regen(session, task, &summary, (deferred_images, deferred_count), min_ppi, report)
     }
 
@@ -1474,6 +1510,7 @@ impl ProductionRunner {
         session: &mut Session,
         task: &TaskRequest,
         min_ppi: f64,
+        scheduled_formats: Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
         report: &mut TaskReport,
     ) -> Result<(), String> {
         if let Ok(state) = session.doc() {
@@ -1489,7 +1526,12 @@ impl ProductionRunner {
                 Some(&report.title),
             );
         }
-        if !task.target_formats.is_empty() {
+        if let Some((formats, mode)) = scheduled_formats {
+            if !formats.is_empty() {
+                let adapted = crate::doc_tools::materialize_target_formats_on_session(session, &formats, mode)?;
+                report.actions = report.actions.saturating_add(adapted);
+            }
+        } else if !task.target_formats.is_empty() {
             let adapted = crate::doc_tools::materialize_target_formats_on_session(session, &task.target_formats, task.settings.multi_format_mode)?;
             report.actions = report.actions.saturating_add(adapted);
         }
@@ -1530,7 +1572,15 @@ impl ProductionRunner {
         let (deferred_images, deferred_count) = deferred;
         if !deferred_images.is_empty() && deferred_count > 0 {
             let current = session.doc().map_err(|e| e.to_string())?;
-            let img_sel = if task.settings.image_model.provider == ProviderKind::ComfyUi || !task.settings.image_model.model.trim().is_empty() {
+            let snap_img_compatible = match task.settings.execution_mode {
+                designcraft_ai_types::protocol::AiExecutionMode::LocalOnly => self.snapshot.settings.image_model.provider.is_local(),
+                designcraft_ai_types::protocol::AiExecutionMode::CloudOnly => !self.snapshot.settings.image_model.provider.is_local(),
+                _ => true,
+            };
+            let img_sel = if task.settings.image_model.provider == ProviderKind::ComfyUi
+                || !task.settings.image_model.model.trim().is_empty()
+                || !snap_img_compatible
+            {
                 &task.settings.image_model
             } else {
                 &self.snapshot.settings.image_model

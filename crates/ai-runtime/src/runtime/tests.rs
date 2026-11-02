@@ -2623,6 +2623,7 @@ fn agentic_publish_applies_multiple_chunks_in_single_undo_and_gates_deferred_ima
                 ],
                 summary: "2 composite illustrations queued for clean single-subject replacement".into(),
             }],
+            scheduled_formats: None,
         }),
         usage: UsageSummary::default(),
     }))
@@ -2973,4 +2974,195 @@ fn bug006_bug007_bug008_d1_d7_d9_d12_end_to_end_runtime_verification() {
     let pack_id = kb_snap.knowledge_packs[0].id.clone();
     let del_snap = runner.handle(&mut session, AiRequest::DeleteKnowledgePack { id: pack_id });
     assert!(del_snap.knowledge_packs.is_empty());
+}
+
+#[test]
+fn continue_remaining_locally_binds_failed_target_uid_across_tab_switches_and_preserves_unbound_new_a4() {
+    let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = ProductionRunner::open(dir.path()).unwrap();
+    let mut session = Session::new();
+
+    // Open two distinct tabs: tab 0 (1080x1080 target of failed cloud NewDocument) and tab 1 (unrelated 595x842 user document).
+    session.execute("file.new", &json!({"width": 1080.0, "height": 1080.0, "pages": 1, "facingPages": false})).unwrap();
+    let target_uid = session.doc().unwrap().uid;
+    session.execute("file.new", &json!({"width": 595.0, "height": 842.0, "pages": 1, "facingPages": false})).unwrap();
+    let unrelated_uid = session.doc().unwrap().uid;
+    assert_eq!(session.doc().unwrap().uid, unrelated_uid);
+
+    let failed_geom = designcraft_ai_types::protocol::DocumentGeometrySpec {
+        width_pt: 1080.0,
+        height_pt: 1080.0,
+        intent: designcraft_ai_types::protocol::DocumentIntentKind::Web,
+        units: "pixels".into(),
+        ..Default::default()
+    };
+    let failed_task = TaskRequest {
+        prompt: "صمم إعلان مقهى مربع".into(),
+        target: TaskTarget::NewDocument { pages: 1, geometry: failed_geom },
+        settings: AiSettings {
+            text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None },
+            ..Default::default()
+        },
+        auto_select_skills: false,
+        ..Default::default()
+    };
+    runner.failed_cloud_task = Some((failed_task, Some(target_uid)));
+    runner.snapshot.can_continue_locally = true;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let local_model = designcraft_ai_types::ModelSelection {
+        provider: ProviderKind::LocalOpenAi,
+        model: "qwen2.5-14b-local".into(),
+        endpoint: Some(format!("http://{addr}/v1/")),
+    };
+
+    let cont_snap = runner.handle(&mut session, AiRequest::ContinueRemainingLocally { job_id: None, local_model: Some(local_model.clone()) });
+    assert!(cont_snap.busy, "msg={}", cont_snap.message);
+    assert_eq!(session.doc().unwrap().uid, target_uid, "must switch back to the failed task's target tab, never overwriting unrelated_uid");
+    assert_eq!(session.documents().len(), 2, "must reuse failed NewDocument tab rather than spawning a 3rd tab");
+    let launched = runner.pending.as_ref().expect("worker launched");
+    assert_eq!(launched.expected.map(|(u, _)| u), Some(target_uid));
+    assert_eq!(launched.task.as_ref().unwrap().target, TaskTarget::CurrentDocument);
+    let _ = runner.handle(&mut session, AiRequest::Cancel);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runner.snapshot.busy && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = runner.handle(&mut session, AiRequest::Poll);
+    }
+
+    // Conversely, an unbound failed NewA4 task (`failed_uid == None`) must NOT turn into CurrentDocument on `unrelated_uid`:
+    session.set_active(1);
+    assert_eq!(session.doc().unwrap().uid, unrelated_uid);
+    runner.failed_cloud_task = Some((
+        TaskRequest { prompt: "صمم نشرة A4".into(), target: TaskTarget::NewA4 { pages: 1 }, auto_select_skills: false, ..Default::default() },
+        None,
+    ));
+    let cont_a4 = runner.handle(&mut session, AiRequest::ContinueRemainingLocally { job_id: None, local_model: Some(local_model) });
+    assert!(cont_a4.busy, "msg={}", cont_a4.message);
+    assert_eq!(runner.pending.as_ref().unwrap().task.as_ref().unwrap().target, TaskTarget::NewA4 { pages: 1 });
+    let _ = runner.handle(&mut session, AiRequest::Cancel);
+    while runner.snapshot.busy && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = runner.handle(&mut session, AiRequest::Poll);
+    }
+}
+
+#[test]
+fn agentic_publish_materializes_scheduled_separate_documents_and_enforces_local_only_image_boundary() {
+    let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = ProductionRunner::open(dir.path()).unwrap();
+    let mut session = Session::new();
+    session.execute("file.new", &json!({"width": 1080.0, "height": 1080.0, "pages": 1, "facingPages": false})).unwrap();
+    let before = session.doc().unwrap().clone();
+
+    let story_spec = designcraft_ai_types::protocol::DocumentGeometrySpec {
+        width_pt: 1080.0,
+        height_pt: 1920.0,
+        intent: designcraft_ai_types::protocol::DocumentIntentKind::Web,
+        units: "pixels".into(),
+        preset_label: "Instagram Story".into(),
+        ..Default::default()
+    };
+    let task = TaskRequest {
+        prompt: "صمم حملة مقهى وأخرج نسخة ستوري منفصلة".into(),
+        target: TaskTarget::CurrentDocument,
+        auto_select_skills: false,
+        ..Default::default()
+    };
+    let (tx, receiver) = std::sync::mpsc::channel();
+    tx.send(worker::Message::Finished(worker::Outcome {
+        result: Ok(worker::Product::Agentic {
+            title: "Campaign Pack".into(),
+            summary: "Created post and scheduled story companion".into(),
+            chunks: vec![vec![EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread": 0, "rect": [80.0, 80.0, 900.0, 260.0], "content": "text", "text": "Specialty Coffee"}),
+            }]],
+            deferred_images: vec![],
+            scheduled_formats: Some((vec![story_spec], designcraft_ai_types::protocol::MultiFormatOutputMode::SeparateDocuments)),
+        }),
+        usage: UsageSummary::default(),
+    }))
+    .unwrap();
+    runner.pending = Some(Pending {
+        roots: None,
+        worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+        id: "agentic-sched-1".into(),
+        started: Instant::now(),
+        task: Some(task),
+        expected: Some((before.uid, before.revision)),
+        expected_doc: Some(before.doc.clone()),
+        expected_prefs: Some(session.prefs.clone()),
+        skills: vec![],
+        executed_model: (ProviderKind::LocalOpenAi, "qwen2.5-14b".into()),
+        settings: AiSettings::default(),
+        deferred_outcome: None,
+        deferred_batch: None,
+    });
+    runner.snapshot.busy = true;
+    let snap = runner.handle(&mut session, AiRequest::Poll);
+    assert_eq!(snap.stage, "completed", "msg={}", snap.message);
+    assert_eq!(session.documents().len(), 2, "agentic scheduled SeparateDocuments companion must materialize on live Session");
+    let companion = &session.documents()[1];
+    assert_eq!((companion.doc.settings.page_width.round(), companion.doc.settings.page_height.round()), (1080.0, 1920.0));
+    assert!(companion.is_dirty(), "generated companion tab must be marked dirty until explicitly saved");
+
+    // Verify LocalOnly neutralizes leftover cloud image_model and blocks cloud ConfirmImageRegeneration:
+    let mut local_only = AiSettings {
+        execution_mode: designcraft_ai_types::protocol::AiExecutionMode::LocalOnly,
+        output_mode: designcraft_ai_types::OutputMode::NativeOnly,
+        text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Ollama, model: "qwen2.5:14b".into(), endpoint: None },
+        image_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "imagen-3.0-generate-002".into(), endpoint: None },
+        ..Default::default()
+    };
+    assert!(!crate::agent_loop::has_configured_image_model(&local_only), "LocalOnly must never expose cloud image queue");
+    enforce_execution_mode(&mut local_only).expect("LocalOnly NativeOnly admission neutralizes leftover cloud image_model");
+    assert!(local_only.image_model.provider.is_local(), "cloud image provider must be cleared on LocalOnly admission");
+}
+
+#[test]
+fn scanned_vector_pdf_attachment_renders_multimodal_png_for_vision_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf_dir = tempfile::tempdir().unwrap();
+    let pdf_path = pdf_dir.path().join("scanned_brand_sheet.pdf");
+
+    // Export a real 1-page vector-only PDF (zero selectable text) using DesignCraft's own PDF exporter.
+    let mut export_session = Session::new();
+    export_session.execute("file.new", &json!({"width": 400.0, "height": 400.0, "pages": 1, "facingPages": false})).unwrap();
+
+    export_session.execute("frame.create", &json!({"spread": 0, "rect": [40.0, 40.0, 360.0, 360.0], "shape": "rect", "fill": "Black"})).unwrap();
+    let roots = file_access::AutomationRoots::new(&[dir.path(), pdf_dir.path()], &[dir.path(), pdf_dir.path()]).unwrap().unwrap();
+    file_access::confine(Some(&roots), || {
+        export_session.execute("file.exportPdf", &json!({"path": pdf_path, "spreads": false, "bleed": false, "marks": false})).unwrap();
+    });
+
+    let base_doc = export_session.doc().unwrap().clone();
+    let task = TaskRequest {
+        prompt: "استخرج ألوان وتكوين الملف الممسوح ضوئياً".into(),
+        settings: AiSettings {
+            text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None },
+            ..Default::default()
+        },
+        attachments: vec![designcraft_ai_types::protocol::TaskAttachment {
+            path: pdf_path.to_string_lossy().into_owned(),
+            role: designcraft_ai_types::protocol::AttachmentRole::KnowledgeReference,
+        }],
+        ..Default::default()
+    };
+    let mut context = json!({});
+    file_access::confine(Some(&roots), || {
+        enrich_production_context_with_memory(&mut context, dir.path(), &base_doc, &task, None).unwrap();
+    });
+    assert!(context.get("_scanned_attachment_images").is_some(), "vision model must receive rendered PNG fallback for zero-text PDF");
+    let images = crate::rag::resolve_scanned_attachment_images(&mut context, &task);
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/jpeg");
+    assert!(images[0].bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+    assert!(context.get("_scanned_attachment_images").is_none(), "base64 payload must be stripped from JSON prompt context");
 }

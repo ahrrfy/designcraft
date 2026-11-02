@@ -137,10 +137,25 @@ pub(crate) enum Work {
 pub(crate) enum Product {
     Indesign(crate::indesign::IndesignExport),
     Plan(ProductionPlan),
-    Agentic { title: String, summary: String, chunks: Vec<Vec<EngineAction>>, deferred_images: Vec<crate::doc_tools::DeferredImagePlan> },
-    BatchPlan { plan: ProductionPlan, proofs: Vec<ProofArtifact> },
-    BatchGroup { plans: Vec<ProductionPlan>, proofs: Vec<ProofArtifact> },
-    Skill { files: PackageFiles, analyses: Vec<CachedAnalysis> },
+    Agentic {
+        title: String,
+        summary: String,
+        chunks: Vec<Vec<EngineAction>>,
+        deferred_images: Vec<crate::doc_tools::DeferredImagePlan>,
+        scheduled_formats: Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
+    },
+    BatchPlan {
+        plan: ProductionPlan,
+        proofs: Vec<ProofArtifact>,
+    },
+    BatchGroup {
+        plans: Vec<ProductionPlan>,
+        proofs: Vec<ProofArtifact>,
+    },
+    Skill {
+        files: PackageFiles,
+        analyses: Vec<CachedAnalysis>,
+    },
     Models(Vec<String>),
     Resources(designcraft_ai_types::ResourceSnapshot),
 }

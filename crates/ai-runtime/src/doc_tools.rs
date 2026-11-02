@@ -33,6 +33,9 @@ pub(crate) struct DocToolWorkspace {
     pub supports_vision: bool,
     pub ai_root: Option<std::path::PathBuf>,
     pub knowledge_index: Option<crate::rag::KnowledgeIndex>,
+    pub knowledge_scanned_images: Vec<ImageInput>,
+    pub scanned_images_delivered: bool,
+    pub scheduled_formats: Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
     pub visual_images_in_turn: usize,
     pub visual_bytes_in_turn: usize,
     pub max_visual_bytes_per_turn: usize,
@@ -56,6 +59,9 @@ impl DocToolWorkspace {
             supports_vision: true,
             ai_root: None,
             knowledge_index: None,
+            knowledge_scanned_images: Vec::new(),
+            scanned_images_delivered: false,
+            scheduled_formats: None,
             visual_images_in_turn: 0,
             visual_bytes_in_turn: 0,
             max_visual_bytes_per_turn: DEFAULT_MAX_VISUAL_BYTES_PER_TURN,
@@ -93,7 +99,7 @@ impl DocToolWorkspace {
             "search_document" => self.search_document(args).map(|v| (v, Vec::new())),
             "inspect_graphics_and_captions" => self.inspect_graphics_and_captions(args).map(|v| (v, Vec::new())),
             "render_visual_check" => self.render_visual_check(args),
-            "search_project_knowledge" => self.search_project_knowledge(args, request).map(|v| (v, Vec::new())),
+            "search_project_knowledge" => self.search_project_knowledge(args, request),
             "lookup_engine_commands" => self.lookup_engine_commands(args).map(|v| (v, Vec::new())),
             "inspect_preflight" => self.inspect_preflight_tool(args).map(|v| (v, Vec::new())),
             "adapt_layout_formats" => self.adapt_layout_formats(args, request).map(|v| (v, Vec::new())),
@@ -676,7 +682,7 @@ impl DocToolWorkspace {
         }))
     }
 
-    fn search_project_knowledge(&mut self, args: &Value, request: &TaskRequest) -> Result<Value, String> {
+    fn search_project_knowledge(&mut self, args: &Value, request: &TaskRequest) -> Result<(Value, Vec<ImageInput>), String> {
         let query = args.get("query").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or("missing non-empty `query`")?;
         let top_k = args.get("top_k").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(6).clamp(1, 16);
         let layer_filter = match args.get("layer").and_then(Value::as_str) {
@@ -694,20 +700,43 @@ impl DocToolWorkspace {
             }
             let profile_roots =
                 self.ai_root.as_deref().and_then(|root| designcraft_engine::file_access::AutomationRoots::new(&[root], &[root]).ok().flatten());
-            let (built_idx, _, _) =
+            let (built_idx, scanned_imgs, _) =
                 crate::rag::build_task_knowledge_index(profile_roots.as_deref(), self.ai_root.as_deref(), &request.attachments, &pack_ids, &[]);
             self.knowledge_index = Some(built_idx);
+            self.knowledge_scanned_images = scanned_imgs;
         }
         let idx = self.knowledge_index.as_ref().ok_or("knowledge index unavailable")?;
         let hits = idx.search_filtered(query, top_k, layer_filter);
         let hit_count = hits.len();
-        Ok(json!({
-            "ok": true,
-            "query": query,
-            "totalChunksIndexed": idx.len(),
-            "hitCount": hit_count,
-            "hits": hits,
-        }))
+        let mut attached_images = Vec::new();
+        if self.supports_vision && !self.scanned_images_delivered && !self.knowledge_scanned_images.is_empty() {
+            for img in &self.knowledge_scanned_images {
+                if self.visual_images_in_turn >= MAX_VISUAL_IMAGES_PER_TURN {
+                    break;
+                }
+                if self.visual_bytes_in_turn.saturating_add(img.bytes.len()) > self.max_visual_bytes_per_turn {
+                    continue;
+                }
+                self.visual_images_in_turn = self.visual_images_in_turn.saturating_add(1);
+                self.visual_bytes_in_turn = self.visual_bytes_in_turn.saturating_add(img.bytes.len());
+                attached_images.push(img.clone());
+            }
+            if !attached_images.is_empty() {
+                self.scanned_images_delivered = true;
+            }
+        }
+        Ok((
+            json!({
+                "ok": true,
+                "query": query,
+                "totalChunksIndexed": idx.len(),
+                "hitCount": hit_count,
+                "hits": hits,
+                "visionAttached": !attached_images.is_empty(),
+                "visionAttachedCount": attached_images.len(),
+            }),
+            attached_images,
+        ))
     }
 
     fn lookup_engine_commands(&self, args: &Value) -> Result<Value, String> {
@@ -813,13 +842,26 @@ impl DocToolWorkspace {
             _ => request.settings.multi_format_mode,
         };
         if mode == MultiFormatOutputMode::SeparateDocuments {
+            let mut combined = match self.scheduled_formats.take() {
+                Some((existing, MultiFormatOutputMode::SeparateDocuments)) => existing,
+                _ => Vec::new(),
+            };
+            for spec in formats {
+                let dup = combined.iter().any(|c| (c.width_pt - spec.width_pt).abs() <= 2.0 && (c.height_pt - spec.height_pt).abs() <= 2.0);
+                if !dup && combined.len() < 16 {
+                    combined.push(spec);
+                }
+            }
+            let scheduled_count = combined.len();
+            self.scheduled_formats = Some((combined, MultiFormatOutputMode::SeparateDocuments));
             return Ok(json!({
                 "ok": true,
                 "mode": "separate_documents",
-                "scheduledFormats": formats.len(),
+                "scheduledFormats": scheduled_count,
                 "note": "Companion document tabs for all secondary formats will be materialized atomically upon task publication.",
             }));
         }
+        self.scheduled_formats = Some((formats.clone(), MultiFormatOutputMode::AlternateLayouts));
         let actions = build_alternate_layout_actions(self.session.doc().map_err(|e| e.to_string())?, &formats);
         if actions.is_empty() {
             return Ok(json!({
@@ -2153,17 +2195,18 @@ pub(crate) fn materialize_target_formats_on_session(
                 let state = session.doc().map_err(|e| e.to_string())?;
                 (state.doc.clone(), state.title())
             };
+            let primary_dims = primary_doc
+                .spreads
+                .first()
+                .and_then(|sp| sp.pages.first())
+                .map(|p| (p.width, p.height))
+                .unwrap_or((primary_doc.settings.page_width, primary_doc.settings.page_height));
+            let mut materialized_dims: Vec<(f64, f64)> = vec![primary_dims];
             let primary_pages = primary_doc.page_count().max(1);
             let mut created_docs = 0usize;
             for fmt in formats.iter().take(12) {
-                let already_open = session.documents().iter().any(|ds| {
-                    ds.doc
-                        .spreads
-                        .first()
-                        .and_then(|sp| sp.pages.first())
-                        .is_some_and(|p| (p.width - fmt.width_pt).abs() <= 2.0 && (p.height - fmt.height_pt).abs() <= 2.0)
-                });
-                if already_open {
+                let already_materialized = materialized_dims.iter().any(|(w, h)| (w - fmt.width_pt).abs() <= 2.0 && (h - fmt.height_pt).abs() <= 2.0);
+                if already_materialized {
                     continue;
                 }
                 let label =
@@ -2173,6 +2216,7 @@ pub(crate) fn materialize_target_formats_on_session(
                 cloned_doc.settings.page_width = fmt.width_pt;
                 cloned_doc.settings.page_height = fmt.height_pt;
                 let companion = DocState::new(cloned_doc, None);
+                let baseline_unsaved = primary_doc.clone();
                 session.add_document(companion);
                 let page_nums: Vec<usize> = (1..=primary_pages).collect();
                 session.execute("liquid.pageRule", &json!({ "rule": "scale", "pages": page_nums })).map_err(|e| e.to_string())?;
@@ -2188,11 +2232,13 @@ pub(crate) fn materialize_target_formats_on_session(
                     .map_err(|e| e.to_string())?;
                 let _ = session.execute("story.fitOverset", &json!({ "minSize": 8.0 }));
                 if let Ok(comp_state) = session.doc_mut() {
-                    comp_state.saved_doc = comp_state.doc.clone();
-                    comp_state.saved_revision = comp_state.revision;
+                    // Keep unsaved generated companions dirty so closing/quitting prompts to save.
+                    comp_state.saved_doc = baseline_unsaved;
+                    comp_state.saved_revision = 0;
                     comp_state.history.undo.clear();
                     comp_state.history.redo.clear();
                 }
+                materialized_dims.push((fmt.width_pt, fmt.height_pt));
                 created_docs = created_docs.saturating_add(1);
             }
             if let Some(idx) = primary_idx {
@@ -2476,5 +2522,53 @@ mod tests {
         .unwrap();
         assert_eq!(created, 2);
         assert_eq!(sep_session.documents().len(), 3);
+        assert!(sep_session.documents()[1].is_dirty(), "generated companion must remain dirty until saved");
+        assert!(sep_session.documents()[2].is_dirty(), "generated companion must remain dirty until saved");
+    }
+
+    #[test]
+    fn separate_format_companions_ignore_unrelated_open_tabs_and_record_scheduled_formats() {
+        let mut session = Session::new();
+        // Unrelated open 1080x1080 document in tab 0:
+        session.execute("file.new", &json!({"width": 1080.0, "height": 1080.0, "pages": 1, "title": "Unrelated Tab"})).unwrap();
+        // Primary campaign document in tab 1 (1080x1920):
+        session.execute("file.new", &json!({"width": 1080.0, "height": 1920.0, "pages": 1, "title": "Campaign Story"})).unwrap();
+        assert_eq!(session.active_index(), Some(1));
+
+        let base = session.doc().unwrap().clone();
+        let req = TaskRequest {
+            prompt: "Create campaign formats".into(),
+            settings: AiSettings::default(),
+            skill_ids: Vec::new(),
+            auto_select_skills: false,
+            target: TaskTarget::CurrentDocument,
+            export_directory: None,
+            attachments: Vec::new(),
+            knowledge_pack_ids: Vec::new(),
+            target_formats: Vec::new(),
+            selection_context: None,
+        };
+        let mut ws = DocToolWorkspace::new(&base, &Prefs::default(), designcraft_engine::cmd::production::catalog(), 150.0);
+        let (res, is_err) = ws.execute_tool(
+            "adapt_layout_formats",
+            &json!({
+                "mode": "separate_documents",
+                "formats": [
+                    {"name": "Instagram Square", "width_pt": 1080.0, "height_pt": 1080.0},
+                    {"name": "Instagram Square Dup", "width_pt": 1080.0, "height_pt": 1080.0}
+                ]
+            }),
+            &req,
+            5,
+        );
+        assert!(!is_err, "{res}");
+        let (sched_specs, sched_mode) = ws.scheduled_formats.clone().expect("scheduled_formats must be persisted");
+        assert_eq!(sched_mode, designcraft_ai_types::protocol::MultiFormatOutputMode::SeparateDocuments);
+        assert_eq!(sched_specs.len(), 1);
+
+        let created = super::materialize_target_formats_on_session(&mut session, &sched_specs, sched_mode).unwrap();
+        assert_eq!(created, 1, "unrelated open 1080x1080 tab must not suppress current campaign's square companion");
+        assert_eq!(session.documents().len(), 3);
+        assert!(session.documents()[2].is_dirty());
     }
 }

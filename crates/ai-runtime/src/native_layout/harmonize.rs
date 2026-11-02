@@ -653,42 +653,64 @@ pub fn remap_step_references(value: &mut Value, old_to_new: &[usize]) {
     }
 }
 
+fn is_numeric_script_reference(r: &str) -> bool {
+    let mut parts = r.split('.');
+    let head = parts.next().unwrap_or("");
+    let head_ok = !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit());
+    head_ok && parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+}
+
+fn remap_reference_expr(expr: &str, old_to_new: &[usize]) -> Option<String> {
+    if !is_numeric_script_reference(expr) {
+        return None;
+    }
+    let (head, suffix) = match expr.find('.') {
+        Some(dot) => (expr.get(..dot)?, expr.get(dot..)?),
+        None => (expr, ""),
+    };
+    let old_idx = head.parse::<usize>().ok()?;
+    let &new_idx = old_to_new.get(old_idx)?;
+    Some(format!("{new_idx}{suffix}"))
+}
+
 fn remap_step_string(input: &str, old_to_new: &[usize]) -> String {
+    if let Some(r) = input.strip_prefix('$')
+        && let Some(remapped) = remap_reference_expr(r, old_to_new)
+    {
+        return format!("${remapped}");
+    }
+    if !input.contains("${") {
+        return input.to_owned();
+    }
     let mut out = String::with_capacity(input.len().saturating_add(8));
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            let braced = bytes.get(i + 1) == Some(&b'{');
-            let digit_start = if braced { i + 2 } else { i + 1 };
-            let mut digit_end = digit_start;
-            while digit_end < bytes.len() && bytes[digit_end].is_ascii_digit() {
-                digit_end += 1;
-            }
-            if digit_end > digit_start
-                && let Some(num_str) = input.get(digit_start..digit_end)
-                && let Ok(old_idx) = num_str.parse::<usize>()
-                && let Some(&new_idx) = old_to_new.get(old_idx)
-            {
-                if braced {
-                    out.push_str("${");
+    let mut rest = input;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            out.push_str("$$");
+            rest = tail;
+        } else if let Some(inner) = after.strip_prefix('{') {
+            if let Some(end) = inner.find('}') {
+                let expr = &inner[..end];
+                out.push_str("${");
+                if let Some(remapped) = remap_reference_expr(expr, old_to_new) {
+                    out.push_str(&remapped);
                 } else {
-                    out.push('$');
+                    out.push_str(expr);
                 }
-                out.push_str(&new_idx.to_string());
-                i = digit_end;
-                continue;
+                out.push('}');
+                rest = &inner[end + 1..];
+            } else {
+                out.push_str("${");
+                rest = inner;
             }
-        }
-        if let Some(rest) = input.get(i..)
-            && let Some(ch) = rest.chars().next()
-        {
-            out.push(ch);
-            i += ch.len_utf8();
         } else {
-            break;
+            out.push('$');
+            rest = after;
         }
     }
+    out.push_str(rest);
     out
 }
 
@@ -892,5 +914,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session.doc().unwrap().doc.assets.len(), 1, "both pages must share 1 deduplicated asset");
+    }
+
+    #[test]
+    fn remap_step_references_preserves_literal_currency_and_escaped_dollars() {
+        let mapping = [1usize, 2, 3, 4];
+        let mut payload = json!({
+            "wholeRef": "$0",
+            "fieldRef": "$0.story",
+            "arrayRef": "$2.ids.0",
+            "bracedInText": "Frame ${0.id} costs $1 today",
+            "escapedBraced": "$${0.id} and ${1.story}",
+            "priceOne": "Only $1 today",
+            "priceDecimal": "Total $2.50",
+            "priceRange": "$1-$2",
+            "grepGroup": "$$1",
+        });
+        remap_step_references(&mut payload, &mapping);
+        assert_eq!(payload["wholeRef"], "$1");
+        assert_eq!(payload["fieldRef"], "$1.story");
+        assert_eq!(payload["arrayRef"], "$3.ids.0");
+        assert_eq!(payload["bracedInText"], "Frame ${1.id} costs $1 today");
+        assert_eq!(payload["escapedBraced"], "$${0.id} and ${2.story}");
+        assert_eq!(payload["priceOne"], "Only $1 today");
+        assert_eq!(payload["priceDecimal"], "Total $2.50");
+        assert_eq!(payload["priceRange"], "$1-$2");
+        assert_eq!(payload["grepGroup"], "$$1");
     }
 }

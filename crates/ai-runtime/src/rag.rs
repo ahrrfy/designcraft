@@ -479,7 +479,7 @@ pub fn ingest_document_bytes(
             let report = designcraft_pdf::extract_text_pages(bytes)?;
             let mut scanned_pages = Vec::new();
             for page in &report.pages {
-                if page.is_likely_scanned {
+                if page.is_likely_scanned || page.text.chars().filter(|c| !c.is_whitespace()).count() < 16 {
                     scanned_pages.push(page.page_number);
                 }
                 let trimmed = page.text.trim();
@@ -651,6 +651,53 @@ pub fn ingest_task_attachments(attachments: &[TaskAttachment]) -> Result<Ingeste
     }
 
     Ok(IngestedAttachmentBundle { chunks, scanned_page_images, warnings })
+}
+
+/// Extract pre-ingested scanned attachment page images from `context` (removing the transient
+/// `_scanned_attachment_images` field so base64 bytes do not bloat prompt JSON), falling back to
+/// bounded on-demand attachment ingestion when `context` was constructed without host pre-enrichment.
+pub fn resolve_scanned_attachment_images(context: &mut Value, request: &designcraft_ai_types::protocol::TaskRequest) -> Vec<ImageInput> {
+    use base64::Engine as _;
+    let taken = context.as_object_mut().and_then(|obj| obj.remove("_scanned_attachment_images"));
+    if !designcraft_ai_providers::supports_agent_vision(&request.settings.text_model) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut total_bytes = 0usize;
+    if let Some(arr) = taken.as_ref().and_then(Value::as_array) {
+        for item in arr.iter().take(MAX_SCANNED_VISION_PAGES) {
+            let Some(media_type) = item.get("mediaType").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(b64) = item.get("base64").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+                continue;
+            };
+            if bytes.is_empty() || total_bytes.saturating_add(bytes.len()) > 1024 * 1024 {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(bytes.len());
+            out.push(ImageInput { mime_type: media_type.to_string(), bytes });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if taken.is_none()
+        && !request.attachments.is_empty()
+        && let Ok(bundle) = ingest_task_attachments(&request.attachments)
+    {
+        for img in bundle.scanned_page_images.into_iter().take(MAX_SCANNED_VISION_PAGES) {
+            if total_bytes.saturating_add(img.bytes.len()) > 1024 * 1024 {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(img.bytes.len());
+            out.push(img);
+        }
+    }
+    out
 }
 
 // ============================================================================
