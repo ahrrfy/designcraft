@@ -468,9 +468,10 @@ fn main() -> std::process::ExitCode {
     gpu_limits::request_adapter_texture_size(&mut options);
     // The graphics backend, decided before the window exists: a driver that faults takes the
     // process down before any Rust code can catch it (see `gpu::backend`).
+    let gpu_version = gpu::backend::version_key(env!("CARGO_PKG_VERSION"), option_env!("DESIGNCRAFT_BUILD_SHA"));
     let fallback = gpu::backend::Fallback::begin(
         if no_prefs() { None } else { profile::config_dir().map(|d| d.join(gpu::backend::FILE)) },
-        env!("CARGO_PKG_VERSION"),
+        &gpu_version,
         &gpu::backend::skipped_backends(&skip),
     );
     let instance_backends = fallback.as_ref().map(gpu::backend::Fallback::backends);

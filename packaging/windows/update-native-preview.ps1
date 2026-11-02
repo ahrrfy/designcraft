@@ -19,6 +19,58 @@ function Test-TrustedCiUrl([string]$Url) {
     return ($Url -cmatch '^https://github\.com/ahrrfy/designcraft/(?:actions/runs/[0-9]+|commit/[0-9a-f]{40})$')
 }
 
+function Test-TransientPreviewWebError($ErrorRecord) {
+    $ex = if ($null -ne $ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    if ($null -eq $ex) { return $false }
+    $respProp = $ex.PSObject.Properties['Response']
+    if ($null -ne $respProp -and $null -ne $respProp.Value) {
+        $statusProp = $respProp.Value.PSObject.Properties['StatusCode']
+        if ($null -ne $statusProp -and $null -ne $statusProp.Value) {
+            $code = [int]$statusProp.Value
+            if ($code -in @(408, 429, 500, 502, 503, 504)) { return $true }
+            if ($code -ge 400 -and $code -lt 500) { return $false }
+        }
+    }
+    return $true
+}
+
+function Invoke-PreviewRestWithRetry([string]$Uri, [hashtable]$Headers, [int]$TimeoutSec = 15, [int]$MaxAttempts = 3, [double]$RetryDelaySeconds = 1.0) {
+    if ($Uri -cnotmatch '^https://api\.github\.com/repos/ahrrfy/designcraft/') { throw 'Untrusted GitHub API URL.' }
+    if ($MaxAttempts -lt 1) { throw 'Invalid retry attempt count.' }
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return (Invoke-RestMethod -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec)
+        } catch {
+            if ($attempt -ge $MaxAttempts -or -not (Test-TransientPreviewWebError $_)) { throw }
+            if ($RetryDelaySeconds -gt 0) {
+                Start-Sleep -Milliseconds ([int][Math]::Round($RetryDelaySeconds * $attempt * 1000))
+            }
+        }
+    }
+}
+
+function Invoke-PreviewDownloadWithRetry([string]$Uri, [string]$OutFile, [int]$TimeoutSec = 60, [int]$MaxAttempts = 3, [double]$RetryDelaySeconds = 1.0) {
+    if ($Uri -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/') { throw 'Untrusted GitHub release asset URL.' }
+    if ($MaxAttempts -lt 1) { throw 'Invalid retry attempt count.' }
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        if (Test-Path -LiteralPath $OutFile -PathType Leaf) {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec
+            return
+        } catch {
+            if (Test-Path -LiteralPath $OutFile -PathType Leaf) {
+                Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            }
+            if ($attempt -ge $MaxAttempts -or -not (Test-TransientPreviewWebError $_)) { throw }
+            if ($RetryDelaySeconds -gt 0) {
+                Start-Sleep -Milliseconds ([int][Math]::Round($RetryDelaySeconds * $attempt * 1000))
+            }
+        }
+    }
+}
+
 function Assert-UpdateMetadata($Metadata) {
     if ($Metadata.schemaVersion -ne 1 -or $Metadata.repository -cne 'ahrrfy/designcraft') { throw 'Unexpected update source.' }
     foreach ($value in @($Metadata.repository, $Metadata.sourceCommit, $Metadata.archive.name, $Metadata.archive.sha256, $Metadata.ciUrl)) {
@@ -437,7 +489,7 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $headers = @{ 'User-Agent' = 'Smart-Design-Updater'; 'Accept' = 'application/vnd.github+json' }
     # Unroll explicitly: Windows PowerShell 5.1 Invoke-RestMethod writes JSON arrays with NoEnumerate.
-    $rawReleases = Invoke-RestMethod -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers $headers -TimeoutSec 45
+    $rawReleases = Invoke-PreviewRestWithRetry -Uri 'https://api.github.com/repos/ahrrfy/designcraft/releases?per_page=20' -Headers $headers -TimeoutSec 15
     $releases = @($rawReleases | ForEach-Object { $_ })
     $release = $releases | Where-Object { -not $_.draft -and $_.tag_name -cmatch '^v[0-9]+\.[0-9]+\.[0-9]+-ai[0-9A-Za-z.-]*$' -and @($_.assets | Where-Object name -eq 'update.json').Count -eq 1 } | Sort-Object published_at -Descending | Select-Object -First 1
     if ($null -eq $release) { Write-PreviewUpdateResult 'no_published_update' $null $null $null; return }
@@ -445,7 +497,7 @@ try {
     if ($asset.size -gt 1048576 -or $asset.browser_download_url -cnotmatch '^https://github\.com/ahrrfy/designcraft/releases/download/v[0-9A-Za-z.-]+/update\.json$') { throw 'Invalid update metadata asset.' }
     $metaPath = Join-Path $root $(if ($canonicalMode) { '.downloaded-update.json' } else { 'downloaded-update.json' })
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $metaPath -TimeoutSec 45
+        Invoke-PreviewDownloadWithRetry -Uri $asset.browser_download_url -OutFile $metaPath -TimeoutSec 20
         $meta = Read-UpdateJson $metaPath
     } finally {
         if ($canonicalMode -and (Test-Path -LiteralPath $metaPath -PathType Leaf)) {
@@ -455,27 +507,27 @@ try {
     Assert-UpdateMetadata $meta
     if ($meta.sourceCommit -ceq $record.published_source_commit) { Write-PreviewUpdateResult 'up_to_date' $meta.sourceCommit $record.executable $meta.ciUrl; return }
     if ($record.published_source_commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Current source commit is unknown; automatic replacement is disabled.' }
-    $comparison = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $record.published_source_commit + '...' + $meta.sourceCommit) -Headers $headers -TimeoutSec 45
+    $comparison = Invoke-PreviewRestWithRetry -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $record.published_source_commit + '...' + $meta.sourceCommit) -Headers $headers -TimeoutSec 15
     if ((Get-PreviewUpdateDecision $record.published_source_commit $meta.sourceCommit $comparison.status) -eq 'up_to_date') {
         $currentCiUrl = if ($record.update_ci_url) { $record.update_ci_url } else { $null }
         Write-PreviewUpdateResult 'up_to_date' $record.published_source_commit $record.executable $currentCiUrl
         return
     }
     if ($meta.ciUrl -cmatch '^https://github\.com/ahrrfy/designcraft/commit/([0-9a-f]{40})$') {
-        $combinedStatus = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/commits/' + $meta.sourceCommit + '/status') -Headers $headers -TimeoutSec 45
-        $mainComparison = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 45
+        $combinedStatus = Invoke-PreviewRestWithRetry -Uri ('https://api.github.com/repos/ahrrfy/designcraft/commits/' + $meta.sourceCommit + '/status') -Headers $headers -TimeoutSec 15
+        $mainComparison = Invoke-PreviewRestWithRetry -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 15
         Assert-PreviewCommitStatusProof $combinedStatus $meta.sourceCommit ([string]$mainComparison.status)
     } else {
         $runId = $meta.ciUrl.Split('/')[-1]
-        $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
+        $ci = Invoke-PreviewRestWithRetry -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 15
         for ($attempt = 0; $attempt -lt 3 -and $ci.path -ceq '.github/workflows/upstream-sync.yml' -and $ci.status -in @('in_progress', 'queued'); $attempt++) {
             Start-Sleep -Seconds 5
-            $ci = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 45
+            $ci = Invoke-PreviewRestWithRetry -Uri ('https://api.github.com/repos/ahrrfy/designcraft/actions/runs/' + $runId) -Headers $headers -TimeoutSec 15
         }
         $syncBaseVal = if ($null -ne $meta.PSObject.Properties['syncBaseCommit'] -and $meta.syncBaseCommit) { [string]$meta.syncBaseCommit } else { '' }
         $mainStatus = ''
         if ($ci.path -ceq '.github/workflows/upstream-sync.yml') {
-            $mainComparison = Invoke-RestMethod -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 45
+            $mainComparison = Invoke-PreviewRestWithRetry -Uri ('https://api.github.com/repos/ahrrfy/designcraft/compare/' + $meta.sourceCommit + '...main') -Headers $headers -TimeoutSec 15
             $mainStatus = [string]$mainComparison.status
         }
         Assert-PreviewCiProof $ci $meta.sourceCommit $syncBaseVal $mainStatus
@@ -487,7 +539,7 @@ try {
         if (Test-Path -LiteralPath $stagedDir) { Remove-Item -LiteralPath $stagedDir -Recurse -Force }
         $archivePath = Join-Path $installDir ('.' + $meta.archive.name)
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 300
+            Invoke-PreviewDownloadWithRetry -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 180
             Expand-VerifiedUpdate $archivePath $stagedDir $meta
         } finally {
             if (Test-Path -LiteralPath $archivePath -PathType Leaf) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
@@ -499,7 +551,7 @@ try {
         $destination = Join-Path $root ('versions/' + $meta.sourceCommit)
         if (-not (Test-Path -LiteralPath $destination)) {
             $archivePath = Join-Path $root $meta.archive.name
-            Invoke-WebRequest -UseBasicParsing -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 300
+            Invoke-PreviewDownloadWithRetry -Uri $archiveAsset[0].browser_download_url -OutFile $archivePath -TimeoutSec 180
             Expand-VerifiedUpdate $archivePath $destination $meta
             Remove-Item -LiteralPath $archivePath
         }

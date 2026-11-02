@@ -20,14 +20,14 @@ pub fn specs() -> Vec<CommandSpec> {
             "Table of Contents…",
             ["Layout"],
             None,
-            "{entries: [{style, level?: 1 (1-9), entryStyle?: paragraph style of its entries (default \"TOC Level n\"), pageNumber?: \"after\"|\"before\"|\"none\", separator?: text between entry and number (default a tab), pageNumberStyle?: character style of the page number, separatorStyle?: character style of the separator, sort?: bool (Sort Entries in Alphabetical Order: among their siblings, each with the entries under it)}] | styles: [names] (levels 1, 2, …), title?: \"Contents\", titleStyle?: paragraph style of the title (default \"TOC Title\"), pageNumbers?: true, createBookmarks?: bool (generate PDF bookmarks; keeps the existing setting when omitted, which is off for a new table), replace?: true (regenerate the existing table of contents in place; false makes a new frame), page?: 1-based page for a new frame (its margins), rect?: [x0,y0,x1,y1] (spread coords)} → {story, entries}",
+            "{entries: [{style, level?: 1 (1-9), entryStyle?: paragraph style of its entries (default \"TOC Level n\"), pageNumber?: \"after\"|\"before\"|\"none\", separator?: text between entry and number (default a tab), pageNumberStyle?: character style of the page number, separatorStyle?: character style of the separator, sort?: bool (Sort Entries in Alphabetical Order: among their siblings, each with the entries under it)}] | styles: [names] (levels 1, 2, …), title?: \"Contents\", titleStyle?: paragraph style of the title (default \"TOC Title\"), pageNumbers?: true, rightToLeft?: bool (RTL paragraph direction, right alignment, right indent and left-margin dot-leader page numbers; default: document binding or Arabic headings), createBookmarks?: bool (generate PDF bookmarks; keeps the existing setting when omitted, which is off for a new table), replace?: true (regenerate the existing table of contents in place; false makes a new frame), page?: 1-based page for a new frame (its margins), rect?: [x0,y0,x1,y1] (spread coords)} → {story, entries}",
             has_doc,
             generate
         ),
         cmd!("toc.update", "Update Table of Contents", ["Layout"], None, "{} — regenerate the existing table of contents", has_toc, |s, _| {
             s.edit(|d, _| {
                 let toc = d.toc.clone().ok_or_else(|| bad("toc.update", "no table of contents"))?;
-                let n = fill(d, &toc, None)?;
+                let n = fill(d, &toc, None, None, false)?;
                 Ok(json!({"story": toc.story.0, "entries": n}))
             })
         }),
@@ -203,27 +203,84 @@ pub fn collect(d: &Document, entries: &[TocEntry], skip: Option<StoryId>) -> Vec
     out
 }
 
-fn ensure_styles(d: &mut Document, levels: u8, width: f64) {
-    let mut want = vec![("TOC Title".to_string(), ParaAttrs { space_after: Some(12.0), ..Default::default() }, Some(16.0))];
+fn is_arabic_script_char(c: char) -> bool {
+    matches!(c, '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' | '\u{08A0}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}')
+}
+
+fn contains_predominantly_arabic(title: &str, found: &[Found]) -> bool {
+    let mut arabic = 0usize;
+    let mut other_alpha = 0usize;
+    for s in std::iter::once(title).chain(found.iter().map(|f| f.text.as_str())) {
+        for c in s.chars() {
+            if is_arabic_script_char(c) {
+                arabic = arabic.saturating_add(1);
+            } else if c.is_alphabetic() {
+                other_alpha = other_alpha.saturating_add(1);
+            }
+        }
+    }
+    arabic > 0 && arabic >= other_alpha
+}
+
+fn build_toc_styles(levels: u8, width: f64, rtl: bool) -> Vec<(String, ParaAttrs, Option<f64>)> {
+    let title_para = if rtl {
+        ParaAttrs {
+            direction: Some(designcraft_doc::TextDirection::RightToLeft),
+            align: Some(Align::Right),
+            space_after: Some(12.0),
+            ..Default::default()
+        }
+    } else {
+        ParaAttrs { space_after: Some(12.0), ..Default::default() }
+    };
+    let mut want = vec![("TOC Title".to_string(), title_para, Some(16.0))];
     for l in 1..=levels.max(1) {
-        let indent = (l as f64 - 1.0) * 12.0;
-        want.push((
-            format!("TOC Level {l}"),
+        let indent = (f64::from(l) - 1.0) * 12.0;
+        let para = if rtl {
+            ParaAttrs {
+                direction: Some(designcraft_doc::TextDirection::RightToLeft),
+                right_indent: Some(indent),
+                space_before: Some(if l == 1 { 4.0 } else { 0.0 }),
+                align: Some(Align::Right),
+                tabs: Some(vec![TabStop {
+                    position: (width - indent).max(36.0),
+                    align: TabAlign::Right,
+                    leader: ". ".into(),
+                    align_on: String::new(),
+                }]),
+                ..Default::default()
+            }
+        } else {
             ParaAttrs {
                 left_indent: Some(indent),
                 space_before: Some(if l == 1 { 4.0 } else { 0.0 }),
                 align: Some(Align::Left),
                 tabs: Some(vec![TabStop { position: width.max(36.0), align: TabAlign::Right, leader: ". ".into(), align_on: String::new() }]),
                 ..Default::default()
-            },
-            None,
-        ));
+            }
+        };
+        want.push((format!("TOC Level {l}"), para, None));
     }
-    let missing: Vec<_> = want.into_iter().filter(|(n, ..)| d.styles.para(n).is_none()).collect();
-    if missing.is_empty() {
+    want
+}
+
+fn ensure_styles_with_dir(d: &mut Document, levels: u8, width: f64, rtl: bool, overwrite_direction: bool) {
+    let want = build_toc_styles(levels, width, rtl);
+    let target_dir = if rtl { Some(designcraft_doc::TextDirection::RightToLeft) } else { None };
+    let needs_sync =
+        overwrite_direction && want.iter().any(|(name, _, _)| d.styles.para(name).is_some_and(|existing| existing.para.direction != target_dir));
+    let missing: Vec<_> = want.iter().filter(|(n, ..)| d.styles.para(n).is_none()).cloned().collect();
+    if missing.is_empty() && !needs_sync {
         return;
     }
     let st = d.styles_mut();
+    if needs_sync {
+        for (name, para, _) in &want {
+            if let Some(existing) = st.paragraph.iter_mut().find(|ps| ps.name == *name) {
+                existing.para = para.clone();
+            }
+        }
+    }
     for (name, para, size) in missing {
         let chars = designcraft_doc::CharAttrs { size, ..Default::default() };
         st.paragraph.push(ParagraphStyle {
@@ -238,13 +295,23 @@ fn ensure_styles(d: &mut Document, levels: u8, width: f64) {
 }
 
 /// Rewrite the TOC story; returns the number of entries.
-fn fill(d: &mut Document, toc: &Toc, width: Option<f64>) -> Result<usize> {
+fn fill(d: &mut Document, toc: &Toc, width: Option<f64>, explicit_rtl: Option<bool>, title_was_explicit: bool) -> Result<usize> {
     let found = collect(d, &toc.entries, Some(toc.story));
     let levels = toc.entries.iter().map(|e| e.level).max().unwrap_or(1);
     let width = width.unwrap_or_else(|| {
         d.story(toc.story).and_then(|st| st.frames.first()).and_then(|f| d.item(*f)).map(|i| i.text_area().width()).unwrap_or(300.0)
     });
-    ensure_styles(d, levels, width);
+    let style_is_rtl = |name: &str| d.styles.para(name).is_some_and(|ps| ps.para.direction == Some(designcraft_doc::TextDirection::RightToLeft));
+    let rtl = explicit_rtl.unwrap_or_else(|| {
+        d.settings.right_to_left_binding
+            || style_is_rtl(toc.title_style.as_deref().unwrap_or("TOC Title"))
+            || style_is_rtl("TOC Level 1")
+            || contains_predominantly_arabic(
+                if !title_was_explicit && toc.title == "Contents" && !found.is_empty() { "" } else { &toc.title },
+                &found,
+            )
+    });
+    ensure_styles_with_dir(d, levels, width, rtl, explicit_rtl.is_some());
     for name in toc.entries.iter().filter_map(|e| e.entry_style.as_deref()).chain(toc.title_style.as_deref()) {
         para_style_exists(d, name)?;
     }
@@ -290,6 +357,7 @@ fn fill(d: &mut Document, toc: &Toc, width: Option<f64>) -> Result<usize> {
         styles.push(e.entry_style.clone().unwrap_or_else(|| format!("TOC Level {}", f.level.max(1))));
     }
     let st = d.story_mut(toc.story).ok_or(designcraft_doc::DocError::NoStory(toc.story))?;
+    st.direction = if rtl { designcraft_doc::TextDirection::RightToLeft } else { designcraft_doc::TextDirection::LeftToRight };
     let len = st.len();
     st.replace(0..len, &text);
     // The text takes the format of the old first character: its character style would spread
@@ -332,6 +400,7 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     if entries.is_empty() {
         return Err(bad("toc.generate", "no entries"));
     }
+    let title_was_explicit = p.get("title").is_some_and(|v| !v.is_null());
     let title = str_param(p, "title").unwrap_or("Contents");
     if title.chars().count() > MAX_TITLE {
         return Err(bad("toc.generate", format!("the title is at most {MAX_TITLE} characters")));
@@ -342,6 +411,10 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("toc.generate", format!("style names are at most {MAX_NAME} characters")));
     }
     let page_numbers = p.get("pageNumbers").and_then(Value::as_bool).unwrap_or(true);
+    let explicit_rtl = match p.get("rightToLeft").filter(|v| !v.is_null()) {
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad("toc.generate", "rightToLeft must be a boolean"))?),
+        None => None,
+    };
     let create_bookmarks = match p.get("createBookmarks") {
         Some(v) => v.as_bool().ok_or_else(|| bad("toc.generate", "createBookmarks must be a boolean"))?,
         None => s.doc()?.doc.toc.as_ref().is_some_and(|t| t.create_bookmarks),
@@ -372,7 +445,7 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
             }
         };
         let toc = Toc { story, title: title.clone(), entries: entries.clone(), page_numbers, title_style: title_style.clone(), create_bookmarks };
-        let n = fill(d, &toc, width)?;
+        let n = fill(d, &toc, width, explicit_rtl, title_was_explicit)?;
         d.toc = Some(toc);
         Ok(json!({"story": story.0, "entries": n}))
     })
@@ -484,6 +557,8 @@ mod tests {
             json!({"entries": [{"style": "Headline", "level": 300}]}),
             json!({"entries": [{"style": "Headline", "level": -1}]}),
             json!({"entries": [{"style": "Headline", "pageNumber": "sideways"}]}),
+            json!({"entries": [{"style": "Headline", "style_extra": 1}], "rightToLeft": "yes"}),
+            json!({"styles": ["Headline"], "rightToLeft": "yes"}),
             json!({"entries": [{"style": "No Such Style"}]}),
             json!({"entries": [{"style": "Headline", "entryStyle": "No Such Style"}]}),
             json!({"entries": [{"style": "Headline", "pageNumberStyle": "No Such Style"}]}),
@@ -702,6 +777,97 @@ mod tests {
         let old: TocEntry = serde_json::from_value(json!({"style": "Head", "level": 1, "pageNumber": "after"})).unwrap();
         assert_eq!(old, TocEntry::new("Head", 1));
         assert!(serde_json::to_value(&old).unwrap().get("sort").is_none());
+    }
+
+    #[test]
+    fn arabic_rtl_toc_sets_direction_right_indent_and_left_page_numbers_without_wrapping() {
+        let (mut s, page) = doc_with(&[
+            ("الفصل الأول: المدخل إلى التصميم", "Chapter"),
+            ("المبحث الأول: الشبكة الطباعية", "Section"),
+            ("الفصل الثاني: الإخراج الفني", "Chapter"),
+        ]);
+        // Auto-detects RTL from Arabic headings even in an LTR-bound document with default title omitted:
+        let res = s
+            .execute(
+                "toc.generate",
+                &json!({
+                    "page": page,
+                    "title": "الفهرس",
+                    "rect": [54, 54, 454, 700],
+                    "styles": ["Chapter", "Section"]
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["entries"], 3);
+
+        let check_composed = |s: &Session| {
+            let d = &s.doc().unwrap().doc;
+            let sid = d.toc.as_ref().unwrap().story;
+            let st = d.story(sid).unwrap();
+            assert_eq!(st.direction, designcraft_doc::TextDirection::RightToLeft);
+
+            let title_ps = d.styles.para("TOC Title").unwrap();
+            assert_eq!(title_ps.para.direction, Some(designcraft_doc::TextDirection::RightToLeft));
+            assert_eq!(title_ps.para.align, Some(Align::Right));
+
+            let l1 = d.styles.para("TOC Level 1").unwrap();
+            assert_eq!(l1.para.direction, Some(designcraft_doc::TextDirection::RightToLeft));
+            assert_eq!(l1.para.align, Some(Align::Right));
+            assert_eq!(l1.para.right_indent, Some(0.0));
+            assert!((l1.para.tabs.as_ref().unwrap()[0].position - 400.0).abs() < 1e-6);
+
+            let l2 = d.styles.para("TOC Level 2").unwrap();
+            assert_eq!(l2.para.direction, Some(designcraft_doc::TextDirection::RightToLeft));
+            assert_eq!(l2.para.align, Some(Align::Right));
+            assert_eq!(l2.para.right_indent, Some(12.0));
+            assert!((l2.para.tabs.as_ref().unwrap()[0].position - 388.0).abs() < 1e-6);
+
+            let cs = compose_story(d, sid, &ComposeOptions::default());
+            assert!(cs.overset_at.is_none(), "RTL TOC must not overset");
+            let ft = &cs.frames[0];
+            assert_eq!(ft.lines.len(), 4, "title + 3 TOC entries must each stay on a single line without wrapping");
+
+            // Check Level 1 (line 1) and Level 2 (line 2) visual positions in spread coordinates (frame x0=54, x1=454):
+            let frame_x0 = 54.0;
+            for (line_idx, expected_right_edge) in [(1usize, frame_x0 + 400.0), (2usize, frame_x0 + 388.0)] {
+                let line = &ft.lines[line_idx];
+                let num_glyph = line
+                    .glyphs
+                    .iter()
+                    .find(|g| st.text.get(g.byte..g.byte.saturating_add(g.len)) == Some("1"))
+                    .expect("page number glyph on TOC line");
+                assert!(
+                    (num_glyph.x - frame_x0).abs() < 2.0,
+                    "line {line_idx}: page number must sit flush at left margin ({frame_x0}), got x={}",
+                    num_glyph.x
+                );
+
+                let arabic_max_right = line.glyphs.iter().filter(|g| g.rtl && g.len > 0).map(|g| g.x + g.adv).fold(0.0f64, f64::max);
+                assert!(
+                    (arabic_max_right - expected_right_edge).abs() < 2.0,
+                    "line {line_idx}: Arabic heading right edge must align to {expected_right_edge}, got {arabic_max_right}"
+                );
+            }
+        };
+
+        check_composed(&s);
+
+        // `toc.update` preserves RTL styles, direction, and single-line left-margin page numbers:
+        s.execute("toc.update", &json!({})).unwrap();
+        check_composed(&s);
+
+        // Explicit `rightToLeft: false` overrides back to LTR, and `rightToLeft: true` restores RTL:
+        s.execute("toc.generate", &json!({"page": page, "title": "الفهرس", "styles": ["Chapter", "Section"], "rightToLeft": false})).unwrap();
+        assert_eq!(
+            s.doc().unwrap().doc.story(s.doc().unwrap().doc.toc.as_ref().unwrap().story).unwrap().direction,
+            designcraft_doc::TextDirection::LeftToRight
+        );
+        s.execute(
+            "toc.generate",
+            &json!({"page": page, "title": "الفهرس", "rect": [54, 54, 454, 700], "styles": ["Chapter", "Section"], "rightToLeft": true}),
+        )
+        .unwrap();
+        check_composed(&s);
     }
 
     /// `p` with the TOC page added when it is an object and has none.

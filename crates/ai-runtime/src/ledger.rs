@@ -159,7 +159,7 @@ impl UsageLedger {
         if self.charged_tokens.saturating_add(allowance) > self.budget.token_limit {
             return Err("Token budget cannot admit another request; shorten context or raise the limit".into());
         }
-        let local = matches!(provider, ProviderKind::Ollama | ProviderKind::ComfyUi);
+        let local = provider.is_local();
         let rates = if image_call { image_rates.cloned() } else { self.budget.rates.clone() };
         if let Some(r) = &rates {
             validate_rates(r)?;

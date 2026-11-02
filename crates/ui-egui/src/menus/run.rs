@@ -86,9 +86,13 @@ fn run_ui_part1(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
         "ai.production" | "ai.skills" | "ai.usage" | "ai.providers" | "ai.local" => {
             let open = p.get("open").and_then(Value::as_bool).unwrap_or(true);
             app.ui.ai.open = open;
+            if let Some(docked) = p.get("docked").and_then(Value::as_bool) {
+                app.ui.ai.docked = docked;
+            }
             if !open {
                 return Some(Ok(json!({"open": false, "tab": app.ui.ai.tab, "available": app.services.ai.is_some()})));
             }
+            app.ui.ai.focus_mode = p.get("focus").and_then(Value::as_bool).unwrap_or(false);
             app.ui.ai.tab = match id {
                 "ai.skills" => 1,
                 "ai.usage" => 2,

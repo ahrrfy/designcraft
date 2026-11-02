@@ -12,12 +12,18 @@ use serde_json::{Value, json};
 const MAX_AGENT_TURNS: usize = 20;
 
 pub(crate) fn has_configured_image_model(settings: &AiSettings) -> bool {
+    if settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::LocalOnly && !settings.image_model.provider.is_local() {
+        return false;
+    }
+    if settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::CloudOnly && settings.image_model.provider.is_local() {
+        return false;
+    }
     if validate_endpoint(&settings.image_model).is_err() {
         return false;
     }
     match settings.image_model.provider {
         ProviderKind::ComfyUi => settings.comfy_workflow.is_some(),
-        ProviderKind::Ollama => false,
+        ProviderKind::Ollama | ProviderKind::LocalOpenAi => false,
         ProviderKind::Gemini | ProviderKind::OpenAi => {
             let model = settings.image_model.model.trim();
             !model.is_empty() && !designcraft_ai_types::is_non_image_model(settings.image_model.provider, model)
@@ -58,11 +64,15 @@ pub(crate) fn run_open_document_agent_loop(
     let mut workspace = DocToolWorkspace::new(base, prefs, catalog.clone(), min_ppi);
     workspace.allow_image_queue = allow_image_queue;
     workspace.supports_vision = supports_vision;
+    workspace.ai_root = context.get("_ai_profile_root").and_then(Value::as_str).map(std::path::PathBuf::from);
     let overview = workspace.inspect_document_overview(request)?;
 
     let system = build_agent_system_prompt(catalog, skills, allow_image_queue, supports_vision)?;
-    let initial_user = build_initial_user_message(request, context, &overview)?;
-    let mut messages = vec![AgentMessage::User { text: initial_user, images: Vec::new() }];
+    let mut prompt_context = context.clone();
+    let initial_images = crate::rag::resolve_scanned_attachment_images(&mut prompt_context, request);
+    workspace.scanned_images_delivered = !initial_images.is_empty();
+    let initial_user = build_initial_user_message(request, &prompt_context, &overview)?;
+    let mut messages = vec![AgentMessage::User { text: initial_user, images: initial_images }];
 
     let style_profile = skills.iter().find_map(|s| s.design_profile.as_ref());
 
@@ -143,7 +153,7 @@ pub(crate) fn run_open_document_agent_loop(
 
     // If the model ran out of turns after applying edits without calling `complete_task`, rescue only if preflight has no blocking errors.
     if workspace.completed_title.is_none() {
-        if workspace.applied_chunks.is_empty() && workspace.deferred_images.is_empty() {
+        if workspace.applied_chunks.is_empty() && workspace.deferred_images.is_empty() && workspace.scheduled_formats.is_none() {
             return Err("AI agent finished without applying any native document commands or queueing illustrations".into());
         }
         let mut preflight = workspace.preflight_summary()?;
@@ -170,6 +180,7 @@ pub(crate) fn run_open_document_agent_loop(
     let mut summary = workspace.completed_summary.unwrap_or_else(|| title.clone());
     let mut chunks = workspace.applied_chunks;
     let mut deferred_batches = workspace.deferred_images;
+    let scheduled_formats = workspace.scheduled_formats;
 
     if !deferred_batches.is_empty() {
         let total_imgs: usize = deferred_batches.iter().map(|b| b.images.len()).sum();
@@ -190,7 +201,7 @@ pub(crate) fn run_open_document_agent_loop(
                     chunks.extend(expanded_chunks);
                     deferred_batches.clear();
                 }
-                Err(budget_reason) if !chunks.is_empty() => {
+                Err(budget_reason) if !chunks.is_empty() || scheduled_formats.is_some() => {
                     summary = format!("{summary} ({total_imgs} illustration(s) staged for confirmation — {budget_reason})");
                 }
                 Err(err) => return Err(err),
@@ -200,12 +211,12 @@ pub(crate) fn run_open_document_agent_loop(
         }
     }
 
-    if chunks.is_empty() && deferred_batches.is_empty() {
+    if chunks.is_empty() && deferred_batches.is_empty() && scheduled_formats.is_none() {
         return Err("No native document actions or queued illustrations were produced".into());
     }
 
     runner.progress("Finalizing verified native document update", 0.96)?;
-    Ok(Product::Agentic { title, summary, chunks, deferred_images: deferred_batches })
+    Ok(Product::Agentic { title, summary, chunks, deferred_images: deferred_batches, scheduled_formats })
 }
 
 /// Retain raw visual render bytes only on recent `ToolResults` turns within the 8-image / 2 MiB
@@ -303,7 +314,13 @@ fn build_agent_system_prompt(catalog: &Value, skills: &[SkillSnapshot], allow_im
          - Within a single `apply_engine_commands` batch, reference earlier results via `$N.id` or `$N.story` (0-based within that batch).\n\
          - Before calling `complete_task`, `preflight.oversetErrors` MUST be `0`. If font replacement or text edits cause overset text, run `{{\"command\": \"story.fitOverset\", \"params\": {{\"minSize\": 8.0}}}}` or enlarge/reflow the frame inside `safeRectInSpread`.\n\
          {image_tool_guidance}\n\
-         6. COMPLETION:\n\
+         6. KNOWLEDGE RAG, PREFLIGHT, DATA RECORDS & MULTI-FORMAT ADAPTATION:\n\
+         - Call `search_project_knowledge` whenever user attachments or active Knowledge Packs contain source copy, brand rules, or curriculum facts.\n\
+         - Call `lookup_engine_commands` to inspect exact command parameter schemas before using unfamiliar engine commands.\n\
+         - Call `inspect_preflight` anytime to verify zero overset/missing-glyph/bleed errors.\n\
+         - Call `populate_data_records` when an attached `.xlsx`/`.csv`/`.tsv` (`DataRecords`) should populate repeated cards, badges, menus, or catalog items.\n\
+         - Call `adapt_layout_formats` when adapting a campaign across multiple social/print formats (`AlternateLayouts` or `SeparateDocuments`).\n\
+         7. COMPLETION:\n\
          - Once every requirement in the user's prompt is satisfied and there is zero overset text, call `complete_task` with a clear `title` and `summary` (in the user's prompt language). All applied batches commit to the user's open document as ONE atomic Undo step.\n\
          \n\
          VETTED NATIVE ENGINE COMMAND CATALOG:\n\
@@ -316,9 +333,19 @@ fn build_agent_system_prompt(catalog: &Value, skills: &[SkillSnapshot], allow_im
 
 fn build_initial_user_message(request: &TaskRequest, context: &Value, overview: &Value) -> Result<String, String> {
     let resolved_fonts = context.get("resolved_print_fonts").cloned().unwrap_or(Value::Null);
+    let art_direction = context.get("brief_art_direction").cloned().unwrap_or(Value::Null);
+    let selection_ctx = context.get("selection_context").cloned().unwrap_or(Value::Null);
+    let design_memory = context.get("session_design_memory").cloned().unwrap_or(Value::Null);
+    let rag_hits = context.get("rag_grounding_hits").cloned().unwrap_or(Value::Null);
     let payload = json!({
         "userPrompt": request.prompt,
         "resolvedPrintFonts": resolved_fonts,
+        "artDirection": art_direction,
+        "selectionContext": selection_ctx,
+        "sessionDesignMemory": design_memory,
+        "initialKnowledgeHits": rag_hits,
+        "attachments": request.attachments,
+        "targetFormats": request.target_formats,
         "documentOverview": overview,
     });
     serde_json::to_string(&payload).map_err(|e| e.to_string())
@@ -348,10 +375,12 @@ fn try_apply_json_fallback(
     let saved_doc = workspace.session.doc().ok().cloned();
     let saved_chunks_len = workspace.applied_chunks.len();
     let saved_images_len = workspace.deferred_images.len();
+    let saved_sched = workspace.scheduled_formats.clone();
 
     let rollback = |ws: &mut DocToolWorkspace, doc_opt: Option<DocState>| {
         ws.applied_chunks.truncate(saved_chunks_len);
         ws.deferred_images.truncate(saved_images_len);
+        ws.scheduled_formats = saved_sched;
         ws.completed_title = None;
         ws.completed_summary = None;
         if let Some(prev_doc) = doc_opt {
@@ -421,9 +450,8 @@ fn extract_json_object(text: &str) -> Option<&str> {
 }
 
 fn default_title_from_prompt(prompt: &str) -> String {
-    let trimmed = prompt.trim();
-    let snippet: String = trimmed.chars().take(64).collect();
-    if snippet.is_empty() { "AI Document Edit".into() } else { snippet }
+    let clean = crate::brief_planner::sanitize_visible_title(prompt);
+    if clean.trim().is_empty() { "AI Document Edit".into() } else { clean }
 }
 
 #[allow(dead_code)]

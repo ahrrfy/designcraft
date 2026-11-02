@@ -1027,7 +1027,54 @@ fn curated_schemas() -> Vec<(&'static str, Value, Value)> {
             ),
             json!({"name":"Unit Header","type":"runningHeader","style":"Heading 1"}),
         ),
-        ("variables.insert", object(&[("name", string())], &["name"]), json!({"name":"Unit Header"})),
+        (
+            "variables.insert",
+            object(
+                &[("name", string()), ("frame", integer(1, u64::MAX)), ("story", integer(1, u64::MAX)), ("index", integer(0, 16777216))],
+                &["name"],
+            ),
+            json!({"name":"Unit Header","frame":"$0.id"}),
+        ),
+        (
+            "liquid.pageRule",
+            object(
+                &[
+                    ("rule", choice(&["off", "scale", "reCenter", "guideBased", "objectBased", "controlledByParent"])),
+                    ("pages", array(integer(1, 10000), 1, 1000)),
+                ],
+                &["rule"],
+            ),
+            json!({"rule":"objectBased","pages":[1]}),
+        ),
+        (
+            "liquid.object",
+            object(
+                &[
+                    ("ids", ids()),
+                    ("resizeWidth", boolean()),
+                    ("resizeHeight", boolean()),
+                    ("pinTop", boolean()),
+                    ("pinBottom", boolean()),
+                    ("pinLeft", boolean()),
+                    ("pinRight", boolean()),
+                ],
+                &[],
+            ),
+            json!({"ids":["$0.id"],"resizeWidth":true,"resizeHeight":false,"pinTop":true,"pinLeft":true,"pinRight":true}),
+        ),
+        (
+            "layout.createAlternate",
+            object(
+                &[
+                    ("name", json!({"type":"string","minLength":1,"maxLength":200})),
+                    ("width", dim()),
+                    ("height", dim()),
+                    ("rule", choice(&["off", "scale", "reCenter", "guideBased", "objectBased", "controlledByParent"])),
+                ],
+                &["width", "height"],
+            ),
+            json!({"name":"Social Square","width":1080,"height":1080,"rule":"objectBased"}),
+        ),
         (
             "layout.marginsAndColumns",
             object(
@@ -1284,6 +1331,7 @@ fn curated_schemas() -> Vec<(&'static str, Value, Value)> {
             object(
                 &[
                     ("base64", json!({"type":"string","maxLength":8388608})),
+                    ("reuseAsset", integer(1, u64::MAX)),
                     ("name", json!({"type":"string","maxLength":256})),
                     ("frame", integer(1, u64::MAX)),
                     ("spread", spread_target()),
@@ -1291,7 +1339,7 @@ fn curated_schemas() -> Vec<(&'static str, Value, Value)> {
                     ("y", number(-15552.0, 15552.0)),
                     ("width", dim()),
                 ],
-                &["base64", "name"],
+                &[],
             ),
             json!({"base64":"<PNG or JPEG base64>","name":"illustration.png","x":54,"y":200,"width":200}),
         ),

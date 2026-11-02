@@ -3,18 +3,21 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod agent_loop;
+pub mod brief_planner;
 mod design;
 mod doc_tools;
 mod facing_pages;
 mod image_repetition;
 mod image_review;
 pub mod indesign;
+pub mod intent_geometry;
 pub mod ledger;
 pub mod localserver;
 mod native_layout;
 mod native_print_fonts;
 mod print_contract;
 mod production_cache;
+pub mod rag;
 mod references;
 pub mod resources;
 mod runtime;

@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 mod export;
+pub mod extract;
 mod gradient_inks;
 pub mod inks;
 mod links;
@@ -52,6 +53,7 @@ pub use export::{
     BookletKind, BookletOptions, booklet_pairs, booklet_pairs_directed, export_booklet, export_pdf, export_pdf_with_report, merge_pdfs, print_color,
     sheet_spreads,
 };
+pub use extract::{ExtractedPdfPage, PdfExtractionReport, extract_text_pages};
 pub use pdfx::{check_pdfx4, has_rgb_groups, make_pdfx4};
 pub use pdfx1a::check_pdfx1a;
 pub use transitions::{add_blend_space, add_catalog_entries, add_page_entries, add_transitions};

@@ -64,13 +64,13 @@ pub fn specs() -> Vec<CommandSpec> {
             "Insert Variable",
             ["Type", "Text Variables"],
             None,
-            "{name} — at the text insertion point",
+            "{name, frame?, story?, index?} — at the text insertion point, or into `frame`/`story` at UTF-8 byte `index` (default: end of story)",
             super::has_text,
             |s, p| {
                 let name = str_param(p, "name").ok_or_else(|| bad("variables.insert", "missing name"))?;
                 let i = s.doc()?.doc.variable(name).ok_or_else(|| bad("variables.insert", format!("no variable `{name}`")))?;
                 let c = var_char(i).ok_or_else(|| bad("variables.insert", "too many variables"))?;
-                s.execute("text.insert", &json!({"text": c.to_string()}))
+                insert_variable(s, p, c)
             }
         ),
         cmd!(
@@ -97,6 +97,84 @@ pub fn specs() -> Vec<CommandSpec> {
 /// The selected text holds a variable instance (InDesign: select the variable, then Convert
 /// Variable to Text). The endnote story is rebuilt from the stories' endnotes, so an edit there
 /// would not last.
+fn insert_variable(s: &mut Session, p: &Value, c: char) -> Result<Value> {
+    let has_frame = p.get("frame").is_some_and(|v| !v.is_null());
+    let has_story = p.get("story").is_some_and(|v| !v.is_null());
+    let has_index = p.get("index").is_some_and(|v| !v.is_null());
+    if !has_frame && !has_story {
+        if has_index {
+            return Err(bad("variables.insert", "`index` requires `frame` or `story`"));
+        }
+        return s.execute("text.insert", &json!({"text": c.to_string()}));
+    }
+    let explicit_story = if has_story {
+        Some(designcraft_doc::StoryId(p.get("story").and_then(Value::as_u64).ok_or_else(|| bad("variables.insert", "`story` must be a story id"))?))
+    } else {
+        None
+    };
+    let explicit_frame = if has_frame {
+        Some(designcraft_doc::ItemId(
+            p.get("frame").and_then(Value::as_u64).ok_or_else(|| bad("variables.insert", "`frame` must be a text frame id"))?,
+        ))
+    } else {
+        None
+    };
+    let explicit_index = if has_index {
+        let raw = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("variables.insert", "`index` must be a non-negative byte offset"))?;
+        Some(usize::try_from(raw).map_err(|_| bad("variables.insert", "`index` is out of range"))?)
+    } else {
+        None
+    };
+    let ins = c.to_string();
+    s.edit(|d, sel| {
+        let sid = match (explicit_story, explicit_frame) {
+            (Some(sid), Some(fid)) => {
+                let tf = d
+                    .item(fid)
+                    .and_then(|it| it.text_frame())
+                    .ok_or_else(|| bad("variables.insert", format!("item {} is not a text frame", fid.0)))?;
+                if tf.story != sid {
+                    return Err(bad("variables.insert", format!("frame {} does not belong to story {}", fid.0, sid.0)));
+                }
+                sid
+            }
+            (Some(sid), None) => sid,
+            (None, Some(fid)) => d
+                .item(fid)
+                .and_then(|it| it.text_frame())
+                .map(|tf| tf.story)
+                .ok_or_else(|| bad("variables.insert", format!("item {} is not a text frame", fid.0)))?,
+            (None, None) => return Err(bad("variables.insert", "missing `frame` or `story`")),
+        };
+        if d.endnote_story == Some(sid) {
+            return Err(bad("variables.insert", "cannot insert directly into the generated endnote story"));
+        }
+        let st = d.story_mut(sid).ok_or(designcraft_doc::DocError::NoStory(sid))?;
+        let pos = match explicit_index {
+            Some(idx) => {
+                if idx > st.len() || !st.text.is_char_boundary(idx) {
+                    return Err(bad(
+                        "variables.insert",
+                        format!("`index` {idx} must be a UTF-8 character boundary within story length {}", st.len()),
+                    ));
+                }
+                idx
+            }
+            None => st.len(),
+        };
+        st.replace(pos..pos, &ins);
+        if let Some(t) = sel.text.as_mut().filter(|t| t.story == sid && t.cell.is_none()) {
+            if t.anchor >= pos {
+                t.anchor = t.anchor.saturating_add(ins.len());
+            }
+            if t.focus >= pos {
+                t.focus = t.focus.saturating_add(ins.len());
+            }
+        }
+        Ok(json!({"story": sid.0, "index": pos}))
+    })
+}
+
 fn has_selected_instance(s: &Session) -> std::result::Result<(), String> {
     has_doc(s)?;
     let st = s.active().ok_or("no document")?;

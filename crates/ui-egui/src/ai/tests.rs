@@ -53,6 +53,7 @@ fn ai23_curriculum_preview_uses_the_injected_host_without_starting_production() 
         skill_ids: vec![],
         auto_select_skills: true,
         export_directory: None,
+        ..TaskRequest::default()
     };
     let result = request_command(&mut app, &json!({"method":"preview_production","request":request}));
     assert!(result.is_ok(), "Local curriculum preview should be available: {result:?}");
@@ -282,6 +283,7 @@ fn continuation_request(target: TaskTarget) -> TaskRequest {
         auto_select_skills: false,
         target,
         export_directory: Some("book-output".into()),
+        ..TaskRequest::default()
     }
 }
 
@@ -2647,6 +2649,7 @@ fn ai28_ui_refresh_edited_proofs_retired_gemini_and_bound_draft_pages() {
                 auto_select_skills: false,
                 target: TaskTarget::ContinueBook,
                 export_directory: None,
+                ..TaskRequest::default()
             },
             document_uid: Some(77),
             document_path: None,
@@ -2735,6 +2738,7 @@ fn ai28_round1_review_fixes_16m_tokens_spread_aligned_estimates_and_http_alerts(
             auto_select_skills: false,
             target: TaskTarget::NewA4 { pages: 32 },
             export_directory: None,
+            ..TaskRequest::default()
         },
         document_uid: None,
         document_path: None,
@@ -3171,4 +3175,217 @@ fn ai33_ui_large_script_card_slicing_scoped_skill_errors_and_blank_planner_conti
     cont_panel.run_steps(3);
     assert!(cont_panel.query_by_label("Blank document will automatically expand from 1 to 365 pages and start at page 1.").is_some());
     assert!(!cont_panel.get_by_label("Produce").accesskit_node().is_disabled());
+}
+
+#[test]
+fn ai37_docked_studio_side_end_rtl_ltr_float_and_focus_rail() {
+    let mut app = DesignApp::new(
+        Session::new(),
+        Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() },
+    );
+    app.session.execute("file.new", &json!({"pages": 2, "title": "Studio Dock Test"})).unwrap();
+    app.run("ai.production", json!({})).unwrap();
+    assert!(app.ui.ai.docked, "AI Studio defaults to docked Side::End");
+
+    // 1. English LTR: docked on the right half of the 1280px window, leaving generous canvas space.
+    let mut harness = crate::test_window::open(app, egui::vec2(1280.0, 900.0));
+    harness.run_steps(3);
+    let ltr_rect = harness.state().app.ui.ai.last_panel_rect.expect("docked rect recorded");
+    assert!(ltr_rect.min.x > 640.0, "LTR docked AI Studio sits on the right side: {ltr_rect:?}");
+    assert!(ltr_rect.width() >= 300.0 && ltr_rect.width() <= 560.0);
+    assert!(harness.get_by_label("Produce").rect().max.y < 600.0, "Produce CTA stays comfortably above the fold");
+
+    // 2. Switch to Arabic RTL: docked panel flips to the left side (Side::End in RTL).
+    harness.state_mut().app.run("app.language", json!({"lang": "ar"})).unwrap();
+    harness.run_steps(3);
+    let rtl_rect = harness.state().app.ui.ai.last_panel_rect.expect("RTL docked rect recorded");
+    assert!(rtl_rect.max.x < 640.0, "RTL docked AI Studio sits on the left side: {rtl_rect:?}");
+
+    // 3. Toggle Deep Focus Mode: collapses to compact 56px vertical rail, then expands back.
+    harness.get_by_label("وضع التركيز").click();
+    harness.run_steps(3);
+    assert!(harness.state().app.ui.ai.focus_mode);
+    let rail_rect = harness.state().app.ui.ai.last_panel_rect.expect("focus rail rect");
+    assert!(rail_rect.width() <= 64.0, "Focus rail collapses to ~56px: {rail_rect:?}");
+    harness.get_by_label("توسيع").click();
+    harness.run_steps(3);
+    assert!(!harness.state().app.ui.ai.focus_mode);
+
+    // 4. Float/Dock toggle switches cleanly between docked panel and floating window.
+    harness.state_mut().app.run("app.language", json!({"lang": ""})).unwrap();
+    harness.run_steps(2);
+    harness.get_by_label("Float").click();
+    harness.run_steps(3);
+    assert!(!harness.state().app.ui.ai.docked);
+    harness.get_by_label("Dock").click();
+    harness.run_steps(3);
+    assert!(harness.state().app.ui.ai.docked);
+}
+
+#[test]
+fn ai37_execution_modes_local_discovery_and_cloud_failure_continue_locally() {
+    let mut state = AiUiState { prompt: "Design a 4-page science summary".into(), new_document: true, pages: 4, ..Default::default() };
+    state.snapshot.available = true;
+    state.settings.text_model = ModelSelection { provider: ProviderKind::Gemini, model: "gemini-3.8-flash".into(), endpoint: None };
+    state.settings.verify_generated_images = true;
+    state.settings.resources.context_tokens = 4096;
+    state.settings.budget.max_output_tokens = 8192;
+    state.local_ollama.model = "qwen2.5:14b".into();
+
+    let mut prod = harness_builder()
+        .with_size(egui::vec2(1100.0, 820.0))
+        .build_ui_state(|ui, (st, reqs)| production(ui, st, false, true, &[], &mut None, reqs), (state, Vec::<AiRequest>::new()));
+    prod.run_steps(2);
+
+    // Clicking "Local" sets ExecutionMode::LocalOnly, switches away from Gemini, clears verify_generated_images, and clamps max_output_tokens.
+    prod.get_by_label("Local").click();
+    prod.run_steps(2);
+    assert_eq!(prod.state().0.settings.execution_mode, designcraft_ai_types::AiExecutionMode::LocalOnly);
+    assert_eq!(prod.state().0.settings.text_model.provider, ProviderKind::Ollama);
+    assert_eq!(prod.state().0.settings.text_model.model, "qwen2.5:14b");
+    assert!(!prod.state().0.settings.verify_generated_images);
+    assert_eq!(prod.state().0.settings.budget.max_output_tokens, 2048);
+    assert!(matches!(prod.state().1.last(), Some(AiRequest::UpdateSettings(_))));
+
+    // Simulate cloud rate-limit failure with can_continue_locally = true -> 1-click "Continue remaining pages locally".
+    prod.state_mut().1.clear();
+    prod.state_mut().0.snapshot.stage = "failed".into();
+    prod.state_mut().0.snapshot.message = "HTTP 429 rate limit exceeded on Gemini API".into();
+    prod.state_mut().0.snapshot.can_continue_locally = true;
+    prod.state_mut().0.snapshot.batch = Some(designcraft_ai_types::protocol::BatchSnapshot {
+        job_id: "batch-cloud-429".into(),
+        status: "failed".into(),
+        total_pages: 12,
+        completed_pages: 4,
+        ..Default::default()
+    });
+    prod.run_steps(2);
+    prod.get_by_label("Continue remaining pages locally").click();
+    prod.run_steps(2);
+    assert!(matches!(
+        prod.state().1.last(),
+        Some(AiRequest::ContinueRemainingLocally { job_id: Some(id), local_model: Some(m) })
+            if id == "batch-cloud-429" && m.provider == ProviderKind::Ollama && m.model == "qwen2.5:14b"
+    ));
+
+    // Local AI tab: 1-Click "Scan Local AI Servers" & discovered LocalOpenAi "Use this model".
+    let mut local_state = AiUiState::default();
+    local_state.snapshot.available = true;
+    local_state.snapshot.discovered_local_endpoints = vec![designcraft_ai_types::DiscoveredLocalEndpoint {
+        provider: ProviderKind::LocalOpenAi,
+        endpoint: "http://127.0.0.1:1234/v1".into(),
+        reachable: true,
+        models: vec!["qwen3-14b-instruct".into()],
+        message: "LM Studio ready".into(),
+    }];
+    let mut local_panel = harness_builder()
+        .with_size(egui::vec2(1000.0, 800.0))
+        .build_ui_state(|ui, (st, reqs)| super::panel_local::local_ai(ui, st, false, true, true, reqs), (local_state, Vec::<AiRequest>::new()));
+    local_panel.run_steps(2);
+    local_panel.get_by_label("Scan Local AI Servers").click();
+    local_panel.run_steps(2);
+    assert!(matches!(local_panel.state().1.last(), Some(AiRequest::DiscoverLocalEndpoints)));
+    local_panel.get_by_label("Use this model").click();
+    local_panel.run_steps(2);
+    assert_eq!(local_panel.state().0.settings.text_model.provider, ProviderKind::LocalOpenAi);
+    assert_eq!(local_panel.state().0.settings.text_model.model, "qwen3-14b-instruct");
+    assert_eq!(local_panel.state().0.settings.text_model.endpoint.as_deref(), Some("http://127.0.0.1:1234/v1"));
+}
+
+#[test]
+fn ai37_bilingual_prompt_geometry_inference_and_a4_book_compatibility() {
+    // 1. Arabic multi-format social ad campaign prompt -> TaskTarget::NewDocument (1080x1080 Web, 6 pages) + 3 campaign target_formats!
+    let mut social_state =
+        AiUiState {
+            prompt: "اريد 6 تصاميم سوشيل ميديا لاعلانات من احجام شخصية واحجام تجارية وشركات".into(), new_document: true, ..Default::default()
+        };
+    social_state.settings.text_model.model = "gemini-3.8-flash".into();
+    let social_task = social_state.production_task();
+    match &social_task.target {
+        TaskTarget::NewDocument { pages, geometry } => {
+            assert_eq!(*pages, 6);
+            assert_eq!((geometry.width_pt, geometry.height_pt), (1080.0, 1080.0));
+            assert_eq!(geometry.intent, designcraft_ai_types::DocumentIntentKind::Web);
+        }
+        other => panic!("expected NewDocument geometry for social ad campaign, got {other:?}"),
+    }
+    assert_eq!(social_task.target_formats.len(), 3, "personal + commercial/corporate campaign sizes populate 3 formats");
+
+    // 2. Standard A4 book prompt preserves TaskTarget::NewA4 backwards compatibility.
+    let mut book_state =
+        AiUiState { prompt: "تصميم كتاب علوم تفاعلي للأطفال".into(), new_document: true, pages: 8, ..Default::default() };
+    book_state.settings.text_model.model = "gemini-3.8-flash".into();
+    let book_task = book_state.production_task();
+    assert_eq!(book_task.target, TaskTarget::NewA4 { pages: 8 });
+    assert!(book_task.target_formats.is_empty());
+}
+
+#[test]
+fn ai37_selection_context_capture_context_menus_and_knowledge_pack_rag_ui() {
+    // Create a session with a selected text frame containing story text and verify SelectionContext capture.
+    let mut session = Session::new();
+    session.execute("file.new", &json!({"pages": 2, "title": "Selection Context Doc"})).unwrap();
+    let created = session.execute("frame.create", &json!({"rect": [36.0, 36.0, 240.0, 120.0], "content": "text"})).unwrap();
+    let item_id = created["id"].as_u64().expect("created frame id");
+    let story_id = match &session.active().unwrap().doc.item(designcraft_doc::ItemId(item_id)).unwrap().content {
+        designcraft_doc::Content::Text(tf) => tf.story.0,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    session.execute("text.insert", &json!({"story": story_id, "at": 0, "text": "Original headline copy"})).unwrap();
+    session.execute("selection.set", &json!({"ids": [item_id]})).unwrap();
+
+    let app =
+        DesignApp::new(session, Services { ai: Some(Box::new(|_, _| AiSnapshot { available: true, ..Default::default() })), ..Default::default() });
+    let sel_ctx = super::capture_selection_context(&app).expect("selection context captured from selected frame");
+    assert_eq!(sel_ctx.selected_item_ids, vec![item_id]);
+    assert_eq!(sel_ctx.selected_story_id, Some(story_id));
+    assert_eq!(sel_ctx.selected_text_snippet.as_deref(), Some("Original headline copy"));
+
+    // Verify Object & Text right-click context menus expose "Run with AI…" and clicking triggers ai.runPrompt!
+    let mut ctx_menu = harness_builder().with_size(egui::vec2(500.0, 700.0)).build_ui_state(
+        |ui, app| {
+            crate::menus::context_menu(app, ui, crate::menus::ContextMenu::Object);
+            crate::menus::context_menu(app, ui, crate::menus::ContextMenu::Text);
+        },
+        app,
+    );
+    ctx_menu.run_steps(2);
+    assert_eq!(ctx_menu.query_all_by_label("Run with AI…").count(), 2, "both Object and Text context menus expose Run with AI…");
+    let mut app = ctx_menu.into_state();
+
+    // Invoking ai.runPrompt without prompt opens docked AI Studio in Edit current document mode with selection scoped!
+    app.run("ai.runPrompt", json!({})).unwrap();
+    assert!(app.ui.ai.open);
+    assert!(!app.ui.ai.new_document);
+    assert!(app.ui.ai.scope_to_selection);
+    assert!(app.ui.ai.focus_prompt_next_frame);
+    assert_eq!(app.ui.ai.live_selection.as_ref().map(|c| c.selected_item_ids.clone()), Some(vec![item_id]));
+
+    // Verify References & Knowledge Pack UI dispatches CreateKnowledgePack and toggles active_knowledge_packs.
+    let mut rag_state = AiUiState { prompt: "Design brand brochure from attached brief".into(), ..Default::default() };
+    rag_state.settings.text_model.model = "gemini-3.8-flash".into();
+    assert!(rag_state.attach_file_path("C:\\brand\\guidelines.pdf", None));
+    rag_state.kp_name_input = "Acme Brand Pack".into();
+    rag_state.kp_desc_input = "2026 Identity".into();
+    rag_state.snapshot.knowledge_packs = vec![designcraft_ai_types::KnowledgePackSummary {
+        id: "kp-acme".into(),
+        name: "Existing Curriculum Pack".into(),
+        description: "Grade 1".into(),
+        file_count: 2,
+        chunk_count: 18,
+        updated_at: "2026-11-01T00:00:00Z".into(),
+        sources: vec!["unit1.pdf".into()],
+    }];
+
+    let mut rag_panel = harness_builder()
+        .with_size(egui::vec2(1100.0, 900.0))
+        .build_ui_state(|ui, (st, reqs)| production(ui, st, false, true, &[], &mut None, reqs), (rag_state, Vec::<AiRequest>::new()));
+    rag_panel.run_steps(3);
+    rag_panel.get_by_label("Create Knowledge Pack").click();
+    rag_panel.run_steps(2);
+    assert!(matches!(
+        rag_panel.state().1.last(),
+        Some(AiRequest::CreateKnowledgePack { name, description, paths })
+            if name == "Acme Brand Pack" && description == "2026 Identity" && paths == &vec!["C:\\brand\\guidelines.pdf".to_string()]
+    ));
 }

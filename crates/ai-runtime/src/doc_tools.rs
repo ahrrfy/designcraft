@@ -31,6 +31,11 @@ pub(crate) struct DocToolWorkspace {
     pub min_ppi: f64,
     pub allow_image_queue: bool,
     pub supports_vision: bool,
+    pub ai_root: Option<std::path::PathBuf>,
+    pub knowledge_index: Option<crate::rag::KnowledgeIndex>,
+    pub knowledge_scanned_images: Vec<ImageInput>,
+    pub scanned_images_delivered: bool,
+    pub scheduled_formats: Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
     pub visual_images_in_turn: usize,
     pub visual_bytes_in_turn: usize,
     pub max_visual_bytes_per_turn: usize,
@@ -52,6 +57,11 @@ impl DocToolWorkspace {
             min_ppi,
             allow_image_queue: true,
             supports_vision: true,
+            ai_root: None,
+            knowledge_index: None,
+            knowledge_scanned_images: Vec::new(),
+            scanned_images_delivered: false,
+            scheduled_formats: None,
             visual_images_in_turn: 0,
             visual_bytes_in_turn: 0,
             max_visual_bytes_per_turn: DEFAULT_MAX_VISUAL_BYTES_PER_TURN,
@@ -89,14 +99,19 @@ impl DocToolWorkspace {
             "search_document" => self.search_document(args).map(|v| (v, Vec::new())),
             "inspect_graphics_and_captions" => self.inspect_graphics_and_captions(args).map(|v| (v, Vec::new())),
             "render_visual_check" => self.render_visual_check(args),
-            "apply_engine_commands" => self.apply_engine_commands(args).map(|v| (v, Vec::new())),
+            "search_project_knowledge" => self.search_project_knowledge(args, request),
+            "lookup_engine_commands" => self.lookup_engine_commands(args).map(|v| (v, Vec::new())),
+            "inspect_preflight" => self.inspect_preflight_tool(args).map(|v| (v, Vec::new())),
+            "adapt_layout_formats" => self.adapt_layout_formats(args, request).map(|v| (v, Vec::new())),
+            "populate_data_records" => self.populate_data_records(args, request).map(|v| (v, Vec::new())),
+            "apply_engine_commands" => self.apply_engine_commands(args, request).map(|v| (v, Vec::new())),
             "queue_image_generations" => self.queue_image_generations(args).map(|v| (v, Vec::new())),
             "complete_task" => self.complete_task(args, remaining_turns).map(|v| (v, Vec::new())),
             other => {
                 let available = if self.allow_image_queue {
-                    "inspect_document_overview, inspect_pages, search_document, inspect_graphics_and_captions, render_visual_check, apply_engine_commands, queue_image_generations, complete_task"
+                    "inspect_document_overview, inspect_pages, search_document, inspect_graphics_and_captions, render_visual_check, search_project_knowledge, lookup_engine_commands, inspect_preflight, adapt_layout_formats, populate_data_records, apply_engine_commands, queue_image_generations, complete_task"
                 } else {
-                    "inspect_document_overview, inspect_pages, search_document, inspect_graphics_and_captions, render_visual_check, apply_engine_commands, complete_task"
+                    "inspect_document_overview, inspect_pages, search_document, inspect_graphics_and_captions, render_visual_check, search_project_knowledge, lookup_engine_commands, inspect_preflight, adapt_layout_formats, populate_data_records, apply_engine_commands, complete_task"
                 };
                 Err(format!("Unknown tool `{other}`. Available tools: {available}."))
             }
@@ -667,7 +682,358 @@ impl DocToolWorkspace {
         }))
     }
 
-    fn apply_engine_commands(&mut self, args: &Value) -> Result<Value, String> {
+    fn search_project_knowledge(&mut self, args: &Value, request: &TaskRequest) -> Result<(Value, Vec<ImageInput>), String> {
+        let query = args.get("query").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or("missing non-empty `query`")?;
+        let top_k = args.get("top_k").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(6).clamp(1, 16);
+        let layer_filter = match args.get("layer").and_then(Value::as_str) {
+            Some("user_reference" | "knowledge_pack" | "project_or_pack") => Some(crate::rag::KnowledgeLayer::ProjectOrPack),
+            Some("approved_skill") => Some(crate::rag::KnowledgeLayer::ApprovedSkill),
+            Some("engine_catalog" | "engine_command") => Some(crate::rag::KnowledgeLayer::EngineCommand),
+            _ => None,
+        };
+        if self.knowledge_index.is_none() {
+            let mut pack_ids = request.knowledge_pack_ids.clone();
+            for id in &request.settings.active_knowledge_packs {
+                if !pack_ids.contains(id) {
+                    pack_ids.push(id.clone());
+                }
+            }
+            let profile_roots =
+                self.ai_root.as_deref().and_then(|root| designcraft_engine::file_access::AutomationRoots::new(&[root], &[root]).ok().flatten());
+            let (built_idx, scanned_imgs, _) =
+                crate::rag::build_task_knowledge_index(profile_roots.as_deref(), self.ai_root.as_deref(), &request.attachments, &pack_ids, &[]);
+            self.knowledge_index = Some(built_idx);
+            self.knowledge_scanned_images = scanned_imgs;
+        }
+        let idx = self.knowledge_index.as_ref().ok_or("knowledge index unavailable")?;
+        let hits = idx.search_filtered(query, top_k, layer_filter);
+        let hit_count = hits.len();
+        let mut attached_images = Vec::new();
+        if self.supports_vision && !self.scanned_images_delivered && !self.knowledge_scanned_images.is_empty() {
+            for img in &self.knowledge_scanned_images {
+                if self.visual_images_in_turn >= MAX_VISUAL_IMAGES_PER_TURN {
+                    break;
+                }
+                if self.visual_bytes_in_turn.saturating_add(img.bytes.len()) > self.max_visual_bytes_per_turn {
+                    continue;
+                }
+                self.visual_images_in_turn = self.visual_images_in_turn.saturating_add(1);
+                self.visual_bytes_in_turn = self.visual_bytes_in_turn.saturating_add(img.bytes.len());
+                attached_images.push(img.clone());
+            }
+            if !attached_images.is_empty() {
+                self.scanned_images_delivered = true;
+            }
+        }
+        Ok((
+            json!({
+                "ok": true,
+                "query": query,
+                "totalChunksIndexed": idx.len(),
+                "hitCount": hit_count,
+                "hits": hits,
+                "visionAttached": !attached_images.is_empty(),
+                "visionAttachedCount": attached_images.len(),
+            }),
+            attached_images,
+        ))
+    }
+
+    fn lookup_engine_commands(&self, args: &Value) -> Result<Value, String> {
+        let query = args.get("query").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        let category = args.get("category").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let combined_query = match category {
+            Some(cat) if !query.is_empty() => format!("{cat} {query}"),
+            Some(cat) => cat.to_owned(),
+            None => query.to_owned(),
+        };
+        if combined_query.trim().is_empty() {
+            return Err("provide `query` or `category` to look up native engine commands".into());
+        }
+        let mut matches = crate::rag::lookup_engine_commands(&combined_query, Some(&self.catalog), 16);
+        if let Some(cat) = category {
+            let prefix = format!("{}.", cat.to_ascii_lowercase());
+            let filtered: Vec<Value> = matches
+                .iter()
+                .filter(|m| {
+                    m.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.to_ascii_lowercase().starts_with(&prefix) || c.to_ascii_lowercase().contains(&cat.to_ascii_lowercase()))
+                })
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                matches = filtered;
+            }
+        }
+        matches.truncate(12);
+        Ok(json!({
+            "ok": true,
+            "count": matches.len(),
+            "commands": matches,
+        }))
+    }
+
+    fn inspect_preflight_tool(&mut self, args: &Value) -> Result<Value, String> {
+        let ppi = args.get("min_ppi").and_then(Value::as_f64).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(self.min_ppi);
+        let raw = self.session.execute("preflight.run", &json!({"minPpi": ppi})).map_err(|e| e.to_string())?;
+        let issues = raw.get("issues").and_then(Value::as_array).cloned().unwrap_or_default();
+        let overset_errors = issues.iter().filter(|i| matches!(i.get("kind").and_then(Value::as_str), Some("overset" | "oversetText"))).count();
+        let page_count = self.session.doc().map(|d| d.doc.page_count()).unwrap_or(0);
+        Ok(json!({
+            "ok": true,
+            "minPpi": ppi,
+            "pageCount": page_count,
+            "errors": raw.get("errors").and_then(Value::as_u64).unwrap_or(0),
+            "warnings": raw.get("warnings").and_then(Value::as_u64).unwrap_or(0),
+            "oversetErrors": overset_errors,
+            "issues": issues,
+        }))
+    }
+
+    fn adapt_layout_formats(&mut self, args: &Value, request: &TaskRequest) -> Result<Value, String> {
+        use designcraft_ai_types::protocol::{DocumentGeometrySpec, MultiFormatOutputMode};
+
+        let formats: Vec<DocumentGeometrySpec> = if let Some(arr) = args.get("formats").and_then(Value::as_array) {
+            let mut parsed = Vec::with_capacity(arr.len());
+            for (idx, item) in arr.iter().enumerate() {
+                if let Ok(spec) = serde_json::from_value::<DocumentGeometrySpec>(item.clone()) {
+                    parsed.push(spec);
+                    continue;
+                }
+                let width_pt = item
+                    .get("width_pt")
+                    .or_else(|| item.get("width"))
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| format!("formats[{idx}]: missing numeric `width_pt`"))?;
+                let height_pt = item
+                    .get("height_pt")
+                    .or_else(|| item.get("height"))
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| format!("formats[{idx}]: missing numeric `height_pt`"))?;
+                let preset_label = ["preset_label", "name", "label", "preset_id"]
+                    .into_iter()
+                    .find_map(|k| item.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()))
+                    .unwrap_or("Alternate Format")
+                    .to_string();
+                let mut spec = DocumentGeometrySpec { width_pt, height_pt, preset_label, ..Default::default() };
+                if let Some(m) = item.get("margin_pt").and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0) {
+                    spec.margins_pt = Some([m, m, m, m]);
+                }
+                parsed.push(spec);
+            }
+            parsed
+        } else if !request.target_formats.is_empty() {
+            request.target_formats.clone()
+        } else {
+            crate::intent_geometry::infer_brief_geometry_detail(&request.prompt, &request.settings).map(|d| d.target_formats).unwrap_or_default()
+        };
+        if formats.is_empty() {
+            return Err("No target formats provided in `formats` or `request.target_formats`".into());
+        }
+        for fmt in &formats {
+            crate::intent_geometry::validate_geometry_spec(fmt)?;
+        }
+        let mode = match args.get("mode").and_then(Value::as_str) {
+            Some("separate_documents") => MultiFormatOutputMode::SeparateDocuments,
+            Some("alternate_layouts") => MultiFormatOutputMode::AlternateLayouts,
+            _ => request.settings.multi_format_mode,
+        };
+        if mode == MultiFormatOutputMode::SeparateDocuments {
+            let mut combined = match self.scheduled_formats.take() {
+                Some((existing, MultiFormatOutputMode::SeparateDocuments)) => existing,
+                _ => Vec::new(),
+            };
+            for spec in formats {
+                let dup = combined.iter().any(|c| (c.width_pt - spec.width_pt).abs() <= 2.0 && (c.height_pt - spec.height_pt).abs() <= 2.0);
+                if !dup && combined.len() < 16 {
+                    combined.push(spec);
+                }
+            }
+            let scheduled_count = combined.len();
+            self.scheduled_formats = Some((combined, MultiFormatOutputMode::SeparateDocuments));
+            return Ok(json!({
+                "ok": true,
+                "mode": "separate_documents",
+                "scheduledFormats": scheduled_count,
+                "note": "Companion document tabs for all secondary formats will be materialized atomically upon task publication.",
+            }));
+        }
+        self.scheduled_formats = Some((formats.clone(), MultiFormatOutputMode::AlternateLayouts));
+        let actions = build_alternate_layout_actions(self.session.doc().map_err(|e| e.to_string())?, &formats);
+        if actions.is_empty() {
+            return Ok(json!({
+                "ok": true,
+                "mode": "alternate_layouts",
+                "stepsApplied": 0,
+                "note": "All requested target format dimensions already exist in this document.",
+            }));
+        }
+        let cmd_json = serde_json::to_value(&actions).map_err(|e| e.to_string())?;
+        self.apply_engine_commands(&json!({"commands": cmd_json, "summary": "Create multi-format alternate layouts"}), request)
+    }
+
+    fn populate_data_records(&mut self, args: &Value, request: &TaskRequest) -> Result<Value, String> {
+        let chosen_path = if let Some(explicit) = args.get("attachment_path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+            let clean = designcraft_ai_types::sanitize_user_path(explicit);
+            if !request.attachments.iter().any(|a| a.path == clean) {
+                return Err("`attachment_path` must reference one of the task's authorized `attachments`".into());
+            }
+            clean
+        } else if let Some(att) =
+            request.attachments.iter().find(|a| a.role == designcraft_ai_types::protocol::AttachmentRole::DataRecords).or_else(|| {
+                request.attachments.iter().find(|a| {
+                    std::path::Path::new(&a.path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "xlsx" | "csv" | "tsv"))
+                })
+            })
+        {
+            att.path.clone()
+        } else {
+            return Err("No DataRecords (.xlsx / .csv / .tsv) attachment found in task attachments".into());
+        };
+
+        designcraft_engine::file_access::check_read(&chosen_path)?;
+        let bytes = designcraft_engine::io::read_capped(std::path::Path::new(&chosen_path), 16 * 1024 * 1024)
+            .map_err(|e| format!("read {chosen_path}: {e}"))?;
+        let (headers, rows) = parse_tabular_records(std::path::Path::new(&chosen_path), &bytes)?;
+        if rows.is_empty() {
+            return Err("Data attachment contains zero data rows".into());
+        }
+
+        let (existing_pages, page_w, page_h, margin, rtl_doc, placeholder_stories) = {
+            let st = self.session.doc().map_err(|e| e.to_string())?;
+            let p0 = st.doc.spreads.first().and_then(|s| s.pages.first());
+            let w = p0.map(|p| p.width).unwrap_or(st.doc.settings.page_width).max(120.0);
+            let h = p0.map(|p| p.height).unwrap_or(st.doc.settings.page_height).max(120.0);
+            let m = p0.map(|p| p.margins.top.max(18.0)).unwrap_or(36.0).min(w * 0.2).min(h * 0.2);
+            let placeholders: Vec<u64> =
+                st.doc.stories.iter().filter(|(_, story)| story.text.contains("{{") && story.text.contains("}}")).map(|(sid, _)| sid.0).collect();
+            (st.doc.spreads.len(), w, h, m, st.doc.settings.right_to_left_binding, placeholders)
+        };
+
+        let default_per_page = if !placeholder_stories.is_empty() || page_w <= 420.0 || page_h <= 300.0 { 1 } else { 4 };
+        let records_per_page =
+            args.get("records_per_page").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(default_per_page).clamp(1, 12);
+        let columns = args
+            .get("columns")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(if records_per_page == 1 { 1 } else { 2 })
+            .clamp(1, 4)
+            .min(records_per_page);
+
+        let capped_rows: Vec<&Vec<String>> = rows.iter().take(120).collect();
+        let pages_needed = capped_rows.len().div_ceil(records_per_page).max(1);
+
+        let mut cmds: Vec<EngineAction> = Vec::new();
+        for sid in placeholder_stories {
+            cmds.push(EngineAction { command: "story.setText".into(), params: json!({"story": sid, "text": ""}) });
+        }
+        if pages_needed > existing_pages {
+            cmds.push(EngineAction { command: "layout.pages.insert".into(), params: json!({"count": pages_needed - existing_pages}) });
+        }
+
+        let grid_rows = records_per_page.div_ceil(columns).max(1);
+        let gap = 14.0_f64;
+        let usable_w = (page_w - 2.0 * margin - gap * ((columns.saturating_sub(1)) as f64)).max(60.0);
+        let usable_h = (page_h - 2.0 * margin - gap * ((grid_rows.saturating_sub(1)) as f64)).max(60.0);
+        let cell_w = usable_w / (columns as f64);
+        let cell_h = usable_h / (grid_rows as f64);
+
+        for (rec_idx, row) in capped_rows.iter().enumerate() {
+            if cmds.len().saturating_add(6) > MAX_ACTIONS {
+                let batch_json = serde_json::to_value(&cmds).map_err(|e| e.to_string())?;
+                self.apply_engine_commands(&json!({"commands": batch_json, "summary": "Populate data record cards"}), request)?;
+                cmds.clear();
+            }
+            let spread_idx = rec_idx / records_per_page;
+            let slot_in_page = rec_idx % records_per_page;
+            let r_idx = slot_in_page / columns;
+            let raw_c = slot_in_page % columns;
+            let c_idx = if rtl_doc { columns.saturating_sub(1).saturating_sub(raw_c) } else { raw_c };
+
+            let x0 = margin + (c_idx as f64) * (cell_w + gap);
+            let y0 = margin + (r_idx as f64) * (cell_h + gap);
+            let x1 = x0 + cell_w;
+            let y1 = y0 + cell_h;
+
+            let mut lines = Vec::new();
+            for (col_i, val) in row.iter().enumerate() {
+                let trimmed = val.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(hdr) = headers.get(col_i).map(|h| h.trim()).filter(|h| !h.is_empty()) {
+                    if col_i == 0 {
+                        lines.push(trimmed.to_owned());
+                    } else {
+                        lines.push(format!("{hdr}: {trimmed}"));
+                    }
+                } else {
+                    lines.push(trimmed.to_owned());
+                }
+            }
+            let card_text = if lines.is_empty() { format!("Record {}", rec_idx + 1) } else { lines.join("\n") };
+            let is_arabic = card_text.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c));
+
+            let bg_step = cmds.len();
+            cmds.push(EngineAction {
+                command: "frame.create".into(),
+                params: json!({
+                    "spread": spread_idx,
+                    "rect": [x0, y0, x1, y1],
+                    "shape": "rectangle",
+                    "content": "unassigned"
+                }),
+            });
+            cmds.push(EngineAction {
+                command: "object.stroke".into(),
+                params: json!({
+                    "ids": [format!("${bg_step}.id")],
+                    "swatch": "Black",
+                    "weight": 0.75
+                }),
+            });
+            let pad = (cell_w.min(cell_h) * 0.08).clamp(6.0, 14.0);
+            let txt_step = cmds.len();
+            cmds.push(EngineAction {
+                command: "frame.create".into(),
+                params: json!({
+                    "spread": spread_idx,
+                    "rect": [x0 + pad, y0 + pad, (x1 - pad).max(x0 + pad + 24.0), (y1 - pad).max(y0 + pad + 24.0)],
+                    "content": "text",
+                    "text": card_text,
+                    "caret": false
+                }),
+            });
+            cmds.push(EngineAction {
+                command: "story.setDirection".into(),
+                params: json!({
+                    "story": format!("${txt_step}.story"),
+                    "direction": if is_arabic || rtl_doc { "rightToLeft" } else { "leftToRight" }
+                }),
+            });
+        }
+        cmds.push(EngineAction { command: "story.fitOverset".into(), params: json!({"minSize": 8.0}) });
+        let batch_json = serde_json::to_value(&cmds).map_err(|e| e.to_string())?;
+        self.apply_engine_commands(&json!({"commands": batch_json, "summary": "Populate structured data records"}), request)?;
+
+        Ok(json!({
+            "ok": true,
+            "sourcePath": chosen_path,
+            "headers": headers,
+            "recordsPopulated": capped_rows.len(),
+            "populatedRecords": capped_rows.len(),
+            "pagesUsed": pages_needed,
+        }))
+    }
+
+    fn apply_engine_commands(&mut self, args: &Value, request: &TaskRequest) -> Result<Value, String> {
         if self.applied_chunks.len() >= MAX_CHUNKS {
             return Err(format!("Exceeded maximum of {MAX_CHUNKS} command batches per task; call complete_task."));
         }
@@ -678,7 +1044,22 @@ impl DocToolWorkspace {
         }
         let mut temp_plan = designcraft_ai_types::protocol::ProductionPlan { title: "Agent chunk".into(), commands: actions, images: Vec::new() };
         crate::native_layout::normalize_command_aliases(&mut temp_plan);
-        crate::worker::validate_actions(&temp_plan.commands, &self.catalog, OutputMode::NativeOnly)?;
+        {
+            let cur_state = self.session.doc().map_err(|e| e.to_string())?.clone();
+            crate::native_layout::harmonize_actions(
+                &mut temp_plan.commands,
+                &cur_state,
+                &crate::native_layout::HarmonizeOptions {
+                    allow_swatch_synthesis: true,
+                    preferred_arabic_font: request.settings.arabic_font.clone(),
+                    arabic_context: crate::facing_pages::auto_direction(&request.prompt) == "rightToLeft",
+                    attachments: request.attachments.clone(),
+                },
+            );
+        }
+        let has_placed_img = temp_plan.commands.iter().any(|a| matches!(a.command.as_str(), "file.place" | "frame.placeImage"));
+        let validate_mode = if has_placed_img { OutputMode::NativeWithImages } else { OutputMode::NativeOnly };
+        crate::worker::validate_actions(&temp_plan.commands, &self.catalog, validate_mode)?;
         actions = temp_plan.commands;
 
         let apply_res = self
@@ -687,7 +1068,7 @@ impl DocToolWorkspace {
                 "production.apply",
                 &json!({
                     "commands": actions,
-                    "outputMode": "native_only",
+                    "outputMode": if has_placed_img { "native_with_images" } else { "native_only" },
                     "label": "Agent step",
                     "requirePreflight": false,
                     "minPpi": self.min_ppi,
@@ -1260,6 +1641,85 @@ pub(crate) fn tool_definitions(allow_image_queue: bool) -> Vec<ToolDefinition> {
                 "required": ["commands"]
             }),
         },
+        ToolDefinition {
+            name: "search_project_knowledge".into(),
+            description: "Search across user-attached reference documents (PDF, DOCX, XLSX, CSV, TXT, MD) and active local Knowledge Packs using bilingual Arabic/English BM25 ranking.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keywords or question in Arabic or English."},
+                    "layer": {
+                        "type": "string",
+                        "enum": ["all", "user_reference", "knowledge_pack"],
+                        "description": "Optional knowledge layer filter."
+                    },
+                    "top_k": {"type": "integer", "description": "Maximum chunks to return (1..16, default 6)."}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "lookup_engine_commands".into(),
+            description: "Look up exact DesignCraft native engine command names, parameter schemas, and examples by keyword or category prefix.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Command name or capability keyword (e.g. 'alternate layout', 'gradient', 'table merge')."},
+                    "category": {"type": "string", "description": "Optional command namespace filter (e.g. 'layout', 'liquid', 'table', 'type', 'object')."}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "inspect_preflight".into(),
+            description: "Run live DesignCraft print/layout preflight on the current draft document, reporting overset text, missing font glyphs, bleed, and resolution issues.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "min_ppi": {"type": "number", "description": "Optional minimum effective image PPI threshold (default 150)."}
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "adapt_layout_formats".into(),
+            description: "Adapt the primary layout across multiple target formats (e.g. Instagram Square 1:1, Story 9:16, Landscape 16:9) either as Alternate Layouts inside one document or scheduled Separate Documents.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["alternate_layouts", "separate_documents"],
+                        "description": "Optional output mode override."
+                    },
+                    "formats": {
+                        "type": "array",
+                        "description": "Optional list of target format specs (defaults to `request.target_formats`).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "preset_id": {"type": "string"},
+                                "width_pt": {"type": "number"},
+                                "height_pt": {"type": "number"},
+                                "margin_pt": {"type": "number"}
+                            },
+                            "required": ["width_pt", "height_pt"]
+                        }
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "populate_data_records".into(),
+            description: "Populate structured native card grids across document pages from an attached `.xlsx`, `.csv`, or `.tsv` (`DataRecords`) file.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "attachment_path": {"type": "string", "description": "Optional path matching one of `request.attachments`."},
+                    "records_per_page": {"type": "integer", "description": "Cards per page (1..12, default 4)."},
+                    "columns": {"type": "integer", "description": "Grid columns per page (1..4, default 2)."}
+                }
+            }),
+        },
     ];
     if allow_image_queue {
         tools.push(ToolDefinition {
@@ -1545,9 +2005,253 @@ fn slice_context(s: &str, start: usize, end: usize, radius: usize) -> String {
     s.get(c0..c1).unwrap_or("").to_string()
 }
 
+fn build_alternate_layout_actions(state: &DocState, formats: &[designcraft_ai_types::protocol::DocumentGeometrySpec]) -> Vec<EngineAction> {
+    let existing_dims: Vec<(f64, f64)> = state.doc.spreads.iter().flat_map(|sp| sp.pages.iter().map(|p| (p.width, p.height))).collect();
+    let base_pages = existing_dims.len().max(1);
+    let mut pending: Vec<&designcraft_ai_types::protocol::DocumentGeometrySpec> = Vec::new();
+    for fmt in formats.iter().take(12) {
+        let already = existing_dims.iter().any(|(w, h)| (*w - fmt.width_pt).abs() <= 2.0 && (*h - fmt.height_pt).abs() <= 2.0)
+            || pending.iter().any(|prev| (prev.width_pt - fmt.width_pt).abs() <= 2.0 && (prev.height_pt - fmt.height_pt).abs() <= 2.0);
+        if !already {
+            pending.push(fmt);
+        }
+    }
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    let primary_pages: Vec<usize> = (1..=base_pages).collect();
+    let mut actions = vec![EngineAction {
+        command: "liquid.pageRule".into(),
+        params: json!({
+            "rule": "scale",
+            "pages": primary_pages,
+        }),
+    }];
+    let mut cur_pages = base_pages;
+    for (idx, fmt) in pending.into_iter().enumerate() {
+        let label = if !fmt.preset_label.trim().is_empty() {
+            fmt.preset_label.clone()
+        } else {
+            format!("Format {} ({:.0}x{:.0})", idx + 2, fmt.width_pt, fmt.height_pt)
+        };
+        actions.push(EngineAction {
+            command: "layout.createAlternate".into(),
+            params: json!({
+                "name": truncate_utf8(&label, 64),
+                "width": fmt.width_pt,
+                "height": fmt.height_pt,
+                "rule": "scale",
+            }),
+        });
+        if cur_pages > base_pages {
+            let extra_start = cur_pages.saturating_add(base_pages);
+            let extra_end = cur_pages.saturating_mul(2);
+            let extra_pages: Vec<usize> = (extra_start..extra_end).collect();
+            if !extra_pages.is_empty() {
+                actions.push(EngineAction { command: "layout.pages.delete".into(), params: json!({ "pages": extra_pages }) });
+            }
+        }
+        cur_pages = cur_pages.saturating_add(base_pages);
+    }
+    actions.push(EngineAction { command: "story.fitOverset".into(), params: json!({ "minSize": 8.0 }) });
+    actions
+}
+
+fn parse_delimited_line(line: &str, delim: char) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if in_quotes && chars.peek() == Some(&'"') {
+                cur.push('"');
+                let _ = chars.next();
+            } else {
+                in_quotes = !in_quotes;
+            }
+        } else if ch == delim && !in_quotes {
+            cells.push(cur.trim().to_owned());
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    cells.push(cur.trim().to_owned());
+    cells
+}
+
+fn parse_tabular_records(path: &std::path::Path, bytes: &[u8]) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let ext = path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "csv" | "tsv") {
+        let delim = if ext == "tsv" { b'\t' } else { b',' };
+        if let Ok(mut records) = designcraft_textimport::csv_records(bytes, delim) {
+            records.retain(|r| r.iter().any(|c| !c.trim().is_empty()));
+            if !records.is_empty() {
+                let headers = records.remove(0);
+                return Ok((headers, records));
+            }
+        }
+        let text = std::str::from_utf8(bytes).map(ToOwned::to_owned).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned());
+        let text = text.trim_start_matches('\u{feff}');
+        let ch_delim = if ext == "tsv" { '\t' } else { ',' };
+        let mut parsed_rows: Vec<Vec<String>> = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .take(500)
+            .map(|l| parse_delimited_line(l, ch_delim))
+            .filter(|r| r.iter().any(|c| !c.is_empty()))
+            .collect();
+        if parsed_rows.is_empty() {
+            return Err("Tabular file contains no non-empty rows".into());
+        }
+        let headers = parsed_rows.remove(0);
+        return Ok((headers, parsed_rows));
+    }
+
+    if ext == "xlsx"
+        && let Ok(mut records) = designcraft_textimport::xlsx_records(bytes, None)
+    {
+        records.retain(|r| r.iter().any(|c| !c.trim().is_empty()));
+        if !records.is_empty() {
+            let headers = records.remove(0);
+            return Ok((headers, records));
+        }
+    }
+
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let extracted =
+        designcraft_textimport::extract_structured_text(&name, bytes).map_err(|e| format!("extract tabular records from {}: {e}", path.display()))?;
+    if let Some(table) = extracted.tables.iter().find(|t| !t.rows.is_empty()) {
+        return Ok((table.headers.clone(), table.rows.clone()));
+    }
+    let mut parsed_rows: Vec<Vec<String>> = Vec::new();
+    for raw_line in extracted.plain_text.lines().take(600) {
+        let line = raw_line.trim();
+        if line.is_empty() || (line.starts_with("===") && line.ends_with("===")) || (line.starts_with('#') && !line.contains('\t')) {
+            continue;
+        }
+        let cells: Vec<String> = if line.contains('\t') {
+            line.split('\t').map(|c| c.trim().to_owned()).collect()
+        } else if line.contains('|') {
+            let trimmed = line.trim_matches('|');
+            if trimmed.chars().all(|c| matches!(c, '-' | ':' | '|' | ' ')) {
+                continue;
+            }
+            trimmed.split('|').map(|c| c.trim().to_owned()).collect()
+        } else if line.contains(',') {
+            parse_delimited_line(line, ',')
+        } else {
+            vec![line.to_owned()]
+        };
+        if cells.iter().any(|c| !c.is_empty()) {
+            parsed_rows.push(cells);
+        }
+    }
+    if parsed_rows.is_empty() {
+        return Err("Spreadsheet/document contains no tabular rows".into());
+    }
+    let headers = parsed_rows.remove(0);
+    Ok((headers, parsed_rows))
+}
+
+pub(crate) fn materialize_target_formats_on_session(
+    session: &mut Session,
+    formats: &[designcraft_ai_types::protocol::DocumentGeometrySpec],
+    mode: designcraft_ai_types::protocol::MultiFormatOutputMode,
+) -> Result<usize, String> {
+    for fmt in formats.iter().take(12) {
+        crate::intent_geometry::validate_geometry_spec(fmt)?;
+    }
+    match mode {
+        designcraft_ai_types::protocol::MultiFormatOutputMode::AlternateLayouts => {
+            let actions = {
+                let state = session.doc().map_err(|e| e.to_string())?;
+                build_alternate_layout_actions(state, formats)
+            };
+            if actions.is_empty() {
+                return Ok(0);
+            }
+            let count = actions.len();
+            session
+                .execute(
+                    "production.apply",
+                    &json!({
+                        "commands": actions,
+                        "outputMode": "native_only",
+                        "label": "Create multi-format alternate layouts",
+                        "requirePreflight": false,
+                        "minPpi": 150.0,
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(count)
+        }
+        designcraft_ai_types::protocol::MultiFormatOutputMode::SeparateDocuments => {
+            let primary_idx = session.active_index();
+            let (primary_doc, base_title) = {
+                let state = session.doc().map_err(|e| e.to_string())?;
+                (state.doc.clone(), state.title())
+            };
+            let primary_dims = primary_doc
+                .spreads
+                .first()
+                .and_then(|sp| sp.pages.first())
+                .map(|p| (p.width, p.height))
+                .unwrap_or((primary_doc.settings.page_width, primary_doc.settings.page_height));
+            let mut materialized_dims: Vec<(f64, f64)> = vec![primary_dims];
+            let primary_pages = primary_doc.page_count().max(1);
+            let mut created_docs = 0usize;
+            for fmt in formats.iter().take(12) {
+                let already_materialized = materialized_dims.iter().any(|(w, h)| (w - fmt.width_pt).abs() <= 2.0 && (h - fmt.height_pt).abs() <= 2.0);
+                if already_materialized {
+                    continue;
+                }
+                let label =
+                    if !fmt.preset_label.trim().is_empty() { fmt.preset_label.clone() } else { format!("{:.0}x{:.0}", fmt.width_pt, fmt.height_pt) };
+                let mut cloned_doc = (*primary_doc).clone();
+                cloned_doc.title = format!("{base_title} — {}", truncate_utf8(&label, 48));
+                cloned_doc.settings.page_width = fmt.width_pt;
+                cloned_doc.settings.page_height = fmt.height_pt;
+                let companion = DocState::new(cloned_doc, None);
+                let baseline_unsaved = primary_doc.clone();
+                session.add_document(companion);
+                let page_nums: Vec<usize> = (1..=primary_pages).collect();
+                session.execute("liquid.pageRule", &json!({ "rule": "scale", "pages": page_nums })).map_err(|e| e.to_string())?;
+                session
+                    .execute(
+                        "layout.pageSize",
+                        &json!({
+                            "pages": page_nums,
+                            "width": fmt.width_pt,
+                            "height": fmt.height_pt,
+                        }),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let _ = session.execute("story.fitOverset", &json!({ "minSize": 8.0 }));
+                if let Ok(comp_state) = session.doc_mut() {
+                    // Keep unsaved generated companions dirty so closing/quitting prompts to save.
+                    comp_state.saved_doc = baseline_unsaved;
+                    comp_state.saved_revision = 0;
+                    comp_state.history.undo.clear();
+                    comp_state.history.redo.clear();
+                }
+                materialized_dims.push((fmt.width_pt, fmt.height_pt));
+                created_docs = created_docs.saturating_add(1);
+            }
+            if let Some(idx) = primary_idx {
+                session.set_active(idx);
+            }
+            Ok(created_docs)
+        }
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use designcraft_ai_types::protocol::{AiSettings, TaskTarget};
 
@@ -1565,6 +2269,7 @@ mod tests {
             auto_select_skills: false,
             target: TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         };
 
         let mut ws = DocToolWorkspace::new(&base, &s.prefs, designcraft_engine::cmd::production::catalog(), 150.0);
@@ -1692,6 +2397,7 @@ mod tests {
             auto_select_skills: false,
             target: TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         };
 
         let (gfx_res, _, gfx_err) = ws.execute_tool_multimodal("inspect_graphics_and_captions", &json!({"start_page": 1, "end_page": 1}), &req, 5);
@@ -1704,5 +2410,165 @@ mod tests {
         assert_eq!(hit["page"], 3, "threaded match displayed in frame on page 3 must report page 3, got {hit}");
         assert_eq!(hit["spread"], 2);
         assert_eq!(hit["frameId"], f3["id"]);
+    }
+
+    #[test]
+    fn m2_new_agent_tools_rag_preflight_tabular_records_and_multiformat_adaptation_work_end_to_end() {
+        let ai_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let csv_path = data_dir.path().join("badges.csv");
+        std::fs::write(&csv_path, "Name,Role,Company\nأحمد المنصور,مدير التصميم,دار الإبداع\nSara Al-Qahtani,Lead Architect,DesignCraft Studio\n")
+            .unwrap();
+        let brand_md = data_dir.path().join("brand-rules.md");
+        std::fs::write(&brand_md, "# Brand Rules\nOfficial corporate accent hex is #D97706 Amber Gold with #0F172A Midnight Navy.\n").unwrap();
+
+        let access = designcraft_engine::file_access::AutomationRoots::new(&[ai_dir.path(), data_dir.path()], &[ai_dir.path()]).unwrap().unwrap();
+        let pack = designcraft_engine::file_access::confine(Some(&access), || {
+            crate::rag::create_knowledge_pack(
+                &access,
+                ai_dir.path(),
+                "Corporate Brand Pack",
+                "Brand colors and typography rules",
+                &[brand_md.to_string_lossy().into_owned()],
+            )
+        })
+        .unwrap();
+
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 1, "facingPages": false, "width": 252.0, "height": 144.0})).unwrap();
+        s.execute(
+            "frame.create",
+            &json!({"spread": 0, "rect": [18.0, 24.0, 234.0, 120.0], "content": "text", "text": "{{Name}} — {{Role}} ({{Company}})"}),
+        )
+        .unwrap();
+        let base = s.doc().unwrap().clone();
+        let mut ws = DocToolWorkspace::new(&base, &s.prefs, designcraft_engine::cmd::production::catalog(), 150.0);
+        ws.ai_root = Some(ai_dir.path().to_path_buf());
+
+        let req = TaskRequest {
+            prompt: "Populate VIP badges from CSV and adapt to Instagram Story and LinkedIn Banner".into(),
+            settings: AiSettings::default(),
+            target: TaskTarget::CurrentDocument,
+            attachments: vec![designcraft_ai_types::protocol::TaskAttachment {
+                path: csv_path.to_string_lossy().into_owned(),
+                role: designcraft_ai_types::protocol::AttachmentRole::DataRecords,
+            }],
+            knowledge_pack_ids: vec![pack.id.clone()],
+            ..Default::default()
+        };
+
+        // 1. search_project_knowledge retrieves from persisted Knowledge Pack & session CSV attachment:
+        let (rag_res, rag_err) = designcraft_engine::file_access::confine(Some(&access), || {
+            ws.execute_tool("search_project_knowledge", &json!({"query": "Amber Gold #D97706", "top_k": 4}), &req, 6)
+        });
+        assert!(!rag_err, "{rag_res}");
+        assert!(rag_res["hitCount"].as_u64().unwrap() >= 1);
+
+        // 2. lookup_engine_commands finds exact schemas dynamically:
+        let (cmd_res, cmd_err) = ws.execute_tool("lookup_engine_commands", &json!({"query": "alternate layout liquid", "limit": 5}), &req, 6);
+        assert!(!cmd_err, "{cmd_res}");
+        assert!(cmd_res["commands"].as_array().unwrap().iter().any(|c| c["command"] == "layout.createAlternate"));
+
+        // 3. inspect_preflight runs cleanly:
+        let (pf_res, pf_err) = ws.execute_tool("inspect_preflight", &json!({}), &req, 6);
+        assert!(!pf_err, "{pf_res}");
+        assert_eq!(pf_res["ok"], true);
+
+        // 4. populate_data_records expands 1 template page into 2 data-populated pages:
+        let (pop_res, pop_err) =
+            designcraft_engine::file_access::confine(Some(&access), || ws.execute_tool("populate_data_records", &json!({}), &req, 6));
+        assert!(!pop_err, "{pop_res}");
+        assert_eq!(pop_res["populatedRecords"], 2);
+        assert_eq!(ws.session.doc().unwrap().doc.page_count(), 2);
+
+        // 5. adapt_layout_formats adds Instagram Post + Story alternate layouts (2 base pages * 2 new formats = +4 pages -> 6 total):
+        let (adapt_res, adapt_err) = ws.execute_tool(
+            "adapt_layout_formats",
+            &json!({
+                "mode": "alternate_layouts",
+                "formats": [
+                    {"name": "Instagram Post", "width_pt": 1080.0, "height_pt": 1080.0},
+                    {"name": "Instagram Story", "width_pt": 1080.0, "height_pt": 1920.0}
+                ]
+            }),
+            &req,
+            6,
+        );
+        assert!(!adapt_err, "{adapt_res}");
+        assert_eq!(ws.session.doc().unwrap().doc.page_count(), 6);
+
+        // 6. SeparateDocuments mode spawns independent companion documents in Session:
+        let mut sep_session = Session::new();
+        sep_session.add_document(ws.session.doc().unwrap().clone());
+        let specs = vec![
+            designcraft_ai_types::protocol::DocumentGeometrySpec {
+                width_pt: 1080.0,
+                height_pt: 1080.0,
+                preset_label: "Instagram Post".into(),
+                ..Default::default()
+            },
+            designcraft_ai_types::protocol::DocumentGeometrySpec {
+                width_pt: 1200.0,
+                height_pt: 628.0,
+                preset_label: "LinkedIn Post".into(),
+                ..Default::default()
+            },
+        ];
+        let created = super::materialize_target_formats_on_session(
+            &mut sep_session,
+            &specs,
+            designcraft_ai_types::protocol::MultiFormatOutputMode::SeparateDocuments,
+        )
+        .unwrap();
+        assert_eq!(created, 2);
+        assert_eq!(sep_session.documents().len(), 3);
+        assert!(sep_session.documents()[1].is_dirty(), "generated companion must remain dirty until saved");
+        assert!(sep_session.documents()[2].is_dirty(), "generated companion must remain dirty until saved");
+    }
+
+    #[test]
+    fn separate_format_companions_ignore_unrelated_open_tabs_and_record_scheduled_formats() {
+        let mut session = Session::new();
+        // Unrelated open 1080x1080 document in tab 0:
+        session.execute("file.new", &json!({"width": 1080.0, "height": 1080.0, "pages": 1, "title": "Unrelated Tab"})).unwrap();
+        // Primary campaign document in tab 1 (1080x1920):
+        session.execute("file.new", &json!({"width": 1080.0, "height": 1920.0, "pages": 1, "title": "Campaign Story"})).unwrap();
+        assert_eq!(session.active_index(), Some(1));
+
+        let base = session.doc().unwrap().clone();
+        let req = TaskRequest {
+            prompt: "Create campaign formats".into(),
+            settings: AiSettings::default(),
+            skill_ids: Vec::new(),
+            auto_select_skills: false,
+            target: TaskTarget::CurrentDocument,
+            export_directory: None,
+            attachments: Vec::new(),
+            knowledge_pack_ids: Vec::new(),
+            target_formats: Vec::new(),
+            selection_context: None,
+        };
+        let mut ws = DocToolWorkspace::new(&base, &Prefs::default(), designcraft_engine::cmd::production::catalog(), 150.0);
+        let (res, is_err) = ws.execute_tool(
+            "adapt_layout_formats",
+            &json!({
+                "mode": "separate_documents",
+                "formats": [
+                    {"name": "Instagram Square", "width_pt": 1080.0, "height_pt": 1080.0},
+                    {"name": "Instagram Square Dup", "width_pt": 1080.0, "height_pt": 1080.0}
+                ]
+            }),
+            &req,
+            5,
+        );
+        assert!(!is_err, "{res}");
+        let (sched_specs, sched_mode) = ws.scheduled_formats.clone().expect("scheduled_formats must be persisted");
+        assert_eq!(sched_mode, designcraft_ai_types::protocol::MultiFormatOutputMode::SeparateDocuments);
+        assert_eq!(sched_specs.len(), 1);
+
+        let created = super::materialize_target_formats_on_session(&mut session, &sched_specs, sched_mode).unwrap();
+        assert_eq!(created, 1, "unrelated open 1080x1080 tab must not suppress current campaign's square companion");
+        assert_eq!(session.documents().len(), 3);
+        assert!(session.documents()[2].is_dirty());
     }
 }

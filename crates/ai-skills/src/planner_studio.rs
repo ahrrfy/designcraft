@@ -147,7 +147,7 @@ impl FamilyBuilder {
                     "fontFamily": "Tahoma",
                     "fontStyle": if bold { "Bold" } else { "Regular" },
                     "size": size,
-                    "leading": {"kind": "points", "value": size + 3.5},
+                    "leading": {"kind": "points", "value": size + 2.5},
                     "fill": fill
                 }
             }),
@@ -390,13 +390,13 @@ pub(crate) fn style_package() -> Result<PackageFiles> {
 
 fn build_cover() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 379.0, 74.0], (BLOSSOM, 0.14), (NAVY, 0.3, 0.7), "part.cover.ribbon");
+    b.card([40.0, 40.0, 379.0, 74.0], (BLOSSOM, 0.14), (NAVY, 0.3, 0.7), "part.cover.ribbon");
     b.slot(
         "edition-badge",
         "Top collection or seasonal edition badge",
         "STARLIGHT & BLOSSOM • 365 EDITION",
-        [48.0, 48.0, 371.0, 70.0],
-        9.5,
+        [48.0, 44.0, 371.0, 70.0],
+        9.0,
         true,
         "center",
         NAVY,
@@ -407,18 +407,18 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         "book-title",
         "Main planner, journal, or notebook cover title",
         "Starlight & Blossom 365 Planner",
-        [50.0, 90.0, 369.0, 132.0],
-        15.0,
+        [50.0, 88.0, 369.0, 130.0],
+        14.0,
         true,
         "center",
         NAVY,
-        72,
+        64,
     );
     b.slot(
         "book-subtitle",
         "Inspiring cover subtitle and scope",
         "Daily Sanctuary • Seasonal Gardens • Mindful Escapes",
-        [50.0, 134.0, 369.0, 168.0],
+        [50.0, 133.0, 369.0, 169.0],
         9.5,
         false,
         "center",
@@ -431,32 +431,32 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         "pillar-1",
         "First planner feature highlight",
         "12 Seasonal Botanical Chapters",
-        [46.0, 398.0, 199.0, 430.0],
+        [46.0, 396.0, 199.0, 430.0],
         8.5,
         true,
         "center",
         NAVY,
-        56,
+        50,
     );
     b.card([214.0, 392.0, 379.0, 434.0], (SAGE, 0.12), (NAVY, 0.25, 0.6), "part.cover.pillar-2");
     b.slot(
         "pillar-2",
         "Second planner feature highlight",
         "Daily Focus & Gratitude Rituals",
-        [220.0, 398.0, 373.0, 430.0],
+        [220.0, 396.0, 373.0, 430.0],
         8.5,
         true,
         "center",
         NAVY,
-        56,
+        50,
     );
-    b.card([40.0, 442.0, 379.0, 524.0], (GOLD, 0.10), (NAVY, 0.3, 0.7), "part.cover.owner-box");
+    b.card([40.0, 442.0, 379.0, 526.0], (GOLD, 0.10), (NAVY, 0.3, 0.7), "part.cover.owner-box");
     b.slot(
         "owner-line",
         "Personal ownership and year inscription",
-        "Belongs to: ______________________   Year: ______",
-        [50.0, 452.0, 369.0, 486.0],
-        9.5,
+        "Belongs to: __________________   Year: ____",
+        [50.0, 448.0, 369.0, 484.0],
+        9.0,
         true,
         "center",
         NAVY,
@@ -466,7 +466,7 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
         "cover-motto",
         "Closing cover blessing or motto",
         "One mindful page, one gentle victory, every day of the year.",
-        [50.0, 488.0, 369.0, 518.0],
+        [50.0, 487.0, 369.0, 521.0],
         8.5,
         false,
         "center",
@@ -491,30 +491,30 @@ fn build_cover() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 278.0, 92.0], (BLOSSOM, 0.12), (NAVY, 0.28, 0.65), "part.wheel.header");
+    b.card([40.0, 40.0, 278.0, 106.0], (BLOSSOM, 0.12), (NAVY, 0.28, 0.65), "part.wheel.header");
     b.slot(
         "page-title",
         "Front-matter or vision page heading",
         "Wheel of Dreams & Life Compass",
-        [48.0, 47.0, 270.0, 70.0],
-        12.0,
+        [48.0, 44.0, 270.0, 74.0],
+        10.5,
         true,
         "left",
         NAVY,
-        64,
+        56,
     );
     b.slot(
         "page-subtitle",
         "Instruction for rating or mapping life pillars",
-        "Shade each petal from 1–10 and set your seasonal intention.",
-        [48.0, 70.0, 270.0, 89.0],
-        8.5,
+        "Rate each petal 1–10 and set your intention.",
+        [48.0, 76.0, 270.0, 102.0],
+        8.0,
         false,
         "left",
         NAVY,
-        84,
+        76,
     );
-    b.graphic_slot_frame([286.0, 42.0, 379.0, 92.0], ROSE, "part.art.corner-motif");
+    b.graphic_slot_frame([286.0, 40.0, 379.0, 106.0], ROSE, "part.art.corner-motif");
     // Vector 8-spoke concentric lotus/compass wheel centered at (209.5, 212.0), radius 92 pt
     b.ellipse([117.5, 120.0, 301.5, 304.0], ROSE, 0.08, NAVY, 0.35, 0.8);
     b.ellipse([147.5, 150.0, 271.5, 274.0], SKY, 0.08, NAVY, 0.25, 0.55);
@@ -576,12 +576,12 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
         "guiding-word",
         "Personal word of the year or guiding compass",
         "Word of the Year & North Star Intention: ________________________",
-        [48.0, 488.0, 371.0, 520.0],
+        [48.0, 487.0, 371.0, 521.0],
         9.0,
         true,
         "center",
         NAVY,
-        96,
+        88,
     );
     b.footer_chrome();
     b.finish(
@@ -591,7 +591,7 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "corner-motif".into(),
             purpose: "Delicate watercolor lotus and starlight corner stationery vignette, no text".into(),
-            rect: [286.0, 42.0, 379.0, 92.0],
+            rect: [286.0, 40.0, 379.0, 106.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
@@ -601,51 +601,51 @@ fn build_ownership_wheel() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 266.0, 96.0], (ROSE, 0.13), (NAVY, 0.3, 0.7), "part.month.banner");
+    b.card([40.0, 40.0, 266.0, 104.0], (ROSE, 0.13), (NAVY, 0.3, 0.7), "part.month.banner");
     b.slot(
         "month-name",
         "Month title and seasonal theme",
         "Month 01 • Frost & Starlight Garden",
-        [48.0, 48.0, 258.0, 72.0],
-        12.5,
+        [48.0, 44.0, 258.0, 74.0],
+        10.5,
         true,
         "left",
         NAVY,
-        64,
+        54,
     );
     b.slot(
         "month-quote",
         "Seasonal opening quote or focus motto",
         "Plant quiet seeds beneath the winter stars.",
-        [48.0, 73.0, 258.0, 93.0],
-        8.5,
+        [48.0, 75.0, 258.0, 101.0],
+        8.0,
         false,
         "left",
         NAVY,
-        84,
+        76,
     );
-    b.graphic_slot_frame([274.0, 42.0, 379.0, 96.0], BLOSSOM, "part.art.monthly-header-art");
-    // Calendar header strip + 5x7 calendar grid (x: 40..379, y: 104..364)
-    b.card([40.0, 104.0, 379.0, 128.0], (NAVY, 0.88), (NAVY, 0.9, 0.6), "part.month.weekdays");
+    b.graphic_slot_frame([274.0, 40.0, 379.0, 104.0], BLOSSOM, "part.art.monthly-header-art");
+    // Calendar header strip + 5x7 calendar grid (x: 40..379, y: 110..362)
+    b.card([40.0, 110.0, 379.0, 140.0], (NAVY, 0.88), (NAVY, 0.9, 0.6), "part.month.weekdays");
     b.slot(
         "weekdays-bar",
         "Seven weekday column labels",
         "SUN     MON     TUE     WED     THU     FRI     SAT",
-        [46.0, 108.0, 373.0, 125.0],
-        8.5,
+        [46.0, 112.0, 373.0, 138.0],
+        8.0,
         true,
         "center",
         "[Paper]",
-        72,
+        68,
     );
-    b.card([40.0, 130.0, 379.0, 360.0], ("[Paper]", 1.0), (NAVY, 0.3, 0.7), "part.month.grid");
+    b.card([40.0, 142.0, 379.0, 362.0], ("[Paper]", 1.0), (NAVY, 0.3, 0.7), "part.month.grid");
     let mut grid_lines = Vec::new();
     for col in 1..7 {
         let x = 40.0 + f64::from(col) * (339.0 / 7.0);
-        grid_lines.push([[x, 130.0], [x, 360.0]]);
+        grid_lines.push([[x, 142.0], [x, 362.0]]);
     }
     for row in 1..5 {
-        let y = 130.0 + f64::from(row) * (230.0 / 5.0);
+        let y = 142.0 + f64::from(row) * (220.0 / 5.0);
         grid_lines.push([[40.0, y], [379.0, y]]);
     }
     b.rules(&grid_lines, NAVY, 0.18, 0.45);
@@ -678,7 +678,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
         "month-reward",
         "Key dates, birthdays, and end-of-month celebration",
         "Key Dates & Monthly Reward: ____________________________________",
-        [48.0, 472.0, 371.0, 518.0],
+        [48.0, 470.0, 371.0, 520.0],
         8.5,
         false,
         "left",
@@ -693,7 +693,7 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "monthly-header-art".into(),
             purpose: "Seasonal watercolor floral and botanical header motif for the month, no text".into(),
-            rect: [274.0, 42.0, 379.0, 96.0],
+            rect: [274.0, 40.0, 379.0, 104.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
@@ -703,77 +703,77 @@ fn build_monthly_garden() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 282.0, 88.0], (SKY, 0.14), (NAVY, 0.28, 0.65), "part.week.header");
+    b.card([40.0, 40.0, 282.0, 104.0], (SKY, 0.14), (NAVY, 0.28, 0.65), "part.week.header");
     b.slot(
         "week-title",
         "Week number, season, and date span",
         "Week 01 • Starlight Compass Overview",
-        [48.0, 47.0, 274.0, 68.0],
-        11.5,
+        [48.0, 44.0, 274.0, 74.0],
+        10.5,
         true,
         "left",
         NAVY,
-        64,
+        56,
     );
     b.slot(
         "week-focus",
         "Single guiding focus for the week",
         "Main Focus: Protect creative mornings & gentle evenings",
-        [48.0, 68.0, 274.0, 86.0],
-        8.5,
+        [48.0, 75.0, 274.0, 101.0],
+        8.0,
         false,
         "left",
         NAVY,
-        84,
+        80,
     );
-    b.graphic_slot_frame([290.0, 42.0, 379.0, 88.0], SKY, "part.art.weekly-accent");
+    b.graphic_slot_frame([290.0, 40.0, 379.0, 104.0], SKY, "part.art.weekly-accent");
 
     let cards = [
-        ("days-mon-tue", "Monday & Tuesday cloud plan", "Mon / Tue • Priority blocks & appointments", [40.0, 96.0, 205.0, 198.0], ROSE),
-        ("days-wed-thu", "Wednesday & Thursday cloud plan", "Wed / Thu • Deep work & mid-week check-in", [214.0, 96.0, 379.0, 198.0], BLOSSOM),
-        ("days-fri-sat", "Friday & Saturday sanctuary plan", "Fri / Sat • Wrap-up, family & outdoor joy", [40.0, 206.0, 205.0, 308.0], SAGE),
-        ("day-sun-reset", "Sunday reset & weekly prep", "Sunday Reset • Tidy space, meal prep & rest", [214.0, 206.0, 379.0, 308.0], GOLD),
+        ("days-mon-tue", "Monday & Tuesday cloud plan", "Mon / Tue • Priority blocks & appointments", [40.0, 112.0, 205.0, 210.0], ROSE),
+        ("days-wed-thu", "Wednesday & Thursday cloud plan", "Wed / Thu • Deep work & mid-week check-in", [214.0, 112.0, 379.0, 210.0], BLOSSOM),
+        ("days-fri-sat", "Friday & Saturday sanctuary plan", "Fri / Sat • Wrap-up, family & outdoor joy", [40.0, 216.0, 205.0, 314.0], SAGE),
+        ("day-sun-reset", "Sunday reset & weekly prep", "Sunday Reset • Tidy space, meal prep & rest", [214.0, 216.0, 379.0, 314.0], GOLD),
     ];
     for (id, purpose, sample, rect, swatch) in cards {
         b.card(rect, (swatch, 0.09), (NAVY, 0.25, 0.6), &format!("part.week.{id}"));
-        b.slot(id, purpose, sample, [rect[0] + 8.0, rect[1] + 6.0, rect[2] - 8.0, rect[3] - 48.0], 8.5, true, "left", NAVY, 96);
+        b.slot(id, purpose, sample, [rect[0] + 8.0, rect[1] + 6.0, rect[2] - 8.0, rect[1] + 56.0], 8.5, true, "left", NAVY, 78);
         b.rules(
             &[
-                [[rect[0] + 10.0, rect[3] - 32.0], [rect[2] - 10.0, rect[3] - 32.0]],
-                [[rect[0] + 10.0, rect[3] - 14.0], [rect[2] - 10.0, rect[3] - 14.0]],
+                [[rect[0] + 10.0, rect[3] - 28.0], [rect[2] - 10.0, rect[3] - 28.0]],
+                [[rect[0] + 10.0, rect[3] - 12.0], [rect[2] - 10.0, rect[3] - 12.0]],
             ],
             NAVY,
             0.18,
             0.45,
         );
     }
-    b.card([40.0, 318.0, 379.0, 422.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.week.priorities");
+    b.card([40.0, 322.0, 379.0, 422.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.week.priorities");
     b.slot(
         "top-three-week",
         "Weekly top-3 outcomes & habit tracker prompt",
         "Top 3 Weekly Outcomes & Habit Check (M T W T F S S):",
-        [48.0, 324.0, 371.0, 354.0],
+        [48.0, 327.0, 371.0, 362.0],
         9.0,
         true,
         "left",
         NAVY,
         88,
     );
-    b.rule([48.0, 374.0], [371.0, 374.0], NAVY, 0.2, 0.5, None);
-    b.rule([48.0, 398.0], [371.0, 398.0], NAVY, 0.2, 0.5, None);
+    b.rule([48.0, 382.0], [371.0, 382.0], NAVY, 0.2, 0.5, None);
+    b.rule([48.0, 404.0], [371.0, 404.0], NAVY, 0.2, 0.5, None);
     b.card([40.0, 430.0, 379.0, 526.0], (BLOSSOM, 0.08), (NAVY, 0.25, 0.6), "part.week.gratitude");
     b.slot(
         "weekly-win",
         "Weekly gratitude, joy jar & reflection prompt",
         "Brightest Moment of the Week & Next Week's Wish:",
-        [48.0, 438.0, 371.0, 472.0],
+        [48.0, 436.0, 371.0, 472.0],
         9.0,
         true,
         "left",
         NAVY,
         96,
     );
-    b.rule([48.0, 496.0], [371.0, 496.0], NAVY, 0.2, 0.5, None);
+    b.rule([48.0, 498.0], [371.0, 498.0], NAVY, 0.2, 0.5, None);
     b.footer_chrome();
     b.finish(
         "weekly-compass",
@@ -782,7 +782,7 @@ fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "weekly-accent".into(),
             purpose: "Soft watercolor starlight compass and floral corner accent, no embedded text".into(),
-            rect: [290.0, 42.0, 379.0, 88.0],
+            rect: [290.0, 40.0, 379.0, 104.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
@@ -792,49 +792,49 @@ fn build_weekly_compass() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 286.0, 88.0], (ROSE, 0.12), (NAVY, 0.28, 0.65), "part.daily.header");
+    b.card([40.0, 40.0, 286.0, 104.0], (ROSE, 0.12), (NAVY, 0.28, 0.65), "part.daily.header");
     b.slot(
         "day-header",
         "Day number, date/season label, and weekday",
         "Day 001 • Frost & Starlight Sanctuary",
-        [48.0, 46.0, 278.0, 68.0],
-        11.5,
+        [48.0, 44.0, 278.0, 74.0],
+        10.5,
         true,
         "left",
         NAVY,
-        68,
+        58,
     );
     b.slot(
         "morning-intention",
         "Morning energy & single guiding intention",
         "Today's Gentle Intention: Move with calm focus.",
-        [48.0, 68.0, 278.0, 86.0],
-        8.5,
+        [48.0, 75.0, 278.0, 101.0],
+        8.0,
         false,
         "left",
         NAVY,
-        88,
+        82,
     );
-    b.graphic_slot_frame([294.0, 42.0, 379.0, 88.0], SAGE, "part.art.daily-botanical");
+    b.graphic_slot_frame([294.0, 40.0, 379.0, 104.0], SAGE, "part.art.daily-botanical");
 
     // Left column: Top 3 Priorities + Micro-Joy (x: 40..204)
-    b.card([40.0, 96.0, 204.0, 250.0], (GOLD, 0.11), (NAVY, 0.26, 0.6), "part.daily.top3");
+    b.card([40.0, 112.0, 204.0, 260.0], (GOLD, 0.11), (NAVY, 0.26, 0.6), "part.daily.top3");
     b.slot(
         "priority-heading",
         "Top 3 Must-Do Focus Cards heading & prompt",
         "Top 3 Must-Do Priorities:",
-        [48.0, 102.0, 196.0, 126.0],
+        [48.0, 117.0, 196.0, 145.0],
         9.0,
         true,
         "left",
         NAVY,
-        56,
+        46,
     );
     b.slot(
         "priority-list",
         "Suggested focus slots or scripted daily anchors",
         "1. Deep work block\n2. Key follow-up\n3. Self-care pause",
-        [48.0, 130.0, 196.0, 240.0],
+        [48.0, 148.0, 196.0, 254.0],
         8.5,
         false,
         "left",
@@ -842,12 +842,12 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
         120,
     );
 
-    b.card([40.0, 258.0, 204.0, 386.0], (BLOSSOM, 0.10), (NAVY, 0.25, 0.6), "part.daily.microjoy");
+    b.card([40.0, 268.0, 204.0, 388.0], (BLOSSOM, 0.10), (NAVY, 0.25, 0.6), "part.daily.microjoy");
     b.slot(
         "micro-joy",
         "Unique daily micro-joy or mindfulness activity",
         "Today's Micro-Joy:\nSavor a warm cup away from screens for 10 quiet minutes.",
-        [48.0, 266.0, 196.0, 378.0],
+        [48.0, 274.0, 196.0, 382.0],
         8.5,
         false,
         "left",
@@ -855,20 +855,20 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
         130,
     );
 
-    // Right column: Time-Block Rhythm (x: 212..379, y: 96..386)
-    b.card([212.0, 96.0, 379.0, 386.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.daily.timeline");
+    // Right column: Time-Block Rhythm (x: 212..379, y: 112..388)
+    b.card([212.0, 112.0, 379.0, 388.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.daily.timeline");
     b.slot(
         "schedule-heading",
         "Daily time-blocking column heading",
         "Time-Block Flow (07:00 – 21:00)",
-        [220.0, 102.0, 371.0, 126.0],
+        [220.0, 117.0, 371.0, 145.0],
         9.0,
         true,
         "left",
         NAVY,
-        56,
+        48,
     );
-    let timeline: Vec<_> = (0..8).map(|step| [[220.0, 148.0 + f64::from(step) * 28.0], [371.0, 148.0 + f64::from(step) * 28.0]]).collect();
+    let timeline: Vec<_> = (0..8).map(|step| [[220.0, 166.0 + f64::from(step) * 28.0], [371.0, 166.0 + f64::from(step) * 28.0]]).collect();
     b.rules(&timeline, NAVY, 0.18, 0.45);
 
     // Bottom sanctuary: Gratitude + Evening Reflection + Wellness drops
@@ -877,20 +877,20 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
         "gratitude-prompt",
         "Unique evening gratitude & reflection question",
         "Evening Gratitude • What small moment made you smile today?",
-        [48.0, 402.0, 371.0, 434.0],
+        [48.0, 401.0, 371.0, 435.0],
         9.0,
         true,
         "left",
         NAVY,
-        110,
+        100,
     );
-    b.rule([48.0, 458.0], [371.0, 458.0], NAVY, 0.2, 0.45, None);
-    b.rule([48.0, 484.0], [371.0, 484.0], NAVY, 0.2, 0.45, None);
+    b.rule([48.0, 456.0], [371.0, 456.0], NAVY, 0.2, 0.45, None);
+    b.rule([48.0, 478.0], [371.0, 478.0], NAVY, 0.2, 0.45, None);
     b.slot(
         "wellness-bar",
         "Hydration, mood, energy & sleep check line",
         "Water: [ ] [ ] [ ] [ ]   Mood: 1 2 3 4 5   Rest: ____ hrs",
-        [48.0, 494.0, 371.0, 520.0],
+        [48.0, 488.0, 371.0, 520.0],
         8.5,
         false,
         "center",
@@ -905,7 +905,7 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "daily-botanical".into(),
             purpose: "Small seasonal watercolor flower or botanical corner stamp, no text".into(),
-            rect: [294.0, 42.0, 379.0, 88.0],
+            rect: [294.0, 40.0, 379.0, 104.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
@@ -915,13 +915,13 @@ fn build_daily_sanctuary() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 379.0, 90.0], (BLOSSOM, 0.14), (NAVY, 0.3, 0.7), "part.escape.header");
+    b.card([40.0, 40.0, 379.0, 104.0], (BLOSSOM, 0.14), (NAVY, 0.3, 0.7), "part.escape.header");
     b.slot(
         "escape-title",
         "Entertainment, brain game, coloring, or bingo challenge title",
         "Creative Sanctuary • Blossom Logic & Mindful Art",
-        [48.0, 47.0, 371.0, 70.0],
-        12.0,
+        [48.0, 44.0, 371.0, 74.0],
+        10.5,
         true,
         "center",
         NAVY,
@@ -931,8 +931,8 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
         "escape-rules",
         "Short instructions for the weekly puzzle, bingo, or coloring escape",
         "Unplug for 15 minutes: sketch, color, or complete the 4×4 seasonal grid.",
-        [48.0, 70.0, 371.0, 88.0],
-        8.5,
+        [48.0, 75.0, 371.0, 101.0],
+        8.0,
         false,
         "center",
         NAVY,
@@ -940,7 +940,7 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
     );
 
     // Upper creative art / coloring / doodle canvas
-    b.graphic_slot_frame([48.0, 98.0, 371.0, 272.0], BLOSSOM, "part.art.escape-canvas");
+    b.graphic_slot_frame([48.0, 112.0, 371.0, 274.0], BLOSSOM, "part.art.escape-canvas");
 
     // Lower 4x4 interactive Bingo / Mini-Sudoku / Challenge Grid (x: 40..232, y: 282..466) + Reflection Side Card
     b.card([40.0, 282.0, 232.0, 466.0], ("[Paper]", 1.0), (NAVY, 0.32, 0.75), "part.escape.grid");
@@ -968,7 +968,7 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
         "creative-spark",
         "Takeaway spark, riddle hint, or mood check after completing the page",
         "Creative Spark • How do you feel after this mindful break? ______________",
-        [48.0, 482.0, 371.0, 518.0],
+        [48.0, 480.0, 371.0, 520.0],
         8.5,
         true,
         "center",
@@ -983,7 +983,7 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "escape-canvas".into(),
             purpose: "Clean black-and-pastel line-art botanical mandala or whimsical illustration for mindful coloring, no text".into(),
-            rect: [48.0, 98.0, 371.0, 272.0],
+            rect: [48.0, 112.0, 371.0, 274.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
@@ -993,47 +993,47 @@ fn build_creative_escape() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 288.0, 88.0], (SAGE, 0.13), (NAVY, 0.28, 0.65), "part.notes.header");
+    b.card([40.0, 40.0, 288.0, 104.0], (SAGE, 0.13), (NAVY, 0.28, 0.65), "part.notes.header");
     b.slot(
         "notes-title",
         "Cornell / Dot-Grid studio topic heading",
         "Enchanted Cornell & Idea Studio",
-        [48.0, 46.0, 280.0, 68.0],
-        11.5,
+        [48.0, 44.0, 280.0, 74.0],
+        10.5,
         true,
         "left",
         NAVY,
-        64,
+        58,
     );
     b.slot(
         "notes-meta",
         "Subject, project, or date tag",
         "Topic / Project: ______________________   Date: ______",
-        [48.0, 68.0, 280.0, 86.0],
-        8.5,
+        [48.0, 75.0, 280.0, 101.0],
+        8.0,
         false,
         "left",
         NAVY,
         84,
     );
-    b.graphic_slot_frame([296.0, 42.0, 379.0, 88.0], GOLD, "part.art.notes-motif");
+    b.graphic_slot_frame([296.0, 40.0, 379.0, 104.0], GOLD, "part.art.notes-motif");
 
-    // Cue column (x: 40..136) + Main capture zone (x: 144..379), y: 96..444
-    b.card([40.0, 96.0, 136.0, 444.0], (SKY, 0.08), (NAVY, 0.25, 0.6), "part.notes.cues");
-    b.slot("cue-heading", "Left cue/questions column prompt", "Key Cues &\nQuestions", [46.0, 102.0, 130.0, 142.0], 8.5, true, "left", NAVY, 48);
-    b.card([144.0, 96.0, 379.0, 444.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.notes.body");
+    // Cue column (x: 40..136) + Main capture zone (x: 144..379), y: 112..444
+    b.card([40.0, 112.0, 136.0, 444.0], (SKY, 0.08), (NAVY, 0.25, 0.6), "part.notes.cues");
+    b.slot("cue-heading", "Left cue/questions column prompt", "Key Cues &\nQuestions", [46.0, 117.0, 130.0, 169.0], 8.5, true, "left", NAVY, 38);
+    b.card([144.0, 112.0, 379.0, 444.0], ("[Paper]", 1.0), (NAVY, 0.28, 0.65), "part.notes.body");
     b.slot(
         "capture-heading",
         "Main notes & sketches column prompt",
         "Ideas, Insights & Structured Notes",
-        [152.0, 102.0, 371.0, 126.0],
+        [152.0, 117.0, 371.0, 145.0],
         9.0,
         true,
         "left",
         NAVY,
-        64,
+        60,
     );
-    let capture_lines: Vec<_> = (0..10).map(|step| [[152.0, 148.0 + f64::from(step) * 28.0], [371.0, 148.0 + f64::from(step) * 28.0]]).collect();
+    let capture_lines: Vec<_> = (0..10).map(|step| [[152.0, 168.0 + f64::from(step) * 27.0], [371.0, 168.0 + f64::from(step) * 27.0]]).collect();
     b.rules(&capture_lines, NAVY, 0.16, 0.45);
 
     // Bottom synthesis summary
@@ -1042,14 +1042,14 @@ fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
         "summary-prompt",
         "Bottom Cornell synthesis & next action prompt",
         "Key Synthesis & Next Action Step:",
-        [48.0, 458.0, 371.0, 484.0],
+        [48.0, 457.0, 371.0, 487.0],
         9.0,
         true,
         "left",
         NAVY,
         84,
     );
-    b.rule([48.0, 506.0], [371.0, 506.0], NAVY, 0.2, 0.45, None);
+    b.rule([48.0, 508.0], [371.0, 508.0], NAVY, 0.2, 0.45, None);
     b.footer_chrome();
     b.finish(
         "cornell-dot-notes",
@@ -1058,7 +1058,7 @@ fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "notes-motif".into(),
             purpose: "Minimal pastel botanical quill or notebook stationery emblem, no text".into(),
-            rect: [296.0, 42.0, 379.0, 88.0],
+            rect: [296.0, 40.0, 379.0, 104.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
@@ -1068,13 +1068,13 @@ fn build_cornell_notes() -> (PageFamily, Vec<EngineAction>) {
 
 fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
     let mut b = FamilyBuilder::new();
-    b.card([40.0, 42.0, 379.0, 86.0], (ROSE, 0.14), (NAVY, 0.28, 0.65), "part.scrap.header");
+    b.card([40.0, 40.0, 379.0, 104.0], (ROSE, 0.14), (NAVY, 0.28, 0.65), "part.scrap.header");
     b.slot(
         "scrapbook-title",
         "Monthly memory scrapbook or gallery heading",
         "Monthly Polaroid Keepsakes & Memories",
-        [48.0, 46.0, 371.0, 68.0],
-        12.0,
+        [48.0, 44.0, 371.0, 74.0],
+        10.5,
         true,
         "center",
         NAVY,
@@ -1084,48 +1084,48 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
         "scrapbook-sub",
         "Subtitle inviting photos, tickets, or sketches",
         "Paste a favorite photo, ticket stub, pressed leaf, or memory sketch.",
-        [48.0, 68.0, 371.0, 84.0],
-        8.5,
+        [48.0, 75.0, 371.0, 101.0],
+        8.0,
         false,
         "center",
         NAVY,
         92,
     );
 
-    // Polaroid outer frame (x: 40..226, y: 96..344) + photo image_slot inside + caption strip
-    b.card([40.0, 96.0, 226.0, 344.0], ("[Paper]", 1.0), (NAVY, 0.35, 0.85), "part.scrap.polaroid");
-    b.graphic_slot_frame([50.0, 106.0, 216.0, 294.0], ROSE, "part.art.memory-photo");
+    // Polaroid outer frame (x: 40..226, y: 112..346) + photo image_slot inside + caption strip
+    b.card([40.0, 112.0, 226.0, 346.0], ("[Paper]", 1.0), (NAVY, 0.35, 0.85), "part.scrap.polaroid");
+    b.graphic_slot_frame([50.0, 120.0, 216.0, 298.0], ROSE, "part.art.memory-photo");
     b.slot(
         "polaroid-caption",
         "Caption strip beneath the Polaroid photo frame",
         "Snapshot of the Month • Date & Place",
-        [50.0, 300.0, 216.0, 336.0],
+        [50.0, 304.0, 216.0, 340.0],
         8.5,
         true,
         "center",
         NAVY,
-        64,
+        54,
     );
 
     // Right keepsake cards (x: 236..379)
-    b.card([236.0, 96.0, 379.0, 216.0], (GOLD, 0.12), (NAVY, 0.25, 0.6), "part.scrap.favorites");
+    b.card([236.0, 112.0, 379.0, 225.0], (GOLD, 0.12), (NAVY, 0.25, 0.6), "part.scrap.favorites");
     b.slot(
         "favorites-box",
         "Book, film, song, or cafe of the month",
         "Favorites Log:\n• Book:\n• Film/Song:\n• Cozy Spot:",
-        [244.0, 104.0, 371.0, 208.0],
+        [244.0, 118.0, 371.0, 219.0],
         8.5,
         false,
         "left",
         NAVY,
-        120,
+        110,
     );
-    b.card([236.0, 224.0, 379.0, 344.0], (SKY, 0.11), (NAVY, 0.25, 0.6), "part.scrap.lesson");
+    b.card([236.0, 233.0, 379.0, 346.0], (SKY, 0.11), (NAVY, 0.25, 0.6), "part.scrap.lesson");
     b.slot(
         "proud-moment",
         "Proudest win and lesson learned this month",
         "Proudest Win & Gentle Lesson Learned:",
-        [244.0, 232.0, 371.0, 336.0],
+        [244.0, 239.0, 371.0, 340.0],
         8.5,
         false,
         "left",
@@ -1139,12 +1139,12 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
         "memory-story",
         "Gratitude letter or story from the month",
         "Unforgettable Story, Quote, or Gratitude Letter from This Month:",
-        [48.0, 362.0, 371.0, 396.0],
+        [48.0, 360.0, 371.0, 396.0],
         9.0,
         true,
         "left",
         NAVY,
-        110,
+        100,
     );
     for step in 0..4 {
         let y = 420.0 + f64::from(step) * 26.0;
@@ -1158,10 +1158,161 @@ fn build_polaroid_scrapbook() -> (PageFamily, Vec<EngineAction>) {
         vec![DesignImageSlot {
             id: "memory-photo".into(),
             purpose: "Cozy pastel watercolor seasonal keepsake scene inside a Polaroid frame, no text".into(),
-            rect: [50.0, 106.0, 216.0, 294.0],
+            rect: [50.0, 120.0, 216.0, 298.0],
             crop: None,
             source_aspect_ratio: None,
             views: vec![],
         }],
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn rects_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
+        a[0] < b[2] - 0.01 && a[2] > b[0] + 0.01 && a[1] < b[3] - 0.01 && a[3] > b[1] + 0.01
+    }
+
+    fn parse_rect(value: &serde_json::Value) -> [f64; 4] {
+        let arr = value.as_array().expect("rect array");
+        [arr[0].as_f64().unwrap(), arr[1].as_f64().unwrap(), arr[2].as_f64().unwrap(), arr[3].as_f64().unwrap()]
+    }
+
+    #[test]
+    fn all_eight_planner_studio_families_have_non_overlapping_bounds_and_tahoma_arabic_headroom() {
+        let _instruction_pkg = instruction_package().expect("instruction package builds");
+        let style_pkg = style_package().expect("style package builds");
+        let manifest_bytes = style_pkg.get("designcraft.json").expect("manifest present");
+        let manifest: NativeManifest = serde_json::from_slice(manifest_bytes).expect("valid manifest");
+        let profile = manifest.design_profile.expect("design profile present");
+        profile.validate().expect("design profile validates");
+        assert_eq!(profile.page_families.len(), 8);
+
+        let pt_per_mm = 72.0 / 25.4;
+        let page_w = profile.page_mm[0] * pt_per_mm;
+        let page_h = profile.page_mm[1] * pt_per_mm;
+        let safe_margin = profile.margin_mm * pt_per_mm;
+        let safe_bounds = [safe_margin, safe_margin, page_w - safe_margin, page_h - safe_margin];
+
+        for family in &profile.page_families {
+            let tpl_bytes = style_pkg.get(&family.template).unwrap_or_else(|| panic!("missing template {}", family.template));
+            let actions: Vec<EngineAction> = serde_json::from_slice(tpl_bytes).expect("valid template actions");
+
+            let mut graphic_rects = Vec::new();
+            let mut horizontal_rules = Vec::new();
+            for action in &actions {
+                if action.command == "frame.create" && action.params.get("content").and_then(|v| v.as_str()) == Some("graphic") {
+                    graphic_rects.push(parse_rect(&action.params["rect"]));
+                } else if action.command == "line.create" {
+                    let a = action.params["a"].as_array().unwrap();
+                    let b = action.params["b"].as_array().unwrap();
+                    let (ax, ay) = (a[0].as_f64().unwrap(), a[1].as_f64().unwrap());
+                    let (bx, by) = (b[0].as_f64().unwrap(), b[1].as_f64().unwrap());
+                    assert!(
+                        ax >= safe_bounds[0] - 0.01 && bx <= safe_bounds[2] + 0.01 && ay >= safe_bounds[1] - 0.01 && by <= safe_bounds[3] + 0.01,
+                        "rule outside safe bounds in {}",
+                        family.id
+                    );
+                    if (ay - by).abs() < 0.01 {
+                        horizontal_rules.push((ax.min(bx), ax.max(bx), ay));
+                    }
+                }
+            }
+
+            for img_slot in &family.image_slots {
+                let r = img_slot.rect;
+                assert!(
+                    r[0] >= safe_bounds[0] && r[1] >= safe_bounds[1] && r[2] <= safe_bounds[2] && r[3] <= safe_bounds[3],
+                    "image slot {}/{} outside safe bounds: {r:?}",
+                    family.id,
+                    img_slot.id
+                );
+                assert!(
+                    graphic_rects.iter().any(|g| (0..4).all(|i| (g[i] - r[i]).abs() < 0.01)),
+                    "image slot {}/{} rect {r:?} does not match graphic frame {graphic_rects:?}",
+                    family.id,
+                    img_slot.id
+                );
+            }
+
+            let mut slot_rects: Vec<(&str, [f64; 4])> = Vec::new();
+            for slot in &family.text_slots {
+                let create = actions.get(slot.command).unwrap_or_else(|| panic!("invalid command index in {}/{}", family.id, slot.id));
+                assert_eq!(create.command, "frame.create");
+                assert_eq!(create.params.get("content").and_then(|v| v.as_str()), Some("text"));
+                let rect = parse_rect(&create.params["rect"]);
+                let width = rect[2] - rect[0];
+                let height = rect[3] - rect[1];
+                assert!(width >= 40.0 && height >= 20.0, "slot {}/{} too small: {rect:?}", family.id, slot.id);
+                assert!(
+                    rect[0] >= safe_bounds[0] && rect[1] >= safe_bounds[1] && rect[2] <= safe_bounds[2] && rect[3] <= 530.0,
+                    "slot {}/{} outside safe area or overlaps footer: {rect:?}",
+                    family.id,
+                    slot.id
+                );
+
+                for (other_id, other_rect) in &slot_rects {
+                    assert!(
+                        !rects_overlap(rect, *other_rect),
+                        "text slots {}/{} ({rect:?}) and {} ({other_rect:?}) overlap",
+                        family.id,
+                        slot.id,
+                        other_id
+                    );
+                }
+                for img_slot in &family.image_slots {
+                    assert!(
+                        !rects_overlap(rect, img_slot.rect),
+                        "text slot {}/{} ({rect:?}) overlaps image slot {} ({:?})",
+                        family.id,
+                        slot.id,
+                        img_slot.id,
+                        img_slot.rect
+                    );
+                }
+                for &(rx0, rx1, ry) in &horizontal_rules {
+                    let x_overlaps = rect[0] < rx1 - 0.01 && rect[2] > rx0 + 0.01;
+                    let y_intersects = ry > rect[1] + 0.01 && ry < rect[3] - 0.01;
+                    assert!(!(x_overlaps && y_intersects), "text slot {}/{} ({rect:?}) intersects handwriting rule at y={ry}", family.id, slot.id);
+                }
+                slot_rects.push((slot.id.as_str(), rect));
+
+                let char_cmd = &actions[slot.command + 1];
+                assert_eq!(char_cmd.command, "type.char");
+                let attrs = &char_cmd.params["attrs"];
+                assert_eq!(attrs["fontFamily"].as_str(), Some("Tahoma"));
+                let bold = attrs["fontStyle"].as_str() == Some("Bold");
+                let size = attrs["size"].as_f64().expect("font size");
+                let leading = attrs["leading"]["value"].as_f64().expect("leading points");
+                assert!((leading - (size + 2.5)).abs() < 0.01);
+
+                // Every slot must fit at least 2 full Tahoma/Arabic lines to prevent single-wrap OversetText:
+                let min_two_line_h = 2.0 * leading + 2.0;
+                assert!(
+                    height + 0.01 >= min_two_line_h,
+                    "slot {}/{} height {height} < 2-line Tahoma/Arabic minimum {min_two_line_h}",
+                    family.id,
+                    slot.id
+                );
+
+                let avg_char_pt = if bold { size * 0.58 } else { size * 0.52 };
+                let chars_per_line = ((width - 4.0) / avg_char_pt).floor().max(1.0) as usize;
+                let sample = create.params["text"].as_str().unwrap_or("");
+                let explicit_breaks = sample.matches('\n').count();
+                let sample_lines: usize = sample.split('\n').map(|line| line.chars().count().max(1).div_ceil(chars_per_line)).sum();
+                let budget_lines = (slot.max_chars * 115).div_ceil(100).div_ceil(chars_per_line) + explicit_breaks;
+                let required_lines = sample_lines.max(budget_lines);
+                let required_h = (required_lines as f64) * leading + 2.0;
+                assert!(
+                    height + 0.01 >= required_h,
+                    "slot {}/{} height {height:.1} insufficient for {required_lines} lines ({required_h:.1} pt needed at size={size}, max_chars={}, width={width:.1})",
+                    family.id,
+                    slot.id,
+                    slot.max_chars
+                );
+            }
+        }
+    }
 }

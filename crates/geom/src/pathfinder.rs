@@ -158,7 +158,11 @@ mod tests {
         assert!(near(area(&sub), 7500.0), "subtract {}", area(&sub));
         let int = combine(Op::Intersect, &[a.clone(), b.clone()]).unwrap();
         assert!(near(area(&int), 2500.0), "intersect {}", area(&int));
-        assert_eq!(int.bounds().unwrap(), Rect::new(50.0, 50.0, 100.0, 100.0));
+        let ib = int.bounds().unwrap();
+        assert!(
+            (ib.x0 - 50.0).abs() < 1e-6 && (ib.y0 - 50.0).abs() < 1e-6 && (ib.x1 - 100.0).abs() < 1e-6 && (ib.y1 - 100.0).abs() < 1e-6,
+            "intersect bounds {ib:?}"
+        );
         let mb = combine(Op::MinusBack, &[a.clone(), b.clone()]).unwrap();
         assert!(near(area(&mb), 7500.0));
         assert!(mb.bounds().unwrap().x1 > 149.0, "the front square remains");

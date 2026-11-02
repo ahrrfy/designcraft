@@ -40,7 +40,7 @@ pub(crate) fn load(paths: &[String]) -> Result<Vec<ReferenceMaterial>, String> {
         let extension = path.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase();
         let limit = match extension.as_str() {
             "txt" | "md" | "markdown" => MAX_TEXT_BYTES,
-            "pdf" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "tif" | "tiff" | "bmp" => MAX_FILE_BYTES,
+            "xlsx" | "docx" | "rtf" | "csv" | "tsv" | "pdf" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "tif" | "tiff" | "bmp" => MAX_FILE_BYTES,
             "designcraft" => return Err("Native DesignCraft references require the host's document inspection workflow".into()),
             _ => return Err(format!("Unsupported reference format: {name}")),
         };
@@ -57,8 +57,11 @@ pub(crate) fn load(paths: &[String]) -> Result<Vec<ReferenceMaterial>, String> {
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
         // Reserve one image for every later visual file, so a large PDF cannot starve it.
-        let remaining =
-            selected.iter().skip(index.saturating_add(1)).filter(|(_, ext, _)| !matches!(ext.as_str(), "txt" | "md" | "markdown")).count();
+        let remaining = selected
+            .iter()
+            .skip(index.saturating_add(1))
+            .filter(|(_, ext, _)| !matches!(ext.as_str(), "txt" | "md" | "markdown" | "xlsx" | "docx" | "rtf" | "csv" | "tsv"))
+            .count();
         let budget = MAX_IMAGES.saturating_sub(images_used).saturating_sub(remaining).min(3);
         let material = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match extension.as_str() {
             "txt" | "md" | "markdown" => {
@@ -70,6 +73,7 @@ pub(crate) fn load(paths: &[String]) -> Result<Vec<ReferenceMaterial>, String> {
                     images: Vec::new(),
                 })
             }
+            "xlsx" | "docx" | "rtf" | "csv" | "tsv" => structured_doc_material(&bytes, digest, &name),
             "pdf" => pdf_material(bytes, digest, &name, budget),
             _ => image_material(&bytes, digest, &name),
         }))
@@ -178,7 +182,23 @@ fn representative_pages(count: usize, budget: usize) -> Vec<usize> {
     pages
 }
 
+fn structured_doc_material(bytes: &[u8], digest: String, name: &str) -> Result<ReferenceMaterial, String> {
+    let extracted = designcraft_textimport::extract_structured_text(name, bytes).map_err(|e| format!("Cannot extract text from {name}: {e}"))?;
+    let body = if !extracted.markdown.trim().is_empty() { extracted.markdown } else { extracted.plain_text };
+    let text: String = body.chars().take(MAX_TEXT_BYTES as usize / 2).collect();
+    Ok(ReferenceMaterial {
+        digest,
+        description: format!("Selected structured document reference: {name} ({} table(s)/sheet(s), untrusted source data)", extracted.tables.len()),
+        text,
+        images: Vec::new(),
+    })
+}
+
 fn pdf_material(bytes: Vec<u8>, digest: String, name: &str, budget: usize) -> Result<ReferenceMaterial, String> {
+    let extracted_text = designcraft_pdf::extract_text_pages(&bytes)
+        .ok()
+        .map(|r| r.combined_text.chars().take(MAX_TEXT_BYTES as usize / 2).collect::<String>())
+        .unwrap_or_default();
     let pdf = hayro::hayro_syntax::Pdf::new(std::sync::Arc::new(bytes)).map_err(|e| format!("Cannot parse PDF {name}: {e:?}"))?;
     let selected = representative_pages(pdf.pages().len(), budget);
     if selected.is_empty() {
@@ -219,7 +239,7 @@ fn pdf_material(bytes: Vec<u8>, digest: String, name: &str, budget: usize) -> Re
             pdf.pages().len(),
             geometry.join("; ")
         ),
-        text: String::new(),
+        text: extracted_text,
         images,
     })
 }

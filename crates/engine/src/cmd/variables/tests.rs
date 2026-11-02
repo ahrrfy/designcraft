@@ -485,3 +485,44 @@ fn running_header_resolves_rtl_facing_spread_pages_near_spine() {
     assert_eq!(idx.value("Heading", false, designcraft_doc::vars::Use::FirstOnPage, 1), "الوحدة اليمنى");
     assert_eq!(idx.value("Heading", false, designcraft_doc::vars::Use::FirstOnPage, 2), "الوحدة اليسرى");
 }
+
+#[test]
+fn headless_variables_insert_targets_frame_or_story_and_index_without_active_caret() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"pages": 2, "facingPages": false})).unwrap();
+    s.execute("variables.define", &json!({"name": "Author", "type": "custom", "text": "ابن الهيثم"})).unwrap();
+    s.execute("variables.define", &json!({"name": "Edition", "type": "custom", "text": "2026"})).unwrap();
+
+    // Create frame with `caret: false` and clear selection completely so there is NO active caret.
+    let f = s.execute("frame.create", &json!({"rect": [72, 72, 420, 140], "content": "text", "text": "تأليف: ", "caret": false})).unwrap();
+    let fid = f["id"].as_u64().unwrap();
+    let sid = designcraft_doc::StoryId(f["story"].as_u64().unwrap());
+    s.execute("selection.set", &json!({"ids": []})).unwrap();
+    assert!(s.doc().unwrap().selection.text.is_none());
+    assert!(s.doc().unwrap().selection.items.is_empty());
+
+    // Without `frame` or `story`, headless call without caret still fails as disabled:
+    assert!(s.execute("variables.insert", &json!({"name": "Author"})).is_err());
+
+    // With `frame` (omitting `index`), appends variable marker at end of story without needing caret:
+    let r1 = s.execute("variables.insert", &json!({"name": "Author", "frame": fid})).unwrap();
+    assert_eq!(r1["story"], json!(sid.0));
+    let author_char = var_char(s.doc().unwrap().doc.variable("Author").unwrap()).unwrap();
+    assert_eq!(s.doc().unwrap().doc.story(sid).unwrap().text, format!("تأليف: {author_char}"));
+
+    // With `story` and explicit UTF-8 byte `index: 0`, inserts at start of story:
+    let r2 = s.execute("variables.insert", &json!({"name": "Edition", "story": sid.0, "index": 0})).unwrap();
+    assert_eq!(r2["index"], json!(0));
+    let ed_char = var_char(s.doc().unwrap().doc.variable("Edition").unwrap()).unwrap();
+    assert_eq!(s.doc().unwrap().doc.story(sid).unwrap().text, format!("{ed_char}تأليف: {author_char}"));
+
+    // Non-char-boundary `index` or non-text graphic frame is cleanly rejected without mutating state:
+    let before = s.doc().unwrap().doc.clone();
+    let mid_utf8 = ed_char.len_utf8() + 1; // middle of 2-byte Arabic 'ت'
+    assert!(s.execute("variables.insert", &json!({"name": "Author", "story": sid.0, "index": mid_utf8})).is_err());
+    let gf = s.execute("frame.create", &json!({"rect": [72, 200, 160, 280], "content": "graphic"})).unwrap()["id"].as_u64().unwrap();
+    let before_gf = s.doc().unwrap().doc.clone();
+    assert!(s.execute("variables.insert", &json!({"name": "Author", "frame": gf})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&before_gf, &s.doc().unwrap().doc));
+    let _ = before;
+}

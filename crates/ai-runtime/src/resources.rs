@@ -18,6 +18,13 @@ pub fn set_active_gpu_adapter(name: impl Into<String>, vram_mb: u64) {
         return;
     }
     let mut guard = ACTIVE_GPU_ADAPTER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if vram_mb == 0
+        && let Some(existing) = guard.as_ref()
+        && existing.name.trim().eq_ignore_ascii_case(&trimmed)
+        && existing.total_vram_mb > 0
+    {
+        return;
+    }
     *guard = Some(GpuSnapshot { name: trimmed, total_vram_mb: vram_mb, free_vram_mb: 0 });
 }
 
@@ -75,7 +82,7 @@ pub struct LocalRequestGuard {
 impl LocalRequestGuard {
     pub fn acquire(selection: &ModelSelection, policy: &LocalResourcePolicy) -> Result<Self, String> {
         policy.validate()?;
-        if !matches!(selection.provider, ProviderKind::Ollama | ProviderKind::ComfyUi) {
+        if !selection.provider.is_local() {
             return Ok(Self { _lease: designcraft_ai_providers::LocalInferenceLease::inactive() });
         }
         if selection.provider == ProviderKind::Ollama && is_cloud_model(&selection.model) {
@@ -258,6 +265,7 @@ fn probe_platform_gpus(_nvidia_gpus: &[GpuSnapshot], _total_ram_mb: u64, _availa
     let Ok(system_root) = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).ok_or(()) else {
         return Vec::new();
     };
+    let registry_gpus = probe_windows_registry_gpus(&system_root);
     let powershell = system_root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
     let mut command = Command::new(powershell);
     command.args([
@@ -266,9 +274,127 @@ fn probe_platform_gpus(_nvidia_gpus: &[GpuSnapshot], _total_ram_mb: u64, _availa
         "-Command",
         "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json -Compress",
     ]);
-    run_bounded_command(command, Duration::from_secs(3), 32_768, "Windows GPU telemetry unavailable")
+    let cim_gpus = run_bounded_command(command, Duration::from_secs(3), 32_768, "Windows GPU telemetry unavailable")
         .and_then(|json_text| parse_windows_cim_gpus(&json_text))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    merge_gpu_snapshots(registry_gpus, cim_gpus)
+}
+
+#[cfg(target_os = "windows")]
+fn probe_windows_registry_gpus(system_root: &Path) -> Vec<GpuSnapshot> {
+    let reg_exe = system_root.join("System32").join("reg.exe");
+    let class_roots = [
+        r"HKLM\SYSTEM\ControlSet001\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
+        r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}",
+    ];
+    for class_root in class_roots {
+        let mut list_cmd = Command::new(&reg_exe);
+        list_cmd.args(["query", class_root]);
+        let Ok(list_out) = run_bounded_command(list_cmd, Duration::from_secs(1), 16_384, "Windows registry GPU query unavailable") else {
+            continue;
+        };
+        let subkeys = parse_windows_registry_subkeys(&list_out);
+        if subkeys.is_empty() {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        for subkey in subkeys.into_iter().take(8) {
+            let mut desc_cmd = Command::new(&reg_exe);
+            desc_cmd.args(["query", &subkey, "/v", "DriverDesc"]);
+            let Ok(desc_out) = run_bounded_command(desc_cmd, Duration::from_millis(500), 4096, "Windows registry DriverDesc unavailable") else {
+                continue;
+            };
+            let mut vram_cmd = Command::new(&reg_exe);
+            vram_cmd.args(["query", &subkey, "/v", "HardwareInformation.qwMemorySize"]);
+            let vram_out =
+                run_bounded_command(vram_cmd, Duration::from_millis(500), 4096, "Windows registry qwMemorySize unavailable").unwrap_or_default();
+            if let Some(gpu) = parse_windows_registry_gpu_entry(&desc_out, &vram_out) {
+                candidates.push((is_software_or_virtual_adapter(&gpu.name), gpu));
+            }
+        }
+        if !candidates.is_empty() {
+            let has_real_gpu = candidates.iter().any(|(is_virtual, _)| !*is_virtual);
+            let filtered = candidates.into_iter().filter(|(is_virtual, _)| !has_real_gpu || !*is_virtual).map(|(_, gpu)| gpu).collect();
+            return merge_gpu_snapshots(filtered, Vec::new());
+        }
+    }
+    Vec::new()
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn parse_windows_registry_subkeys(list_output: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in list_output.lines() {
+        let trimmed = line.trim();
+        let Some((_, tail)) = trimmed.rsplit_once('\\') else {
+            continue;
+        };
+        if tail.len() == 4 && tail.bytes().all(|b| b.is_ascii_digit()) {
+            let normalized =
+                if let Some(rest) = trimmed.strip_prefix("HKEY_LOCAL_MACHINE\\") { format!("HKLM\\{rest}") } else { trimmed.to_string() };
+            keys.push(normalized);
+        }
+    }
+    keys
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn parse_windows_registry_gpu_entry(desc_output: &str, qw_vram_output: &str) -> Option<GpuSnapshot> {
+    let mut name: Option<String> = None;
+    for line in desc_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("DriverDesc")
+            && let Some((_, after_type)) = trimmed.split_once("REG_SZ")
+        {
+            let candidate = after_type.trim();
+            if !candidate.is_empty() && candidate.len() <= 256 {
+                name = Some(candidate.to_string());
+                break;
+            }
+        }
+    }
+    let name = name?;
+    let mut vram_bytes: u64 = 0;
+    for line in qw_vram_output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("HardwareInformation.qwMemorySize") {
+            continue;
+        }
+        if let Some((_, val_str)) = trimmed.split_once("REG_QWORD") {
+            let raw = val_str.trim();
+            let parsed = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                raw.parse::<u64>().ok()
+            };
+            if let Some(bytes) = parsed {
+                vram_bytes = bytes;
+                break;
+            }
+        } else if let Some((_, bin_str)) = trimmed.split_once("REG_BINARY") {
+            let hex: String = bin_str.chars().filter(char::is_ascii_hexdigit).collect();
+            if hex.len() == 16 {
+                let mut le_bytes = [0u8; 8];
+                let mut ok = true;
+                for (idx, slot) in le_bytes.iter_mut().enumerate() {
+                    let start = idx.saturating_mul(2);
+                    if let Some(pair) = hex.get(start..start.saturating_add(2))
+                        && let Ok(b) = u8::from_str_radix(pair, 16)
+                    {
+                        *slot = b;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    vram_bytes = u64::from_le_bytes(le_bytes);
+                    break;
+                }
+            }
+        }
+    }
+    Some(GpuSnapshot { name, total_vram_mb: vram_bytes / 1_048_576, free_vram_mb: 0 })
 }
 
 #[cfg(target_os = "macos")]
@@ -761,5 +887,38 @@ mod tests {
         *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         cvar.notify_all();
         probe_server.join().unwrap();
+    }
+
+    #[test]
+    fn bug002_windows_registry_64bit_qword_and_binary_vram_outweighs_4gib_cim_cap() {
+        let reg_list = "\
+HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000\n\
+HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0001\n\
+HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\Settings\n";
+        let subkeys = parse_windows_registry_subkeys(reg_list);
+        assert_eq!(subkeys.len(), 2);
+        assert!(subkeys[0].ends_with("\\0000"));
+        assert!(subkeys[1].ends_with("\\0001"));
+
+        // 12 GiB = 12 * 1024^3 = 0x300000000 = 12,288 MB (previously capped at 4,095 MB via 32-bit AdapterRAM).
+        let desc_12g = "HKEY_LOCAL_MACHINE\\...\\0000\n    DriverDesc    REG_SZ    NVIDIA GeForce RTX 4070 Ti\n";
+        let qword_12g = "HKEY_LOCAL_MACHINE\\...\\0000\n    HardwareInformation.qwMemorySize    REG_QWORD    0x300000000\n";
+        let gpu_qword = parse_windows_registry_gpu_entry(desc_12g, qword_12g).expect("parsed 12 GiB REG_QWORD GPU");
+        assert_eq!(gpu_qword.name, "NVIDIA GeForce RTX 4070 Ti");
+        assert_eq!(gpu_qword.total_vram_mb, 12_288);
+
+        // 16 GiB = 0x400000000 encoded as 8-byte little-endian REG_BINARY: 00 00 00 00 04 00 00 00.
+        let desc_16g = "HKEY_LOCAL_MACHINE\\...\\0001\n    DriverDesc    REG_SZ    AMD Radeon RX 7800 XT\n";
+        let bin_16g = "HKEY_LOCAL_MACHINE\\...\\0001\n    HardwareInformation.qwMemorySize    REG_BINARY    0000000004000000\n";
+        let gpu_bin = parse_windows_registry_gpu_entry(desc_16g, bin_16g).expect("parsed 16 GiB REG_BINARY GPU");
+        assert_eq!(gpu_bin.name, "AMD Radeon RX 7800 XT");
+        assert_eq!(gpu_bin.total_vram_mb, 16_384);
+
+        // Merging 64-bit registry VRAM with 32-bit capped Win32_VideoController (0xFFFF_FFFF = 4095 MB) preserves 12,288 MB!
+        let cim_capped = parse_windows_cim_gpus(r#"[{"Name":"NVIDIA GeForce RTX 4070 Ti","AdapterRAM":4294967295}]"#).unwrap();
+        assert_eq!(cim_capped[0].total_vram_mb, 4095);
+        let merged = merge_gpu_snapshots(vec![gpu_qword], cim_capped);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].total_vram_mb, 12_288);
     }
 }

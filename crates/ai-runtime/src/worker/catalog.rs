@@ -255,6 +255,8 @@ pub(super) fn native_result_contract(command: &str) -> Option<Value> {
         | "object.effects"
         | "object.textWrap" => json!({"changed":"integer"}),
         "layout.pages.insert" => json!({"pages":"integer","total":"integer"}),
+        "liquid.pageRule" => json!({"pages":"integer"}),
+        "liquid.object" => json!({"objects":"integer"}),
         "layout.documentSetup" => {
             json!({"width":"number","height":"number","pages":"integer","startPage":"integer","facingPages":"boolean","binding":"string","intent":"string","bleed":"number[]","slug":"number[]","margins":"object","primaryTextFrame":"boolean"})
         }

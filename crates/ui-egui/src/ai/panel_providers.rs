@@ -52,14 +52,26 @@ pub(super) fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available
                 ui.radio_value(&mut s.key_for_images, true, rtl::widget(ui, text(a, "Image provider", "مزود الصور")));
             });
             let selection = if s.key_for_images { s.settings.image_model.clone() } else { s.settings.text_model.clone() };
-            rtl::label(ui, format!("{} / {}", provider_name(selection.provider), selection.endpoint.as_deref().unwrap_or("default endpoint")));
+            let default_endpoint = match selection.provider {
+                ProviderKind::LocalOpenAi => "http://127.0.0.1:1234/v1",
+                ProviderKind::OpenAi | ProviderKind::Gemini | ProviderKind::Ollama | ProviderKind::ComfyUi => "default endpoint",
+            };
+            rtl::label(ui, format!("{} / {}", provider_name(selection.provider), selection.endpoint.as_deref().unwrap_or(default_endpoint)));
+            if selection.provider == ProviderKind::LocalOpenAi {
+                label(
+                    ui,
+                    a,
+                    "Optional bearer key for LM Studio / vLLM / llama.cpp / Jan (leave blank when local auth is disabled).",
+                    "مفتاح اختياري لخوادم LM Studio / vLLM / llama.cpp / Jan (اتركه فارغاً إذا لم يطلب الخادم المحلي مفتاحاً).",
+                );
+            }
             ui.add(egui::TextEdit::singleline(&mut s.api_key.0).password(true).char_limit(4096).desired_width(f32::INFINITY))
                 .accessible_name("Protected API key input");
             ui.horizontal(|ui| {
-                let remote = matches!(selection.provider, ProviderKind::OpenAi | ProviderKind::Gemini);
+                let supports_key = matches!(selection.provider, ProviderKind::OpenAi | ProviderKind::Gemini | ProviderKind::LocalOpenAi);
                 if ui
                     .add_enabled(
-                        remote && !s.api_key.0.trim().is_empty(),
+                        supports_key && !s.api_key.0.trim().is_empty(),
                         egui::Button::new(rtl::widget(ui, text(a, "Save protected key", "حفظ المفتاح المحمي"))),
                     )
                     .clicked()
@@ -72,7 +84,7 @@ pub(super) fn providers(ui: &mut egui::Ui, s: &mut AiUiState, a: bool, available
                 if button(ui, a, "Refresh presence", "تحديث حالة المفاتيح") {
                     requests.push(AiRequest::RefreshCredentials);
                 }
-                if ui.add_enabled(remote, egui::Button::new(rtl::widget(ui, text(a, "Remove stored key", "حذف المفتاح المحفوظ")))).clicked()
+                if ui.add_enabled(supports_key, egui::Button::new(rtl::widget(ui, text(a, "Remove stored key", "حذف المفتاح المحفوظ")))).clicked()
                 {
                     requests.push(AiRequest::RemoveApiKey { selection: selection.clone() });
                 }

@@ -43,6 +43,7 @@ fn ai23_native_only_ignores_unused_invalid_image_endpoint_in_settings_and_batch_
                 auto_select_skills: false,
                 target: TaskTarget::NewA4 { pages: 1 },
                 export_directory: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -65,6 +66,7 @@ fn continuation_saved_draft_survives_model_validation_and_restart_without_author
         skill_ids: vec![],
         auto_select_skills: false,
         export_directory: None,
+        ..Default::default()
     };
     let state = runner.handle(&mut session, AiRequest::Start(request.clone()));
     assert!(!state.busy, "Missing model must not launch a provider");
@@ -142,6 +144,7 @@ fn ai23_local_curriculum_preview_never_launches_generation_or_edits_documents() 
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 48 },
         export_directory: None,
+        ..Default::default()
     };
     runner.preview_production(&session, request.clone()).unwrap();
     let preview = runner.snapshot.production_preview.as_ref().unwrap();
@@ -195,6 +198,7 @@ fn assert_automatic_template_batch(total_pages: u32, requested: u32, total_batch
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: total_pages },
         export_directory: None,
+        ..Default::default()
     };
     runner.start(&mut session, request).unwrap();
     let batch = runner.snapshot.batch.as_ref().expect("Positive review groups require proof approval even for a single group");
@@ -255,6 +259,7 @@ fn template_admission_preserves_long_arabic_briefs_verbatim() {
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 48 },
         export_directory: None,
+        ..Default::default()
     };
     runner.start(&mut session, request).unwrap();
     let pending = runner.pending.as_ref().unwrap();
@@ -275,6 +280,7 @@ fn template_admission_rejects_briefs_above_the_shared_byte_limit_before_launch()
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 48 },
         export_directory: None,
+        ..Default::default()
     };
     let error = runner.start(&mut session, request).unwrap_err();
     assert!(error.contains(&MAX_BRIEF_BYTES.to_string()), "{error}");
@@ -298,6 +304,7 @@ fn assert_current_document_template_guidance(has_content: bool) {
         auto_select_skills: false,
         target: TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     runner.start(&mut session, request).unwrap();
     let pending = runner.pending.as_ref().unwrap();
@@ -359,6 +366,7 @@ fn new_document_context_and_publication_use_the_same_pinned_profile_geometry() {
         skill_ids: vec![pinned.skill_id],
         auto_select_skills: false,
         export_directory: None,
+        ..Default::default()
     };
     let mut report = TaskReport {
         design_style: None,
@@ -687,6 +695,7 @@ fn new_document_publication_preserves_active_ime_before_any_side_effect() {
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 1 },
         export_directory: None,
+        ..Default::default()
     };
     let plan = ProductionPlan {
         title: "Refused publication".into(),
@@ -774,6 +783,7 @@ fn private_profile_links_cannot_redirect_reads_samples_or_trace_writes() {
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 1 },
         export_directory: None,
+        ..Default::default()
     };
     let plan = ProductionPlan {
         title: "test".into(),
@@ -849,6 +859,7 @@ fn confined_requests_reject_external_paths_before_side_effects_or_workers() {
             auto_select_skills: false,
             target: TaskTarget::NewA4 { pages: 1 },
             export_directory: Some(outside_path.clone()),
+            ..Default::default()
         }),
     ];
     for request in requests {
@@ -879,6 +890,7 @@ fn launch_retains_roots_when_completion_is_polled_unconfined() {
         auto_select_skills: false,
         target: TaskTarget::CurrentDocument,
         export_directory: Some(outside.path().join("output").to_string_lossy().into_owned()),
+        ..Default::default()
     };
     // Exercise the launch boundary directly: completion must recheck paths even if
     // an upstream validation is missing or a destination changed while generating.
@@ -1021,6 +1033,7 @@ fn local_ollama_worker_publishes_new_native_document_and_measured_history() {
             auto_select_skills: false,
             target: TaskTarget::NewA4 { pages: 1 },
             export_directory: None,
+            ..Default::default()
         }),
     );
     assert!(snapshot.busy, "{}", snapshot.message);
@@ -1572,6 +1585,7 @@ fn running_usage_and_full_diagnostics_are_visible_before_worker_finishes() {
         expected_prefs: None,
         task: None,
         skills: vec![],
+        executed_model: (ProviderKind::Ollama, String::new()),
         settings: Default::default(),
         deferred_outcome: None,
         deferred_batch: None,
@@ -1617,6 +1631,7 @@ fn facing_nonbatch_mapping_failure_restores_original_active_document() {
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 2 },
         export_directory: None,
+        ..Default::default()
     };
     // A missing absolute spread is valid in ordinary nonbatch engine actions,
     // but cannot be mapped safely into a facing-page book.
@@ -1679,6 +1694,7 @@ fn stale_result_cannot_touch_another_document() {
         auto_select_skills: false,
         target: TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let plan = ProductionPlan {
         title: "test".into(),
@@ -1741,11 +1757,13 @@ fn nonbatch_production_rejects_changed_preferences_before_any_publication() {
             auto_select_skills: false,
             target: TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         }),
         expected: Some((before.uid, before.revision)),
         expected_doc: Some(before.doc.clone()),
         expected_prefs: Some(original_prefs),
         skills: vec![],
+        executed_model: (settings.text_model.provider, settings.text_model.model.clone()),
         settings,
         deferred_outcome: None,
         deferred_batch: None,
@@ -1780,6 +1798,7 @@ fn cancel_wins_over_already_queued_completion() {
         auto_select_skills: false,
         target: TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let plan = ProductionPlan {
         title: "test".into(),
@@ -1797,6 +1816,7 @@ fn cancel_wins_over_already_queued_completion() {
         expected_prefs: Some(session.prefs.clone()),
         task: Some(task),
         skills: Vec::new(),
+        executed_model: (ProviderKind::Ollama, String::new()),
         settings: Default::default(),
         deferred_outcome: None,
         deferred_batch: None,
@@ -1860,6 +1880,7 @@ fn runtime_rejects_media_models_in_text_slot_and_allows_component_safe_text_alia
                 auto_select_skills: false,
                 target: TaskTarget::CurrentDocument,
                 export_directory: None,
+                ..Default::default()
             }),
         );
         assert_eq!(start.stage, "failed", "{bad_model}");
@@ -1934,6 +1955,7 @@ fn kg2_islamic_curriculum_combines_seven_skills_and_pinned_skills_without_contex
             skill_ids: vec!["early-years-booklet-planning".into()],
             auto_select_skills: true,
             export_directory: None,
+            ..Default::default()
         }),
     );
     assert_ne!(preview.stage, "failed", "preview failed: {}", preview.message);
@@ -2036,6 +2058,7 @@ fn portable_catalog_verifies_sha256_digests_and_enables_manual_and_default_previ
                 auto_select_skills: true,
                 target: TaskTarget::NewA4 { pages: 12 },
                 export_directory: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2056,6 +2079,7 @@ fn portable_catalog_verifies_sha256_digests_and_enables_manual_and_default_previ
                 auto_select_skills: false,
                 target: TaskTarget::NewA4 { pages: 8 },
                 export_directory: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2114,6 +2138,7 @@ fn portable_catalog_verifies_sha256_digests_and_enables_manual_and_default_previ
                 auto_select_skills: false,
                 target: TaskTarget::NewA4 { pages: 8 },
                 export_directory: None,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -2187,6 +2212,7 @@ fn portable_catalog_verifies_sha256_digests_and_enables_manual_and_default_previ
                 auto_select_skills: false,
                 target: TaskTarget::NewA4 { pages: 8 },
                 export_directory: None,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -2220,6 +2246,7 @@ fn start_rejects_mismatched_image_and_inspection_models_before_spending_requests
             auto_select_skills: false,
             target: TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         }),
     );
     assert_eq!(snap1.stage, "failed");
@@ -2242,6 +2269,7 @@ fn start_rejects_mismatched_image_and_inspection_models_before_spending_requests
             auto_select_skills: false,
             target: TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         }),
     );
     assert_eq!(snap2.stage, "failed");
@@ -2265,6 +2293,7 @@ fn start_rejects_mismatched_image_and_inspection_models_before_spending_requests
             auto_select_skills: false,
             target: TaskTarget::CurrentDocument,
             export_directory: None,
+            ..Default::default()
         }),
     );
     assert_eq!(snap3.stage, "failed");
@@ -2291,6 +2320,7 @@ fn start_rejects_mismatched_image_and_inspection_models_before_spending_requests
                 auto_select_skills: false,
                 target: TaskTarget::ContinueBook,
                 export_directory: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2370,6 +2400,7 @@ fn ai28_bound_production_draft_preserves_target_total_pages_across_reopen() {
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 32 },
         export_directory: None,
+        ..Default::default()
     };
     runner.save_production_draft(&session, &task).unwrap();
     assert_eq!(runner.snapshot.production_draft.as_ref().unwrap().progress.target_total_pages, Some(32));
@@ -2405,6 +2436,7 @@ fn ai28_single_page_arabic_one_shot_publish_sets_rtl_binding_and_r2l_pdf() {
         auto_select_skills: false,
         target: TaskTarget::NewA4 { pages: 1 },
         export_directory: Some(export_dir.path().to_string_lossy().into_owned()),
+        ..Default::default()
     };
     let plan = designcraft_ai_types::protocol::ProductionPlan {
         title: "غلاف كتاب العلوم".into(),
@@ -2426,6 +2458,7 @@ fn ai28_single_page_arabic_one_shot_publish_sets_rtl_binding_and_r2l_pdf() {
         expected_doc: None,
         expected_prefs: None,
         skills: vec![],
+        executed_model: (request.settings.text_model.provider, request.settings.text_model.model.clone()),
         settings: request.settings,
         deferred_outcome: None,
         deferred_batch: None,
@@ -2457,6 +2490,7 @@ fn ai31_selection_revision_bump_and_transient_interaction_preserve_current_docum
         auto_select_skills: false,
         target: TaskTarget::CurrentDocument,
         export_directory: None,
+        ..Default::default()
     };
     let plan = ProductionPlan {
         title: "Added frame".into(),
@@ -2475,6 +2509,7 @@ fn ai31_selection_revision_bump_and_transient_interaction_preserve_current_docum
         expected_doc: Some(before.doc.clone()),
         expected_prefs: Some(session.prefs.clone()),
         skills: vec![],
+        executed_model: (ProviderKind::Ollama, String::new()),
         settings: Default::default(),
         deferred_outcome: None,
         deferred_batch: None,
@@ -2545,6 +2580,7 @@ fn agentic_publish_applies_multiple_chunks_in_single_undo_and_gates_deferred_ima
         skill_ids: vec![],
         auto_select_skills: false,
         export_directory: None,
+        ..Default::default()
     };
     let (tx, receiver) = std::sync::mpsc::channel();
     tx.send(worker::Message::Finished(worker::Outcome {
@@ -2587,6 +2623,7 @@ fn agentic_publish_applies_multiple_chunks_in_single_undo_and_gates_deferred_ima
                 ],
                 summary: "2 composite illustrations queued for clean single-subject replacement".into(),
             }],
+            scheduled_formats: None,
         }),
         usage: UsageSummary::default(),
     }))
@@ -2601,6 +2638,7 @@ fn agentic_publish_applies_multiple_chunks_in_single_undo_and_gates_deferred_ima
         expected_doc: Some(before.doc.clone()),
         expected_prefs: Some(session.prefs.clone()),
         skills: vec![],
+        executed_model: (settings.text_model.provider, settings.text_model.model.clone()),
         settings,
         deferred_outcome: None,
         deferred_batch: None,
@@ -2688,6 +2726,7 @@ fn confirm_image_regeneration_promotes_native_only_non_gemini_and_sizes_request_
             skill_ids: vec![],
             auto_select_skills: false,
             export_directory: None,
+            ..Default::default()
         },
         skills: vec![],
         style_profile: None,
@@ -2711,4 +2750,419 @@ fn confirm_image_regeneration_promotes_native_only_non_gemini_and_sizes_request_
         std::thread::sleep(std::time::Duration::from_millis(10));
         let _ = runner.handle(&mut session, AiRequest::Poll);
     }
+}
+
+#[test]
+fn bug005_non_educational_arabic_and_english_prompts_never_auto_select_kg_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = ProductionRunner::open(dir.path()).unwrap();
+    let session = Session::new();
+
+    for non_edu_prompt in [
+        "صمم هوية شركة عقارية فاخرة وكتيب استثماري من 4 صفحات",
+        "صمم منشور انستغرام لمطعم قهوة مختصة وتقنية تحميص الحبوب",
+        "Create a corporate cybersecurity annual report with executive KPIs",
+    ] {
+        let selected = runner.prepare_automatic_skills(&session, non_edu_prompt).unwrap();
+        assert!(
+            selected.iter().all(|id| !id.starts_with("kg-") && !id.starts_with("early-years-")),
+            "prompt `{non_edu_prompt}` leaked KG/early-years skills: {selected:?}"
+        );
+    }
+
+    // Conversely, genuine kindergarten / early-childhood prompts DO match kg-* / early-years-* skills!
+    let kg_selected = runner.prepare_automatic_skills(&session, "صمم نشاط علوم لرياض الأطفال مستوى تمهيدي KG2 عن الحواس الخمس").unwrap();
+    assert!(
+        kg_selected.iter().any(|id| id.starts_with("kg-") || id.starts_with("early-years-")),
+        "expected KG skill for genuine KG prompt, got {kg_selected:?}"
+    );
+}
+
+#[test]
+fn bug006_bug007_bug008_d1_d7_d9_d12_end_to_end_runtime_verification() {
+    let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+    let dir = tempfile::tempdir().unwrap();
+    let docs_dir = tempfile::tempdir().unwrap();
+    let mut runner = ProductionRunner::open(dir.path()).unwrap();
+    let mut session = Session::new();
+
+    // 1. BUG-007 + BUG-008: Universal PreviewProduction works with 0 provider calls across ALL genres & targets,
+    //    and strips conversational meta-prefixes from `sanitized_title`!
+    let social_geom =
+        crate::intent_geometry::infer_brief_geometry_detail("رائع الآن صمم لي منشور انستغرام مربع 1080×1080 لمقهى قهوة مختصة", &AiSettings::default())
+            .expect("social geometry inferred");
+    assert_eq!((social_geom.primary.width_pt.round(), social_geom.primary.height_pt.round()), (1080.0, 1080.0));
+    let preview_req = TaskRequest {
+        prompt: "رائع الآن صمم لي منشور انستغرام مربع 1080×1080 لمقهى قهوة مختصة".into(),
+        target: TaskTarget::NewDocument { pages: 1, geometry: social_geom.primary.clone() },
+        auto_select_skills: false,
+        ..Default::default()
+    };
+    let snap_preview = runner.handle(&mut session, AiRequest::PreviewProduction(preview_req));
+    let preview = snap_preview.production_preview.expect("universal preview must succeed without curriculum skill");
+    let sanitized_title = preview["sanitized_title"].as_str().unwrap_or_default();
+    assert!(!sanitized_title.starts_with("رائع"), "conversational prefix must be stripped: {sanitized_title}");
+    assert_eq!(preview["total_pages"], 1);
+    assert_eq!(
+        (preview["inferred_geometry"]["width_pt"].as_f64().unwrap().round(), preview["inferred_geometry"]["height_pt"].as_f64().unwrap().round()),
+        (1080.0, 1080.0)
+    );
+
+    // Also verify PreviewProduction on CurrentDocument (non-curriculum):
+    session.execute("file.new", &json!({"width": 252.0, "height": 144.0, "pages": 2, "facingPages": false})).unwrap();
+    let card_preview_snap = runner.handle(
+        &mut session,
+        AiRequest::PreviewProduction(TaskRequest {
+            prompt: "Design a luxury minimalist business card front and back".into(),
+            target: TaskTarget::CurrentDocument,
+            auto_select_skills: false,
+            ..Default::default()
+        }),
+    );
+    let card_preview = card_preview_snap.production_preview.expect("CurrentDocument business card preview");
+    assert_eq!(card_preview["total_pages"], 2);
+
+    // 2. BUG-006: `TaskReport` records actual `executed_model` (e.g. LocalOpenAi) even when `settings.text_model` is Gemini!
+    runner.snapshot.settings.text_model =
+        designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None };
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(worker::Message::Finished(worker::Outcome {
+        result: Ok(worker::Product::Models(vec!["qwen2.5-coder-14b-instruct".into()])),
+        usage: Default::default(),
+    }))
+    .unwrap();
+    runner.pending = Some(Pending {
+        roots: None,
+        worker: worker::Worker { receiver: rx, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+        id: "list-local-openai".into(),
+        started: std::time::Instant::now(),
+        task: None,
+        expected: None,
+        expected_doc: None,
+        expected_prefs: None,
+        skills: vec![],
+        settings: runner.snapshot.settings.clone(),
+        executed_model: (ProviderKind::LocalOpenAi, "qwen2.5-coder-14b-instruct".into()),
+        deferred_outcome: None,
+        deferred_batch: None,
+    });
+    let list_snap = runner.handle(&mut session, AiRequest::Poll);
+    let last_report = list_snap.reports.first().expect("TaskReport recorded");
+    assert_eq!(last_report.provider, ProviderKind::LocalOpenAi, "BUG-006: report must attribute LocalOpenAi, not Gemini");
+    assert_eq!(last_report.model, "qwen2.5-coder-14b-instruct");
+
+    // 3. D7: UpdateSettings(LocalOnly) + DiscoverLocalEndpoints (0 ledger cost, probes mock loopback HTTP /v1/models):
+    let mock_lm_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_lm_addr = mock_lm_listener.local_addr().unwrap();
+    let lm_thread = std::thread::spawn(move || {
+        for _ in 0..2 {
+            if let Ok((mut stream, _)) = mock_lm_listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = std::io::Read::read(&mut stream, &mut buf)
+                    && n > 0
+                {
+                    let body = r#"{"data":[{"id":"qwen2.5-14b-local"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+                }
+            }
+        }
+    });
+    let mut local_settings = runner.snapshot.settings.clone();
+    local_settings.execution_mode = designcraft_ai_types::protocol::AiExecutionMode::LocalOnly;
+    local_settings.text_model = designcraft_ai_types::ModelSelection {
+        provider: ProviderKind::LocalOpenAi,
+        model: "qwen2.5-14b-local".into(),
+        endpoint: Some(format!("http://{mock_lm_addr}/v1/")),
+    };
+    let mode_snap = runner.handle(&mut session, AiRequest::UpdateSettings(local_settings));
+    assert_eq!(mode_snap.settings.execution_mode, designcraft_ai_types::protocol::AiExecutionMode::LocalOnly);
+    let disc_snap = runner.handle(&mut session, AiRequest::DiscoverLocalEndpoints);
+    let _ = lm_thread.join();
+    assert!(!disc_snap.discovered_local_endpoints.is_empty());
+    assert!(
+        disc_snap.discovered_local_endpoints.iter().any(|ep| ep.reachable && ep.models.iter().any(|m| m == "qwen2.5-14b-local")),
+        "expected mock LocalOpenAi endpoint in discovered_local_endpoints: {:?}",
+        disc_snap.discovered_local_endpoints
+    );
+
+    // 4. D1: AiRequest::Start with TaskTarget::NewDocument immediately creates live workspace document with exact custom dimensions!
+    let custom_geom = designcraft_ai_types::protocol::DocumentGeometrySpec {
+        width_pt: 1920.0,
+        height_pt: 1080.0,
+        intent: designcraft_ai_types::protocol::DocumentIntentKind::Web,
+        units: "pixels".into(),
+        facing_pages: Some(false),
+        right_to_left: Some(true),
+        margins_pt: Some([48.0, 48.0, 64.0, 64.0]),
+        bleed_pt: 0.0,
+        columns: 12,
+        column_gutter_pt: 24.0,
+        preset_label: "Presentation 16:9".into(),
+    };
+    let start_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let start_addr = start_listener.local_addr().unwrap();
+    let start_server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = start_listener.accept() {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+            let mut buf = [0u8; 2048];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"error":{"message":"mock quick stop"}}"#;
+            let resp = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+        }
+    });
+    let start_model = designcraft_ai_types::ModelSelection {
+        provider: ProviderKind::LocalOpenAi,
+        model: "qwen2.5-14b-local".into(),
+        endpoint: Some(format!("http://{start_addr}/v1/")),
+    };
+    let start_req = TaskRequest {
+        prompt: "صمم عرض تقديمي للشركة من 3 شرائح".into(),
+        settings: AiSettings {
+            execution_mode: designcraft_ai_types::protocol::AiExecutionMode::LocalOnly,
+            text_model: start_model.clone(),
+            ..Default::default()
+        },
+        target: TaskTarget::NewDocument { pages: 3, geometry: custom_geom },
+        ..Default::default()
+    };
+    let started_snap = runner.handle(&mut session, AiRequest::Start(start_req));
+    assert!(started_snap.busy, "msg={}", started_snap.message);
+    let live_doc = &session.doc().expect("live document immediately created on Start").doc;
+    assert_eq!(live_doc.page_count(), 3);
+    assert_eq!((live_doc.settings.page_width.round(), live_doc.settings.page_height.round()), (1920.0, 1080.0));
+    assert_eq!(live_doc.settings.intent, designcraft_engine::doc::Intent::Web);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runner.snapshot.busy && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = runner.handle(&mut session, AiRequest::Poll);
+    }
+    let _ = start_server.join();
+    if runner.batch.is_some() {
+        let _ = runner.handle(&mut session, AiRequest::Cancel);
+    }
+    while crate::resources::LocalRequestGuard::acquire(&start_model, &Default::default()).is_err() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // 5. D9: CreateKnowledgePack + DeleteKnowledgePack via ProductionRunner::handle:
+    let kb_file = docs_dir.path().join("guide.md");
+    std::fs::write(&kb_file, "# Guide\nPrimary corporate color is #1E3A8A.\n").unwrap();
+    let roots = file_access::AutomationRoots::new(&[dir.path(), docs_dir.path()], &[dir.path()]).unwrap().unwrap();
+    let kb_snap = file_access::confine(Some(&roots), || {
+        runner.handle(
+            &mut session,
+            AiRequest::CreateKnowledgePack {
+                name: "Brand Guide".into(),
+                description: "Official hex palette".into(),
+                paths: vec![kb_file.to_string_lossy().into_owned()],
+            },
+        )
+    });
+    assert_eq!(kb_snap.knowledge_packs.len(), 1, "msg={}", kb_snap.message);
+    let pack_id = kb_snap.knowledge_packs[0].id.clone();
+    let del_snap = runner.handle(&mut session, AiRequest::DeleteKnowledgePack { id: pack_id });
+    assert!(del_snap.knowledge_packs.is_empty());
+}
+
+#[test]
+fn continue_remaining_locally_binds_failed_target_uid_across_tab_switches_and_preserves_unbound_new_a4() {
+    let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = ProductionRunner::open(dir.path()).unwrap();
+    let mut session = Session::new();
+
+    // Open two distinct tabs: tab 0 (1080x1080 target of failed cloud NewDocument) and tab 1 (unrelated 595x842 user document).
+    session.execute("file.new", &json!({"width": 1080.0, "height": 1080.0, "pages": 1, "facingPages": false})).unwrap();
+    let target_uid = session.doc().unwrap().uid;
+    session.execute("file.new", &json!({"width": 595.0, "height": 842.0, "pages": 1, "facingPages": false})).unwrap();
+    let unrelated_uid = session.doc().unwrap().uid;
+    assert_eq!(session.doc().unwrap().uid, unrelated_uid);
+
+    let failed_geom = designcraft_ai_types::protocol::DocumentGeometrySpec {
+        width_pt: 1080.0,
+        height_pt: 1080.0,
+        intent: designcraft_ai_types::protocol::DocumentIntentKind::Web,
+        units: "pixels".into(),
+        ..Default::default()
+    };
+    let failed_task = TaskRequest {
+        prompt: "صمم إعلان مقهى مربع".into(),
+        target: TaskTarget::NewDocument { pages: 1, geometry: failed_geom },
+        settings: AiSettings {
+            text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None },
+            ..Default::default()
+        },
+        auto_select_skills: false,
+        ..Default::default()
+    };
+    runner.failed_cloud_task = Some((failed_task, Some(target_uid)));
+    runner.snapshot.can_continue_locally = true;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let local_model = designcraft_ai_types::ModelSelection {
+        provider: ProviderKind::LocalOpenAi,
+        model: "qwen2.5-14b-local".into(),
+        endpoint: Some(format!("http://{addr}/v1/")),
+    };
+
+    let cont_snap = runner.handle(&mut session, AiRequest::ContinueRemainingLocally { job_id: None, local_model: Some(local_model.clone()) });
+    assert!(cont_snap.busy, "msg={}", cont_snap.message);
+    assert_eq!(session.doc().unwrap().uid, target_uid, "must switch back to the failed task's target tab, never overwriting unrelated_uid");
+    assert_eq!(session.documents().len(), 2, "must reuse failed NewDocument tab rather than spawning a 3rd tab");
+    let launched = runner.pending.as_ref().expect("worker launched");
+    assert_eq!(launched.expected.map(|(u, _)| u), Some(target_uid));
+    assert_eq!(launched.task.as_ref().unwrap().target, TaskTarget::CurrentDocument);
+    let _ = runner.handle(&mut session, AiRequest::Cancel);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runner.snapshot.busy && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = runner.handle(&mut session, AiRequest::Poll);
+    }
+
+    // Conversely, an unbound failed NewA4 task (`failed_uid == None`) must NOT turn into CurrentDocument on `unrelated_uid`:
+    session.set_active(1);
+    assert_eq!(session.doc().unwrap().uid, unrelated_uid);
+    runner.failed_cloud_task = Some((
+        TaskRequest { prompt: "صمم نشرة A4".into(), target: TaskTarget::NewA4 { pages: 1 }, auto_select_skills: false, ..Default::default() },
+        None,
+    ));
+    let cont_a4 = runner.handle(&mut session, AiRequest::ContinueRemainingLocally { job_id: None, local_model: Some(local_model) });
+    assert!(cont_a4.busy, "msg={}", cont_a4.message);
+    assert_eq!(runner.pending.as_ref().unwrap().task.as_ref().unwrap().target, TaskTarget::NewA4 { pages: 1 });
+    let _ = runner.handle(&mut session, AiRequest::Cancel);
+    while runner.snapshot.busy && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = runner.handle(&mut session, AiRequest::Poll);
+    }
+}
+
+#[test]
+fn agentic_publish_materializes_scheduled_separate_documents_and_enforces_local_only_image_boundary() {
+    let _serial = crate::worker::LOCAL_TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _memory = crate::resources::TestAdmissionGuard::healthy();
+    let dir = tempfile::tempdir().unwrap();
+    let mut runner = ProductionRunner::open(dir.path()).unwrap();
+    let mut session = Session::new();
+    session.execute("file.new", &json!({"width": 1080.0, "height": 1080.0, "pages": 1, "facingPages": false})).unwrap();
+    let before = session.doc().unwrap().clone();
+
+    let story_spec = designcraft_ai_types::protocol::DocumentGeometrySpec {
+        width_pt: 1080.0,
+        height_pt: 1920.0,
+        intent: designcraft_ai_types::protocol::DocumentIntentKind::Web,
+        units: "pixels".into(),
+        preset_label: "Instagram Story".into(),
+        ..Default::default()
+    };
+    let task = TaskRequest {
+        prompt: "صمم حملة مقهى وأخرج نسخة ستوري منفصلة".into(),
+        target: TaskTarget::CurrentDocument,
+        auto_select_skills: false,
+        ..Default::default()
+    };
+    let (tx, receiver) = std::sync::mpsc::channel();
+    tx.send(worker::Message::Finished(worker::Outcome {
+        result: Ok(worker::Product::Agentic {
+            title: "Campaign Pack".into(),
+            summary: "Created post and scheduled story companion".into(),
+            chunks: vec![vec![EngineAction {
+                command: "frame.create".into(),
+                params: json!({"spread": 0, "rect": [80.0, 80.0, 900.0, 260.0], "content": "text", "text": "Specialty Coffee"}),
+            }]],
+            deferred_images: vec![],
+            scheduled_formats: Some((vec![story_spec], designcraft_ai_types::protocol::MultiFormatOutputMode::SeparateDocuments)),
+        }),
+        usage: UsageSummary::default(),
+    }))
+    .unwrap();
+    runner.pending = Some(Pending {
+        roots: None,
+        worker: worker::Worker { receiver, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) },
+        id: "agentic-sched-1".into(),
+        started: Instant::now(),
+        task: Some(task),
+        expected: Some((before.uid, before.revision)),
+        expected_doc: Some(before.doc.clone()),
+        expected_prefs: Some(session.prefs.clone()),
+        skills: vec![],
+        executed_model: (ProviderKind::LocalOpenAi, "qwen2.5-14b".into()),
+        settings: AiSettings::default(),
+        deferred_outcome: None,
+        deferred_batch: None,
+    });
+    runner.snapshot.busy = true;
+    let snap = runner.handle(&mut session, AiRequest::Poll);
+    assert_eq!(snap.stage, "completed", "msg={}", snap.message);
+    assert_eq!(session.documents().len(), 2, "agentic scheduled SeparateDocuments companion must materialize on live Session");
+    let companion = &session.documents()[1];
+    assert_eq!((companion.doc.settings.page_width.round(), companion.doc.settings.page_height.round()), (1080.0, 1920.0));
+    assert!(companion.is_dirty(), "generated companion tab must be marked dirty until explicitly saved");
+
+    // Verify LocalOnly neutralizes leftover cloud image_model and blocks cloud ConfirmImageRegeneration:
+    let mut local_only = AiSettings {
+        execution_mode: designcraft_ai_types::protocol::AiExecutionMode::LocalOnly,
+        output_mode: designcraft_ai_types::OutputMode::NativeOnly,
+        text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Ollama, model: "qwen2.5:14b".into(), endpoint: None },
+        image_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "imagen-3.0-generate-002".into(), endpoint: None },
+        ..Default::default()
+    };
+    assert!(!crate::agent_loop::has_configured_image_model(&local_only), "LocalOnly must never expose cloud image queue");
+    enforce_execution_mode(&mut local_only).expect("LocalOnly NativeOnly admission neutralizes leftover cloud image_model");
+    assert!(local_only.image_model.provider.is_local(), "cloud image provider must be cleared on LocalOnly admission");
+}
+
+#[test]
+fn scanned_vector_pdf_attachment_renders_multimodal_png_for_vision_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf_dir = tempfile::tempdir().unwrap();
+    let pdf_path = pdf_dir.path().join("scanned_brand_sheet.pdf");
+
+    // Export a real 1-page vector-only PDF (zero selectable text) using DesignCraft's own PDF exporter.
+    let mut export_session = Session::new();
+    export_session.execute("file.new", &json!({"width": 400.0, "height": 400.0, "pages": 1, "facingPages": false})).unwrap();
+
+    export_session.execute("frame.create", &json!({"spread": 0, "rect": [40.0, 40.0, 360.0, 360.0], "shape": "rect", "fill": "Black"})).unwrap();
+    let roots = file_access::AutomationRoots::new(&[dir.path(), pdf_dir.path()], &[dir.path(), pdf_dir.path()]).unwrap().unwrap();
+    file_access::confine(Some(&roots), || {
+        export_session.execute("file.exportPdf", &json!({"path": pdf_path, "spreads": false, "bleed": false, "marks": false})).unwrap();
+    });
+
+    let base_doc = export_session.doc().unwrap().clone();
+    let task = TaskRequest {
+        prompt: "استخرج ألوان وتكوين الملف الممسوح ضوئياً".into(),
+        settings: AiSettings {
+            text_model: designcraft_ai_types::ModelSelection { provider: ProviderKind::Gemini, model: "gemini-2.5-flash".into(), endpoint: None },
+            ..Default::default()
+        },
+        attachments: vec![designcraft_ai_types::protocol::TaskAttachment {
+            path: pdf_path.to_string_lossy().into_owned(),
+            role: designcraft_ai_types::protocol::AttachmentRole::KnowledgeReference,
+        }],
+        ..Default::default()
+    };
+    let mut context = json!({});
+    file_access::confine(Some(&roots), || {
+        enrich_production_context_with_memory(&mut context, dir.path(), &base_doc, &task, None).unwrap();
+    });
+    assert!(context.get("_scanned_attachment_images").is_some(), "vision model must receive rendered PNG fallback for zero-text PDF");
+    let images = crate::rag::resolve_scanned_attachment_images(&mut context, &task);
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/jpeg");
+    assert!(images[0].bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+    assert!(context.get("_scanned_attachment_images").is_none(), "base64 payload must be stripped from JSON prompt context");
 }

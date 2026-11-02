@@ -62,11 +62,14 @@ fn endpoint_security() {
     }
 
     // Local providers allow only localhost, 127.0.0.1, or [::1], and reject metadata IPs and URL credentials.
-    for local_provider in [ProviderKind::Ollama, ProviderKind::ComfyUi] {
+    for local_provider in [ProviderKind::Ollama, ProviderKind::LocalOpenAi, ProviderKind::ComfyUi] {
         for allowed in ["http://localhost:11434", "https://localhost:11434", "http://127.0.0.1:8188", "http://[::1]:8188"] {
             assert!(validate_endpoint(&selection(local_provider, Some(allowed))).is_ok(), "{allowed}");
         }
         for rejected in [
+            "https://api.openai.com/v1",
+            "http://api.openai.com/v1",
+            "http://192.168.1.5:1234",
             "http://169.254.169.254/",
             "https://169.254.169.254/",
             "http://user:pass@127.0.0.1:11434/",
@@ -78,6 +81,17 @@ fn endpoint_security() {
             assert!(validate_endpoint(&selection(local_provider, Some(rejected))).is_err(), "{rejected}");
         }
     }
+
+    assert_eq!(validate_endpoint(&selection(ProviderKind::LocalOpenAi, None)).unwrap().as_str(), "http://127.0.0.1:1234/v1/");
+    assert_eq!(validate_endpoint(&selection(ProviderKind::LocalOpenAi, Some("   "))).unwrap().as_str(), "http://127.0.0.1:1234/v1/");
+    assert_eq!(
+        validate_endpoint(&selection(ProviderKind::LocalOpenAi, Some("http://127.0.0.1:1234"))).unwrap().as_str(),
+        "http://127.0.0.1:1234/v1/"
+    );
+    assert_eq!(
+        validate_endpoint(&selection(ProviderKind::LocalOpenAi, Some("http://localhost:8080/v1"))).unwrap().as_str(),
+        "http://localhost:8080/v1/"
+    );
 }
 
 #[test]
@@ -1363,5 +1377,257 @@ mod native_tests {
             results[0].images[0].mime_type = "image/svg+xml".into();
         }
         assert!(crate::agent::agent_turn_body(&ollama_txt, &bad_req, false).is_err());
+    }
+
+    #[test]
+    fn local_openai_mock_models_generation_think_stripping_and_response_format_fallback() {
+        let cancel = AtomicBool::new(false);
+        let (endpoint, server) = mock(vec![
+            (
+                200,
+                json!({
+                    "object": "list",
+                    "data": [
+                        {"id": "qwen3-8b-instruct"},
+                        {"id": "text-embedding-nomic-embed"},
+                        {"id": "flux.1-schnell"},
+                        {"id": "llama-3.3-70b@q4_k_m"}
+                    ]
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>\nPlan layout slots carefully.\n</think>\n{\"actions\":[{\"command\":\"frame.create\"}]}"
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 140,
+                        "completion_tokens": 52,
+                        "prompt_tokens_details": {"cached_tokens": 32},
+                        "completion_tokens_details": {"reasoning_tokens": 19}
+                    }
+                })
+                .to_string(),
+            ),
+            (400, r#"{"error":"response_format is not supported"}"#.into()),
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>fallback</think>\n```json\n{\"actions\":[]}\n```"
+                        }
+                    }],
+                    "usage": {"prompt_tokens": 60, "completion_tokens": 15}
+                })
+                .to_string(),
+            ),
+        ]);
+        // Strip trailing slash from mock endpoint to also verify `/v1/` normalization over TCP:
+        let bare_endpoint = endpoint.trim_end_matches('/').to_string();
+        let mut sel = ModelSelection { provider: ProviderKind::LocalOpenAi, model: "llama-3.3-70b@q4_k_m".into(), endpoint: Some(bare_endpoint) };
+
+        let discovered = list_models(&sel, Some("   "), &cancel).unwrap();
+        let ids: Vec<&str> = discovered.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["llama-3.3-70b@q4_k_m", "qwen3-8b-instruct"]);
+
+        let mut gen_req = request();
+        gen_req.images.push(ImageInput { mime_type: "image/png".into(), bytes: vec![1, 2, 3] });
+        let gen_resp = generate(&sel, Some("local-vllm-token"), &gen_req, &cancel).unwrap();
+        assert!(gen_resp.error.is_none());
+        assert_eq!(gen_resp.text, "{\"actions\":[{\"command\":\"frame.create\"}]}");
+        assert_eq!(
+            gen_resp.usage,
+            Usage {
+                input_tokens: Some(140),
+                output_tokens: Some(52),
+                cached_input_tokens: Some(32),
+                cache_write_tokens: None,
+                reasoning_tokens: Some(19),
+            }
+        );
+
+        sel.model = "qwen3-8b-instruct".into();
+        let fallback_resp = generate(&sel, None, &request(), &cancel).unwrap();
+        assert!(fallback_resp.error.is_none());
+        assert_eq!(fallback_resp.text, "{\"actions\":[]}");
+
+        let captured = server.join().unwrap();
+        assert_eq!(captured.len(), 4);
+        assert!(captured[0].starts_with("GET /v1/models HTTP/1.1"));
+        assert!(!captured[0].to_ascii_lowercase().contains("authorization:"), "blank key must omit Authorization header");
+        assert!(captured[1].starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(captured[1].contains("Bearer local-vllm-token"));
+        let (_, req1_body_str) = captured[1].split_once("\r\n\r\n").unwrap();
+        let req1_json: Value = serde_json::from_str(req1_body_str).unwrap();
+        assert_eq!(req1_json["response_format"], json!({"type": "json_object"}));
+        assert_eq!(req1_json["max_tokens"], 256);
+        assert_eq!(req1_json["messages"][1]["content"][1]["image_url"]["url"], "data:image/png;base64,AQID");
+        assert!(req1_json["messages"][1]["content"][0]["text"].as_str().unwrap().contains("OUTPUT JSON CONTRACT:"));
+
+        let (_, req3_body_str) = captured[3].split_once("\r\n\r\n").unwrap();
+        let req3_json: Value = serde_json::from_str(req3_body_str).unwrap();
+        assert!(req3_json.get("response_format").is_none(), "HTTP 400 fallback must strip response_format");
+
+        // Verify finish_reason == "length" preserves usage and reports truncation:
+        let truncated = parse_generation(
+            ProviderKind::LocalOpenAi,
+            &json!({
+                "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "{\"actions\":["}}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 256}
+            }),
+        )
+        .unwrap();
+        assert!(truncated.error.as_deref().unwrap().contains("length"));
+        assert_eq!(truncated.usage.input_tokens, Some(50));
+        assert_eq!(truncated.usage.output_tokens, Some(256));
+
+        // Verify generate_images returns clean unsupported error:
+        let img_err = generate_images(
+            &sel,
+            None,
+            &ImageRequest { prompt: "Botanical icon".into(), size: None, quality: None, comfy: None, resources: Default::default() },
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(img_err, "LocalOpenAi does not generate raster images; select ComfyUI or Native Vector mode");
+
+        // Verify distinct LocalOriginLease tag (3_u8) isolates LocalOpenAi from Ollama (1_u8) on the same origin:
+        let origin = Url::parse("http://127.0.0.1:19999/v1/").unwrap();
+        let lease_ollama = crate::native::LocalOriginLease::acquire(ProviderKind::Ollama, &origin).unwrap();
+        let lease_local_openai = crate::native::LocalOriginLease::acquire(ProviderKind::LocalOpenAi, &origin).unwrap();
+        assert!(crate::native::LocalOriginLease::acquire(ProviderKind::LocalOpenAi, &origin).is_err());
+        drop(lease_local_openai);
+        drop(lease_ollama);
+    }
+
+    #[test]
+    fn local_openai_agent_turn_roundtrip_and_multimodal_tool_results() {
+        let cancel = AtomicBool::new(false);
+        let tool = ToolDefinition {
+            name: "inspect_pages".into(),
+            description: "Inspect document pages".into(),
+            parameters: json!({"type": "object", "properties": {"pages": {"type": "array", "items": {"type": "integer"}}}}),
+        };
+        let (endpoint, server) = mock(vec![
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>Inspect page 1 first</think>",
+                            "tool_calls": [{
+                                "id": "call_local_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "inspect_pages",
+                                    "arguments": "{\"pages\":[1]}"
+                                }
+                            }]
+                        }
+                    }],
+                    "usage": {"prompt_tokens": 80, "completion_tokens": 24}
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "<think>All good</think>Page 1 passed inspection."
+                        }
+                    }],
+                    "usage": {"prompt_tokens": 112, "completion_tokens": 16}
+                })
+                .to_string(),
+            ),
+        ]);
+        let sel = ModelSelection { provider: ProviderKind::LocalOpenAi, model: "qwen2.5-vl-7b-instruct".into(), endpoint: Some(endpoint) };
+        assert!(supports_agent_vision(&sel));
+
+        let req1 = AgentTurnRequest {
+            system: "Inspect before editing".into(),
+            messages: vec![AgentMessage::User { text: "Check page 1".into(), images: Vec::new() }],
+            tools: vec![tool.clone()],
+            max_output_tokens: 512,
+            resources: Default::default(),
+        };
+        let turn1 = generate_agent_turn(&sel, None, &req1, &cancel).unwrap();
+        assert!(turn1.error.is_none());
+        assert_eq!(turn1.tool_calls.len(), 1);
+        assert_eq!(turn1.tool_calls[0].id, "call_local_1");
+        assert_eq!(turn1.tool_calls[0].name, "inspect_pages");
+        assert_eq!(turn1.tool_calls[0].arguments, json!({"pages": [1]}));
+        assert_eq!(turn1.usage.input_tokens, Some(80));
+        assert_eq!(turn1.usage.output_tokens, Some(24));
+
+        let req2 = AgentTurnRequest {
+            system: "Inspect before editing".into(),
+            messages: vec![
+                AgentMessage::User { text: "Check page 1".into(), images: Vec::new() },
+                AgentMessage::Assistant { text: turn1.text, tool_calls: turn1.tool_calls, raw_provider_turn: None },
+                AgentMessage::ToolResults {
+                    results: vec![ToolResultMessage {
+                        call_id: "call_local_1".into(),
+                        name: "inspect_pages".into(),
+                        output: json!({"ok": true, "overset": false}),
+                        images: vec![ImageInput { mime_type: "image/png".into(), bytes: vec![1, 2, 3] }],
+                    }],
+                },
+            ],
+            tools: vec![tool],
+            max_output_tokens: 512,
+            resources: Default::default(),
+        };
+        let turn2 = generate_agent_turn(&sel, None, &req2, &cancel).unwrap();
+        assert!(turn2.error.is_none());
+        assert!(turn2.tool_calls.is_empty());
+        assert_eq!(turn2.text, "Page 1 passed inspection.");
+
+        let captured = server.join().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].starts_with("POST /v1/chat/completions HTTP/1.1"));
+        let (_, body2_str) = captured[1].split_once("\r\n\r\n").unwrap();
+        let body2: Value = serde_json::from_str(body2_str).unwrap();
+        assert_eq!(body2["messages"][2]["role"], "assistant");
+        assert_eq!(body2["messages"][2]["tool_calls"][0]["id"], "call_local_1");
+        assert_eq!(body2["messages"][2]["tool_calls"][0]["function"]["arguments"], "{\"pages\":[1]}");
+        assert_eq!(body2["messages"][3]["role"], "tool");
+        assert_eq!(body2["messages"][3]["tool_call_id"], "call_local_1");
+        assert_eq!(body2["messages"][4]["role"], "user");
+        assert_eq!(body2["messages"][4]["content"][1]["image_url"]["url"], "data:image/png;base64,AQID");
+
+        // Also verify JSON-embedded tool-call fallback after stripping <think>:
+        let embedded = crate::agent::parse_agent_turn(
+            ProviderKind::LocalOpenAi,
+            &json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "<think>Use JSON fallback</think>\n{\"tool_calls\":[{\"name\":\"inspect_pages\",\"arguments\":{\"pages\":[2]}}]}"
+                    }
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 18}
+            }),
+        )
+        .unwrap();
+        assert!(embedded.error.is_none());
+        assert_eq!(embedded.tool_calls.len(), 1);
+        assert_eq!(embedded.tool_calls[0].name, "inspect_pages");
+        assert_eq!(embedded.tool_calls[0].arguments, json!({"pages": [2]}));
     }
 }

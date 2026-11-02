@@ -108,7 +108,21 @@ impl Runner<'_> {
             }
             strip(&mut prompt, 0);
         }
-        crate::production_cache::digest(&json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"arabicTashkeel":request.settings.arabic_tashkeel,"arabicFont":request.settings.arabic_font,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id})).map(Some)
+        let image_digests: Vec<String> = generation
+            .images
+            .iter()
+            .map(|img| {
+                let d: [u8; 32] = Sha256::digest(&img.bytes).into();
+                d.iter().map(|b| format!("{b:02x}")).collect()
+            })
+            .collect();
+        let mut key_obj = json!({"version":"ai18-native-contract-v1","model":request.settings.text_model,"output":request.settings.output_mode,"arabicTashkeel":request.settings.arabic_tashkeel,"arabicFont":request.settings.arabic_font,"system":generation.system,"schema":generation.json_schema,"prompt":prompt,"outputLimit":generation.max_output_tokens,"geometry":base.doc.settings,"nextNativeId":base.doc.next_id});
+        if !image_digests.is_empty()
+            && let Some(map) = key_obj.as_object_mut()
+        {
+            map.insert("attachmentImages".into(), json!(image_digests));
+        }
+        crate::production_cache::digest(&key_obj).map(Some)
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn cached_plan(
@@ -386,6 +400,7 @@ impl Runner<'_> {
                     summary: format!("Generated and placed {total_imgs} confirmed illustration(s) in 1 Undo step"),
                     chunks,
                     deferred_images: Vec::new(),
+                    scheduled_formats: None,
                 })
             }
             Work::Skill { prompt, reference_paths, context, settings, catalog, registry_root, design_style } => {
@@ -654,7 +669,8 @@ impl Runner<'_> {
             || unbound_math_request(&request.prompt, &skills)
             || continuation_style_geometry_differs(&request, &base, &skills);
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
-        if current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook) {
+        let custom_new_doc = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::NewDocument { .. });
+        if current_document || custom_new_doc || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook) {
             opened_document_geometry(&mut context, &base)?;
         }
         let profiles = skills.iter().filter_map(|s| s.design_profile.as_ref()).collect::<Vec<_>>();
@@ -664,11 +680,18 @@ impl Runner<'_> {
         let profile = profiles.first().copied();
         if let Some(profile) = profile {
             profile.validate()?;
-            if !current_document && !adaptive_layout {
+            if !current_document && !custom_new_doc && !adaptive_layout {
                 preflight_profile_image_ratios(profile, &request.settings)?;
             }
         }
-        if current_document && scope.is_none() && !self.planning_only && !explicit_script && self.provider.supports_agent_loop() {
+        let data_driven_new_doc =
+            custom_new_doc && request.attachments.iter().any(|a| a.role == designcraft_ai_types::protocol::AttachmentRole::DataRecords);
+        if (current_document || data_driven_new_doc)
+            && scope.is_none()
+            && !self.planning_only
+            && !explicit_script
+            && self.provider.supports_agent_loop()
+        {
             return crate::agent_loop::run_open_document_agent_loop(self, &request, &context, &catalog, &skills, &base, &prefs);
         }
         if !adaptive_layout
@@ -718,7 +741,28 @@ impl Runner<'_> {
         {
             return self.generic_review_group(&request, &context, &catalog, &skills, &base, &prefs, scope);
         }
-        let plan = self.generic_production_plan(&request, &context, &catalog, &skills, &base, &prefs, scope)?;
+        let plan_outcome = self.generic_production_plan(&request, &context, &catalog, &skills, &base, &prefs, scope);
+        let unscoped_pages = u32::try_from(base.doc.spreads.len()).unwrap_or(0);
+        let plan = match plan_outcome {
+            Ok(plan) => plan,
+            Err(err)
+                if scope.is_some_and(|s| s.count > 1)
+                    && super::plan::is_token_truncation_error(&err)
+                    && self.ledger.remaining_requests() >= scope.map_or(1, |s| s.count) =>
+            {
+                let Some(batch_scope) = scope else { return Err(err) };
+                return self.generic_review_group_with_capacity(&request, &context, &catalog, &skills, &base, &prefs, batch_scope, 1);
+            }
+            Err(err)
+                if scope.is_none()
+                    && unscoped_pages > 1
+                    && super::plan::is_token_truncation_error(&err)
+                    && self.ledger.remaining_requests() >= unscoped_pages =>
+            {
+                self.split_unscoped_multipage_plan(&request, &context, &catalog, &skills, &base, &prefs, unscoped_pages)?
+            }
+            Err(err) => return Err(err),
+        };
         if let Some(scope) = scope {
             self.progress("Preparing complete review proofs", 0.9)?;
             let proofs = batch_proofs_with_layout(&plan, &base, &prefs, &request.settings, &request.prompt, self.cancel, scope)?;
@@ -726,6 +770,79 @@ impl Runner<'_> {
         } else {
             Ok(Product::Plan(plan))
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn split_unscoped_multipage_plan(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        catalog: &Value,
+        skills: &[SkillSnapshot],
+        base: &DocState,
+        prefs: &Prefs,
+        page_count: u32,
+    ) -> Result<ProductionPlan, String> {
+        let mut scratch = Session::new();
+        scratch.prefs = prefs.clone();
+        scratch.add_document(base.clone());
+        let full_scope = BatchScope { start: 0, count: page_count };
+        let min_ppi = self.print.as_ref().and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
+        let mut merged_commands = Vec::new();
+        let mut merged_images = Vec::new();
+        let mut merged_title = String::new();
+
+        for page_idx in 0..page_count {
+            check_cancel(self.cancel)?;
+            let page_scope = BatchScope { start: page_idx, count: 1 };
+            let mut page_context = internal_template_context(context, scratch.doc().map_err(|e| e.to_string())?, full_scope, page_scope)?;
+            let remaining_requests = request.settings.budget.max_requests.saturating_sub(self.ledger.summary().requests);
+            let obj = page_context.as_object_mut().ok_or("Invalid split page context")?;
+            obj.insert("batch_scope".into(), json!(page_scope));
+            obj.insert("remainingTaskRequests".into(), json!(remaining_requests));
+            let remaining_chunks = page_count.saturating_sub(page_idx).max(1);
+            let page_plan = self.generic_production_plan_with_min_requests(
+                request,
+                &page_context,
+                catalog,
+                skills,
+                scratch.doc().map_err(|e| e.to_string())?,
+                prefs,
+                Some(page_scope),
+                remaining_chunks,
+                false,
+            )?;
+            scratch
+                .execute(
+                    "production.apply",
+                    &json!({
+                        "commands": page_plan.commands,
+                        "outputMode": request.settings.output_mode,
+                        "label": page_plan.title,
+                        "requirePreflight": true,
+                        "minPpi": min_ppi,
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+            if merged_title.is_empty() && !page_plan.title.trim().is_empty() {
+                merged_title = page_plan.title.clone();
+            }
+            let offset = merged_commands.len();
+            let old_to_new: Vec<usize> = (0..page_plan.commands.len()).map(|i| offset.saturating_add(i)).collect();
+            for mut cmd in page_plan.commands {
+                if offset > 0 {
+                    crate::native_layout::harmonize::remap_step_references(&mut cmd.params, &old_to_new);
+                }
+                merged_commands.push(cmd);
+            }
+            merged_images.extend(page_plan.images);
+        }
+
+        Ok(ProductionPlan {
+            title: if merged_title.is_empty() { "Split Multi-Page Production".into() } else { merged_title },
+            commands: merged_commands,
+            images: merged_images,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -756,7 +873,11 @@ impl Runner<'_> {
         defer_images: bool,
     ) -> Result<ProductionPlan, String> {
         let current_document = matches!(request.target, designcraft_ai_types::protocol::TaskTarget::CurrentDocument);
-        let opened_document = current_document || matches!(request.target, designcraft_ai_types::protocol::TaskTarget::ContinueBook);
+        let opened_document = current_document
+            || matches!(
+                request.target,
+                designcraft_ai_types::protocol::TaskTarget::ContinueBook | designcraft_ai_types::protocol::TaskTarget::NewDocument { .. }
+            );
         let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
         let explicit_script = crate::script_contract::parse(&request.prompt)?.is_some();
         let adaptive_layout = explicit_script
@@ -812,8 +933,11 @@ impl Runner<'_> {
         let mut image_cache = BTreeMap::new();
         let mut image_bytes = 0usize;
         let repair_attempts = if request.settings.allow_paid_repairs { request.settings.budget.repair_attempts } else { 0 };
-        for attempt in 0..=repair_attempts {
-            let stage = Self::generic_attempt_stage(attempt, repair_attempts, scope);
+        let mut attempt = 0u32;
+        let mut truncation_recovery_used = false;
+        loop {
+            let max_attempts = if truncation_recovery_used { repair_attempts.max(1) } else { repair_attempts };
+            let stage = Self::generic_attempt_stage(attempt, max_attempts, scope);
             self.progress(&stage, 0.15)?;
             let response = self.generate_plan_candidate(&request.settings.text_model, &generation)?;
             let has_provider_error = response.error.is_some();
@@ -880,16 +1004,35 @@ impl Runner<'_> {
                         }
                     }
                 }
-                Err(error) => (response.text, error),
+                Err(error) => (response.text.clone(), error),
             };
             check_cancel(self.cancel)?;
             self.record_rejected_plan_evidence(attempt, &previous, &validation, scope)?;
-            if attempt == repair_attempts {
+            let truncated =
+                super::plan::is_token_truncation_error(&validation) || response.error.as_deref().is_some_and(super::plan::is_token_truncation_error);
+            if truncated && !truncation_recovery_used && self.ledger.remaining_requests() >= min_text_requests {
+                truncation_recovery_used = true;
+                generation.prompt = format!(
+                    "{original}\n\nCRITICAL TOKEN RECOVERY: Your previous attempt truncated at MAX_TOKENS before closing valid JSON. Output a COMPACT valid JSON ProductionPlan immediately: omit verbose labels, avoid duplicate formatting calls, keep strings concise, and ensure all brackets/braces close cleanly within {} output tokens.",
+                    generation.max_output_tokens
+                );
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            let effective_max = if truncation_recovery_used { repair_attempts.max(1) } else { repair_attempts };
+            if attempt >= effective_max {
                 return Err(if has_provider_error { validation } else { format!("AI plan rejected: {validation}") });
             }
-            generation.prompt = repair_prompt(&original, &previous, &validation)?;
+            generation.prompt = if truncated {
+                format!(
+                    "{original}\n\nCRITICAL TOKEN RECOVERY: Previous response hit MAX_TOKENS ({validation}). Output a COMPACT valid JSON ProductionPlan that closes cleanly within {} output tokens.",
+                    generation.max_output_tokens
+                )
+            } else {
+                repair_prompt(&original, &previous, &validation)?
+            };
+            attempt = attempt.saturating_add(1);
         }
-        Err("AI plan was not produced".into())
     }
 
     fn generic_attempt_stage(attempt: u32, repair_attempts: u32, scope: Option<BatchScope>) -> String {
@@ -988,10 +1131,14 @@ impl Runner<'_> {
             system.push_str("\nFACING-PAGE COORDINATION: document.facing_page_context provides absolute companion pages for occasional magazine-style relationships when authored content benefits from a linked pair. Keep each lesson complete. Companion members marked context_only are reference data only: do not generate, replace, approve or advance them, and never widen the mandatory batch scope. Linking every facing pair is not required.");
         }
         system.push_str("\nNATIVE ACTION HEADROOM: the full expanded page must fit 512 native actions. Each five/ten/twenty-frame activity is compiled locally using two actions per cell/token plus up to three shared formatting actions. Each repeated single-subject set uses four initial actions and two per equal-sized copy (four per resized copy). Leave room for all images and measured text recovery; preserve every source word, quantity and the user's review-page count.");
+        if model_needs_thinking_margin(&request.settings.text_model) {
+            system.push_str("\nREASONING & OUTPUT BUDGET DISCIPLINE: Keep internal chain-of-thought brief so the complete JSON ProductionPlan finishes well inside max_output_tokens without truncation.");
+        }
         if request.settings.output_mode == OutputMode::NativeWithImages {
             system.push('\n');
             system.push_str(crate::image_repetition::POLICY);
         }
+        let scanned_images = crate::rag::resolve_scanned_attachment_images(&mut document_context, request);
         let original = bounded_json(&json!({"request":scoped_prompt,"target":request.target,"document":document_context}), MAX_PROMPT)?;
         let mut schema = plan_schema(catalog, request.settings.output_mode)?;
         if scope.is_some() {
@@ -1005,7 +1152,7 @@ impl Runner<'_> {
             prompt: original.clone(),
             json_schema: schema,
             max_output_tokens: request.settings.budget.max_output_tokens,
-            images: Vec::new(),
+            images: scanned_images,
             resources: request.settings.resources.clone(),
         };
         Ok((generation, original))
@@ -1039,6 +1186,19 @@ impl Runner<'_> {
             })
             .transpose()?;
         let mut plan = parse_plan(native_text.as_deref().unwrap_or(&response.text), request.settings.output_mode, catalog)?;
+        if !explicit_script {
+            plan.title = crate::brief_planner::sanitize_visible_title(&plan.title);
+        }
+        crate::native_layout::harmonize_actions(
+            &mut plan.commands,
+            base,
+            &crate::native_layout::HarmonizeOptions {
+                allow_swatch_synthesis: scope.is_none(),
+                preferred_arabic_font: request.settings.arabic_font.clone(),
+                arabic_context: crate::facing_pages::auto_direction(&request.prompt) == "rightToLeft",
+                attachments: request.attachments.clone(),
+            },
+        );
         prepare_editorial_plan_with_mode(&mut plan, &request.prompt, context, None, request.settings.arabic_tashkeel)?;
         if let Some(contract) = &self.print {
             self.diagnostics(crate::native_print_fonts::apply(&mut plan, base, prefs, contract)?)?;
@@ -1116,12 +1276,35 @@ impl Runner<'_> {
         prefs: &Prefs,
         review: BatchScope,
     ) -> Result<Product, String> {
+        let default_cap =
+            if crate::script_contract::parse(&request.prompt)?.is_some() || self.print.is_some() || unbound_math_request(&request.prompt, skills) {
+                1
+            } else {
+                generic_page_capacity(request.settings.output_mode)
+            };
+        self.generic_review_group_with_capacity(request, context, catalog, skills, base, prefs, review, default_cap)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn generic_review_group_with_capacity(
+        &mut self,
+        request: &TaskRequest,
+        context: &Value,
+        catalog: &Value,
+        skills: &[SkillSnapshot],
+        base: &DocState,
+        prefs: &Prefs,
+        review: BatchScope,
+        capacity: u32,
+    ) -> Result<Product, String> {
         let end = review_end(review)?;
         validate_batch_result(base, base, review)?;
         let profile = skills.iter().find_map(|skill| skill.design_profile.as_ref());
         let opened = matches!(
             request.target,
-            designcraft_ai_types::protocol::TaskTarget::CurrentDocument | designcraft_ai_types::protocol::TaskTarget::ContinueBook
+            designcraft_ai_types::protocol::TaskTarget::CurrentDocument
+                | designcraft_ai_types::protocol::TaskTarget::ContinueBook
+                | designcraft_ai_types::protocol::TaskTarget::NewDocument { .. }
         );
         let adaptive = crate::script_contract::parse(&request.prompt)?.is_some()
             || self.print.is_some()
@@ -1133,12 +1316,7 @@ impl Runner<'_> {
         } else {
             profile.map_or(GeometryCheck::Engine, GeometryCheck::Profile)
         };
-        let capacity =
-            if crate::script_contract::parse(&request.prompt)?.is_some() || self.print.is_some() || unbound_math_request(&request.prompt, skills) {
-                1
-            } else {
-                generic_page_capacity(request.settings.output_mode)
-            };
+        let capacity = capacity.max(1);
         let mut scratch = Session::new();
         scratch.prefs = prefs.clone();
         scratch.add_document(base.clone());

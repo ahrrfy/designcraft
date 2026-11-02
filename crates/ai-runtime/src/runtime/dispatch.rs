@@ -2,11 +2,11 @@ use super::{
     AiRequest, AiSettings, AiSnapshot, ApprovalEvidence, EngineAction, Instant, MAX_BRIEF_BYTES, MAX_REPORTS, Ordering, Path, Pending,
     PendingImageApproval, PendingImageRegen, ProductionRunner, Provenance, ProviderKind, SecretString, Session, SystemTime, TaskReport, TaskRequest,
     TaskTarget, TryRecvError, UNIX_EPOCH, UsageSummary, Value, VisualDensityMode, apply_execution_settings_to_draft, batch, book_binding,
-    bounded_task_skills, compact_context, corrected_design_context, enrich_production_context, ensure_preflight, ensure_preflight_at,
-    ensure_publication_idle, file_access, initialize_facing_document, initialize_print_document, is_publication_temporarily_busy, json,
-    merge_pinned_and_automatic_skills, production_document_params, require_generation_models, require_text_model, science, selected_skill_references,
-    skill_is_compatible, supported_commands, task_document_context, validate_endpoint, validate_production_draft, validate_settings,
-    validate_skill_templates, worker, write_json,
+    bounded_task_skills, compact_context, corrected_design_context, enforce_execution_mode, enrich_production_context_with_memory, ensure_preflight,
+    ensure_preflight_at, ensure_publication_idle, file_access, initialize_facing_document, initialize_print_document,
+    is_publication_temporarily_busy, json, merge_pinned_and_automatic_skills, production_document_params, require_generation_models,
+    require_text_model, science, selected_skill_references, skill_is_compatible, supported_commands, task_document_context, validate_endpoint,
+    validate_production_draft, validate_settings, validate_skill_templates, worker, write_json,
 };
 
 impl ProductionRunner {
@@ -37,6 +37,9 @@ impl ProductionRunner {
                     | AiRequest::RefreshCredentials
                     | AiRequest::RefreshResources
                     | AiRequest::ExportSkill { .. }
+                    | AiRequest::DiscoverLocalEndpoints
+                    | AiRequest::CreateKnowledgePack { .. }
+                    | AiRequest::DeleteKnowledgePack { .. }
             )
         {
             self.snapshot.message = "Finish reviewing or cancel the current production batch before another operation".into();
@@ -45,7 +48,14 @@ impl ProductionRunner {
         if self.snapshot.busy
             && !matches!(
                 request,
-                AiRequest::Poll | AiRequest::Cancel | AiRequest::PauseBatch { .. } | AiRequest::ResumeBatch { .. } | AiRequest::InspectSkill { .. }
+                AiRequest::Poll
+                    | AiRequest::Cancel
+                    | AiRequest::PauseBatch { .. }
+                    | AiRequest::ResumeBatch { .. }
+                    | AiRequest::InspectSkill { .. }
+                    | AiRequest::DiscoverLocalEndpoints
+                    | AiRequest::CreateKnowledgePack { .. }
+                    | AiRequest::DeleteKnowledgePack { .. }
             )
         {
             self.snapshot.message = "An AI task is running; cancel or wait before starting another operation".into();
@@ -328,8 +338,175 @@ impl ProductionRunner {
             }
             AiRequest::ConfirmImageRegeneration { job_id } => self.confirm_image_regeneration(session, &job_id)?,
             AiRequest::DismissImageRegeneration { job_id } => self.dismiss_image_regeneration(&job_id)?,
+            AiRequest::DiscoverLocalEndpoints => self.discover_local_endpoints(),
+            AiRequest::ContinueRemainingLocally { job_id, local_model } => self.continue_remaining_locally(session, job_id, local_model)?,
+            AiRequest::CreateKnowledgePack { name, description, paths } => {
+                let mut clean_paths = Vec::with_capacity(paths.len().min(64));
+                for raw in paths.iter().take(64) {
+                    let clean = designcraft_ai_types::sanitize_user_path(raw);
+                    if !clean.is_empty() {
+                        file_access::check_read(&clean)?;
+                        clean_paths.push(clean);
+                    }
+                }
+                let summary = crate::rag::create_knowledge_pack(&self.profile_access, &self.root, &name, &description, &clean_paths)?;
+                self.snapshot.knowledge_packs = crate::rag::list_knowledge_packs(&self.profile_access, &self.root)?;
+                self.snapshot.message =
+                    format!("Knowledge pack '{}' saved ({} files, {} chunks)", summary.name, summary.file_count, summary.chunk_count);
+            }
+            AiRequest::DeleteKnowledgePack { id } => {
+                crate::rag::delete_knowledge_pack(&self.profile_access, &self.root, &id)?;
+                self.snapshot.settings.active_knowledge_packs.retain(|existing| existing != &id);
+                self.snapshot.knowledge_packs = crate::rag::list_knowledge_packs(&self.profile_access, &self.root)?;
+                self.snapshot.message = format!("Deleted knowledge pack {id}");
+            }
         }
         Ok(())
+    }
+
+    pub(super) fn compute_can_continue_locally(&self) -> bool {
+        let has_failed_batch = self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed" && self.pending.is_none());
+        let has_failed_task = self.failed_cloud_task.is_some() && self.pending.is_none();
+        has_failed_batch || has_failed_task
+    }
+
+    pub(super) fn discover_local_endpoints(&mut self) {
+        let mut targets: Vec<(ProviderKind, String)> = vec![
+            (ProviderKind::Ollama, "http://127.0.0.1:11434".into()),
+            (ProviderKind::LocalOpenAi, "http://127.0.0.1:1234/v1".into()),
+            (ProviderKind::LocalOpenAi, "http://127.0.0.1:8080/v1".into()),
+            (ProviderKind::ComfyUi, "http://127.0.0.1:8188".into()),
+        ];
+        for custom in
+            [Some(&self.snapshot.settings.text_model), self.snapshot.settings.hybrid_local_model.as_ref(), Some(&self.snapshot.settings.image_model)]
+                .into_iter()
+                .flatten()
+        {
+            if custom.provider.is_local()
+                && let Some(ep) = custom.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                let trimmed = ep.trim_end_matches('/').to_owned();
+                if !targets.iter().any(|(p, e)| *p == custom.provider && e.trim_end_matches('/') == trimmed) {
+                    targets.push((custom.provider, trimmed));
+                }
+            }
+        }
+
+        let results: Vec<designcraft_ai_types::protocol::DiscoveredLocalEndpoint> = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                targets.into_iter().map(|(provider, endpoint)| scope.spawn(move || probe_single_local_endpoint(provider, endpoint))).collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| designcraft_ai_types::protocol::DiscoveredLocalEndpoint {
+                        provider: ProviderKind::LocalOpenAi,
+                        endpoint: String::new(),
+                        reachable: false,
+                        models: Vec::new(),
+                        message: "Local probe worker panicked".into(),
+                    })
+                })
+                .filter(|item| !item.endpoint.is_empty())
+                .collect()
+        });
+
+        let reachable_count = results.iter().filter(|e| e.reachable).count();
+        self.snapshot.discovered_local_endpoints = results;
+        self.snapshot.can_continue_locally = self.compute_can_continue_locally();
+        self.snapshot.message = format!("Local endpoint discovery finished: {reachable_count} reachable server(s); zero usage ledger impact");
+    }
+
+    pub(super) fn continue_remaining_locally(
+        &mut self,
+        session: &mut Session,
+        job_id: Option<String>,
+        local_model: Option<designcraft_ai_types::ModelSelection>,
+    ) -> Result<(), String> {
+        let resolved = if let Some(explicit) = local_model {
+            explicit
+        } else if let Some(hybrid) = self.snapshot.settings.hybrid_local_model.clone().filter(|m| !m.model.trim().is_empty()) {
+            hybrid
+        } else if let Some(found) = self
+            .snapshot
+            .discovered_local_endpoints
+            .iter()
+            .find(|ep| ep.reachable && matches!(ep.provider, ProviderKind::Ollama | ProviderKind::LocalOpenAi) && !ep.models.is_empty())
+        {
+            designcraft_ai_types::ModelSelection {
+                provider: found.provider,
+                model: found.models.first().cloned().unwrap_or_default(),
+                endpoint: Some(found.endpoint.clone()),
+            }
+        } else if matches!(self.snapshot.settings.text_model.provider, ProviderKind::Ollama | ProviderKind::LocalOpenAi)
+            && !self.snapshot.settings.text_model.model.trim().is_empty()
+        {
+            self.snapshot.settings.text_model.clone()
+        } else {
+            return Err("Select or discover a local Ollama or LocalOpenAi text model before continuing locally".into());
+        };
+
+        if !matches!(resolved.provider, ProviderKind::Ollama | ProviderKind::LocalOpenAi) || resolved.model.trim().is_empty() {
+            return Err("Local continuation requires a valid Ollama or LocalOpenAi text model".into());
+        }
+        validate_endpoint(&resolved)?;
+
+        if let Some(job) = self.batch.as_mut() {
+            if job.snapshot.status != "failed" {
+                return Err("Current batch job is not in a failed state ready for local continuation".into());
+            }
+            if let Some(expected_id) = &job_id
+                && &job.snapshot.job_id != expected_id
+            {
+                return Err("Batch job ID does not match the failed job".into());
+            }
+            let target_id = job.snapshot.job_id.clone();
+            job.task.settings.text_model = resolved;
+            job.task.settings.execution_mode = designcraft_ai_types::protocol::AiExecutionMode::LocalOnly;
+            job.task.settings.verify_generated_images = false;
+            if !job.task.settings.image_model.provider.is_local() {
+                job.task.settings.output_mode = designcraft_ai_types::OutputMode::NativeOnly;
+            }
+            if job.task.settings.budget.max_output_tokens >= job.task.settings.resources.context_tokens {
+                job.task.settings.resources.context_tokens = job.task.settings.budget.max_output_tokens.saturating_add(4096).min(131_072);
+            }
+            self.failed_cloud_task = None;
+            self.snapshot.can_continue_locally = false;
+            return self.retry_batch(session, &target_id);
+        }
+
+        if let Some((mut task, failed_uid)) = self.failed_cloud_task.take() {
+            if let Some(uid) = failed_uid {
+                let Some(target_idx) = session.documents().iter().position(|doc| doc.uid == uid) else {
+                    self.failed_cloud_task = Some((task, failed_uid));
+                    return Err("The document targeted by the failed cloud task is no longer open; open it or start a fresh task".into());
+                };
+                session.set_active(target_idx);
+                if matches!(task.target, TaskTarget::NewDocument { .. }) {
+                    task.target = TaskTarget::CurrentDocument;
+                }
+            }
+            task.settings.text_model = resolved;
+            task.settings.execution_mode = designcraft_ai_types::protocol::AiExecutionMode::LocalOnly;
+            task.settings.verify_generated_images = false;
+            if !task.settings.image_model.provider.is_local() {
+                task.settings.output_mode = designcraft_ai_types::OutputMode::NativeOnly;
+            }
+            if task.settings.budget.max_output_tokens >= task.settings.resources.context_tokens {
+                task.settings.resources.context_tokens = task.settings.budget.max_output_tokens.saturating_add(4096).min(131_072);
+            }
+            let backup = (task.clone(), failed_uid);
+            self.snapshot.can_continue_locally = false;
+            if let Err(err) = self.start(session, task) {
+                if self.pending.is_none() {
+                    self.failed_cloud_task = Some(backup);
+                    self.snapshot.can_continue_locally = self.compute_can_continue_locally();
+                }
+                return Err(err);
+            }
+            return Ok(());
+        }
+
+        Err("No failed cloud job or task is available to continue locally".into())
     }
 
     pub(super) fn dismiss_image_regeneration(&mut self, job_id: &str) -> Result<(), String> {
@@ -375,7 +552,13 @@ impl ProductionRunner {
         let target_revision = target.revision;
         let expected_doc = pending_regen.expected_doc.clone();
         let mut effective_settings = pending_regen.task.settings.clone();
-        if (self.snapshot.settings.image_model.provider == ProviderKind::ComfyUi || !self.snapshot.settings.image_model.model.trim().is_empty())
+        let snap_img_compatible = match effective_settings.execution_mode {
+            designcraft_ai_types::protocol::AiExecutionMode::LocalOnly => self.snapshot.settings.image_model.provider.is_local(),
+            designcraft_ai_types::protocol::AiExecutionMode::CloudOnly => !self.snapshot.settings.image_model.provider.is_local(),
+            _ => true,
+        };
+        if snap_img_compatible
+            && (self.snapshot.settings.image_model.provider == ProviderKind::ComfyUi || !self.snapshot.settings.image_model.model.trim().is_empty())
             && validate_endpoint(&self.snapshot.settings.image_model).is_ok()
         {
             effective_settings.image_model = self.snapshot.settings.image_model.clone();
@@ -388,6 +571,7 @@ impl ProductionRunner {
         let per_image_reqs = if effective_settings.verify_generated_images { 4u32 } else { 1u32 };
         let needed_reqs = u32::try_from(pending_regen.approval.count).unwrap_or(u32::MAX).saturating_mul(per_image_reqs).clamp(1, 10_000);
         effective_settings.budget.max_requests = effective_settings.budget.max_requests.max(needed_reqs);
+        enforce_execution_mode(&mut effective_settings)?;
         validate_settings(&effective_settings)?;
         require_generation_models(&effective_settings)?;
         let mut task = pending_regen.task.clone();
@@ -415,9 +599,17 @@ impl ProductionRunner {
 
     pub(super) fn start(&mut self, session: &mut Session, mut task: TaskRequest) -> Result<(), String> {
         task.export_directory = task.export_directory.as_deref().map(designcraft_ai_types::sanitize_user_path).filter(|s| !s.is_empty());
+        for att in &mut task.attachments {
+            att.path = designcraft_ai_types::sanitize_user_path(&att.path);
+            if !att.path.is_empty() {
+                file_access::check_read(&att.path)?;
+            }
+        }
+        task.attachments.retain(|att| !att.path.is_empty());
         if task.settings.visual_density == VisualDensityMode::PureNativeVector {
             task.settings.output_mode = designcraft_ai_types::OutputMode::NativeOnly;
         }
+        enforce_execution_mode(&mut task.settings)?;
         if matches!(task.target, TaskTarget::ContinueBook | TaskTarget::CurrentDocument) {
             let current = session.doc().map_err(|e| e.to_string())?;
             task.settings.facing_pages |= current.doc.settings.facing_pages;
@@ -432,9 +624,16 @@ impl ProductionRunner {
         if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
             return Err(format!("Enter a nonempty brief of at most {MAX_BRIEF_BYTES} UTF-8 bytes (1 MiB)"));
         }
-        self.save_production_draft(session, &task)?;
-        require_text_model(&task.settings)?;
-        require_generation_models(&task.settings)?;
+        if task.target_formats.is_empty()
+            && matches!(task.target, TaskTarget::NewDocument { .. } | TaskTarget::NewA4 { .. })
+            && let Some(detail) = crate::intent_geometry::infer_brief_geometry_detail(&task.prompt, &task.settings)
+            && detail.target_formats.len() >= 2
+        {
+            task.target_formats = detail.target_formats;
+        }
+        for fmt in &task.target_formats {
+            crate::intent_geometry::validate_geometry_spec(fmt)?;
+        }
         let (mut expected, mut expected_doc) = match task.target {
             TaskTarget::CurrentDocument => {
                 let current = session.doc().map_err(|e| e.to_string())?;
@@ -456,7 +655,20 @@ impl ProductionRunner {
                 }
                 (None, None)
             }
+            TaskTarget::NewDocument { pages, ref geometry } => {
+                if !(1..=1000).contains(&pages) {
+                    return Err("AI new documents support 1–1000 pages".into());
+                }
+                crate::intent_geometry::validate_geometry_spec(geometry)?;
+                if task.settings.pages_per_batch == 0 && pages > 8 {
+                    return Err("Books over eight pages require reviewed batches".into());
+                }
+                (None, None)
+            }
         };
+        self.save_production_draft(session, &task)?;
+        require_text_model(&task.settings)?;
+        require_generation_models(&task.settings)?;
         if let Some((uid, _)) = expected
             && self.pending_image_regen.as_ref().is_some_and(|p| p.approval.document_uid == uid)
         {
@@ -498,8 +710,32 @@ impl ProductionRunner {
             expected = Some((current.uid, current.revision));
             expected_doc = Some(current.doc.clone());
         }
+        // Validate credentials before creating a live NewDocument workspace tab so failed admission leaves zero orphan tabs.
+        let mut preflight_selections = vec![task.settings.text_model.clone()];
+        if task.settings.output_mode == designcraft_ai_types::OutputMode::NativeWithImages {
+            preflight_selections.push(task.settings.image_model.clone());
+        }
+        self.prepare_credentials(&preflight_selections)?;
+        if let TaskTarget::NewDocument { pages, ref geometry } = task.target {
+            if self.pending.is_some() {
+                return Err("Only one AI task can run in this window".into());
+            }
+            ensure_publication_idle(session)?;
+            let params = crate::intent_geometry::geometry_to_file_new_params(geometry, pages, &task.settings, &task.prompt)?;
+            session.execute("file.new", &params).map_err(|e| e.to_string())?;
+            {
+                let created_mut = session.doc_mut().map_err(|e| e.to_string())?;
+                created_mut.history.undo.clear();
+                created_mut.history.redo.clear();
+            }
+            let created = session.doc().map_err(|e| e.to_string())?;
+            expected = Some((created.uid, created.revision));
+            expected_doc = Some(created.doc.clone());
+            self.save_production_draft(session, &task)?;
+        }
         let (base, mut context) = task_document_context(session, &task.target, profile, &task.prompt, &task.settings)?;
-        enrich_production_context(&mut context, &self.root, &base, &task)?;
+        let memory = expected.and_then(|(uid, _)| self.design_memory.get(&uid));
+        enrich_production_context_with_memory(&mut context, &self.root, &base, &task, memory)?;
         let print_contract = crate::print_contract::PrintContract::from_prompt(&task.prompt)?;
         if print_contract.is_some() && self.print_contracts.len() >= 1024 {
             return Err("Too many document print contracts in this application session; save open work and restart before creating another".into());
@@ -514,12 +750,16 @@ impl ProductionRunner {
             crate::design::check_geometry(Some(&base), &base, profile)?;
         }
         let settings = task.settings.clone();
+        self.failed_cloud_task = None;
+        self.snapshot.can_continue_locally = false;
         if self.batch.as_ref().is_some_and(|job| job.snapshot.status == "failed") {
             // An explicit new Produce may replace a failed task; Retry instead keeps
             // its original pinned skills and cumulative ledger.
             self.cancel_batch();
         }
-        if matches!(task.target, TaskTarget::ContinueBook) || matches!(task.target, TaskTarget::NewA4 { .. } if settings.pages_per_batch > 0) {
+        if matches!(task.target, TaskTarget::ContinueBook)
+            || matches!(task.target, TaskTarget::NewA4 { .. } | TaskTarget::NewDocument { .. } if settings.pages_per_batch > 0)
+        {
             return self.start_batches(session, task, snapshots, base, context);
         }
         let work = worker::Work::Production {
@@ -536,12 +776,20 @@ impl ProductionRunner {
     pub(super) fn preview_production(&mut self, session: &Session, task: TaskRequest) -> Result<(), String> {
         self.snapshot.production_preview = None;
         if task.prompt.trim().is_empty() || task.prompt.len() > MAX_BRIEF_BYTES {
-            return Err("Enter valid production instructions before previewing the curriculum".into());
+            return Err("Enter valid production instructions before previewing production".into());
         }
-        match task.target {
-            TaskTarget::NewA4 { pages } if (1..=1000).contains(&pages) => {}
-            TaskTarget::ContinueBook => {}
-            _ => return Err("Curriculum preview requires a new 1–1000-page book or an existing book to continue".into()),
+        match &task.target {
+            TaskTarget::NewA4 { pages } if (1..=1000).contains(pages) => {}
+            TaskTarget::NewDocument { pages, geometry } if (1..=1000).contains(pages) => {
+                crate::intent_geometry::validate_geometry_spec(geometry)?;
+            }
+            TaskTarget::ContinueBook => {
+                let _ = session.doc().map_err(|e| e.to_string())?;
+            }
+            TaskTarget::CurrentDocument => {
+                let _ = session.doc().map_err(|e| e.to_string())?;
+            }
+            _ => return Err("Production preview requires 1–1000 pages or an open document".into()),
         }
         let ids = if task.auto_select_skills {
             let auto_ids = self.prepare_skills_for_style(session, &task.prompt, task.settings.design_style.as_deref())?;
@@ -570,40 +818,104 @@ impl ProductionRunner {
                 styles.push(skill);
             }
         }
-        if styles.is_empty()
+        let wants_curriculum_fallback = styles.is_empty()
             && task.auto_select_skills
             && task.settings.design_style.is_none()
-            && let Some(fallback_id) = self.default_preview_style_id()
-        {
+            && matches!(task.target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook)
+            && (super::proofs::has_educational_kg_cues(&task.prompt) || crate::template_plan::is_stationery_or_planner_prompt(&task.prompt));
+        if wants_curriculum_fallback && let Some(fallback_id) = self.default_preview_style_id() {
             self.prepare_style(session, &fallback_id)?;
             styles.push(self.registry.snapshot(&fallback_id, &[]).map_err(|error| error.to_string())?);
         }
-        if styles.len() != 1 {
-            return Err("Choose one compatible design style to preview its curriculum".into());
+        if styles.len() > 1 {
+            return Err("Choose one compatible design style to preview production".into());
         }
-        let style = styles.first().ok_or("Missing preview style")?;
-        let profile = style.design_profile.as_ref().ok_or("Missing preview profile")?;
-        let (mut base, _) = task_document_context(session, &task.target, Some(profile), &task.prompt, &task.settings)?;
+        let style_opt = styles.first();
+        let profile_opt = style_opt.and_then(|s| s.design_profile.as_ref());
+        let (mut base, _) = task_document_context(session, &task.target, profile_opt, &task.prompt, &task.settings)?;
         if matches!(task.target, TaskTarget::ContinueBook) {
-            base = self.project_continuable_preview_base(&base, &session.prefs, &task, Some(profile))?;
+            base = self.project_continuable_preview_base(&base, &session.prefs, &task, profile_opt)?;
         }
         let total = u32::try_from(base.doc.page_count()).map_err(|_| "Preview page count exceeds its limit")?;
         let start = if matches!(task.target, TaskTarget::ContinueBook) {
-            batch::continuation_or_blank_progress(&base, Some(profile), &task.prompt)?.1
+            batch::continuation_or_blank_progress(&base, profile_opt, &task.prompt)?.1
         } else {
             0
         };
         let remaining = total.checked_sub(start).ok_or("Invalid preview range")?;
         let count = remaining.min(task.settings.pages_per_batch.max(1)).min(32);
-        let blueprint = crate::template_plan::curriculum_blueprint(&task.prompt, style, worker::BatchScope { start, count }, total)?;
-        let rtl = if matches!(task.target, TaskTarget::ContinueBook) {
-            base.doc.settings.right_to_left_binding
-        } else {
-            book_binding(&task.settings, &task.prompt)
+        let rtl = match &task.target {
+            TaskTarget::ContinueBook | TaskTarget::CurrentDocument => base.doc.settings.right_to_left_binding,
+            TaskTarget::NewDocument { geometry, .. } => geometry.right_to_left.unwrap_or_else(|| book_binding(&task.settings, &task.prompt)),
+            TaskTarget::NewA4 { .. } => book_binding(&task.settings, &task.prompt),
         };
-        self.snapshot.production_preview = Some(json!({"style":profile.name,"revision":style.revision,"total_pages":total,
-            "binding":if rtl {"RTL"} else {"LTR"},"preview_pages":count,"blueprint":blueprint}));
-        self.snapshot.message = "Local curriculum preview only; no provider request, document edit or production approval".into();
+        let inferred_detail = crate::intent_geometry::infer_brief_geometry_detail(&task.prompt, &task.settings);
+        let art_blueprint = crate::brief_planner::expand_brief_blueprint(&task, Some(&base.doc));
+        let effective_geometry = match &task.target {
+            TaskTarget::NewDocument { geometry, .. } => geometry.clone(),
+            _ => inferred_detail.as_ref().map(|d| d.primary.clone()).unwrap_or_else(|| art_blueprint.inferred_geometry.clone()),
+        };
+        let effective_formats = if !task.target_formats.is_empty() {
+            task.target_formats.clone()
+        } else {
+            inferred_detail.map(|d| d.target_formats).unwrap_or_else(|| art_blueprint.target_formats.clone())
+        };
+        let mut active_packs = task.knowledge_pack_ids.clone();
+        for id in &task.settings.active_knowledge_packs {
+            if !active_packs.contains(id) {
+                active_packs.push(id.clone());
+            }
+        }
+        let execution_mode_plan = match task.settings.execution_mode {
+            designcraft_ai_types::protocol::AiExecutionMode::Auto => {
+                format!("Auto ({:?} / {})", task.settings.text_model.provider, task.settings.text_model.model)
+            }
+            designcraft_ai_types::protocol::AiExecutionMode::LocalOnly => {
+                format!("LocalOnly ({:?} / {} — zero cloud traffic)", task.settings.text_model.provider, task.settings.text_model.model)
+            }
+            designcraft_ai_types::protocol::AiExecutionMode::CloudOnly => {
+                format!("CloudOnly ({:?} / {} — zero local traffic)", task.settings.text_model.provider, task.settings.text_model.model)
+            }
+            designcraft_ai_types::protocol::AiExecutionMode::SmartHybrid => {
+                let cont = task
+                    .settings
+                    .hybrid_local_model
+                    .as_ref()
+                    .map(|m| format!("{:?} / {}", m.provider, m.model))
+                    .unwrap_or_else(|| "unconfigured local model".into());
+                format!(
+                    "SmartHybrid (Batch 1 Cloud {:?} {} -> Batch 2+ Local {})",
+                    task.settings.text_model.provider, task.settings.text_model.model, cont
+                )
+            }
+        };
+
+        let mut preview_json = json!({
+            "detected_genre": art_blueprint.detected_genre,
+            "sanitized_title": art_blueprint.clean_subject,
+            "style": profile_opt.map(|p| p.name.clone()).unwrap_or_else(|| art_blueprint.detected_genre.clone()),
+            "revision": style_opt.map(|s| s.revision.clone()).unwrap_or_else(|| "dynamic-v1".into()),
+            "total_pages": total,
+            "binding": if rtl { "RTL" } else { "LTR" },
+            "preview_pages": count,
+            "inferred_geometry": effective_geometry,
+            "target_formats": effective_formats,
+            "art_direction": art_blueprint.typography_scale,
+            "curated_palette": art_blueprint.recommended_palette,
+            "page_blueprints": art_blueprint.page_blueprints,
+            "active_knowledge_packs": active_packs,
+            "attachment_count": task.attachments.len(),
+            "execution_mode_plan": execution_mode_plan,
+        });
+        if let (Some(style), Some(_profile)) = (style_opt, profile_opt)
+            && matches!(task.target, TaskTarget::NewA4 { .. } | TaskTarget::ContinueBook)
+            && let Ok(curriculum_bp) = crate::template_plan::curriculum_blueprint(&task.prompt, style, worker::BatchScope { start, count }, total)
+            && let Some(obj) = preview_json.as_object_mut()
+        {
+            obj.insert("blueprint".into(), curriculum_bp);
+        }
+        self.snapshot.production_preview = Some(preview_json);
+        self.snapshot.message = "Local production preview only; no provider request, document edit or production approval".into();
         Ok(())
     }
 
@@ -688,6 +1000,14 @@ impl ProductionRunner {
             worker::Work::Production { prefs, .. } | worker::Work::DeferredImages { prefs, .. } => Some(prefs.clone()),
             _ => None,
         };
+        let executed_model = match &work {
+            worker::Work::Models(selection) => (selection.provider, selection.model.clone()),
+            worker::Work::Production { request, .. } => (request.settings.text_model.provider, request.settings.text_model.model.clone()),
+            worker::Work::DeferredImages { settings, .. } => (settings.image_model.provider, settings.image_model.model.clone()),
+            worker::Work::Skill { settings, .. } => (settings.text_model.provider, settings.text_model.model.clone()),
+            worker::Work::Resources => (settings.text_model.provider, "local-hardware-probe".into()),
+            worker::Work::Indesign(_) => (settings.text_model.provider, "external-indesign-export".into()),
+        };
         let worker = worker::spawn(work, keys, roots.clone())?;
         self.pending = Some(Pending {
             roots,
@@ -700,6 +1020,7 @@ impl ProductionRunner {
             expected_prefs,
             skills,
             settings,
+            executed_model,
             deferred_outcome: None,
             deferred_batch: None,
         });
@@ -813,9 +1134,13 @@ impl ProductionRunner {
             design_style: self.style_use(&pending.skills, pending.task.as_ref().map(|task| &task.target)),
             id: pending.id,
             status: "failed".into(),
-            title: pending.task.as_ref().map(|t| t.prompt.chars().take(80).collect()).unwrap_or_else(|| "AI service operation".into()),
-            provider: pending.settings.text_model.provider,
-            model: pending.settings.text_model.model.clone(),
+            title: pending
+                .task
+                .as_ref()
+                .map(|t| crate::brief_planner::sanitize_visible_title(&t.prompt))
+                .unwrap_or_else(|| "AI service operation".into()),
+            provider: pending.executed_model.0,
+            model: pending.executed_model.1.clone(),
             settings: Some(pending.settings.clone()),
             skills: pending.skills,
             usage: outcome.usage,
@@ -845,11 +1170,20 @@ impl ProductionRunner {
             Ok(()) => {
                 report.status = "completed".into();
                 self.snapshot.stage = "completed".into();
+                self.failed_cloud_task = None;
+                self.snapshot.can_continue_locally = self.compute_can_continue_locally();
             }
             Err(error) => {
                 report.status = if cancelled { "cancelled" } else { "failed" }.into();
                 report.message = error;
                 self.snapshot.stage = report.status.clone();
+                if !cancelled && !pending.executed_model.0.is_local() && pending.task.is_some() {
+                    let failed_uid = pending.expected.map(|(uid, _)| uid);
+                    self.failed_cloud_task = pending.task.clone().map(|t| (t, failed_uid));
+                } else if cancelled {
+                    self.failed_cloud_task = None;
+                }
+                self.snapshot.can_continue_locally = self.compute_can_continue_locally();
             }
         }
         if report.message.is_empty() {
@@ -919,8 +1253,15 @@ impl ProductionRunner {
             worker::Product::Plan(plan) => {
                 self.publish_plan_product(session, task, expected, expected_doc, plan, report)?;
             }
-            worker::Product::Agentic { title, summary, chunks, deferred_images } => {
-                self.publish_agentic_product(session, task, expected, expected_doc, (title, summary, chunks, deferred_images), report)?;
+            worker::Product::Agentic { title, summary, chunks, deferred_images, scheduled_formats } => {
+                self.publish_agentic_product(
+                    session,
+                    task,
+                    expected,
+                    expected_doc,
+                    (title, summary, chunks, deferred_images, scheduled_formats),
+                    report,
+                )?;
             }
         }
         Ok(())
@@ -978,7 +1319,7 @@ impl ProductionRunner {
             _ => (None, None),
         };
         let context = match task.target {
-            TaskTarget::CurrentDocument | TaskTarget::ContinueBook => compact_context(session)?,
+            TaskTarget::CurrentDocument | TaskTarget::ContinueBook | TaskTarget::NewDocument { .. } => compact_context(session)?,
             TaskTarget::NewA4 { pages } => json!({"newA4Pages":pages,"documentParams":page_params}),
         };
         if let Err(err) = write_json(
@@ -992,7 +1333,8 @@ impl ProductionRunner {
             return Err(err);
         }
         report.artifacts.push(trace.to_string_lossy().into_owned());
-        let new_document = matches!(task.target, TaskTarget::NewA4 { .. });
+        let new_facing_document = (matches!(task.target, TaskTarget::NewA4 { .. }) && task.settings.facing_pages)
+            || matches!(task.target, TaskTarget::NewDocument { ref geometry, .. } if geometry.facing_pages.unwrap_or(false));
         let min_ppi = crate::print_contract::PrintContract::from_prompt(&task.prompt)?.and_then(|contract| contract.min_image_ppi()).unwrap_or(150.0);
         let mut created = false;
         let published = (|| {
@@ -1009,7 +1351,7 @@ impl ProductionRunner {
                 baseline.history.redo.clear();
             }
             let current = session.doc().map_err(|e| e.to_string())?;
-            let mapped = if new_document && task.settings.facing_pages { Some(crate::facing_pages::map_plan(&plan, current)?) } else { None };
+            let mapped = if new_facing_document { Some(crate::facing_pages::map_plan(&plan, current)?) } else { None };
             let applied = mapped.as_ref().unwrap_or(&plan);
             let params = json!({"commands":applied.commands,"outputMode":task.settings.output_mode,"label":applied.title,"expectedDocumentUid":current.uid,"expectedRevision":current.revision,"requirePreflight":true,"minPpi":min_ppi});
             session.execute("production.apply", &params).map_err(|e| e.to_string())?;
@@ -1031,7 +1373,7 @@ impl ProductionRunner {
         };
         report.actions = actions;
         report.title = title;
-        self.finalize_published_artifacts(session, task, min_ppi, report)?;
+        self.finalize_published_artifacts(session, task, min_ppi, None, report)?;
         report.message = format!("Created {} editable native actions; {} preflight notices", report.actions, report.issues.len());
         Ok(())
     }
@@ -1043,10 +1385,16 @@ impl ProductionRunner {
         task: &Option<TaskRequest>,
         expected: Option<(u64, u64)>,
         expected_doc: Option<&std::sync::Arc<designcraft_engine::doc::Document>>,
-        agentic: (String, String, Vec<Vec<EngineAction>>, Vec<crate::doc_tools::DeferredImagePlan>),
+        agentic: (
+            String,
+            String,
+            Vec<Vec<EngineAction>>,
+            Vec<crate::doc_tools::DeferredImagePlan>,
+            Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
+        ),
         report: &mut TaskReport,
     ) -> Result<(), String> {
-        let (title, summary, chunks, deferred_images) = agentic;
+        let (title, summary, chunks, deferred_images, scheduled_formats) = agentic;
         let task = task.as_ref().ok_or("Production result has no originating task")?;
         ensure_publication_idle(session)?;
         if let Some(directory) = &task.export_directory {
@@ -1153,7 +1501,7 @@ impl ProductionRunner {
         }
         report.actions = total_actions;
         report.title = title;
-        self.finalize_published_artifacts(session, task, min_ppi, report)?;
+        self.finalize_published_artifacts(session, task, min_ppi, scheduled_formats, report)?;
         self.record_deferred_image_regen(session, task, &summary, (deferred_images, deferred_count), min_ppi, report)
     }
 
@@ -1162,8 +1510,31 @@ impl ProductionRunner {
         session: &mut Session,
         task: &TaskRequest,
         min_ppi: f64,
+        scheduled_formats: Option<(Vec<designcraft_ai_types::protocol::DocumentGeometrySpec>, designcraft_ai_types::protocol::MultiFormatOutputMode)>,
         report: &mut TaskReport,
     ) -> Result<(), String> {
+        if let Ok(state) = session.doc() {
+            let uid = state.uid;
+            let doc_arc = state.doc.clone();
+            let entry = self.design_memory.entry(uid).or_insert_with(|| crate::brief_planner::SessionDesignMemory::new(uid));
+            entry.harvest_from_document(
+                uid,
+                &doc_arc,
+                None,
+                Some(&crate::brief_planner::sanitize_visible_title(&task.prompt)),
+                &task.knowledge_pack_ids,
+                Some(&report.title),
+            );
+        }
+        if let Some((formats, mode)) = scheduled_formats {
+            if !formats.is_empty() {
+                let adapted = crate::doc_tools::materialize_target_formats_on_session(session, &formats, mode)?;
+                report.actions = report.actions.saturating_add(adapted);
+            }
+        } else if !task.target_formats.is_empty() {
+            let adapted = crate::doc_tools::materialize_target_formats_on_session(session, &task.target_formats, task.settings.multi_format_mode)?;
+            report.actions = report.actions.saturating_add(adapted);
+        }
         if let Some(contract) = crate::print_contract::PrintContract::from_prompt(&task.prompt)? {
             self.print_contracts.insert(session.doc().map_err(|e| e.to_string())?.uid, contract);
         }
@@ -1201,12 +1572,20 @@ impl ProductionRunner {
         let (deferred_images, deferred_count) = deferred;
         if !deferred_images.is_empty() && deferred_count > 0 {
             let current = session.doc().map_err(|e| e.to_string())?;
-            let img_sel = if task.settings.image_model.provider == ProviderKind::ComfyUi || !task.settings.image_model.model.trim().is_empty() {
+            let snap_img_compatible = match task.settings.execution_mode {
+                designcraft_ai_types::protocol::AiExecutionMode::LocalOnly => self.snapshot.settings.image_model.provider.is_local(),
+                designcraft_ai_types::protocol::AiExecutionMode::CloudOnly => !self.snapshot.settings.image_model.provider.is_local(),
+                _ => true,
+            };
+            let img_sel = if task.settings.image_model.provider == ProviderKind::ComfyUi
+                || !task.settings.image_model.model.trim().is_empty()
+                || !snap_img_compatible
+            {
                 &task.settings.image_model
             } else {
                 &self.snapshot.settings.image_model
             };
-            let estimated_cost_usd = if matches!(img_sel.provider, ProviderKind::ComfyUi | ProviderKind::Ollama) {
+            let estimated_cost_usd = if img_sel.provider.is_local() {
                 Some(0.0)
             } else {
                 task.settings
@@ -1257,5 +1636,91 @@ impl ProductionRunner {
             report.message = format!("{} ({} native actions; {} preflight notices)", summary.trim(), report.actions, report.issues.len());
         }
         Ok(())
+    }
+}
+
+fn probe_single_local_endpoint(provider: ProviderKind, endpoint: String) -> designcraft_ai_types::protocol::DiscoveredLocalEndpoint {
+    use designcraft_ai_types::protocol::DiscoveredLocalEndpoint;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpStream, ToSocketAddrs as _};
+    use std::time::Duration;
+
+    if !provider.is_local() {
+        return DiscoveredLocalEndpoint { provider, endpoint, reachable: false, models: Vec::new(), message: "Non-local provider".into() };
+    }
+
+    let probe_selection = designcraft_ai_types::ModelSelection { provider, model: "probe".into(), endpoint: Some(endpoint.clone()) };
+    if let Err(err) = validate_endpoint(&probe_selection) {
+        return DiscoveredLocalEndpoint { provider, endpoint, reachable: false, models: Vec::new(), message: format!("Skipped endpoint: {err}") };
+    }
+
+    let stripped = endpoint.trim().strip_prefix("http://").or_else(|| endpoint.trim().strip_prefix("https://")).unwrap_or(endpoint.trim());
+    let authority = stripped.split('/').next().unwrap_or("");
+    let addrs: Vec<std::net::SocketAddr> = authority.to_socket_addrs().map(|it| it.filter(|a| a.ip().is_loopback()).collect()).unwrap_or_default();
+    if addrs.is_empty() {
+        return DiscoveredLocalEndpoint {
+            provider,
+            endpoint,
+            reachable: false,
+            models: Vec::new(),
+            message: "Loopback socket address could not be resolved".into(),
+        };
+    }
+
+    let mut connected_stream: Option<TcpStream> = None;
+    for addr in addrs {
+        if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(450)) {
+            connected_stream = Some(stream);
+            break;
+        }
+    }
+    let Some(mut stream) = connected_stream else {
+        return DiscoveredLocalEndpoint {
+            provider,
+            endpoint,
+            reachable: false,
+            models: Vec::new(),
+            message: "Unreachable (connection refused or timed out)".into(),
+        };
+    };
+
+    if provider == ProviderKind::ComfyUi {
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(450)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(550)));
+        let req_bytes = format!("GET /system_stats HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+        if let Err(err) = stream.write_all(req_bytes.as_bytes()) {
+            return DiscoveredLocalEndpoint { provider, endpoint, reachable: false, models: Vec::new(), message: format!("Unreachable ({err})") };
+        }
+        let mut resp_buf = Vec::with_capacity(2048);
+        let _ = stream.take(16 * 1024).read_to_end(&mut resp_buf);
+        let head = String::from_utf8_lossy(&resp_buf);
+        let first_line = head.lines().next().unwrap_or("");
+        if first_line.starts_with("HTTP/1.") && first_line.contains(" 200") {
+            return DiscoveredLocalEndpoint {
+                provider,
+                endpoint,
+                reachable: true,
+                models: vec!["comfyui-workflow".into()],
+                message: "ComfyUI server reachable".into(),
+            };
+        }
+        return DiscoveredLocalEndpoint {
+            provider,
+            endpoint,
+            reachable: false,
+            models: Vec::new(),
+            message: format!("Unexpected status ({first_line})"),
+        };
+    }
+
+    drop(stream);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    match designcraft_ai_providers::list_models(&probe_selection, None, &cancel) {
+        Ok(models) => {
+            let model_ids: Vec<String> = models.into_iter().take(64).map(|m| m.id).collect();
+            let count = model_ids.len();
+            DiscoveredLocalEndpoint { provider, endpoint, reachable: true, models: model_ids, message: format!("Reachable ({count} model(s))") }
+        }
+        Err(err) => DiscoveredLocalEndpoint { provider, endpoint, reachable: false, models: Vec::new(), message: format!("Unreachable ({err})") },
     }
 }

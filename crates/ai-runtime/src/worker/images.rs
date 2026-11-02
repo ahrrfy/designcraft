@@ -33,6 +33,12 @@ impl Runner<'_> {
         if settings.output_mode == OutputMode::NativeOnly {
             return Err("Native-only output forbids generated raster images".into());
         }
+        if settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::LocalOnly && !settings.image_model.provider.is_local() {
+            return Err("LocalOnly execution mode forbids cloud image providers; select ComfyUI or switch Output Mode to Native Only".into());
+        }
+        if settings.execution_mode == designcraft_ai_types::protocol::AiExecutionMode::CloudOnly && settings.image_model.provider.is_local() {
+            return Err("CloudOnly execution mode forbids local image endpoints; select a cloud image provider or Native Only".into());
+        }
         validate_image_review_settings(settings)?;
         let style_context = illustration_style(style_profile)?;
         image_command_budget(&plan, profile)?;
@@ -332,10 +338,7 @@ pub(super) fn validate_image_review_settings(settings: &AiSettings) -> Result<()
 }
 
 pub(super) fn validate_monetary_image_rates(settings: &AiSettings) -> Result<(), String> {
-    if settings.budget.max_cost_usd.is_some()
-        && settings.output_mode == OutputMode::NativeWithImages
-        && !matches!(settings.image_model.provider, ProviderKind::Ollama | ProviderKind::ComfyUi)
-    {
+    if settings.budget.max_cost_usd.is_some() && settings.output_mode == OutputMode::NativeWithImages && !settings.image_model.provider.is_local() {
         let has_rate = settings.image_rates.as_ref().and_then(|r| r.image_per_request.or(r.image_reserve_usd)).is_some();
         if !has_rate {
             return Err("Set rates for the selected provider before using a monetary limit".into());

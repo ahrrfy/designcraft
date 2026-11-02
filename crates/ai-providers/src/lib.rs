@@ -158,6 +158,40 @@ pub fn supports_agent_vision(selection: &ModelSelection) -> bool {
                 || base.ends_with("vl")
                 || matches!(base, "gemma3" | "gemma4" | "llama4" | "qwen3.5" | "mistral-small3.1" | "mistral-small3.2")
         }
+        ProviderKind::LocalOpenAi => {
+            let base = leaf.split([':', '@']).next().unwrap_or(leaf);
+            let tag = leaf.split_once([':', '@']).map_or("", |(_, t)| t);
+            if base.starts_with("gemma-2")
+                || base.starts_with("gemma-3-1b")
+                || base.starts_with("gemma3-1b")
+                || base.starts_with("gemma-3n-e2b")
+                || (matches!(base, "gemma3" | "gemma-3") && (tag.starts_with("1b") || tag.contains("-1b")))
+            {
+                return false;
+            }
+            base.contains("vision")
+                || base.contains("llava")
+                || base.contains("moondream")
+                || base.contains("pixtral")
+                || base.contains("minicpm-v")
+                || base.contains("internvl")
+                || base.contains("smolvlm")
+                || base.contains("-vl-")
+                || base.ends_with("-vl")
+                || base.ends_with("vl")
+                || base.starts_with("gemma-3")
+                || base.starts_with("gemma3")
+                || base.starts_with("gemma-4")
+                || base.starts_with("gemma4")
+                || base.starts_with("llama-4")
+                || base.starts_with("llama4")
+                || base.starts_with("qwen3.5")
+                || base.starts_with("qwen-3.5")
+                || base.starts_with("mistral-small-3.1")
+                || base.starts_with("mistral-small3.1")
+                || base.starts_with("mistral-small-3.2")
+                || base.starts_with("mistral-small3.2")
+        }
         ProviderKind::ComfyUi => false,
     }
 }
@@ -398,9 +432,13 @@ pub fn validate_endpoint(selection: &ModelSelection) -> Result<Url, String> {
         ProviderKind::OpenAi => "https://api.openai.com/v1/",
         ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta/",
         ProviderKind::Ollama => "http://127.0.0.1:11434/",
+        ProviderKind::LocalOpenAi => "http://127.0.0.1:1234/v1/",
         ProviderKind::ComfyUi => "http://127.0.0.1:8188/",
     };
-    let raw = selection.endpoint.as_deref().unwrap_or(default);
+    let raw = match selection.provider {
+        ProviderKind::LocalOpenAi => selection.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default),
+        _ => selection.endpoint.as_deref().unwrap_or(default),
+    };
     if raw.len() > 2048 {
         return Err("AI endpoint is too long".into());
     }
@@ -408,7 +446,10 @@ pub fn validate_endpoint(selection: &ModelSelection) -> Result<Url, String> {
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("AI endpoint must not contain credentials, query, or fragment".into());
     }
-    let local = matches!(selection.provider, ProviderKind::Ollama | ProviderKind::ComfyUi);
+    if url.port() == Some(0) {
+        return Err("Invalid AI endpoint port".into());
+    }
+    let local = selection.provider.is_local();
     if local {
         if !matches!(url.scheme(), "http" | "https") {
             return Err("Local AI endpoint requires HTTP or HTTPS".into());
@@ -441,7 +482,9 @@ pub fn validate_endpoint(selection: &ModelSelection) -> Result<Url, String> {
         }
     }
     let path = url.path().to_string();
-    if !path.ends_with('/') {
+    if selection.provider == ProviderKind::LocalOpenAi && (path.is_empty() || path == "/") {
+        url.set_path("/v1/");
+    } else if !path.ends_with('/') {
         url.set_path(&format!("{path}/"));
     }
     Ok(url)
