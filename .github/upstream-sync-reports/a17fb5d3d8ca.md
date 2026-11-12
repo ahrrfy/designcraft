@@ -1,0 +1,395 @@
+# Upstream integration review
+
+CONFLICTS: automatic merge stopped safely to preserve Smart Design features. Resolve conflicts manually.
+
+- Fork main base: 78b4c8d0b0f647bb7339b7e40e8deadbd44879fa
+- Upstream main: a17fb5d3d8ca53072c38366c88916b20fccaa340
+- Source: https://github.com/storytold/designcraft
+
+## Conflicting paths
+
+~~~text
+.github/workflows/release.yml
+README.md
+ROADMAP.md
+apps/designcraft/src/main.rs
+contributors/people.toml
+crates/color/src/gradient.rs
+crates/compose/src/shape.rs
+crates/compose/src/warichu.rs
+crates/doc/src/lib.rs
+crates/doc/src/tests.rs
+crates/engine/src/cmd/book.rs
+crates/engine/src/cmd/export/pdf.rs
+crates/engine/src/cmd/file/place.rs
+crates/engine/src/cmd/interchange.rs
+crates/engine/src/cmd/layout/registry.rs
+crates/engine/src/cmd/liquid.rs
+crates/engine/src/cmd/package.rs
+crates/engine/src/cmd/print.rs
+crates/engine/src/cmd/toc.rs
+crates/engine/src/cmd/variables/tests.rs
+crates/engine/src/dtd.rs
+crates/engine/src/io.rs
+crates/engine/src/tests.rs
+crates/fonts/src/fontdb/tests/fallback.rs
+crates/fonts/src/lib.rs
+crates/idml/src/export/story.rs
+crates/images/src/lib.rs
+crates/images/src/tests.rs
+crates/mcp/src/tests.rs
+crates/mcp/src/tools.rs
+crates/pdf/src/lib.rs
+crates/render/src/fx.rs
+crates/render/src/tests.rs
+crates/ui-egui/Cargo.toml
+crates/ui-egui/src/app.rs
+crates/ui-egui/src/chrome/tests.rs
+crates/ui-egui/src/control.rs
+crates/ui-egui/src/credits.rs
+crates/ui-egui/src/lib.rs
+crates/ui-egui/src/menus/tests.rs
+crates/ui-egui/src/services.rs
+crates/ui-egui/src/toolbar.rs
+docs/gaps.md
+docs/roadmap.md
+~~~
+
+## Upstream changed paths
+
+~~~text
+A	.github/workflows/house-rules.yml
+M	.github/workflows/packaging-lint.yml
+M	.github/workflows/release.yml
+M	AGENTS.md
+M	CLAUDE.md
+M	Cargo.lock
+M	Cargo.toml
+M	NOTICE
+M	README.md
+M	ROADMAP.md
+M	apps/designcraft-cli/Cargo.toml
+M	apps/designcraft-cli/examples/pdf_export.rs
+M	apps/designcraft-cli/src/main.rs
+M	apps/designcraft-cli/tests/it/cli.rs
+M	apps/designcraft/Cargo.toml
+M	apps/designcraft/src/gpu.rs
+M	apps/designcraft/src/gpu/backend.rs
+M	apps/designcraft/src/gpu_limits.rs
+M	apps/designcraft/src/logging.rs
+M	apps/designcraft/src/main.rs
+A	apps/designcraft/src/pointer.rs
+A	apps/designcraft/src/window_frame.rs
+M	contributors/people.toml
+M	crates/color/src/cms/lab.rs
+M	crates/color/src/gradient.rs
+M	crates/color/src/lib.rs
+M	crates/compose/Cargo.toml
+M	crates/compose/src/breaker.rs
+M	crates/compose/src/cache.rs
+M	crates/compose/src/grep.rs
+M	crates/compose/src/hyphen.rs
+M	crates/compose/src/hyphen/dict.rs
+M	crates/compose/src/lib.rs
+M	crates/compose/src/notes.rs
+M	crates/compose/src/overlay.rs
+M	crates/compose/src/parabox.rs
+M	crates/compose/src/placed.rs
+M	crates/compose/src/shape.rs
+M	crates/compose/src/table.rs
+M	crates/compose/src/tests.rs
+M	crates/compose/src/warichu.rs
+M	crates/doc/src/anchored.rs
+M	crates/doc/src/arrow.rs
+M	crates/doc/src/assets.rs
+M	crates/doc/src/attrs/language.rs
+M	crates/doc/src/attrs/tests.rs
+M	crates/doc/src/build.rs
+M	crates/doc/src/edit.rs
+M	crates/doc/src/endnotes.rs
+M	crates/doc/src/item.rs
+M	crates/doc/src/lib.rs
+M	crates/doc/src/mojikumi.rs
+M	crates/doc/src/notes.rs
+M	crates/doc/src/page.rs
+M	crates/doc/src/selection.rs
+M	crates/doc/src/story.rs
+M	crates/doc/src/styles.rs
+M	crates/doc/src/swatch_refs.rs
+M	crates/doc/src/table.rs
+M	crates/doc/src/table/edit.rs
+M	crates/doc/src/table/merge.rs
+M	crates/doc/src/tests.rs
+M	crates/doc/src/vars.rs
+M	crates/doc/src/xref.rs
+A	crates/doc/tests/autocraft_regression.rs
+A	crates/doc/tests/autocraft_regression_2514.rs
+M	crates/engine/src/cmd.rs
+M	crates/engine/src/cmd/anchored.rs
+M	crates/engine/src/cmd/anchors.rs
+M	crates/engine/src/cmd/book.rs
+M	crates/engine/src/cmd/captions.rs
+M	crates/engine/src/cmd/changes.rs
+M	crates/engine/src/cmd/datamerge.rs
+M	crates/engine/src/cmd/datamerge/fill.rs
+M	crates/engine/src/cmd/datamerge/parse.rs
+M	crates/engine/src/cmd/datamerge/tests.rs
+M	crates/engine/src/cmd/edit.rs
+M	crates/engine/src/cmd/editorial.rs
+M	crates/engine/src/cmd/endnotes.rs
+M	crates/engine/src/cmd/export/flatten.rs
+M	crates/engine/src/cmd/export/formats.rs
+M	crates/engine/src/cmd/export/pdf.rs
+M	crates/engine/src/cmd/export/registry.rs
+M	crates/engine/src/cmd/export/text_tests.rs
+A	crates/engine/src/cmd/export_batch.rs
+M	crates/engine/src/cmd/file/bytes.rs
+M	crates/engine/src/cmd/file/new.rs
+M	crates/engine/src/cmd/file/open.rs
+M	crates/engine/src/cmd/file/place.rs
+M	crates/engine/src/cmd/find.rs
+M	crates/engine/src/cmd/find/tests.rs
+M	crates/engine/src/cmd/fonts.rs
+M	crates/engine/src/cmd/index.rs
+M	crates/engine/src/cmd/interactive.rs
+M	crates/engine/src/cmd/interchange.rs
+M	crates/engine/src/cmd/layout.rs
+M	crates/engine/src/cmd/layout/pages.rs
+M	crates/engine/src/cmd/layout/parents.rs
+M	crates/engine/src/cmd/layout/registry.rs
+M	crates/engine/src/cmd/layout/sections.rs
+M	crates/engine/src/cmd/linked.rs
+M	crates/engine/src/cmd/links.rs
+M	crates/engine/src/cmd/links/tests.rs
+M	crates/engine/src/cmd/liquid.rs
+M	crates/engine/src/cmd/mathexpr.rs
+M	crates/engine/src/cmd/media.rs
+M	crates/engine/src/cmd/notes.rs
+M	crates/engine/src/cmd/object.rs
+M	crates/engine/src/cmd/overrides.rs
+M	crates/engine/src/cmd/package.rs
+M	crates/engine/src/cmd/package/tests.rs
+A	crates/engine/src/cmd/parent_resize_tests.rs
+M	crates/engine/src/cmd/paste_svg.rs
+M	crates/engine/src/cmd/paths.rs
+M	crates/engine/src/cmd/place_text.rs
+M	crates/engine/src/cmd/preflight.rs
+A	crates/engine/src/cmd/preflight/white_overprint.rs
+A	crates/engine/src/cmd/preflight/white_overprint/tests.rs
+M	crates/engine/src/cmd/print.rs
+M	crates/engine/src/cmd/select.rs
+M	crates/engine/src/cmd/spelling.rs
+M	crates/engine/src/cmd/style/swatches.rs
+M	crates/engine/src/cmd/table.rs
+M	crates/engine/src/cmd/table/structure.rs
+M	crates/engine/src/cmd/table/styles.rs
+M	crates/engine/src/cmd/table/target.rs
+M	crates/engine/src/cmd/text.rs
+M	crates/engine/src/cmd/text/caret.rs
+M	crates/engine/src/cmd/text/edit.rs
+M	crates/engine/src/cmd/text/format.rs
+M	crates/engine/src/cmd/toc.rs
+M	crates/engine/src/cmd/variables.rs
+M	crates/engine/src/cmd/variables/tests.rs
+M	crates/engine/src/cmd/xml.rs
+M	crates/engine/src/cmd/xref.rs
+M	crates/engine/src/dtd.rs
+M	crates/engine/src/file_access.rs
+M	crates/engine/src/io.rs
+M	crates/engine/src/lib.rs
+M	crates/engine/src/math.rs
+M	crates/engine/src/math/tests.rs
+M	crates/engine/src/recovery.rs
+M	crates/engine/src/recovery/tests.rs
+M	crates/engine/src/script.rs
+M	crates/engine/src/tests.rs
+M	crates/engine/src/tests/idml.rs
+M	crates/engine/src/tests/table.rs
+A	crates/engine/tests/autocraft_regression_2422.rs
+A	crates/engine/tests/hyperlink_offsets.rs
+M	crates/engine/tests/support/optional_content.rs
+M	crates/epub/src/chapters.rs
+M	crates/epub/src/css.rs
+M	crates/epub/src/html.rs
+M	crates/epub/src/package.rs
+M	crates/epub/src/story_writer.rs
+M	crates/epub/src/tests.rs
+M	crates/epub/tests/it/grouped_reading_order.rs
+M	crates/fonts/src/fontdb.rs
+M	crates/fonts/src/fontdb/db.rs
+M	crates/fonts/src/fontdb/face.rs
+M	crates/fonts/src/fontdb/fallback.rs
+M	crates/fonts/src/fontdb/names.rs
+M	crates/fonts/src/fontdb/outline.rs
+M	crates/fonts/src/fontdb/scoped.rs
+M	crates/fonts/src/fontdb/system.rs
+M	crates/fonts/src/fontdb/tests/fallback.rs
+M	crates/fonts/src/lib.rs
+M	crates/format/src/lib.rs
+M	crates/format/src/tests.rs
+M	crates/geom/src/freehand.rs
+M	crates/geom/src/hit.rs
+M	crates/geom/src/path.rs
+M	crates/geom/src/pathfinder.rs
+M	crates/geom/src/stroke_style.rs
+M	crates/geom/src/trace.rs
+M	crates/geom/src/warp.rs
+M	crates/idml/src/export.rs
+M	crates/idml/src/export/designmap.rs
+M	crates/idml/src/export/item.rs
+M	crates/idml/src/export/story.rs
+M	crates/idml/src/export/styles.rs
+M	crates/idml/src/export/table.rs
+M	crates/idml/src/import.rs
+M	crates/idml/src/import/item.rs
+M	crates/idml/src/import/object_style.rs
+M	crates/idml/src/import/story.rs
+M	crates/idml/src/import/styles.rs
+M	crates/idml/src/import/swatches.rs
+M	crates/idml/src/import/table.rs
+M	crates/idml/src/lib.rs
+M	crates/idml/src/names.rs
+M	crates/idml/src/tests.rs
+M	crates/idml/src/tests/assets.rs
+A	crates/idml/tests/autocraft_regression_2410.rs
+M	crates/images/Cargo.toml
+M	crates/images/src/eps.rs
+M	crates/images/src/lib.rs
+M	crates/images/src/tests.rs
+M	crates/mcp/src/server.rs
+M	crates/mcp/src/tests.rs
+M	crates/mcp/src/tools.rs
+M	crates/pdf/src/export.rs
+M	crates/pdf/src/export/images.rs
+M	crates/pdf/src/export/pipeline.rs
+M	crates/pdf/src/export/walk.rs
+M	crates/pdf/src/forms.rs
+M	crates/pdf/src/gradient_inks.rs
+M	crates/pdf/src/lib.rs
+M	crates/pdf/src/links.rs
+M	crates/pdf/src/optional_content.rs
+M	crates/pdf/src/pdfx.rs
+M	crates/pdf/src/pdfx/tests.rs
+M	crates/pdf/src/pdfx1a.rs
+M	crates/pdf/src/tests.rs
+M	crates/pdf/src/x1a_tests.rs
+M	crates/pptx/src/fonts.rs
+M	crates/pptx/src/slide.rs
+M	crates/pptx/src/table.rs
+M	crates/pptx/src/text.rs
+M	crates/render/src/blendspace.rs
+M	crates/render/src/draw.rs
+M	crates/render/src/fx.rs
+M	crates/render/src/lib.rs
+M	crates/render/src/pdf_layers.rs
+M	crates/render/src/pdf_raster.rs
+M	crates/render/src/stroke.rs
+M	crates/render/src/tests.rs
+M	crates/render/src/text.rs
+M	crates/render/tests/it/colorize.rs
+M	crates/textimport/src/docx.rs
+M	crates/textimport/src/docx/tests.rs
+M	crates/textimport/src/docx_numbering.rs
+M	crates/textimport/src/export.rs
+M	crates/textimport/src/lib.rs
+M	crates/textimport/src/rtf.rs
+M	crates/textimport/src/tagged.rs
+M	crates/textimport/src/xlsx.rs
+M	crates/tools/src/layout.rs
+M	crates/tools/src/lib.rs
+M	crates/tools/src/nav.rs
+M	crates/tools/src/pen.rs
+M	crates/tools/src/snap.rs
+M	crates/tools/src/snap/tests.rs
+M	crates/tools/src/tests.rs
+M	crates/ui-egui/Cargo.toml
+M	crates/ui-egui/src/about.rs
+M	crates/ui-egui/src/app.rs
+M	crates/ui-egui/src/app/file_dialogs.rs
+M	crates/ui-egui/src/app/files.rs
+M	crates/ui-egui/src/app/input.rs
+M	crates/ui-egui/src/canvas.rs
+M	crates/ui-egui/src/canvas/frames.rs
+M	crates/ui-egui/src/canvas/input.rs
+M	crates/ui-egui/src/canvas/page_decor.rs
+M	crates/ui-egui/src/canvas/tests.rs
+M	crates/ui-egui/src/canvas/view.rs
+M	crates/ui-egui/src/chrome/control_bar.rs
+M	crates/ui-egui/src/chrome/tests.rs
+M	crates/ui-egui/src/control.rs
+M	crates/ui-egui/src/credits.rs
+M	crates/ui-egui/src/dialogs.rs
+M	crates/ui-egui/src/dialogs/tests.rs
+A	crates/ui-egui/src/export_batch_dialog.rs
+M	crates/ui-egui/src/i18n.rs
+M	crates/ui-egui/src/i18n/ar.rs
+M	crates/ui-egui/src/i18n/cs.rs
+M	crates/ui-egui/src/i18n/de.rs
+M	crates/ui-egui/src/i18n/fr.rs
+A	crates/ui-egui/src/i18n/hu.rs
+M	crates/ui-egui/src/i18n/it.rs
+M	crates/ui-egui/src/i18n/ja.rs
+M	crates/ui-egui/src/i18n/ka.rs
+M	crates/ui-egui/src/i18n/pl.rs
+M	crates/ui-egui/src/i18n/pt_br.rs
+M	crates/ui-egui/src/i18n/ru.rs
+A	crates/ui-egui/src/i18n/sv.rs
+M	crates/ui-egui/src/i18n/table.rs
+M	crates/ui-egui/src/i18n/tests.rs
+M	crates/ui-egui/src/i18n/uk.rs
+M	crates/ui-egui/src/lib.rs
+A	crates/ui-egui/src/links_worker.rs
+M	crates/ui-egui/src/menus.rs
+M	crates/ui-egui/src/menus/invoke.rs
+M	crates/ui-egui/src/menus/keys.rs
+M	crates/ui-egui/src/menus/run.rs
+M	crates/ui-egui/src/menus/state.rs
+M	crates/ui-egui/src/menus/tables.rs
+M	crates/ui-egui/src/menus/tests.rs
+M	crates/ui-egui/src/menus/ui_commands.rs
+M	crates/ui-egui/src/new_document.rs
+M	crates/ui-egui/src/object_control.rs
+M	crates/ui-egui/src/panels/cell_stroke.rs
+M	crates/ui-egui/src/panels/pages.rs
+M	crates/ui-egui/src/panels/pages/tests.rs
+M	crates/ui-egui/src/panels/properties.rs
+M	crates/ui-egui/src/panels/properties/document.rs
+M	crates/ui-egui/src/panels/properties/links.rs
+M	crates/ui-egui/src/panels/properties/object.rs
+M	crates/ui-egui/src/panels/properties/object_panels.rs
+M	crates/ui-egui/src/panels/properties/tests.rs
+M	crates/ui-egui/src/panels/properties/text.rs
+M	crates/ui-egui/src/panels/properties/typography.rs
+M	crates/ui-egui/src/panels/swatches.rs
+M	crates/ui-egui/src/services.rs
+M	crates/ui-egui/src/state.rs
+M	crates/ui-egui/src/taskbar.rs
+M	crates/ui-egui/src/tests.rs
+M	crates/ui-egui/src/toolbar.rs
+M	crates/ui-egui/src/toolbar/tests.rs
+M	crates/ui-egui/src/updates_ui.rs
+M	crates/ui-egui/src/widgets.rs
+A	crates/ui-egui/src/window_frame_tests.rs
+A	crates/ui-egui/tests/flatpak_updates.rs
+M	docs/cjk.md
+M	docs/contributors.md
+M	docs/control-protocol.md
+M	docs/file-format-parity.md
+M	docs/gaps.md
+M	docs/localization-parity.md
+M	docs/mcp.md
+M	docs/roadmap.md
+M	docs/target-app-parity.md
+M	docs/typography-parity.md
+M	docs/ui-parity.md
+A	packaging/linux/ai.storyteller.designcraft.thumbnailer
+M	packaging/linux/flatpak/ai.storyteller.designcraft.bundle.yml
+M	packaging/linux/flatpak/ai.storyteller.designcraft.yml
+M	packaging/linux/nfpm.yaml
+M	packaging/linux/package.sh
+M	packaging/macos/Info.plist.in
+M	packaging/macos/import-cert.sh
+M	packaging/macos/package.sh
+M	xtask/src/main.rs
+M	xtask/src/stats.rs
+~~~
